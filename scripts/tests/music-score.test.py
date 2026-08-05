@@ -797,6 +797,39 @@ class MusicScoreContractTest(unittest.TestCase):
         self.assertEqual(plan, control["music"]["events"])
         self.assertTrue(all(stem["audio_source_sha256"] is None for stem in control["music"]["stems"]))
 
+    def test_ab_capture_evidence_regenerates_byte_identically_and_is_current(self) -> None:
+        """Predicate 4 of #9: score-to-motion is deterministically and audibly inspectable.
+
+        The tracked `docs/evidence/score-to-motion-ab.*` receipt must regenerate
+        byte-identically from the pure f(seed, t) engine, and its content must
+        prove the declared boundaries move the image under the score while the
+        image alone is the control.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            result = run(sys.executable, "scripts/capture-score-motion-ab.py", "--stream", "7", "--out", str(out))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fresh_json = (out / "score-to-motion-ab.json").read_bytes()
+            tracked_json = (ROOT / "docs/evidence/score-to-motion-ab.json").read_bytes()
+            self.assertEqual(fresh_json, tracked_json, "A/B evidence JSON drifted — regenerate it")
+            fresh_md = (out / "score-to-motion-ab.md").read_bytes()
+            tracked_md = (ROOT / "docs/evidence/score-to-motion-ab.md").read_bytes()
+            self.assertEqual(fresh_md, tracked_md, "A/B evidence markdown drifted — regenerate it")
+
+        evidence = json.loads(tracked_json)
+        self.assertEqual(evidence["contract"], self.score["identity"]["contract_sha256"])
+        structural = [row for row in evidence["rows"] if row["kind"] != "downbeat"]
+        moved = [row for row in structural if any(abs(v) > 0.0005 for v in row["visual"]["score_transition"].values())]
+        self.assertTrue(len(structural) >= 7, "one row per declared movement is expected")
+        self.assertTrue(moved, "no declared boundary measurably moves the image")
+        by_id = {row["id"]: row for row in structural}
+        self.assertIn("stillness-entry", by_id)
+        self.assertTrue(by_id["stillness-entry"]["visual"]["hold"], "stillness must declare the visual hold")
+        accented = [row for row in structural if row["kind"] == "cue" and "accent" in row["id"]]
+        self.assertTrue(all(row["visual"]["recast"] is not None for row in accented), "accents must recast the material")
+        audible = [row for row in evidence["rows"] if row["audio"]["notes"]]
+        self.assertTrue(audible, "the fixture must schedule audible notes at declared boundaries")
+
 
 if __name__ == "__main__":
     unittest.main()
