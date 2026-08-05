@@ -1,0 +1,151 @@
+{
+  "schema": "danse.evidence.score-to-motion-frames.v1",
+  "contract": "0979888d8b4aac050a8cabc6c9c5b358209694e2be2555d041887ccb5c78fe7d",
+  "seed": "0x12345678",
+  "stream": 7,
+  "passage": {
+    "index": 0,
+    "t0": 0,
+    "seconds": 362.367024
+  },
+  "tier": "screen",
+  "width": 1024,
+  "height": 768,
+  "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+  "source": "score-to-motion-ab.json",
+  "contact_sheet": "score-to-motion-frames.png",
+  "contact_sheet_sha256": "41eaaefa904b496e36377a19b72ef2899780b8618bede18a418583457433dce4",
+  "determinism": {
+    "absolute_second": 0.0,
+    "mode": "with",
+    "renders": [
+      "with/0",
+      "redraw/0"
+    ],
+    "identical": true,
+    "with_sha256": "21afe5e36bf978052009331276e4f8934dba03ff524c7a9a114461d223e75d28",
+    "redraw_sha256": "21afe5e36bf978052009331276e4f8934dba03ff524c7a9a114461d223e75d28"
+  },
+  "rows": [
+    {
+      "absolute_second": 0.0,
+      "kind": "origin",
+      "id": "ONE",
+      "movement": "ONE",
+      "score_delta_max": 0.0,
+      "psnr_db": 14.594969130009565,
+      "with_sha256": "39de40b3c34e8850089b2ada66ac1ce4c6b113513e32f937f5fbd5d66223ceab",
+      "without_sha256": "ee5085511550144ca0a1b3f73f7b2fa455eea33ad146359b5c43a80ab9f5ae7a"
+    },
+    {
+      "absolute_second": 37.165849,
+      "kind": "movement",
+      "id": "ASSEMBLY",
+      "movement": "ASSEMBLY",
+      "score_delta_max": 0.05,
+      "psnr_db": 11.282046922571592,
+      "with_sha256": "3243740392cef5abf9fd81483084bc6396af02dd7c315256adef1c5f7cc85924",
+      "without_sha256": "975d8b649441120a4361af0ecded048d7b71562e80374d25ae5f1eac6030ef42"
+    },
+    {
+      "absolute_second": 60.394504,
+      "kind": "movement",
+      "id": "DIVISION",
+      "movement": "DIVISION",
+      "score_delta_max": 0.030885,
+      "psnr_db": 25.33026692101714,
+      "with_sha256": "33af625140af1ca3190d3937ed2a3c48d5eaeb71e67cf7ecc15682773870e3f2",
+      "without_sha256": "c8dd1cea0f2b582fb09e1149c1f1efc10584f2e60ecdfe4f6b8d7b7a409cd30a"
+    },
+    {
+      "absolute_second": 111.497546,
+      "kind": "movement",
+      "id": "PHRASE",
+      "movement": "PHRASE",
+      "score_delta_max": 0.153312,
+      "psnr_db": 11.712072467469438,
+      "with_sha256": "5a9fabbf03bde1b96a6c40760e18069373a4e5e537c57f8c2774ce105d4ecda5",
+      "without_sha256": "f3d6e2670630d53f1c366ae4fc5f4701a6560ec6159274dcdb08504029286624"
+    },
+    {
+      "absolute_second": 118.930716,
+      "kind": "cue",
+      "id": "phrase-accent-a",
+      "movement": "PHRASE",
+      "score_delta_max": 0.225905,
+      "psnr_db": 11.622757674416702,
+      "with_sha256": "0550dd5bb598025e69c7f480cc6fc5a8f7753b5ef6f4ba9b0b45d49836d78b9b",
+      "without_sha256": "3fe3f06a67bdef346ced61c19eb8f61bcf9a37bf8adeeeeed69609fc1d2cca90"
+    },
+    {
+      "absolute_second": 122.6473,
+      "kind": "cue",
+      "id": "phrase-accent-b",
+      "movement": "PHRASE",
+      "score_delta_max": 0.293032,
+      "psnr_db": 13.543145855286543,
+      "with_sha256": "c86634068704f53499c8b75158e903cdca14a031b24e3889d6c073bee34b7adc",
+      "without_sha256": "34307f80efba7dd40e7367212902615b00ad11053411766b2baf29d89b72a3c0"
+    },
+    {
+      "absolute_second": 126.363885,
+      "kind": "cue",
+      "id": "phrase-accent-c",
+      "movement": "PHRASE",
+      "score_delta_max": 0.358705,
+      "psnr_db": 14.127380980236124,
+      "with_sha256": "c7887011b61cb571a0e2fdc1ea8adb16acd05e7f5a14cb3e2bcf834bd195eabf",
+      "without_sha256": "9cf5d745b6327e980e7654ed738bea633655f509aa365cfcf02d136c2b6005ea"
+    },
+    {
+      "absolute_second": 209.057898,
+      "kind": "movement",
+      "id": "STILLNESS",
+      "movement": "STILLNESS",
+      "score_delta_max": 0.160507,
+      "psnr_db": 12.961137451860624,
+      "with_sha256": "574cde0e0de0659e79b82bb6b6013d82b09d59b40047046a580fcc2f57de476b",
+      "without_sha256": "2cedb4e2db0be50a9376822abf858121600566c6c696e5713aa301cb34dfa2c2"
+    },
+    {
+      "absolute_second": 264.806671,
+      "kind": "movement",
+      "id": "RESEED",
+      "movement": "RESEED",
+      "score_delta_max": 0.126875,
+      "psnr_db": 15.438918970235402,
+      "with_sha256": "07b3731f420f917a4bc0e564130b0a70d9b831e96aa508e7ae5c824208a5d764",
+      "without_sha256": "0e5b806eb863f665cfecd2f5fdd93859416ec13f20b9be311b1e33b9a0453665"
+    },
+    {
+      "absolute_second": 286.177034,
+      "kind": "cue",
+      "id": "reseed-accent-a",
+      "movement": "RESEED",
+      "score_delta_max": 0.313955,
+      "psnr_db": 14.75784937297411,
+      "with_sha256": "a36aac24b7ee97986a580b2c2b3b78852533fc01045f92e9b50d8213ae638790",
+      "without_sha256": "4b84779ad6617d93da0419de3399c3c27118863727885d5f767f48b616ad6971"
+    },
+    {
+      "absolute_second": 315.909713,
+      "kind": "cue",
+      "id": "reseed-accent-b",
+      "movement": "RESEED",
+      "score_delta_max": 0.423663,
+      "psnr_db": 14.602040092702175,
+      "with_sha256": "12bb2962222bd554c6911e2205bd847154c2055c15a5f816c1419e337aac3f01",
+      "without_sha256": "7da4b64f0933a44b667b10f5493d1ae6aa7abc3bee376a2d55ef68b67b420f1b"
+    },
+    {
+      "absolute_second": 358.650439,
+      "kind": "movement",
+      "id": "SIGNATURE",
+      "movement": "RESEED",
+      "score_delta_max": 0.003516,
+      "psnr_db": 14.423256907290984,
+      "with_sha256": "2eb7bce3068192f41d3833d6173004614fa3d3da8efb0d3a273564d083184feb",
+      "without_sha256": "8af17c1c04494877bdc56902bdc1a9799cdbdb137519312510d96351e6b07e1b"
+    }
+  ]
+}

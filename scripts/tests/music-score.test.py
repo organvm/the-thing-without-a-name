@@ -830,6 +830,59 @@ class MusicScoreContractTest(unittest.TestCase):
         audible = [row for row in evidence["rows"] if row["audio"]["notes"]]
         self.assertTrue(audible, "the fixture must schedule audible notes at declared boundaries")
 
+    def test_frames_capture_receipt_is_self_consistent_and_covers_every_boundary(self) -> None:
+        """Predicate 4 of #9: WITH-score vs WITHOUT-score frames evidence must be lookable.
+
+        The tracked `docs/evidence/score-to-motion-frames.*` receipt cannot be
+        regenerated on CI (it needs the Metal GPU and the corpus), so this test
+        proves the tracked receipt is self-consistent: determinism byte-identical,
+        the contact sheet matches its recorded digest, and one row exists for every
+        structural boundary the numeric A/B receipt already declared to move the
+        image — at an observable PSNR in the direction the score changes the frame.
+        """
+        evidence_dir = ROOT / "docs/evidence"
+        frames = json.loads((evidence_dir / "score-to-motion-frames.json").read_text())
+        ab = json.loads((evidence_dir / "score-to-motion-ab.json").read_text())
+        self.assertEqual(frames["schema"], "danse.evidence.score-to-motion-frames.v1")
+        self.assertEqual(frames["contract"], ab["contract"])
+        self.assertEqual(frames["source"], "score-to-motion-ab.json")
+        self.assertEqual(frames["determinism"]["identical"], True)
+        self.assertEqual(
+            frames["determinism"]["with_sha256"],
+            frames["determinism"]["redraw_sha256"],
+            "the two fresh-process renders must be byte-identical",
+        )
+        sheet = evidence_dir / frames["contact_sheet"]
+        self.assertTrue(sheet.is_file(), f"contact sheet {sheet} is missing")
+        self.assertEqual(
+            sha256(sheet),
+            frames["contact_sheet_sha256"],
+            "contact sheet digest drifted — regenerate it",
+        )
+
+        declared = {
+            round(row["absolute_second"], 3): row
+            for row in ab["rows"]
+            if row["kind"] != "downbeat"
+            and any(abs(v) > 0.0005 for v in row["visual"]["score_transition"].values())
+        }
+        self.assertTrue(len(declared) >= 7, "one row per declared movement is expected")
+        captured = {row["id"]: row["absolute_second"] for row in frames["rows"]}
+        captured_times = [round(row["absolute_second"], 3) for row in frames["rows"]]
+        for absolute_second, row in declared.items():
+            self.assertIn(
+                absolute_second,
+                captured_times,
+                f"boundary {row['id']} at {absolute_second}s missing from frames evidence",
+            )
+        accent_ids = {row["id"] for row in ab["rows"] if row["kind"] == "cue" and "accent" in row["id"]}
+        self.assertTrue(accent_ids.issubset(set(captured)), "accent cues must be captured as their own rows")
+        self.assertEqual(any(row["kind"] == "origin" for row in frames["rows"]), True)
+        for row in frames["rows"]:
+            self.assertGreaterEqual(row["psnr_db"], 0.0)
+            self.assertLess(row["psnr_db"], 40.0, "an observable difference must not look identical")
+            self.assertTrue(row["with_sha256"] and row["without_sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()
