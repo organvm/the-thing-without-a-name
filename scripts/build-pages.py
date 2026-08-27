@@ -45,6 +45,14 @@ INTERACTION_MODULES = (
     "interaction/controller.js",
     "interaction/session.js",
 )
+INTERFACE_FILES = (
+    "interface/actions.js",
+    "interface/state.js",
+    "interface/render.js",
+    "interface/styles.css",
+    "interface/map.v1.json",
+)
+PROJECT_MAP = "interface/map.v1.json"
 VENDOR_BASE = "interaction/vendor/mediapipe"
 VENDOR_MANIFEST = f"{VENDOR_BASE}/manifest.json"
 RUNTIME_FILES = (
@@ -53,6 +61,7 @@ RUNTIME_FILES = (
     "arrival.js",
     *ENGINE_MODULES,
     *INTERACTION_MODULES,
+    *INTERFACE_FILES,
     VENDOR_MANIFEST,
     "music/score.json",
     "render/program.json",
@@ -87,6 +96,47 @@ def safe_relative(value: object, label: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ArtifactError(f"{label} contains an unsafe path component: {value!r}")
     return PurePosixPath(*parts).as_posix()
+
+
+def project_map(root: Path, *, admit_study: bool = False, allow_resolved: bool = False) -> dict:
+    path = source_file(root, PROJECT_MAP)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"cannot read project map: {exc}") from exc
+    if set(value) != {"schema", "title", "version", "nodes"} or value.get("schema") != "danse.map.v1":
+        raise ArtifactError("project map has an unknown shape or schema")
+    nodes = value.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise ArtifactError("project map has no nodes")
+    expected_keys = {"id", "label", "product_id", "route", "fragment", "href", "status", "availability"}
+    ids: list[str] = []
+    for node in nodes:
+        if not isinstance(node, dict) or set(node) != expected_keys:
+            raise ArtifactError("project map contains a malformed node")
+        ids.append(node["id"])
+        if node["product_id"] is None:
+            if node["status"] != "admitted" or node["href"] != node["route"]:
+                raise ArtifactError("unbound project-map nodes must be admitted source routes")
+            continue
+        if node["product_id"] != "project-page-copy":
+            raise ArtifactError("study map nodes name an unknown product")
+        if node["route"] != "./project/":
+            raise ArtifactError("study map nodes use a noncanonical route")
+        canonical = node["route"] + (f"#{node['fragment']}" if node["fragment"] else "")
+        source_gated = node["status"] == "gated" and node["href"] is None
+        resolved = allow_resolved and node["status"] == "admitted" and node["href"] == canonical
+        if not (source_gated or resolved):
+            raise ArtifactError("study map nodes are neither gated nor canonically admitted")
+    if ids != ["live", "study", "cubism", "glitch", "ballet-score", "evidence"] or len(ids) != len(set(ids)):
+        raise ArtifactError("project map identity or order drifted")
+    if admit_study:
+        for node in nodes:
+            if node["product_id"] == "project-page-copy":
+                node["status"] = "admitted"
+                node["availability"] = "available"
+                node["href"] = node["route"] + (f"#{node['fragment']}" if node["fragment"] else "")
+    return value
 
 
 def source_file(root: Path, relative: str) -> Path:
@@ -421,6 +471,7 @@ def source_files(root: Path) -> tuple[str, ...]:
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactError(f"source root is not a regular directory: {root}")
+    project_map(root)
     files = set(RUNTIME_FILES) | corpus_files(root) | vendor_files(root)
     for relative in files:
         source_file(root, relative)
@@ -593,6 +644,10 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             )
         except Exception as exc:
             raise ArtifactError(f"artifact project links failed verification: {exc}") from exc
+    resolved_map = project_map(output, allow_resolved=True)
+    map_has_study = all(node["status"] == "admitted" for node in resolved_map["nodes"])
+    if map_has_study != has_project:
+        raise ArtifactError("project map admission disagrees with the delivered project route")
     return manifest
 
 
@@ -635,7 +690,14 @@ def build(
         source = source_file(root, relative)
         target = output / PurePosixPath(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target, follow_symlinks=False)
+        if relative == PROJECT_MAP:
+            target.write_text(
+                json.dumps(project_map(root, admit_study="project/index.html" in release_files), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        else:
+            shutil.copyfile(source, target, follow_symlinks=False)
         target.chmod(0o644)
         os.utime(target, (0, 0), follow_symlinks=False)
         records.append(

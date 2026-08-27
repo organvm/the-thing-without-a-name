@@ -315,6 +315,157 @@ def run_interaction(page, base: str) -> int:
     return 1
 
 
+def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
+    """Exercise the progressive controls against the live engine adapter."""
+    failures: list[str] = []
+    console_errors: list[str] = []
+    http_errors: list[str] = []
+    page.on("console", lambda message: console_errors.append(f"{message.text} @ {message.location}") if message.type == "error" else None)
+    page.on("response", lambda response: http_errors.append(f"{response.status} {response.url}") if response.status >= 400 else None)
+
+    def want(ok: bool, message: str) -> None:
+        if not ok:
+            failures.append(message)
+
+    def shot(name: str) -> None:
+        if screenshot_dir is None:
+            return
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        # Receipts remain in their category trays; hide only the temporary toast
+        # so deterministic review captures describe the selected surface itself.
+        page.evaluate("""() => {
+          const toast = document.getElementById('toast');
+          if (toast) { toast.hidden = true; toast.textContent = ''; }
+        }""")
+        page.screenshot(path=str(screenshot_dir / f"{name}.png"), full_page=False)
+
+    page.set_viewport_size({"width": 1024, "height": 768})
+    page.emulate_media(reduced_motion="no-preference")
+    page.goto(f"{base}/index.html?score=", wait_until="load")
+    page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    page.wait_for_function("() => document.getElementById('veil').hidden", timeout=180_000)
+    state = page.evaluate("() => danse.controlState")
+    want(state["surface"] == "closed", "control surface did not start closed")
+    want(state["music"] == "unavailable", "missing score was not stated as unavailable")
+    want(page.locator("#danse-dock button").count() == 5, "five-category dock is incomplete")
+    shot("desktop-closed")
+
+    page.click('[data-category="river"]')
+    want(page.locator('#surface-tray[data-open="river"]').is_visible(), "River tray did not open")
+    first_seed = page.evaluate("() => danse.seed")
+    page.click("#river-new")
+    second_seed = page.evaluate("() => danse.seed")
+    want(first_seed != second_seed, "New river did not change the river")
+    want(not page.locator("#river-undo").is_disabled(), "New river did not enable Undo")
+    page.click("#river-undo")
+    want(page.evaluate("() => danse.seed") == first_seed, "Undo did not restore the prior river")
+    page.evaluate("""() => {
+      window.__sharedRiver = null;
+      Object.defineProperty(navigator, 'share', { configurable:true, value:undefined });
+      Object.defineProperty(navigator, 'clipboard', { configurable:true, value:{ writeText: async (value) => { window.__sharedRiver = value; } } });
+    }""")
+    page.click("#river-share")
+    page.wait_for_function("() => !!window.__sharedRiver")
+    want("#s=" in page.evaluate("() => window.__sharedRiver"), "clipboard fallback did not receive a river link")
+    shot("desktop-river-tray")
+
+    page.click('[data-category="score"]')
+    page.click("#program-free")
+    want(page.evaluate("() => danse.controlState.program") == "free", "Free did not change the shared program state")
+    page.click("#program-score")
+    page.wait_for_function("() => danse.controlState.program === 'score-led'")
+    page.click('[data-movement="3"]')
+    want(page.evaluate("() => danse.controlState.movement") == 3, "movement selection did not use the shared action")
+    page.click("#cutout-toggle")
+    want(page.evaluate("() => danse.controlState.cutout") == "on", "Figure cutout state did not turn on")
+    want("cutout=1" in page.url, "Figure cutout did not enter shareable presentation state")
+    page.click("#score-details")
+    want(page.locator("#hud").is_visible(), "visual audition sheet did not open")
+    page.select_option("#conductor-model", "waltz")
+    want(page.evaluate("() => danse.controlState.audition") == "override-active", "conductor override did not become active")
+    page.click("#conductor-reset")
+    want(page.evaluate("() => danse.controlState.audition") == "override-ready", "conductor reset did not report override-ready")
+    shot("desktop-score-sheet")
+    page.press("#conductor-model", "Escape")
+    want(page.locator("#hud").is_hidden(), "Escape did not close the advanced sheet")
+    want(page.evaluate("() => document.activeElement?.dataset.category") == "score", "advanced-sheet focus did not return to the Score control")
+
+    page.click('[data-category="presence"]')
+    page.click("#presence-details")
+    page.focus("#fallback-x")
+    page.press("#fallback-x", "ArrowRight")
+    want(page.evaluate("() => danse.interaction.snapshot().mode") == "off", "a slider activated Presence implicitly")
+    page.click("#fallback-start")
+    want(page.evaluate("() => danse.controlState.presence") == "keyboard-touch", "keyboard-touch Presence did not activate")
+    want(not page.locator("#receipt-save").is_disabled(), "receipt Save stayed disabled after samples existed")
+    page.click("#interaction-stop")
+    page.set_input_files("#receipt-load", files=[{"name": "invalid.json", "mimeType": "application/json", "buffer": b"{}"}])
+    page.wait_for_timeout(100)
+    want("rejected" in page.locator("#presence-receipt").inner_text().lower(), "invalid receipt did not receive explicit rejection status")
+    page.press("#fallback-x", "m")
+    want(page.evaluate("() => danse.controlState.cutout") == "on", "letter shortcut fired while a slider held focus")
+    page.press("#fallback-x", "Escape")
+
+    page.click('[data-category="map"]')
+    page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
+    want(page.locator("#project-map").is_visible(), "Map did not open")
+    want(page.locator('#project-map-list a[href="./project/"]').count() == 0, "gated Study was rendered as a link")
+    want("unavailable" in page.locator("#project-map-list").inner_text().lower(), "gated Study was not visibly unavailable")
+    shot("desktop-map")
+    page.press("#map-close", "Escape")
+    want(page.evaluate("() => document.activeElement?.dataset.category") == "map", "Map focus did not return to its trigger")
+
+    page.focus('[data-category="hold"]')
+    page.press('[data-category="hold"]', "Space")
+    want(page.evaluate("() => danse.controlState.playback") == "held-user", "native button Space did not perform exactly one hold action")
+    page.press('[data-category="hold"]', "Space")
+    want(page.evaluate("() => danse.controlState.playback") == "running", "native button Space did not resume")
+
+    for width in (320, 390):
+        page.set_viewport_size({"width": width, "height": 780})
+        page.click('[data-category="score"]')
+        metrics = page.evaluate("""() => ({
+          overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+          targets: [...document.querySelectorAll('#danse-dock button')].map((button) => ({ width:button.getBoundingClientRect().width, height:button.getBoundingClientRect().height })),
+          dock: document.getElementById('danse-dock').getBoundingClientRect().height,
+        })""")
+        want(not metrics["overflow"], f"{width}px layout overflowed horizontally")
+        want(metrics["dock"] >= 64, f"{width}px dock was shorter than 64px")
+        want(all(item["width"] >= 44 and item["height"] >= 44 for item in metrics["targets"]), f"{width}px dock has a target below 44px")
+        shot(f"mobile-{width}-score-tray")
+        page.click('[data-category="score"]')
+
+    page.set_viewport_size({"width": 1024, "height": 768})
+    page.evaluate("() => { document.documentElement.style.zoom = '200%'; }")
+    zoom = page.evaluate("() => ({ overflow:document.documentElement.scrollWidth > document.documentElement.clientWidth, dock:document.getElementById('danse-dock').getBoundingClientRect().width })")
+    want(not zoom["overflow"], "200% zoom introduced horizontal page overflow")
+    want(zoom["dock"] <= page.viewport_size["width"], "200% zoom pushed the dock outside the viewport")
+    page.evaluate("() => { document.documentElement.style.zoom = ''; }")
+
+    page.emulate_media(reduced_motion="reduce")
+    page.reload(wait_until="load")
+    page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    want(page.evaluate("() => danse.controlState.playback") == "held-reduced", "reduced motion did not arrive held")
+    page.click('[data-category="hold"]')
+    want(page.evaluate("() => danse.controlState.playback") == "running", "explicit reduced-motion opt-in did not resume")
+    shot("reduced-motion-opt-in")
+
+    if console_errors:
+        failures.extend(f"console error: {message}" for message in console_errors)
+    if http_errors:
+        failures.extend(f"HTTP error: {message}" for message in http_errors)
+    print(f"\n  renderer   {page.gl_renderer}")
+    print("  viewports  320x780, 390x780, 1024x768, 200% zoom")
+    print("  states     closed, River, Score, sheet, Presence, Map, reduced motion")
+    if failures:
+        for failure in failures:
+            print(f"  BROKEN — {failure}")
+        print("\nPROGRESSIVE CONTROLS BROKEN")
+        return 1
+    print("\nPROGRESSIVE CONTROLS HOLD — shared actions, focus, status, and layouts passed")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="print the GL renderer and exit")
@@ -322,12 +473,14 @@ def main() -> int:
     ap.add_argument("--arrival", action="store_true", help="run the live page and check every visitor's river")
     ap.add_argument("--probe", action="store_true", help="run probe.html's projection-continuity self-test")
     ap.add_argument("--interaction", action="store_true", help="run local pose/fallback/privacy verification")
+    ap.add_argument("--controls", action="store_true", help="run progressive-control and responsive-layout verification")
+    ap.add_argument("--screenshots", type=Path, help="write control verification screenshots")
     ap.add_argument("--headed", action="store_true", help="show the window (debugging)")
     ap.add_argument("--base", help="use an already-running server instead of starting one")
     args = ap.parse_args()
 
-    if not args.check and not args.verify and not args.arrival and not args.probe and not args.interaction:
-        ap.error("nothing to do — pass --check, --verify, --arrival, --probe or --interaction")
+    if not args.check and not args.verify and not args.arrival and not args.probe and not args.interaction and not args.controls:
+        ap.error("nothing to do — pass --check, --verify, --arrival, --probe, --interaction or --controls")
 
     with contextlib.ExitStack() as stack:
         if args.base:
@@ -341,7 +494,7 @@ def main() -> int:
         if args.check:
             gpu = page.evaluate(READ_RENDERER)
             print(json.dumps({**gpu, "serving": base}, indent=1))
-            if not args.verify and not args.arrival and not args.probe and not args.interaction:
+            if not args.verify and not args.arrival and not args.probe and not args.interaction and not args.controls:
                 return 0
         rc = run_verify(page, base) if args.verify else 0
         if args.arrival:
@@ -350,6 +503,8 @@ def main() -> int:
             rc = run_probe(page, base) or rc
         if args.interaction:
             rc = run_interaction(page, base) or rc
+        if args.controls:
+            rc = run_controls(page, base, args.screenshots) or rc
         return rc
 
 

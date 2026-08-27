@@ -8,6 +8,7 @@
 <meta name="author" content="Anthony J. Padavano">
 <meta name="application-name" content="Danse">
 <meta name="theme-color" content="#0e0e10">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230e0e10'/%3E%3Cpath d='M8 7h7c6 0 10 3 10 9s-4 9-10 9H8z' fill='none' stroke='%23e8e8ee' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="canonical" href="https://organvm.github.io/the-thing-without-a-name/">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Danse">
@@ -128,6 +129,7 @@
     #veil, #bar i { transition: none; }
   }
 </style>
+<link rel="stylesheet" href="./interface/styles.css">
 </head>
 <body>
 <main aria-label="Danse live artwork">
@@ -142,14 +144,15 @@
 </div>
 
 <section id="hud" hidden aria-hidden="true" aria-label="Danse controls and current state">
-  <div id="state">
-    <span><b id="river">—</b> <span id="passage"></span></span>
-    <span><b id="clock">0:00</b></span>
-    <span><b id="cut">—</b></span>
+  <header class="sheet-header"><h2>Details</h2><button class="danse-action" id="sheet-close" type="button">Close</button></header>
+  <details open><summary>Technical state</summary><div id="state">
+    <span>River <b id="river">—</b> <span id="passage"></span></span>
+    <span>River time <b id="clock">0:00</b></span>
+    <span>Cut <b id="cut">—</b></span>
     <span><b id="planes">0</b> planes</span>
     <span><b id="interaction-summary">interaction off</b></span>
-  </div>
-  <p id="keyboard-instructions">Keyboard: <kbd>Space</kbd> hold or resume &middot; <kbd>N</kbd> new river &middot; <kbd>S</kbd> share &middot; <kbd>F</kbd> free &middot; <kbd>1–7</kbd> movement &middot; <kbd>M</kbd> matte &middot; <kbd>H</kbd> controls &middot; <kbd>Escape</kbd> close</p>
+  </div></details>
+  <p id="keyboard-instructions">Keyboard: <kbd>Space</kbd> hold or resume &middot; <kbd>N</kbd> new river &middot; <kbd>S</kbd> share &middot; <kbd>F</kbd> free &middot; <kbd>1–7</kbd> movement &middot; <kbd>M</kbd> Figure cutout &middot; <kbd>H</kbd> controls &middot; <kbd>Escape</kbd> close</p>
   <p id="touch-instructions">Touch: use the Controls button to show or hide this panel. The artwork advances automatically; reduced-motion settings open on a held frame.</p>
   <fieldset id="music-controls">
     <legend>Score-synchronous music</legend>
@@ -199,11 +202,24 @@
       <label for="fallback-reach">Reach <input id="fallback-reach" type="range" min="0" max="100" value="0"></label>
     </div>
     <div class="control-row">
-      <button id="receipt-save" type="button">Save derived receipt</button>
+      <button id="receipt-save" type="button" disabled>Save derived receipt</button>
       <label class="file-control">Replay receipt<input id="receipt-load" type="file" accept="application/json,.json"></label>
     </div>
   </fieldset>
 </section>
+<nav id="danse-dock" aria-label="Danse control categories">
+  <button type="button" data-category="hold" aria-pressed="false" aria-label="Hold motion" aria-keyshortcuts="Space">Hold</button>
+  <button type="button" data-category="river" aria-pressed="false" aria-controls="surface-tray">River</button>
+  <button type="button" data-category="score" aria-pressed="false" aria-controls="surface-tray">Score</button>
+  <button type="button" data-category="presence" aria-pressed="false" aria-controls="surface-tray">Presence</button>
+  <button type="button" data-category="map" aria-pressed="false" aria-controls="project-map">Map</button>
+</nav>
+<section id="surface-tray" hidden aria-label="Danse controls tray">
+  <div class="tray-content" data-tray="river"><div class="tray-heading"><div><h2>River</h2><p>New river, sharing, seed, and river time.</p></div></div><p id="river-seed">Current river: loading</p><div class="tray-actions"><button class="danse-action" type="button" id="river-new">New river</button><button class="danse-action" type="button" id="river-undo" disabled>Undo</button><button class="danse-action" type="button" id="river-share">Share</button></div><p class="tray-status" id="river-receipt" role="status" aria-live="polite">Current river is ready to share.</p></div>
+  <div class="tray-content" data-tray="score"><div class="tray-heading"><div><h2>Score</h2><p>Seven movements, program, Figure cutout, and music.</p></div></div><div class="movement-grid" aria-label="Movement"><button class="danse-action" type="button" data-movement="1" aria-pressed="false">1</button><button class="danse-action" type="button" data-movement="2" aria-pressed="false">2</button><button class="danse-action" type="button" data-movement="3" aria-pressed="false">3</button><button class="danse-action" type="button" data-movement="4" aria-pressed="false">4</button><button class="danse-action" type="button" data-movement="5" aria-pressed="false">5</button><button class="danse-action" type="button" data-movement="6" aria-pressed="false">6</button><button class="danse-action" type="button" data-movement="7" aria-pressed="false">7</button></div><div class="tray-actions"><button class="danse-action" type="button" id="program-score" aria-pressed="true">Score-led</button><button class="danse-action" type="button" id="program-free" aria-pressed="false">Free</button><button class="danse-action" type="button" id="cutout-toggle" aria-pressed="false">Figure cutout: off</button><button class="danse-action" type="button" id="music-tray">Music: stopped</button><button class="danse-action" type="button" id="score-details">Visual audition details</button></div><p class="tray-status" id="score-receipt" role="status" aria-live="polite">Score-led visual program.</p></div>
+  <div class="tray-content" data-tray="presence"><div class="tray-heading"><div><h2>Presence</h2><p>Optional local influence. Sliders never activate Presence.</p></div></div><div class="tray-actions"><button class="danse-action" type="button" id="presence-off" aria-pressed="true">Off</button><button class="danse-action" type="button" id="presence-camera" aria-pressed="false">Camera</button><button class="danse-action" type="button" id="presence-touch" aria-pressed="false">Keyboard-touch</button><button class="danse-action" type="button" id="presence-replay" aria-pressed="false">Replay</button></div><p class="tray-status" id="presence-receipt" role="status" aria-live="polite">Interaction is off.</p><button class="danse-action" type="button" id="presence-details">Presence details and receipts</button></div>
+</section>
+<dialog id="project-map" aria-labelledby="project-map-title"><div class="map-shell"><h2 id="project-map-title">Danse project map</h2><p id="project-map-status" role="status">Loading the public project map.</p><ul id="project-map-list"><li><a href="./">Live artwork</a></li><li><a aria-disabled="true">Study <small>(unavailable until public admission)</small></a></li></ul><button class="danse-action" type="button" id="map-close">Close map</button></div></dialog>
 <button id="hud-toggle" type="button" aria-controls="hud" aria-expanded="false" aria-label="Show Danse controls" aria-keyshortcuts="H">
   <span aria-hidden="true">H</span><span class="wide-label"> &middot; Controls</span>
 </button>
@@ -223,6 +239,9 @@ import { Renderer } from "./engine/renderer.js";
 import { InteractionRenderer } from "./interaction/adapter.js";
 import { InteractionController } from "./interaction/controller.js";
 import { ScoreAudio } from "./sound/browser-midi.js";
+import { ACTIONS, shortcutAction } from "./interface/state.js";
+import { createControlActions } from "./interface/actions.js";
+import { renderControlSurface, renderProjectMap } from "./interface/render.js";
 
 // ── Arriving IS the seed.
 //
@@ -254,6 +273,12 @@ const el = (id) => document.getElementById(id);
 const hud = el("hud");
 const hudToggle = el("hud-toggle");
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+const dock = document.getElementById("danse-dock");
+const tray = document.getElementById("surface-tray");
+const projectMap = document.getElementById("project-map");
+let projectMapData = null;
+let previousRiver = null;
+let controlBus = null;
 
 function setHudVisible(visible) {
   hud.hidden = !visible;
@@ -264,7 +289,7 @@ function setHudVisible(visible) {
 }
 
 setHudVisible(false);
-hudToggle.addEventListener("click", () => setHudVisible(hud.hidden));
+hudToggle.addEventListener("click", toggleControls);
 
 const corpus = await Corpus.load();
 const choreography = choreographyUrl && musicalScore
@@ -294,7 +319,7 @@ else setTimeout(() => { veil.hidden = true; }, 800);
 // yours, not the river's. A reduced-motion visit begins held; Space is still an
 // explicit opt-in to motion, and an OS preference change takes effect at once.
 let heldAt = reducedMotion.matches ? Arrival.now(river) : null;
-let matteK = 0;
+let matteK = query.get("cutout") === "1" ? 1 : 0;
 
 // Pose is an adapter around the pure engine, never an input to it. The adapter
 // receives the same absolute river time as frameAt; camera frames and raw
@@ -332,6 +357,7 @@ function scoreSecondAt(t) {
 
 reducedMotion.addEventListener("change", ({ matches }) => {
   heldAt = matches ? Arrival.now(river) : null;
+  controlBus?.actions.setReducedMotion(matches);
   renderInteraction(interaction.snapshot());
   flash(matches ? "reduced motion · frame held" : "motion resumed");
 });
@@ -432,16 +458,21 @@ function renderInteraction(snapshot) {
   el("camera-start").hidden = snapshot.mode === "camera" || snapshot.retryable;
   el("camera-retry").hidden = !snapshot.retryable;
   el("interaction-stop").disabled = snapshot.mode === "off";
+  el("receipt-save").disabled = !(snapshot.session?.samples > 0);
+  el("presence-receipt").textContent = message;
+  const presence = snapshot.mode === "fallback" ? "keyboard-touch" : ["camera", "replay"].includes(snapshot.mode) ? snapshot.mode : "off";
+  if (controlBus && controlBus.getState().presence !== presence) controlBus.actions.sync({ type: ACTIONS.SET_PRESENCE, value: presence });
 }
 interaction.subscribe(renderInteraction);
 
-el("camera-start").addEventListener("click", () => { void interaction.startCamera(at()); });
-el("camera-retry").addEventListener("click", () => { void interaction.retryCamera(at()); });
-el("fallback-start").addEventListener("click", () => interaction.startFallback(at()));
-el("interaction-stop").addEventListener("click", () => interaction.stop(at()));
+el("camera-start").addEventListener("click", () => { void controlBus.actions.presence("camera"); });
+el("camera-retry").addEventListener("click", () => { void controlBus.actions.presence("camera"); });
+el("fallback-start").addEventListener("click", () => { void controlBus.actions.presence("keyboard-touch"); });
+el("interaction-stop").addEventListener("click", () => { void controlBus.actions.presence("off"); });
 
 const fallbackInputs = ["fallback-x", "fallback-y", "fallback-open", "fallback-reach"];
 function applyFallback() {
+  if (interaction.snapshot().mode !== "fallback") return;
   const value = (id) => Number(el(id).value) / 100;
   interaction.setFallback({
     center: [value("fallback-x"), value("fallback-y")],
@@ -467,8 +498,10 @@ el("receipt-load").addEventListener("change", async (event) => {
   if (!file) return;
   try {
     interaction.loadReceipt(JSON.parse(await file.text()));
+    controlBus?.actions.sync({ type: ACTIONS.SET_PRESENCE, value: "replay" });
     flash("derived interaction receipt loaded");
   } catch (error) {
+    controlBus?.actions.status("presence", `Receipt rejected: ${error.message}`);
     flash(`receipt rejected — ${error.message}`);
   } finally {
     event.target.value = "";
@@ -479,25 +512,29 @@ if (scoreLoadFailure) flash("Musical score unavailable · continuing with the de
 
 const musicButton = el("music-toggle");
 const musicStatus = el("music-status");
+async function toggleMusic() {
+  if (!scoreAudio) return "unavailable";
+  try {
+    if (scoreAudio.playing) {
+      scoreAudio.stop();
+      musicButton.textContent = "Start music";
+      musicStatus.textContent = "Music stopped.";
+      return "stopped";
+    }
+    await scoreAudio.start(scoreSecondAt(at()));
+    musicButton.textContent = "Stop music";
+    musicStatus.textContent = heldAt === null ? "Music follows the score-led choreography." : "Music is suspended while this frame is held.";
+    return heldAt === null ? "playing" : "suspended-by-hold";
+  } catch (error) {
+    musicStatus.textContent = `Music could not start: ${error.message}`;
+    return "error";
+  }
+}
 if (!scoreAudio) {
   musicButton.disabled = true;
   musicStatus.textContent = "Music score unavailable.";
 } else {
-  musicButton.addEventListener("click", async () => {
-    try {
-      if (scoreAudio.playing) {
-        scoreAudio.stop();
-        musicButton.textContent = "Start music";
-        musicStatus.textContent = "Music stopped.";
-        return;
-      }
-      await scoreAudio.start(scoreSecondAt(at()));
-      musicButton.textContent = "Stop music";
-      musicStatus.textContent = "Music follows the score-led choreography.";
-    } catch (error) {
-      musicStatus.textContent = `Music could not start: ${error.message}`;
-    }
-  });
+  musicButton.addEventListener("click", () => { void controlBus?.actions.music(); });
 }
 
 const conductorModel = el("conductor-model");
@@ -527,81 +564,246 @@ function setConductor() {
   });
   describeConductor();
   persistConductor();
+  const active = conductor.model !== "native" || conductor.meter !== null || conductor.tempo !== null;
+  controlBus?.actions.sync({ type: ACTIONS.SET_CONDUCTOR, active, ready: !active });
+}
+function conductorFromControls() {
+  const active = conductorModel.value !== "native" || Boolean(conductorMeter.value) || conductorTempo.dataset.active === "true";
+  return { model: conductorModel.value, meter: conductorMeter.value || null, tempo: conductorTempo.dataset.active === "true" ? conductorTempo.value : null, active, ready: !active };
+}
+function applyConductor(value) {
+  conductorModel.value = value.model ?? conductorModel.value;
+  conductorMeter.value = value.meter ?? "";
+  conductorTempo.value = value.tempo ?? 126;
+  conductorTempo.dataset.active = value.tempo === null || value.tempo === undefined ? "false" : "true";
+  setConductor();
+  return conductorFromControls();
 }
 conductorModel.value = conductor.model;
 conductorMeter.value = conductor.meter ?? "";
 conductorTempo.value = conductor.tempo ?? 126;
 conductorTempo.dataset.active = conductor.tempo === null ? "false" : "true";
 describeConductor();
-conductorModel.addEventListener("change", setConductor);
-conductorMeter.addEventListener("change", setConductor);
-conductorTempo.addEventListener("input", () => { conductorTempo.dataset.active = "true"; setConductor(); });
+conductorModel.addEventListener("change", () => { void controlBus.actions.conductor(conductorFromControls()); });
+conductorMeter.addEventListener("change", () => { void controlBus.actions.conductor(conductorFromControls()); });
+conductorTempo.addEventListener("input", () => { conductorTempo.dataset.active = "true"; void controlBus.actions.conductor(conductorFromControls()); });
 el("conductor-reset").addEventListener("click", () => {
-  conductorModel.value = "native";
-  conductorMeter.value = "";
-  conductorTempo.value = 126;
-  conductorTempo.dataset.active = "false";
-  setConductor();
+  void controlBus.actions.conductor({ model: "native", meter: null, tempo: null, active: false, ready: true });
 });
 
-addEventListener("keydown", async (e) => {
-  const key = e.key.toLowerCase();
-  const isControl = e.target instanceof Element && e.target.closest("button, input, select, textarea, a, [contenteditable]");
-  if (isControl && key !== "h" && e.key !== "Escape") return;
-  if ((e.altKey || e.ctrlKey || e.metaKey) && e.key !== "Escape") return;
-  if (key === "h") {
-    if (!e.repeat) setHudVisible(hud.hidden);
-    e.preventDefault();
-    return;
-  }
-  if (e.key === "Escape") {
-    if (!hud.hidden) {
-      setHudVisible(false);
-      e.preventDefault();
+let surfaceTrigger = null;
+
+function toggleHold() {
+  heldAt = heldAt === null ? at() : null;
+  if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(at()), heldAt !== null);
+  musicStatus.textContent = scoreAudio?.playing && heldAt !== null
+    ? "Music is suspended while this frame is held."
+    : scoreAudio?.playing ? "Music follows the score-led choreography." : musicStatus.textContent;
+  renderInteraction(interaction.snapshot());
+}
+
+function newRiver() {
+  previousRiver = river;
+  river = { ...Arrival.mint(), minted: true, shifted: false };
+  shifted = false;
+  heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
+  el("river-undo").disabled = false;
+  el("river-receipt").textContent = `New river ${hex(river.seed)} created. Undo is available.`;
+  flash(`new river · ${hex(river.seed)}`);
+  return river;
+}
+
+function undoRiver() {
+  if (!previousRiver) return null;
+  river = previousRiver;
+  previousRiver = null;
+  Arrival.remember(river);
+  shifted = Boolean(river.shifted);
+  heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
+  el("river-undo").disabled = true;
+  el("river-receipt").textContent = "Returned to the previous river.";
+  return river;
+}
+
+async function shareRiver() {
+  const link = Arrival.href(river, { mode: program ? null : "free" });
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: "Danse", text: "Join this Danse river.", url: link });
+      el("river-receipt").textContent = "River link handed to the device share sheet.";
+      return "share-sheet";
     }
-    return;
-  }
-  if (e.key === " ") {
-    heldAt = heldAt === null ? at() : null;
-    if (scoreAudio?.playing) scoreAudio.sync(0, heldAt !== null);
-    renderInteraction(interaction.snapshot());
-    e.preventDefault();
-  }
-  if (key === "n") {
-    river = { ...Arrival.mint(), minted: true, shifted: false };
-    shifted = false;
-    heldAt = reducedMotion.matches ? Arrival.now(river) : null;
-  }
-  if (key === "m") { matteK = matteK > 0 ? 0 : 1; }
-  // Hand someone your river. They land in the same water, in sync, having
-  // exchanged nothing with you but the river identity in the link.
-  if (key === "s") {
-    const link = Arrival.href(river, { mode: program ? null : "free" });
+    await navigator.clipboard.writeText(link);
+    el("river-receipt").textContent = "River link copied to the clipboard.";
+    return "clipboard";
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      el("river-receipt").textContent = "Sharing canceled; the river is unchanged.";
+      return "canceled";
+    }
     try {
       await navigator.clipboard.writeText(link);
-      flash(`copied — ${hex(river.seed)} · your river, live`);
+      el("river-receipt").textContent = "Share sheet unavailable; river link copied instead.";
+      return "clipboard-fallback";
     } catch {
-      flash(link);
+      el("river-receipt").textContent = `Copy unavailable. River link: ${link}`;
+      flash(link, 6000);
+      return "visible-link";
     }
   }
-  // Let the piece roam instead of running the phrase — the older dwell cycle the
-  // 2017 reproduction is pinned to.
-  if (key === "f") { program = program ? null : await Program.load(); }
-  // Jump to the head of each movement OF THE PASSAGE YOU ARE IN — the fastest
-  // way to judge a program edit. Movements have no fixed times any more, so this
-  // has to ask the passage where its own movements start.
-  if (program && /^[1-9]$/.test(key)) {
-    const t = at();
-    const p = Program.passageAt(program, river.seed, t, river.stream, musicalScore);
-    if (choreography && musicalScore) {
-      const movement = program.movements[Number(key) - 1];
-      const phraseIndex = choreography.phrase_assignments.findIndex((row) => row.movement_id === movement?.id);
-      if (phraseIndex >= 0) jump(p.t0 + musicalScore.phrases[phraseIndex].start_second);
-    } else {
-      const m = Program.movementsIn(program, river.seed, p.index, river.stream, musicalScore)[Number(key) - 1];
-      if (m) jump(p.t0 + m.t0);
-    }
+}
+
+function jumpMovement(number) {
+  if (!program) {
+    el("score-receipt").textContent = "Movement jumps apply in Score-led mode. Choose Score-led first.";
+    return false;
   }
+  const t = at();
+  const passage = Program.passageAt(program, river.seed, t, river.stream, musicalScore);
+  if (choreography && musicalScore) {
+    const movement = program.movements[number - 1];
+    const phraseIndex = choreography.phrase_assignments.findIndex((row) => row.movement_id === movement?.id);
+    if (phraseIndex >= 0) jump(passage.t0 + musicalScore.phrases[phraseIndex].start_second);
+  } else {
+    const movement = Program.movementsIn(program, river.seed, passage.index, river.stream, musicalScore)[number - 1];
+    if (movement) jump(passage.t0 + movement.t0);
+  }
+  el("score-receipt").textContent = `Movement ${number} selected.`;
+  return true;
+}
+
+async function setProgram(value) {
+  if (value === "free") {
+    program = null;
+    el("score-receipt").textContent = "Free visual program; music remains separately score-native.";
+    return;
+  }
+  if (!program) program = await Program.load();
+  el("score-receipt").textContent = "Score-led visual program.";
+}
+
+function toggleCutout() {
+  matteK = matteK > 0 ? 0 : 1;
+  const url = new URL(location.href);
+  if (matteK) url.searchParams.set("cutout", "1");
+  else url.searchParams.delete("cutout");
+  history.replaceState(null, "", url);
+  el("score-receipt").textContent = `Figure cutout ${matteK ? "on" : "off"}; rectangular fragments move toward the dancer's silhouette.`;
+}
+
+async function setPresence(value) {
+  if (value === "off") { interaction.stop(at()); return "off"; }
+  if (value === "camera") {
+    if (interaction.snapshot().retryable) await interaction.retryCamera(at());
+    else await interaction.startCamera(at());
+    return interaction.snapshot().mode === "camera" ? "camera" : "off";
+  }
+  if (value === "keyboard-touch") { interaction.startFallback(at()); return "keyboard-touch"; }
+  el("receipt-load").click();
+  return controlBus.getState().presence;
+}
+
+function closeVisualSurfaces() {
+  if (projectMap.open) projectMap.close();
+  if (!hud.hidden) setHudVisible(false);
+  const trigger = surfaceTrigger;
+  surfaceTrigger = null;
+  queueMicrotask(() => trigger?.focus());
+}
+
+function openDetails(section, trigger = null) {
+  surfaceTrigger = ["score", "presence"].includes(section)
+    ? dock.querySelector(`[data-category="${section}"]`)
+    : trigger ?? document.activeElement;
+  controlBus.actions.openSheet(section);
+  setHudVisible(true);
+  const target = section === "presence" ? el("interaction-controls") : section === "score" ? el("conductor-controls") : hud;
+  queueMicrotask(() => { target.scrollIntoView({ block: "start" }); el("sheet-close").focus(); });
+}
+
+function toggleControls() {
+  if (hud.hidden) openDetails("details", hudToggle);
+  else controlBus?.actions.close();
+}
+
+async function openMap(trigger) {
+  surfaceTrigger = trigger;
+  controlBus.actions.openMap();
+  if (!projectMap.open) projectMap.showModal();
+  try {
+    if (!projectMapData) {
+      const response = await fetch("./interface/map.v1.json");
+      if (!response.ok) throw new Error(`map request returned ${response.status}`);
+      projectMapData = await response.json();
+    }
+    renderProjectMap(el("project-map-list"), el("project-map-status"), projectMapData);
+  } catch (error) {
+    el("project-map-status").textContent = `Project map unavailable: ${error.message}`;
+  }
+  el("map-close").focus();
+}
+
+controlBus = createControlActions({
+  hold: toggleHold,
+  newRiver,
+  undoRiver,
+  share: shareRiver,
+  movement: jumpMovement,
+  setProgram,
+  toggleCutout,
+  music: toggleMusic,
+  conductor: applyConductor,
+  presence: setPresence,
+  close: closeVisualSurfaces,
+  reportError: (name, error) => flash(`${name} unavailable — ${error.message}`, 5000),
+}, { reducedMotion: reducedMotion.matches, scoreAvailable: Boolean(scoreAudio) });
+
+if (!program) controlBus.actions.sync({ type: ACTIONS.SET_PROGRAM, value: "free" });
+if (matteK) controlBus.actions.sync({ type: ACTIONS.TOGGLE_CUTOUT });
+const conductorActive = conductor.model !== "native" || conductor.meter !== null || conductor.tempo !== null;
+controlBus.actions.sync({ type: ACTIONS.SET_CONDUCTOR, active: conductorActive, ready: !conductorActive });
+controlBus.subscribe((state) => {
+  renderControlSurface(dock, state);
+  const trayOpen = state.surface.startsWith("tray:");
+  tray.hidden = !trayOpen;
+  tray.setAttribute("aria-hidden", String(!trayOpen));
+  tray.dataset.open = trayOpen ? state.surface.split(":")[1] : "";
+  if (state.status.river) el("river-receipt").textContent = state.status.river;
+  if (state.status.score) el("score-receipt").textContent = state.status.score;
+  if (state.status.presence) el("presence-receipt").textContent = state.status.presence;
+});
+
+dock.querySelector('[data-category="hold"]').addEventListener("click", () => { void controlBus.actions.hold(); });
+for (const category of ["river", "score", "presence"]) dock.querySelector(`[data-category="${category}"]`).addEventListener("click", (event) => { surfaceTrigger = event.currentTarget; controlBus.actions.openTray(category); });
+dock.querySelector('[data-category="map"]').addEventListener("click", (event) => { void openMap(event.currentTarget); });
+el("river-new").addEventListener("click", () => { void controlBus.actions.newRiver(); });
+el("river-undo").addEventListener("click", () => { void controlBus.actions.undoRiver(); });
+el("river-share").addEventListener("click", () => { void controlBus.actions.share(); });
+for (const button of tray.querySelectorAll("[data-movement]")) button.addEventListener("click", () => { void controlBus.actions.movement(Number(button.dataset.movement)); });
+el("program-score").addEventListener("click", () => { void controlBus.actions.setProgram("score-led"); });
+el("program-free").addEventListener("click", () => { void controlBus.actions.setProgram("free"); });
+el("cutout-toggle").addEventListener("click", () => { void controlBus.actions.toggleCutout(); });
+el("music-tray").addEventListener("click", () => { void controlBus.actions.music(); });
+el("presence-off").addEventListener("click", () => { void controlBus.actions.presence("off"); });
+el("presence-camera").addEventListener("click", () => { void controlBus.actions.presence("camera"); });
+el("presence-touch").addEventListener("click", () => { void controlBus.actions.presence("keyboard-touch"); });
+el("presence-replay").addEventListener("click", () => { void controlBus.actions.presence("replay"); });
+el("presence-details").addEventListener("click", (event) => openDetails("presence", event.currentTarget));
+el("score-details").addEventListener("click", (event) => openDetails("score", event.currentTarget));
+el("sheet-close").addEventListener("click", () => controlBus.actions.close());
+el("map-close").addEventListener("click", () => controlBus.actions.close());
+projectMap.addEventListener("cancel", (event) => { event.preventDefault(); controlBus.actions.close(); });
+
+addEventListener("keydown", (event) => {
+  const command = shortcutAction(event);
+  if (!command) return;
+  event.preventDefault();
+  if (command.name === "toggleControls") toggleControls();
+  else if (command.name === "close") controlBus.actions.close();
+  else if (command.name === "movement") void controlBus.actions.movement(command.value);
+  else void controlBus.actions[command.name]();
 });
 
 addEventListener("pagehide", () => interaction.stop(at()));
@@ -615,6 +817,8 @@ window.danse = {
   get t() { return at(); }, set t(v) { jump(v); },
   get river() { return river; },
   get seed() { return river.seed; }, set seed(v) { river = { ...river, seed: v >>> 0 }; },
+  get controlState() { return controlBus.getState(); },
+  actions: controlBus.actions,
 };
 </script>
 </body>

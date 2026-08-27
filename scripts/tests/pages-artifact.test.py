@@ -82,6 +82,7 @@ def write(path: Path, data: bytes = b"fixture\n") -> None:
 def public_fixture(root: Path) -> None:
     for relative in PAGES.RUNTIME_FILES:
         write(root / relative)
+    write(root / PAGES.PROJECT_MAP, (ROOT / PAGES.PROJECT_MAP).read_bytes())
     vendor_leaf = "vision_bundle.mjs"
     vendor_data = b"export const localFixture = true;\n"
     write(root / PAGES.VENDOR_BASE / vendor_leaf, vendor_data)
@@ -330,6 +331,9 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("installation/") for path in inventory))
         self.assertFalse(any(path.startswith("rights/") for path in inventory))
         self.assertFalse(any(path.startswith("corpus/tier-receipts/") for path in inventory))
+        project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
+        self.assertEqual(project_map["schema"], "danse.map.v1")
+        self.assertTrue(all(node["href"] is None for node in project_map["nodes"] if node["product_id"]))
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
@@ -403,6 +407,12 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertNotEqual(
             (self.output / "project/index.html").read_bytes(),
             root_index,
+        )
+        project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
+        self.assertTrue(all(node["status"] == "admitted" for node in project_map["nodes"]))
+        self.assertEqual(
+            {node["href"] for node in project_map["nodes"] if node["product_id"]},
+            {"./project/", "./project/#cubism", "./project/#glitch", "./project/#ballet-score", "./project/#evidence"},
         )
         markup = Markup()
         markup.feed((self.output / "project/index.html").read_text(encoding="utf-8"))
@@ -656,8 +666,9 @@ class InterfaceContractTest(unittest.TestCase):
         cls.markup = Markup()
         cls.markup.feed(cls.html)
         cls.script = "\n".join(cls.markup.scripts)
+        cls.styles = (ROOT / "interface/styles.css").read_text(encoding="utf-8")
 
-    def test_hud_is_really_hidden_and_disclosed_by_an_accessible_touch_target(self) -> None:
+    def test_five_category_surface_and_advanced_sheet_are_accessible(self) -> None:
         tag, hud = self.markup.by_id["hud"]
         self.assertEqual(tag, "section")
         self.assertIn("hidden", hud)
@@ -668,17 +679,25 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertEqual(toggle["aria-controls"], "hud")
         self.assertEqual(toggle["aria-expanded"], "false")
         self.assertEqual(toggle["aria-label"], "Show Danse controls")
-        self.assertIn("#hud[hidden] { display: none; }", self.html)
+        tag, dock = self.markup.by_id["danse-dock"]
+        self.assertEqual((tag, dock["aria-label"]), ("nav", "Danse control categories"))
+        categories = [
+            attrs["data-category"]
+            for tag, attrs in self.markup.tags
+            if tag == "button" and attrs.get("data-category")
+        ]
+        self.assertEqual(categories, ["hold", "river", "score", "presence", "map"])
+        self.assertIn('#surface-tray[hidden],#hud[hidden] { display:none; }', self.styles)
         self.assertIn("min-width: 48px; min-height: 48px", self.html)
 
-    def test_keyboard_and_touch_controls_keep_aria_state_in_sync(self) -> None:
+    def test_keyboard_buttons_and_browser_probe_share_named_actions(self) -> None:
         self.assertIn("function setHudVisible(visible)", self.script)
         self.assertIn('hud.setAttribute("aria-hidden", String(!visible))', self.script)
         self.assertIn('hudToggle.setAttribute("aria-expanded", String(visible))', self.script)
-        self.assertIn('hudToggle.addEventListener("click"', self.script)
-        self.assertIn('const key = e.key.toLowerCase()', self.script)
-        self.assertIn('if (key === "h")', self.script)
-        self.assertIn('if (e.key === "Escape")', self.script)
+        self.assertIn('hudToggle.addEventListener("click", toggleControls)', self.script)
+        self.assertIn("const command = shortcutAction(event)", self.script)
+        self.assertIn("createControlActions({", self.script)
+        self.assertIn("actions: controlBus.actions", self.script)
         self.assertIn("keyboard-instructions", self.markup.by_id)
         self.assertIn("touch-instructions", self.markup.by_id)
 
@@ -729,9 +748,11 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_layout_uses_mobile_safe_areas_and_reduced_motion_holds_a_frame(self) -> None:
         self.assertIn("viewport-fit=cover", self.html)
-        self.assertIn("env(safe-area-inset-bottom)", self.html)
+        self.assertIn("env(safe-area-inset-bottom)", self.styles)
         self.assertIn("@media (max-width: 640px)", self.html)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", self.html)
+        self.assertIn("@media (prefers-reduced-motion:reduce)", self.styles)
+        self.assertIn("min-height:calc(64px + env(safe-area-inset-bottom))", self.styles)
+        self.assertIn("min-width:44px; min-height:44px", self.styles)
         self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', self.script)
         self.assertIn(
             "let heldAt = reducedMotion.matches ? Arrival.now(river) : null", self.script
