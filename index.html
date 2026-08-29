@@ -291,7 +291,6 @@ function setHudVisible(visible) {
 }
 
 setHudVisible(false);
-hudToggle.addEventListener("click", toggleControls);
 
 const corpus = await Corpus.load();
 const choreography = choreographyUrl && musicalScore
@@ -357,12 +356,14 @@ function scoreSecondAt(t) {
   return scoreAt(musicalScore, t, { t0: passage.t0, seconds: passage.seconds }).source_second;
 }
 
-reducedMotion.addEventListener("change", ({ matches }) => {
-  heldAt = matches ? Arrival.now(river) : null;
-  controlBus?.actions.setReducedMotion(matches);
+function reducedMotionChanged({ matches }) {
+  const playback = controlBus.getState().playback;
+  if (matches && playback === "running") heldAt = Arrival.now(river);
+  else if (!matches && playback === "held-reduced") heldAt = null;
+  controlBus.actions.setReducedMotion(matches);
   renderInteraction(interaction.snapshot());
-  flash(matches ? "reduced motion · frame held" : "motion resumed");
-});
+  flash(playback === "held-user" ? "manual hold preserved" : matches ? "reduced motion · frame held" : "motion resumed");
+}
 
 function frame() {
   const t = at();
@@ -427,6 +428,10 @@ addEventListener("hashchange", async () => {
   }
   if (generation !== navigationGeneration) return;
   river = nextRiver;
+  previousRiver = null;
+  previousRiverWasRemembered = false;
+  el("river-undo").disabled = true;
+  el("river-receipt").textContent = `River ${hex(river.seed)} arrived from this link. Undo is unavailable.`;
   shifted = nextRiver.shifted;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM, value: program ? "score-led" : "free" });
@@ -748,8 +753,10 @@ function openDetails(section, trigger = null) {
 }
 
 function toggleControls() {
+  if (!controlBus) return;
+  if (projectMap.open) controlBus.actions.close();
   if (hud.hidden) openDetails("details", hudToggle);
-  else controlBus?.actions.close();
+  else controlBus.actions.close();
 }
 
 async function openMap(trigger) {
@@ -801,6 +808,8 @@ controlBus.subscribe((state) => {
   if (state.status.presence) el("presence-receipt").textContent = state.status.presence;
 });
 
+reducedMotion.addEventListener("change", reducedMotionChanged);
+hudToggle.addEventListener("click", toggleControls);
 dock.querySelector('[data-category="hold"]').addEventListener("click", () => { void controlBus.actions.hold(); });
 for (const category of ["river", "score", "presence"]) dock.querySelector(`[data-category="${category}"]`).addEventListener("click", (event) => { surfaceTrigger = event.currentTarget; controlBus.actions.openTray(category); });
 dock.querySelector('[data-category="map"]').addEventListener("click", (event) => { void openMap(event.currentTarget); });

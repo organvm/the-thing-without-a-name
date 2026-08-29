@@ -30,7 +30,10 @@ export function renderControlSurface(root, state) {
     cutout.textContent = `Figure cutout: ${state.cutout}`;
   }
   const music = doc.getElementById("music-tray");
-  if (music) music.textContent = `Music: ${state.music.replaceAll("-", " ")}`;
+  if (music) {
+    music.disabled = state.music === "unavailable";
+    music.textContent = `Music: ${state.music.replaceAll("-", " ")}`;
+  }
   for (const movement of doc.querySelectorAll("[data-movement]")) {
     movement.setAttribute("aria-pressed", String(Number(movement.dataset.movement) === state.movement));
   }

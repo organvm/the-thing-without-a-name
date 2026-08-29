@@ -347,6 +347,8 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     state = page.evaluate("() => danse.controlState")
     want(state["surface"] == "closed", "control surface did not start closed")
     want(state["music"] == "unavailable", "missing score was not stated as unavailable")
+    want(page.locator("#music-tray").is_disabled(), "unavailable primary Music action stayed enabled")
+    want(page.locator("#music-tray").inner_text() == "Music: unavailable", "unavailable primary Music status was incoherent")
     want(page.locator("#danse-dock button").count() == 5, "five-category dock is incomplete")
     shot("desktop-closed")
 
@@ -359,6 +361,17 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(not page.locator("#river-undo").is_disabled(), "New river did not enable Undo")
     page.click("#river-undo")
     want(page.evaluate("() => danse.seed") == first_seed, "Undo did not restore the prior river")
+    page.click("#river-new")
+    joined_seed = page.evaluate("""() => {
+      const seed = (danse.seed + 1) >>> 0;
+      location.hash = `s=${seed}&e=${danse.river.epoch}&u=${danse.river.stream}`;
+      return seed;
+    }""")
+    page.wait_for_function(f"() => danse.seed === {joined_seed}")
+    want(page.locator("#river-undo").is_disabled(), "hash navigation retained stale river Undo")
+    want("undo is unavailable" in page.locator("#river-receipt").inner_text().lower(), "hash navigation retained stale Undo status")
+    want(page.evaluate("async () => await danse.actions.undoRiver()") is None, "hash navigation retained internal river Undo state")
+    want(page.evaluate("() => danse.seed") == joined_seed, "stale Undo changed the hash-arrived river")
     page.evaluate("""() => {
       window.__sharedRiver = null;
       Object.defineProperty(navigator, 'share', { configurable:true, value:undefined });
@@ -415,6 +428,13 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator('#project-map-list a[href="./project/"]').count() == 0, "gated Study was rendered as a link")
     want("unavailable" in page.locator("#project-map-list").inner_text().lower(), "gated Study was not visibly unavailable")
     shot("desktop-map")
+    page.press("#map-close", "h")
+    want(page.locator("#project-map").is_hidden(), "H left the Map open over Details")
+    want(page.locator("#hud").is_visible(), "H did not open Details after closing the Map")
+    want(page.evaluate("() => danse.controlState.surface") == "sheet:details", "H left surface state inconsistent after Map")
+    page.press("#sheet-close", "Escape")
+    page.click('[data-category="map"]')
+    page.wait_for_function("() => document.getElementById('project-map').open")
     page.press("#map-close", "Escape")
     want(page.evaluate("() => document.activeElement?.dataset.category") == "map", "Map focus did not return to its trigger")
 
@@ -452,6 +472,16 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => danse.controlState.playback") == "held-reduced", "reduced motion did not arrive held")
     page.click('[data-category="hold"]')
     want(page.evaluate("() => danse.controlState.playback") == "running", "explicit reduced-motion opt-in did not resume")
+    page.click('[data-category="hold"]')
+    manual_hold = page.evaluate("() => danse.t")
+    page.emulate_media(reduced_motion="no-preference")
+    page.wait_for_function("() => !matchMedia('(prefers-reduced-motion: reduce)').matches && danse.controlState.playback === 'held-user'")
+    want(page.evaluate("() => danse.t") == manual_hold, "preference change replaced the manual held frame")
+    page.click('[data-category="hold"]')
+    page.emulate_media(reduced_motion="reduce")
+    page.wait_for_function("() => danse.controlState.playback === 'held-reduced'")
+    page.emulate_media(reduced_motion="no-preference")
+    page.wait_for_function("() => danse.controlState.playback === 'running'")
     shot("reduced-motion-opt-in")
 
     if console_errors:

@@ -730,6 +730,26 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("keyboard-instructions", self.markup.by_id)
         self.assertIn("touch-instructions", self.markup.by_id)
 
+    def test_controls_initialize_before_listening_and_replace_the_map_atomically(self) -> None:
+        bus = self.script.index("controlBus = createControlActions({")
+        listener = self.script.index('hudToggle.addEventListener("click", toggleControls)')
+        self.assertLess(bus, listener)
+        toggle = self.script.split("function toggleControls() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if (!controlBus) return;", toggle)
+        self.assertIn("if (projectMap.open) controlBus.actions.close();", toggle)
+
+    def test_hash_navigation_expires_pending_river_undo(self) -> None:
+        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        self.assertIn("previousRiver = null;", handler)
+        self.assertIn("previousRiverWasRemembered = false;", handler)
+        self.assertIn('el("river-undo").disabled = true;', handler)
+
+    def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
+        handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('playback === "running"', handler)
+        self.assertIn('playback === "held-reduced"', handler)
+        self.assertNotIn('playback === "held-user"', handler.split("flash", 1)[0])
+
     def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
         self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
         self.assertIn("previousRiverWasRemembered = !river.shifted && Boolean(remembered)", self.script)

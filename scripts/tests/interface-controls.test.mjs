@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createControlActions } from "../../interface/actions.js";
+import { renderControlSurface } from "../../interface/render.js";
 import {
   ACTIONS,
   initialControlState,
@@ -48,12 +49,45 @@ await test("river and reduced-motion transitions keep playback and music synchro
   assert.deepEqual([state.playback, state.music], ["running", "playing"]);
 });
 
+await test("reduced-motion changes preserve a manual hold and its suspended music", () => {
+  let state = initialControlState();
+  state = reduceControlState(state, { type: ACTIONS.SET_MUSIC, value: "playing" });
+  state = reduceControlState(state, { type: ACTIONS.TOGGLE_HOLD, allowMotion: true });
+  assert.deepEqual([state.playback, state.music], ["held-user", "suspended-by-hold"]);
+  state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: true });
+  assert.deepEqual([state.playback, state.music], ["held-user", "suspended-by-hold"]);
+  state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: false });
+  assert.deepEqual([state.playback, state.music], ["held-user", "suspended-by-hold"]);
+});
+
 await test("a new Presence transition clears an obsolete receipt error", () => {
   let state = initialControlState();
   state = reduceControlState(state, { type: ACTIONS.SET_STATUS, category: "presence", message: "Receipt rejected" });
   state = reduceControlState(state, { type: ACTIONS.SET_PRESENCE, value: "camera" });
   assert.equal(state.presence, "camera");
   assert.equal(state.status.presence, "");
+});
+
+await test("an invalid Presence transition is an identity-preserving no-op", () => {
+  let state = initialControlState();
+  state = reduceControlState(state, { type: ACTIONS.SET_STATUS, category: "presence", message: "Receipt rejected" });
+  const before = state;
+  state = reduceControlState(state, { type: ACTIONS.SET_PRESENCE, value: "invalid" });
+  assert.strictEqual(state, before);
+  assert.deepEqual([state.presence, state.status.presence], ["off", "Receipt rejected"]);
+});
+
+await test("the primary Music action mirrors unavailable and available state", () => {
+  const music = { disabled: false, textContent: "" };
+  const doc = {
+    getElementById: (id) => id === "music-tray" ? music : null,
+    querySelectorAll: () => [],
+  };
+  const root = { ownerDocument: doc, dataset: {}, querySelector: () => null };
+  renderControlSurface(root, initialControlState({ scoreAvailable: false }));
+  assert.deepEqual([music.disabled, music.textContent], [true, "Music: unavailable"]);
+  renderControlSurface(root, initialControlState({ scoreAvailable: true }));
+  assert.deepEqual([music.disabled, music.textContent], [false, "Music: stopped"]);
 });
 
 await test("keyboard compatibility yields named actions and respects editable/native controls", () => {

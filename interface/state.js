@@ -61,9 +61,10 @@ export function reduceControlState(state, action) {
       else if (next.playback !== "running" && state.music === "playing") next.music = "suspended-by-hold";
       break;
     case ACTIONS.SET_REDUCED_MOTION:
-      next.playback = action.value ? "held-reduced" : "running";
-      if (action.value && state.music === "playing") next.music = "suspended-by-hold";
-      else if (!action.value && state.music === "suspended-by-hold") next.music = "playing";
+      if (action.value && state.playback === "running") next.playback = "held-reduced";
+      else if (!action.value && state.playback === "held-reduced") next.playback = "running";
+      if (state.music === "playing" && next.playback === "held-reduced") next.music = "suspended-by-hold";
+      else if (state.playback === "held-reduced" && next.playback === "running" && state.music === "suspended-by-hold") next.music = "playing";
       break;
     case ACTIONS.SET_PROGRAM:
       next.program = action.value === "free" ? "free" : "score-led";
@@ -81,7 +82,8 @@ export function reduceControlState(state, action) {
       next.audition = action.active ? "override-active" : action.ready ? "override-ready" : "follow-score";
       break;
     case ACTIONS.SET_PRESENCE:
-      if (PRESENCE.includes(action.value)) next.presence = action.value;
+      if (!PRESENCE.includes(action.value)) return state;
+      next.presence = action.value;
       next.status = withStatus(state, "presence", "");
       break;
     case ACTIONS.OPEN_TRAY:
