@@ -267,6 +267,7 @@ const musicalScore = scoreUrl
     })
   : null;
 let navigationGeneration = 0;
+let programGeneration = 0;
 
 const canvas = document.getElementById("stage");
 const el = (id) => document.getElementById(id);
@@ -278,6 +279,7 @@ const tray = document.getElementById("surface-tray");
 const projectMap = document.getElementById("project-map");
 let projectMapData = null;
 let previousRiver = null;
+let previousRiverWasRemembered = false;
 let controlBus = null;
 
 function setHudVisible(visible) {
@@ -414,18 +416,23 @@ setInterval(() => {
 // not fire this event, so the page cannot chase its own tail.
 addEventListener("hashchange", async () => {
   const generation = ++navigationGeneration;
+  const programIntent = ++programGeneration;
   const nextRiver = Arrival.arrive(location.hash);
   const mode = Arrival.modeOf(location.hash);
   if (mode === "free") program = null;
   else if (!program) {
     const loaded = await Program.load();
     if (generation !== navigationGeneration) return;
-    program = loaded;
+    if (programIntent === programGeneration) program = loaded;
   }
   if (generation !== navigationGeneration) return;
   river = nextRiver;
   shifted = nextRiver.shifted;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM, value: program ? "score-led" : "free" });
+  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: reducedMotion.matches });
+  el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
+  describeProgram();
 });
 
 /** Wind this river to `to` without renaming it. Every jump in the piece is this. */
@@ -434,6 +441,7 @@ function jump(to) {
   shifted = true;
   heldAt = reducedMotion.matches ? to : null;
   scoreAudio?.seek(0);
+  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: reducedMotion.matches });
 }
 
 /** Announce temporary feedback without replacing the controls or live state. */
@@ -604,6 +612,11 @@ function toggleHold() {
 
 function newRiver() {
   previousRiver = river;
+  const remembered = Arrival.recall();
+  previousRiverWasRemembered = !river.shifted && Boolean(remembered)
+    && remembered.seed === river.seed
+    && remembered.stream === river.stream
+    && remembered.epoch === river.epoch;
   river = { ...Arrival.mint(), minted: true, shifted: false };
   shifted = false;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
@@ -611,20 +624,21 @@ function newRiver() {
   el("river-undo").disabled = false;
   el("river-receipt").textContent = `New river ${hex(river.seed)} created. Undo is available.`;
   flash(`new river · ${hex(river.seed)}`);
-  return river;
+  return { ...river, reducedMotion: reducedMotion.matches };
 }
 
 function undoRiver() {
   if (!previousRiver) return null;
   river = previousRiver;
   previousRiver = null;
-  Arrival.remember(river);
+  if (previousRiverWasRemembered) Arrival.remember(river);
+  previousRiverWasRemembered = false;
   shifted = Boolean(river.shifted);
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = true;
   el("river-receipt").textContent = "Returned to the previous river.";
-  return river;
+  return { ...river, reducedMotion: reducedMotion.matches };
 }
 
 async function shareRiver() {
@@ -675,13 +689,23 @@ function jumpMovement(number) {
 }
 
 async function setProgram(value) {
+  const generation = ++programGeneration;
   if (value === "free") {
     program = null;
-    el("score-receipt").textContent = "Free visual program; music remains separately score-native.";
-    return;
+    describeProgram();
+    return true;
   }
-  if (!program) program = await Program.load();
-  el("score-receipt").textContent = "Score-led visual program.";
+  const loaded = program ?? await Program.load();
+  if (generation !== programGeneration) return false;
+  program = loaded;
+  describeProgram();
+  return true;
+}
+
+function describeProgram() {
+  el("score-receipt").textContent = program
+    ? "Score-led visual program."
+    : "Free visual program; music remains separately score-native.";
 }
 
 function toggleCutout() {
@@ -762,6 +786,8 @@ controlBus = createControlActions({
 
 if (!program) controlBus.actions.sync({ type: ACTIONS.SET_PROGRAM, value: "free" });
 if (matteK) controlBus.actions.sync({ type: ACTIONS.TOGGLE_CUTOUT });
+el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
+describeProgram();
 const conductorActive = conductor.model !== "native" || conductor.meter !== null || conductor.tempo !== null;
 controlBus.actions.sync({ type: ACTIONS.SET_CONDUCTOR, active: conductorActive, ready: !conductorActive });
 controlBus.subscribe((state) => {

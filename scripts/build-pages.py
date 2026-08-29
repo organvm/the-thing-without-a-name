@@ -645,8 +645,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         except Exception as exc:
             raise ArtifactError(f"artifact project links failed verification: {exc}") from exc
     resolved_map = project_map(output, allow_resolved=True)
-    map_has_study = all(node["status"] == "admitted" for node in resolved_map["nodes"])
-    if map_has_study != has_project:
+    study = [node for node in resolved_map["nodes"] if node["product_id"]]
+    admitted = [node for node in study if node["status"] == "admitted"]
+    if admitted and len(admitted) != len(study):
+        raise ArtifactError("project map admits study routes partially")
+    if bool(admitted) != has_project:
         raise ArtifactError("project map admission disagrees with the delivered project route")
     return manifest
 

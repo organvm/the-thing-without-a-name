@@ -416,6 +416,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
         )
         markup = Markup()
         markup.feed((self.output / "project/index.html").read_text(encoding="utf-8"))
+        self.assertTrue({"cubism", "glitch", "ballet-score", "evidence"} <= set(markup.by_id))
         hrefs = {
             attrs["href"]
             for tag, attrs in markup.tags
@@ -451,6 +452,34 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("release/") for path in paths))
         self.assertFalse(any(path.startswith("installation/") for path in paths))
         self.assertFalse(any(path.startswith("submission/") for path in paths))
+
+    def test_partially_admitted_study_map_fails_closed(self) -> None:
+        PAGES.build(self.root, self.output, TEST_COMMIT)
+        map_path = self.output / PAGES.PROJECT_MAP
+        project_map = json.loads(map_path.read_text(encoding="utf-8"))
+        node = next(node for node in project_map["nodes"] if node["product_id"])
+        node["status"] = "admitted"
+        node["availability"] = "available"
+        node["href"] = node["route"] + (
+            f"#{node['fragment']}" if node["fragment"] else ""
+        )
+        map_path.write_text(
+            json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in manifest["files"] if record["path"] == PAGES.PROJECT_MAP
+        )
+        record["bytes"] = map_path.stat().st_size
+        record["sha256"] = PAGES.sha256(map_path)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "admits study routes partially"):
+            PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_receipted_project_link_outside_pages_boundary_fails(self) -> None:
         release = release_artifact_fixture(self.base, "public")
@@ -700,6 +729,22 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("actions: controlBus.actions", self.script)
         self.assertIn("keyboard-instructions", self.markup.by_id)
         self.assertIn("touch-instructions", self.markup.by_id)
+
+    def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
+        self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
+        self.assertIn("previousRiverWasRemembered = !river.shifted && Boolean(remembered)", self.script)
+        self.assertIn("if (previousRiverWasRemembered) Arrival.remember(river)", self.script)
+        self.assertIn("const programIntent = ++programGeneration", self.script)
+        self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
+        self.assertIn("if (generation !== programGeneration) return false", self.script)
+        self.assertIn('value: program ? "score-led" : "free"', self.script)
+        self.assertIn("describeProgram();", self.script)
+
+    def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
+        self.assertIn('#project-map [aria-disabled="true"]', self.styles)
+        browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        self.assertIn("presence-receipt')?.textContent", browser)
+        self.assertIn("document.getElementById('veil').hidden", browser)
 
     def test_share_feedback_has_its_own_polite_live_region(self) -> None:
         tag, toast = self.markup.by_id["toast"]

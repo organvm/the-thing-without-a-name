@@ -49,7 +49,7 @@
 #project-map ul { list-style:none; padding:0; }
 #project-map li { padding:16px 0; border-top:1px solid var(--danse-line); }
 #project-map a { color:var(--danse-ink); }
-#project-map a[aria-disabled="true"] { color:#81818d; text-decoration:none; cursor:not-allowed; }
+#project-map [aria-disabled="true"] { color:#81818d; text-decoration:none; cursor:not-allowed; }
 
 @media (min-width:800px) {
   #danse-dock { left:50%; right:auto; top:max(10px,env(safe-area-inset-top)); bottom:auto; transform:translateX(-50%); width:min(760px,calc(100% - 24px)); min-height:56px; padding:4px; border:1px solid var(--danse-line); border-radius:8px; box-shadow:0 12px 36px rgba(0,0,0,.3); }

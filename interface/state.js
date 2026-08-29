@@ -10,6 +10,7 @@ export const CATEGORIES = Object.freeze(["hold", "river", "score", "presence", "
 
 export const ACTIONS = Object.freeze({
   TOGGLE_HOLD: "toggle-hold",
+  RESET_RIVER: "reset-river",
   SET_REDUCED_MOTION: "set-reduced-motion",
   SET_MOVEMENT: "set-movement",
   SET_PROGRAM: "set-program",
@@ -54,9 +55,15 @@ export function reduceControlState(state, action) {
       if (state.music === "playing" && next.playback !== "running") next.music = "suspended-by-hold";
       else if (state.music === "suspended-by-hold" && next.playback === "running") next.music = "playing";
       break;
+    case ACTIONS.RESET_RIVER:
+      next.playback = action.reducedMotion ? "held-reduced" : "running";
+      if (next.playback === "running" && state.music === "suspended-by-hold") next.music = "playing";
+      else if (next.playback !== "running" && state.music === "playing") next.music = "suspended-by-hold";
+      break;
     case ACTIONS.SET_REDUCED_MOTION:
       next.playback = action.value ? "held-reduced" : "running";
       if (action.value && state.music === "playing") next.music = "suspended-by-hold";
+      else if (!action.value && state.music === "suspended-by-hold") next.music = "playing";
       break;
     case ACTIONS.SET_PROGRAM:
       next.program = action.value === "free" ? "free" : "score-led";
@@ -75,6 +82,7 @@ export function reduceControlState(state, action) {
       break;
     case ACTIONS.SET_PRESENCE:
       if (PRESENCE.includes(action.value)) next.presence = action.value;
+      next.status = withStatus(state, "presence", "");
       break;
     case ACTIONS.OPEN_TRAY:
       if (!["river", "score", "presence"].includes(action.category)) return state;

@@ -35,6 +35,27 @@ await test("state contracts cover hold, program, cutout, music, surfaces, auditi
   assert.deepEqual([state.program, state.cutout, state.presence, state.audition], ["free", "on", "keyboard-touch", "override-active"]);
 });
 
+await test("river and reduced-motion transitions keep playback and music synchronized", () => {
+  let state = initialControlState();
+  state = reduceControlState(state, { type: ACTIONS.SET_MUSIC, value: "playing" });
+  state = reduceControlState(state, { type: ACTIONS.TOGGLE_HOLD, allowMotion: true });
+  assert.deepEqual([state.playback, state.music], ["held-user", "suspended-by-hold"]);
+  state = reduceControlState(state, { type: ACTIONS.RESET_RIVER, reducedMotion: false });
+  assert.deepEqual([state.playback, state.music], ["running", "playing"]);
+  state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: true });
+  assert.deepEqual([state.playback, state.music], ["held-reduced", "suspended-by-hold"]);
+  state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: false });
+  assert.deepEqual([state.playback, state.music], ["running", "playing"]);
+});
+
+await test("a new Presence transition clears an obsolete receipt error", () => {
+  let state = initialControlState();
+  state = reduceControlState(state, { type: ACTIONS.SET_STATUS, category: "presence", message: "Receipt rejected" });
+  state = reduceControlState(state, { type: ACTIONS.SET_PRESENCE, value: "camera" });
+  assert.equal(state.presence, "camera");
+  assert.equal(state.status.presence, "");
+});
+
 await test("keyboard compatibility yields named actions and respects editable/native controls", () => {
   const event = (key, tagName = "DIV", extra = {}) => ({ key, target: { tagName, isContentEditable: false }, ...extra });
   assert.deepEqual(shortcutAction(event(" ")), { name: "hold" });
@@ -76,6 +97,18 @@ await test("button and shortcut callers share one action bus", async () => {
 
 await test("only program and Figure cutout enter shareable presentation state", () => {
   assert.deepEqual(sharePresentationState({ program: "free", cutout: "on", playback: "held-user", music: "playing" }), { mode: "free", cutout: true });
+});
+
+await test("reported action failures are consumed at the UI action boundary", async () => {
+  const reports = [];
+  const bus = createControlActions({
+    setProgram: async () => { throw new Error("score unavailable"); },
+    reportError: (name, error) => reports.push([name, error.message]),
+  });
+  const result = await bus.actions.setProgram("free");
+  assert.equal(result, undefined);
+  assert.deepEqual(reports, [["program", "score unavailable"]]);
+  assert.equal(bus.getState().program, "score-led");
 });
 
 process.stdout.write(`interface controls: ${passed} checks passed\n`);

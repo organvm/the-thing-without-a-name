@@ -400,7 +400,10 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(not page.locator("#receipt-save").is_disabled(), "receipt Save stayed disabled after samples existed")
     page.click("#interaction-stop")
     page.set_input_files("#receipt-load", files=[{"name": "invalid.json", "mimeType": "application/json", "buffer": b"{}"}])
-    page.wait_for_timeout(100)
+    page.wait_for_function(
+        "() => (document.getElementById('presence-receipt')?.textContent || '').toLowerCase().includes('rejected')",
+        timeout=10_000,
+    )
     want("rejected" in page.locator("#presence-receipt").inner_text().lower(), "invalid receipt did not receive explicit rejection status")
     page.press("#fallback-x", "m")
     want(page.evaluate("() => danse.controlState.cutout") == "on", "letter shortcut fired while a slider held focus")
@@ -445,6 +448,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.emulate_media(reduced_motion="reduce")
     page.reload(wait_until="load")
     page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    page.wait_for_function("() => document.getElementById('veil').hidden", timeout=180_000)
     want(page.evaluate("() => danse.controlState.playback") == "held-reduced", "reduced motion did not arrive held")
     page.click('[data-category="hold"]')
     want(page.evaluate("() => danse.controlState.playback") == "running", "explicit reduced-motion opt-in did not resume")
