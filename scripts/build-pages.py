@@ -70,6 +70,52 @@ class ArtifactError(RuntimeError):
     """The public artifact would be incomplete or exceed its declared boundary."""
 
 
+def provenance_git_env() -> dict[str, str]:
+    """Return an environment that reads raw Git objects without replacements."""
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+def reject_git_rewrites(root: Path) -> None:
+    """Fail closed on local replacement refs or legacy grafted history."""
+    root = root.absolute().resolve()
+    env = provenance_git_env()
+    replacements = subprocess.run(
+        ["git", "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/replace/"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if replacements.returncode != 0:
+        raise ArtifactError(
+            f"cannot inspect Git replacement refs: {replacements.stderr.strip()}"
+        )
+    if replacements.stdout.strip():
+        raise ArtifactError("source repository contains Git replacement object refs")
+    graft_query = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if graft_query.returncode != 0 or not graft_query.stdout.strip():
+        detail = graft_query.stderr.strip() or "Git returned no graft path"
+        raise ArtifactError(f"cannot inspect legacy Git grafts: {detail}")
+    graft_path = Path(graft_query.stdout.strip())
+    if not graft_path.is_absolute():
+        graft_path = root / graft_path
+    if graft_path.exists():
+        if graft_path.is_symlink() or not graft_path.is_file():
+            raise ArtifactError("legacy Git graft path is not a regular file")
+        if graft_path.stat().st_size:
+            raise ArtifactError(
+                "source repository contains a nonempty legacy Git graft file"
+            )
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -441,11 +487,16 @@ def source_files(root: Path) -> tuple[str, ...]:
 def source_commit(root: Path, explicit: str | None = None) -> str:
     commit = explicit
     if commit is None:
+        try:
+            reject_git_rewrites(root)
+        except Exception as exc:
+            raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
         done = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
+            env=provenance_git_env(),
         )
         if done.returncode != 0:
             raise ArtifactError(f"cannot resolve source commit: {done.stderr.strip()}")
@@ -460,11 +511,17 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
     """Bind a production CLI build to one clean, exact Git worktree."""
     root = root.absolute().resolve()
     expected_commit = source_commit(root, expected_commit)
+    try:
+        reject_git_rewrites(root)
+    except Exception as exc:
+        raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
+    git_env = provenance_git_env()
     identity = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2:
@@ -490,6 +547,7 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     if status.returncode != 0:
         raise ArtifactError(f"cannot inspect source checkout: {status.stderr.strip()}")
@@ -510,6 +568,7 @@ def source_commit_records(
             ["git", "-C", str(root), "show", f"{commit}:{relative}"],
             capture_output=True,
             check=False,
+            env=provenance_git_env(),
         )
         if committed.returncode != 0:
             detail = committed.stderr.decode("utf-8", errors="replace").strip()

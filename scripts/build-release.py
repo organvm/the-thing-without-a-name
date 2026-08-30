@@ -35,6 +35,8 @@ from release_contract import (
     decode_json_object,
     load_json,
     phase_blockers,
+    provenance_git_env,
+    reject_git_rewrites,
     safe_relative,
     sha256,
     source_commit,
@@ -1236,11 +1238,14 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
     """Bind a production CLI build to one clean, exact Git worktree."""
     root = root.absolute().resolve()
     expected_commit = source_commit(root, expected_commit)
+    reject_git_rewrites(root)
+    git_env = provenance_git_env()
     identity = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2:
@@ -1266,6 +1271,7 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     if status.returncode != 0:
         raise ReleaseError(f"cannot inspect source checkout: {status.stderr.strip()}")
@@ -1566,8 +1572,10 @@ def source_release_manifest(
         ["git", "-C", str(root), "show", f"{commit}:{MANIFEST.as_posix()}"],
         capture_output=True,
         check=False,
+        env=provenance_git_env(),
     )
     if committed.returncode == 0:
+        reject_git_rewrites(root)
         data = committed.stdout
     elif allow_worktree_fallback:
         path = source_file(root, MANIFEST.as_posix(), "release manifest")

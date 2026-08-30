@@ -836,6 +836,63 @@ class ProductionCliSourceTest(unittest.TestCase):
             ):
                 BUILD.source_release_manifest(root, commit)
 
+    def test_source_commit_manifest_rejects_git_replacement_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            claimed_commit = initialize_git_fixture(root)
+            manifest = read_manifest(root)
+            manifest["version"] = "0.1.1-draft"
+            write_manifest(root, manifest)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "release/manifest.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "replacement manifest",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            replacement_commit = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "replace",
+                    claimed_commit,
+                    replacement_commit,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "replacement object refs",
+            ):
+                BUILD.source_release_manifest(root, claimed_commit)
+
 
 class AdversarialManifestTest(unittest.TestCase):
     def mutate(self, callback) -> tuple[tempfile.TemporaryDirectory, Path]:

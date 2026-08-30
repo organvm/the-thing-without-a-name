@@ -93,7 +93,9 @@ authentic earlier receipts remain verifiable. Verification regenerates and byte-
 every generated document and inventory, and binds every copied medium to its exact
 source-manifest destination, byte count, and digest. Production receipts hash the
 committed manifest blob rather than checkout-normalized bytes, so a clean CRLF checkout
-verifies against the same source object. Public/release verification also reruns the
+verifies against the same source object. Pages inputs must also equal their raw committed
+blobs, and every provenance Git command disables replacement-object interpretation while
+rejecting replacement refs and nonempty legacy grafts. Public/release verification also reruns the
 source-bound phase blockers; a self-rehashed receipt cannot promote a draft manifest.
 Generated outputs are not committed from the draft phase. The Pages
 receipt retains the source-manifest, release identity/payload, project-byte, and discovery

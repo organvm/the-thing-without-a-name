@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterable, Iterator
@@ -683,11 +684,13 @@ def validate_release(
 def source_commit(root: Path, explicit: str | None = None) -> str:
     commit = explicit
     if commit is None:
+        reject_git_rewrites(root)
         done = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
+            env=provenance_git_env(),
         )
         if done.returncode != 0:
             raise ReleaseError(f"cannot resolve source commit: {done.stderr.strip()}")
@@ -696,3 +699,47 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
     if not HEX40.fullmatch(commit):
         raise ReleaseError(f"source commit must be a full 40-character Git SHA: {commit!r}")
     return commit
+
+
+def provenance_git_env() -> dict[str, str]:
+    """Return an environment that reads raw Git objects without replacements."""
+    env = os.environ.copy()
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+def reject_git_rewrites(root: Path) -> None:
+    """Fail closed on local replacement refs or legacy grafted history."""
+    root = root.absolute().resolve()
+    env = provenance_git_env()
+    replacements = subprocess.run(
+        ["git", "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/replace/"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if replacements.returncode != 0:
+        raise ReleaseError(
+            f"cannot inspect Git replacement refs: {replacements.stderr.strip()}"
+        )
+    if replacements.stdout.strip():
+        raise ReleaseError("source repository contains Git replacement object refs")
+    graft_query = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if graft_query.returncode != 0 or not graft_query.stdout.strip():
+        detail = graft_query.stderr.strip() or "Git returned no graft path"
+        raise ReleaseError(f"cannot inspect legacy Git grafts: {detail}")
+    graft_path = Path(graft_query.stdout.strip())
+    if not graft_path.is_absolute():
+        graft_path = root / graft_path
+    if graft_path.exists():
+        if graft_path.is_symlink() or not graft_path.is_file():
+            raise ReleaseError("legacy Git graft path is not a regular file")
+        if graft_path.stat().st_size:
+            raise ReleaseError("source repository contains a nonempty legacy Git graft file")

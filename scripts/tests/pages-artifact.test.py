@@ -475,6 +475,106 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 require_git_source=True,
             )
 
+    def test_git_replacement_objects_cannot_rewrite_published_provenance(self) -> None:
+        root = self.base / "replacement-source"
+        public_fixture(root)
+        claimed_commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        arrival = root / "arrival.js"
+        arrival.write_bytes(arrival.read_bytes() + b"// replacement payload\n")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "replacement payload",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        replacement_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(root), "replace", claimed_commit, replacement_commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--detach", "-q", claimed_commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rewritten = subprocess.run(
+            ["git", "-C", str(root), "show", f"{claimed_commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        raw = subprocess.run(
+            ["git", "-C", str(root), "show", f"{claimed_commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout
+        self.assertNotEqual(rewritten, raw)
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+        with self.assertRaisesRegex(PAGES.ArtifactError, "replacement object refs"):
+            PAGES.build(
+                root,
+                self.base / "replacement-pages",
+                claimed_commit,
+                require_git_source=True,
+            )
+
+    def test_legacy_git_grafts_cannot_rewrite_published_provenance(self) -> None:
+        root = self.base / "graft-source"
+        public_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        graft_query = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout.strip()
+        graft = Path(graft_query)
+        if not graft.is_absolute():
+            graft = root / graft
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text(f"{commit}\n", encoding="utf-8")
+        with self.assertRaisesRegex(PAGES.ArtifactError, "legacy Git graft"):
+            PAGES.build(
+                root,
+                self.base / "grafted-pages",
+                commit,
+                require_git_source=True,
+            )
+
     def test_verified_public_release_adds_only_declared_outputs_and_keeps_artwork_at_root(self) -> None:
         release, release_source = release_artifact_fixture(self.base, "public")
         selected, binding = PAGES.public_release_files(
