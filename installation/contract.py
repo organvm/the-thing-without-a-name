@@ -1132,15 +1132,15 @@ def installation_workbook(
             "assets": [
                 {
                     "role": role,
-                    "private_asset_id": "required",
+                    "asset_id": "required-private",
                     "verified": "required-true",
-                    "private_receipt_sha256": "required",
+                    "receipt_sha256": "required-private",
                 }
                 for role in spec["hardware_roles"]
             ],
-            "private_cabling_receipt_sha256": "required",
-            "private_power_receipt_sha256": "required",
-            "private_ventilation_receipt_sha256": "required",
+            "cabling_receipt_sha256": "required-private",
+            "power_receipt_sha256": "required-private",
+            "ventilation_receipt_sha256": "required-private",
         },
         "surfaces": [
             {
