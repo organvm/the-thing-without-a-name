@@ -1201,6 +1201,57 @@ class AdversarialManifestTest(unittest.TestCase):
             ):
                 CONTRACT.validate_release(root)
 
+    def test_progressive_controls_receipt_allows_committed_completion_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["checks"][0]["observation"] = (
+                "Synthetic committed completion observation."
+            )
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "add",
+                    "release/manifest.json",
+                    CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "record progressive controls completion",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            CONTRACT.validate_release(root)
+
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
             manifest["media"][1]["id"] = manifest["media"][0]["id"]

@@ -494,8 +494,32 @@ def validate_evidence_only_descendant(root: Path, oid: str) -> None:
     media, and product drift all fail closed.
     """
 
-    payload = _git_output(root, "diff", "--name-only", "-z", f"{oid}..HEAD", "--")
-    changed = {item for item in payload.split("\0") if item}
+    try:
+        source_diff = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "diff",
+                "--name-only",
+                "-z",
+                oid,
+                "HEAD",
+                "--",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ReleaseError("cannot compare the reviewed release source tree") from exc
+    if source_diff.returncode != 0:
+        raise ReleaseError("cannot compare the reviewed release source tree")
+    try:
+        changed = {
+            item.decode("utf-8") for item in source_diff.stdout.split(b"\0") if item
+        }
+    except UnicodeDecodeError as exc:
+        raise ReleaseError("reviewed release source diff contains a non-UTF-8 path") from exc
     invalid = sorted(
         path
         for path in changed
