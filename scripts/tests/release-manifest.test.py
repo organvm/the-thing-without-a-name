@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
@@ -31,6 +33,8 @@ FIXTURE_FILES = (
     "release/manifest.json",
     "release/manifest.schema.json",
     "release/gate-receipt.schema.json",
+    "release/gate-proof.schema.json",
+    "release/owner-attestation.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
     "release/progressive-controls-replay.schema.json",
     "opportunities/omega-20260829.json",
@@ -79,13 +83,7 @@ def load_pages_builder():
 PAGES = load_pages_builder()
 
 
-def initialize_git_fixture(root: Path) -> str:
-    subprocess.run(
-        ["git", "-C", str(root), "init", "-q"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+def commit_git_fixture(root: Path, message: str) -> str:
     subprocess.run(
         ["git", "-C", str(root), "add", "."],
         check=True,
@@ -105,7 +103,7 @@ def initialize_git_fixture(root: Path) -> str:
             "commit.gpgsign=false",
             "commit",
             "-qm",
-            "fixture",
+            message,
         ],
         check=True,
         capture_output=True,
@@ -117,6 +115,16 @@ def initialize_git_fixture(root: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def initialize_git_fixture(root: Path) -> str:
+    subprocess.run(
+        ["git", "-C", str(root), "init", "-q"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return commit_git_fixture(root, "fixture")
 
 
 class Markup(HTMLParser):
@@ -194,39 +202,6 @@ def complete_manifest(root: Path) -> dict:
         "sha256": CONTRACT.sha256(evidence_path),
         "summary": "Synthetic public-safe evidence fixture.",
     }
-    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
-    progressive_path.write_bytes(CONTRACT.canonical_json({
-        "schema": "danse.progressive-controls-replay.v1",
-        "gate_id": "progressive-controls-replay",
-        "result": "satisfied",
-        "observed_at": "2026-08-30T20:00:00Z",
-        "source": {
-            "repository": "organvm/the-thing-without-a-name",
-            "pull_request": 43,
-            "exact_head": "a" * 40,
-            "tree": "b" * 40,
-        },
-        "runtime": {
-            "platform": "darwin",
-            "browser": {"name": "Google Chrome", "version": "fixture"},
-            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: fixture)",
-        },
-        "checks": [
-            {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
-            for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
-        ],
-        "non_actions": [
-            "No deployment, upload, submission, or publication action was performed by this receipt.",
-            "No rights, biography, final-cut, or archive-participation claim was made.",
-            "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
-        ],
-    }))
-    progressive_evidence = {
-        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
-        "sha256": CONTRACT.sha256(progressive_path),
-        "summary": "Synthetic exact-head progressive-controls replay fixture.",
-    }
-
     for claim in manifest["claims"]:
         claim["status"] = "verified"
         claim["evidence"] = copy.deepcopy(evidence)
@@ -253,52 +228,6 @@ def complete_manifest(root: Path) -> dict:
         medium["alt_text"] = f"Synthetic accessible description for {medium['label']}."
     for product in manifest["products"]:
         product["status"] = "ready"
-    for gate in manifest["gates"]:
-        gate["state"] = "satisfied"
-        if gate["id"] == "progressive-controls-replay":
-            gate["evidence"] = copy.deepcopy(progressive_evidence)
-        elif gate["id"] != "live-interaction-replay":
-            receipt_path = root / f"release/evidence/{gate['id']}-receipt.json"
-            required_kinds = sorted(CONTRACT.RELEASE_GATE_REQUIRED_EVIDENCE[gate["id"]])
-            rows = [
-                {
-                    "id": f"{kind}-receipt",
-                    "kind": kind,
-                    "receipt_sha256": evidence["sha256"],
-                    "reference": f"urn:sha256:{evidence['sha256']}",
-                    "summary": f"Synthetic {kind} evidence for the release-contract fixture.",
-                }
-                for kind in required_kinds
-            ]
-            receipt_path.write_bytes(
-                CONTRACT.canonical_json(
-                    {
-                        "schema": CONTRACT.RELEASE_GATE_RECEIPT_SCHEMA,
-                        "gate_id": gate["id"],
-                        "issue": gate["issue"],
-                        "result": "satisfied",
-                        "recorded_at": "2026-08-30T12:00:00Z",
-                        "authority": {
-                            "owner": gate["owner"],
-                            "recorded_by": "Synthetic release fixture",
-                        },
-                        "subject": {
-                            "release_id": manifest["release_id"],
-                            "release_version": manifest["version"],
-                            "repository_head": TEST_COMMIT,
-                        },
-                        "evidence": rows,
-                        "non_actions": [
-                            "The fixture performs no deployment, account action, or legal attestation."
-                        ],
-                    }
-                )
-            )
-            gate["evidence"] = {
-                "path": receipt_path.relative_to(root).as_posix(),
-                "sha256": CONTRACT.sha256(receipt_path),
-                "summary": "Synthetic typed gate receipt for release-contract verification.",
-            }
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
             requirement["status"] = "verified"
@@ -326,7 +255,214 @@ def complete_manifest(root: Path) -> dict:
         "text": "No spoken dialogue. Ambient sound and image events are described in the caption track.",
         "reason": None,
     }
+
+    # Freeze the release content before minting any gate evidence. Receipts bind
+    # this real ancestor commit and its exact tree; the later evidence commit is
+    # allowed to carry the immutable receipts without a self-referential SHA.
     write_manifest(root, manifest)
+    source_head = initialize_git_fixture(root)
+    source_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{source_head}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    observed_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    package_digest = hashlib.sha256(b"synthetic exact package manifest\n").hexdigest()
+
+    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    progressive_path.write_bytes(
+        CONTRACT.canonical_json(
+            {
+                "schema": "danse.progressive-controls-replay.v1",
+                "gate_id": "progressive-controls-replay",
+                "result": "satisfied",
+                "observed_at": observed_at,
+                "source": {
+                    "repository": CONTRACT.RELEASE_REPOSITORY,
+                    "pull_request": 43,
+                    "exact_head": source_head,
+                    "tree": source_tree,
+                },
+                "runtime": {
+                    "platform": "darwin",
+                    "browser": {"name": "Google Chrome", "version": "fixture"},
+                    "graphics": {
+                        "vendor": "Apple",
+                        "api": "Metal",
+                        "renderer": "ANGLE (Apple, ANGLE Metal Renderer: fixture)",
+                    },
+                },
+                "checks": [
+                    {
+                        "id": check_id,
+                        "result": "passed",
+                        "observation": f"Synthetic {check_id} observation.",
+                    }
+                    for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
+                ],
+                "non_actions": [
+                    "No deployment, upload, submission, or publication action was performed by this receipt.",
+                    "No rights, biography, final-cut, or archive-participation claim was made.",
+                    "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
+                ],
+            }
+        )
+    )
+    progressive_evidence = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(progressive_path),
+        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+    }
+
+    pins: dict[tuple[str, str], dict] = {}
+    for gate_index, gate in enumerate(manifest["gates"], start=1):
+        gate["state"] = "satisfied"
+        if gate["id"] == "live-interaction-replay":
+            continue
+        if gate["id"] == "progressive-controls-replay":
+            gate["evidence"] = copy.deepcopy(progressive_evidence)
+            continue
+
+        contract = CONTRACT.RELEASE_GATE_CONTRACTS[gate["id"]]
+        subject = {
+            "release_id": manifest["release_id"],
+            "release_version": manifest["version"],
+            "repository_head": source_head,
+            "repository_tree": source_tree,
+            "package_manifest_sha256": package_digest if contract["package"] else None,
+        }
+        package = CONTRACT._expected_package(subject)
+        rows = []
+        for proof_index, kind in enumerate(contract["proofs"], start=1):
+            proof_path = root / f"release/evidence/proofs/{gate['id']}-{kind}.json"
+            proof_path.parent.mkdir(parents=True, exist_ok=True)
+            if kind == "owner-attestation":
+                comment_id = 9_000_000_000 + gate_index
+                source = {
+                    "repository": CONTRACT.RELEASE_REPOSITORY,
+                    "issue": gate["issue"],
+                    "comment_id": comment_id,
+                    "comment_url": (
+                        f"https://github.com/{CONTRACT.RELEASE_REPOSITORY}/issues/"
+                        f"{gate['issue']}#issuecomment-{comment_id}"
+                    ),
+                    "comment_author": CONTRACT.RELEASE_OWNER_LOGIN,
+                    "comment_created_at": observed_at,
+                    "comment_updated_at": observed_at,
+                    "comment_body_sha256": hashlib.sha256(
+                        f"{gate['id']} owner fixture".encode()
+                    ).hexdigest(),
+                }
+                proof = {
+                    "schema": CONTRACT.RELEASE_OWNER_ATTESTATION_SCHEMA,
+                    "attestation_id": f"{gate['id']}-owner-{gate_index}",
+                    "gate_id": gate["id"],
+                    "issue": gate["issue"],
+                    "kind": kind,
+                    "decision": True,
+                    "recorded_at": observed_at,
+                    "authority": {
+                        "name": CONTRACT.RELEASE_OWNER_NAME,
+                        "github_login": CONTRACT.RELEASE_OWNER_LOGIN,
+                    },
+                    "source": source,
+                    "subject": subject,
+                    "package": package,
+                }
+                pin_extra = {"source": source}
+                schema_name = CONTRACT.RELEASE_OWNER_ATTESTATION_SCHEMA
+            else:
+                issuer_kind = (
+                    "venue"
+                    if kind == "installation-completion"
+                    else "host"
+                    if kind == "presentation-lifecycle"
+                    else "tool"
+                )
+                issuer = {
+                    "kind": issuer_kind,
+                    "identity": f"synthetic-{gate['id']}-{kind}",
+                }
+                proof = {
+                    "schema": CONTRACT.RELEASE_GATE_PROOF_SCHEMA,
+                    "proof_id": f"{gate['id']}-{kind}-{proof_index}",
+                    "gate_id": gate["id"],
+                    "issue": gate["issue"],
+                    "kind": kind,
+                    "result": "passed",
+                    "observed_at": observed_at,
+                    "issuer": issuer,
+                    "subject": subject,
+                    "package": package,
+                    "checks": [
+                        {
+                            "id": check_id,
+                            "result": "passed",
+                            "receipt_sha256": (
+                                package_digest
+                                if kind == "submission-package"
+                                and check_id == "package-manifest"
+                                else hashlib.sha256(
+                                    f"{gate['id']}:{kind}:{check_id}".encode()
+                                ).hexdigest()
+                            ),
+                        }
+                        for check_id in CONTRACT.RELEASE_PROOF_CHECKS[kind]
+                    ],
+                }
+                pin_extra = {"issuer": issuer}
+                schema_name = CONTRACT.RELEASE_GATE_PROOF_SCHEMA
+            proof_path.write_bytes(CONTRACT.canonical_json(proof))
+            record = {
+                "path": proof_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(proof_path),
+                "schema": schema_name,
+            }
+            pins[(gate["id"], kind)] = {**record, **pin_extra}
+            rows.append(
+                {
+                    "id": f"{kind}-{proof_index}",
+                    "kind": kind,
+                    "receipt": record,
+                    "summary": "Pinned typed proof fixture.",
+                }
+            )
+
+        receipt_path = root / f"release/evidence/{gate['id']}-receipt.json"
+        receipt_path.write_bytes(
+            CONTRACT.canonical_json(
+                {
+                    "schema": CONTRACT.RELEASE_GATE_RECEIPT_SCHEMA,
+                    "gate_id": gate["id"],
+                    "issue": gate["issue"],
+                    "result": "satisfied",
+                    "recorded_at": observed_at,
+                    "subject": subject,
+                    "evidence": rows,
+                    "affirms": list(contract["affirms"]),
+                    "does_not_affirm": sorted(
+                        set(CONTRACT.RELEASE_HIGH_RISK_CLAIMS)
+                        - set(contract["affirms"])
+                    ),
+                }
+            )
+        )
+        gate["evidence"] = {
+            "path": receipt_path.relative_to(root).as_posix(),
+            "sha256": CONTRACT.sha256(receipt_path),
+            "summary": "Synthetic typed gate receipt fixture.",
+        }
+
+    write_manifest(root, manifest)
+    commit_git_fixture(root, "authenticated release fixture")
+    CONTRACT.PINNED_GATE_PROOFS.clear()
+    CONTRACT.PINNED_GATE_PROOFS.update(pins)
     return manifest
 
 
@@ -865,21 +1001,21 @@ class AdversarialManifestTest(unittest.TestCase):
             gate = next(
                 gate
                 for gate in manifest["gates"]
-                if gate["id"] == "restore-rehearsal"
+                if gate["id"] == "final-cut-evidence-gate"
             )
             receipt_path = root / gate["evidence"]["path"]
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt["evidence"] = [
                 row
                 for row in receipt["evidence"]
-                if row["kind"] != "machine-verification"
+                if row["kind"] != "submission-validation"
             ]
             receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
             gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
             write_manifest(root, manifest)
             with self.assertRaisesRegex(
                 CONTRACT.ReleaseError,
-                "lacks required evidence: machine-verification",
+                "lacks its exact proof inventory",
             ):
                 CONTRACT.validate_release(root)
 
@@ -992,6 +1128,79 @@ class AdversarialManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
                 CONTRACT.validate_release(root)
 
+    def test_progressive_controls_receipt_requires_a_real_exact_head_and_tree(self) -> None:
+        for mutation, message in (
+            (("exact_head", "f" * 40), "unavailable Git object or relationship"),
+            (("tree", "f" * 40), "tree disagrees with its exact head"),
+        ):
+            with (
+                self.subTest(field=mutation[0]),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["source"][mutation[0]] = mutation[1]
+                receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+                gate = next(
+                    gate
+                    for gate in manifest["gates"]
+                    if gate["id"] == "progressive-controls-replay"
+                )
+                gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, message):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_a_different_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            (root / "reviewed-tree-drift.txt").write_text(
+                "different source tree\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "reviewed-tree-drift.txt"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "different reviewed tree",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "source drift is not limited to its tracked evidence envelope",
+            ):
+                CONTRACT.validate_release(root)
+
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
             manifest["media"][1]["id"] = manifest["media"][0]["id"]
@@ -1061,6 +1270,464 @@ class AdversarialManifestTest(unittest.TestCase):
             write_manifest(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "byte count mismatch"):
                 CONTRACT.validate_release(root, phase="public")
+
+
+class AdversarialReleaseGateReceiptHardeningTest(unittest.TestCase):
+    """Keep terminal gate receipts fail-closed under hostile recomposition."""
+
+    @staticmethod
+    def _gate(manifest: dict, gate_id: str) -> dict:
+        return next(gate for gate in manifest["gates"] if gate["id"] == gate_id)
+
+    def _outer_receipt(
+        self, root: Path, manifest: dict, gate_id: str
+    ) -> tuple[Path, dict]:
+        gate = self._gate(manifest, gate_id)
+        path = root / gate["evidence"]["path"]
+        return path, json.loads(path.read_text(encoding="utf-8"))
+
+    def _write_outer_receipt(
+        self,
+        root: Path,
+        manifest: dict,
+        gate_id: str,
+        path: Path,
+        receipt: dict,
+    ) -> None:
+        path.write_bytes(CONTRACT.canonical_json(receipt))
+        self._gate(manifest, gate_id)["evidence"]["sha256"] = CONTRACT.sha256(path)
+        write_manifest(root, manifest)
+
+    def _rewrite_proof(
+        self,
+        root: Path,
+        manifest: dict,
+        gate_id: str,
+        kind: str,
+        mutate,
+        *,
+        repin_source: bool = False,
+        repin_issuer: bool = False,
+    ) -> dict:
+        outer_path, outer = self._outer_receipt(root, manifest, gate_id)
+        row = next(item for item in outer["evidence"] if item["kind"] == kind)
+        proof_path = root / row["receipt"]["path"]
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+        mutate(proof)
+        proof_path.write_bytes(CONTRACT.canonical_json(proof))
+        digest = CONTRACT.sha256(proof_path)
+        row["receipt"]["sha256"] = digest
+        pin = CONTRACT.PINNED_GATE_PROOFS[(gate_id, kind)]
+        pin["sha256"] = digest
+        if repin_source:
+            pin["source"] = copy.deepcopy(proof["source"])
+        if repin_issuer:
+            pin["issuer"] = copy.deepcopy(proof["issuer"])
+        self._write_outer_receipt(root, manifest, gate_id, outer_path, outer)
+        return proof
+
+    def _rewrite_outer_subject_and_proofs(
+        self,
+        root: Path,
+        manifest: dict,
+        gate_id: str,
+        mutate,
+    ) -> None:
+        outer_path, outer = self._outer_receipt(root, manifest, gate_id)
+        mutate(outer["subject"])
+        expected_package = CONTRACT._expected_package(outer["subject"])
+        for row in outer["evidence"]:
+            proof_path = root / row["receipt"]["path"]
+            proof = json.loads(proof_path.read_text(encoding="utf-8"))
+            proof["subject"] = copy.deepcopy(outer["subject"])
+            proof["package"] = copy.deepcopy(expected_package)
+            proof_path.write_bytes(CONTRACT.canonical_json(proof))
+            digest = CONTRACT.sha256(proof_path)
+            row["receipt"]["sha256"] = digest
+            CONTRACT.PINNED_GATE_PROOFS[(gate_id, row["kind"])]["sha256"] = digest
+        self._write_outer_receipt(root, manifest, gate_id, outer_path, outer)
+
+    def _rewrite_progressive(self, root: Path, manifest: dict, mutate) -> None:
+        path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        mutate(receipt)
+        path.write_bytes(CONTRACT.canonical_json(receipt))
+        gate = self._gate(manifest, "progressive-controls-replay")
+        gate["evidence"]["sha256"] = CONTRACT.sha256(path)
+        write_manifest(root, manifest)
+
+    def test_gate_owner_pin_and_local_typed_proof_cannot_be_self_asserted(self) -> None:
+        cases = (
+            "manifest-owner",
+            "missing-reviewed-pin",
+            "recorded-by-field",
+            "fake-urn-record",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                gate_id = "final-artistic-approval"
+                if case == "manifest-owner":
+                    self._gate(manifest, gate_id)["owner"] = "Any caller"
+                    write_manifest(root, manifest)
+                    expected = "owner or issue drifted"
+                elif case == "missing-reviewed-pin":
+                    CONTRACT.PINNED_GATE_PROOFS.pop((gate_id, "owner-attestation"))
+                    expected = "no authenticated reviewed proof pin"
+                elif case == "recorded-by-field":
+                    self._rewrite_proof(
+                        root,
+                        manifest,
+                        gate_id,
+                        "owner-attestation",
+                        lambda proof: proof.update({"recorded_by": "self-appointed"}),
+                    )
+                    expected = "schema failure"
+                else:
+                    outer_path, outer = self._outer_receipt(root, manifest, gate_id)
+                    outer["evidence"][0]["receipt"]["path"] = (
+                        "urn:sha256:" + outer["evidence"][0]["receipt"]["sha256"]
+                    )
+                    self._write_outer_receipt(
+                        root, manifest, gate_id, outer_path, outer
+                    )
+                    expected = "schema failure"
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root)
+
+    def test_cross_gate_proof_path_identity_and_source_digest_reuse_fail(self) -> None:
+        cases = ("path", "identity", "source-digest", "owner-source-digest")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                if case == "path":
+                    _, source = self._outer_receipt(
+                        root, manifest, "contact-route-approval"
+                    )
+                    target_path, target = self._outer_receipt(
+                        root, manifest, "publication-approval"
+                    )
+                    source_record = copy.deepcopy(source["evidence"][0]["receipt"])
+                    target["evidence"][0]["receipt"] = source_record
+                    CONTRACT.PINNED_GATE_PROOFS[
+                        (
+                            "publication-approval",
+                            "owner-attestation",
+                        )
+                    ] = copy.deepcopy(
+                        CONTRACT.PINNED_GATE_PROOFS[
+                            (
+                                "contact-route-approval",
+                                "owner-attestation",
+                            )
+                        ]
+                    )
+                    self._write_outer_receipt(
+                        root,
+                        manifest,
+                        "publication-approval",
+                        target_path,
+                        target,
+                    )
+                    expected = "reuses a proof path or digest"
+                elif case == "identity":
+                    _, source = self._outer_receipt(root, manifest, "rights-register")
+                    source_proof_path = root / source["evidence"][0]["receipt"]["path"]
+                    source_proof = json.loads(
+                        source_proof_path.read_text(encoding="utf-8")
+                    )
+                    self._rewrite_proof(
+                        root,
+                        manifest,
+                        "release-custody",
+                        "custody-completion",
+                        lambda proof: proof.update(
+                            {"proof_id": source_proof["proof_id"]}
+                        ),
+                    )
+                    expected = "reuses a proof identity"
+                elif case == "source-digest":
+                    _, source = self._outer_receipt(root, manifest, "rights-register")
+                    source_proof_path = root / source["evidence"][0]["receipt"]["path"]
+                    source_proof = json.loads(
+                        source_proof_path.read_text(encoding="utf-8")
+                    )
+                    reused_digest = source_proof["checks"][0]["receipt_sha256"]
+                    self._rewrite_proof(
+                        root,
+                        manifest,
+                        "release-custody",
+                        "custody-completion",
+                        lambda proof: proof["checks"][0].update(
+                            {"receipt_sha256": reused_digest}
+                        ),
+                    )
+                    expected = "reuses a source receipt"
+                else:
+                    _, source = self._outer_receipt(
+                        root, manifest, "final-artistic-approval"
+                    )
+                    source_proof_path = root / source["evidence"][0]["receipt"]["path"]
+                    source_proof = json.loads(
+                        source_proof_path.read_text(encoding="utf-8")
+                    )
+                    reused_digest = source_proof["source"]["comment_body_sha256"]
+                    self._rewrite_proof(
+                        root,
+                        manifest,
+                        "contact-route-approval",
+                        "owner-attestation",
+                        lambda proof: proof["source"].update(
+                            {"comment_body_sha256": reused_digest}
+                        ),
+                        repin_source=True,
+                    )
+                    expected = "reuses a source receipt"
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root)
+
+    def test_repository_subject_rejects_unavailable_nonancestor_wrong_tree_and_time(
+        self,
+    ) -> None:
+        cases = ("unavailable", "nonancestor", "wrong-tree", "before-commit", "future")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                gate_id = "final-artistic-approval"
+                outer_path, outer = self._outer_receipt(root, manifest, gate_id)
+                if case == "unavailable":
+                    outer["subject"]["repository_head"] = "f" * 40
+                    expected = "unavailable Git object or relationship"
+                elif case == "nonancestor":
+                    tree = subprocess.run(
+                        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    environment = {
+                        **os.environ,
+                        "GIT_AUTHOR_NAME": "Danse Test",
+                        "GIT_AUTHOR_EMAIL": "danse-test@example.invalid",
+                        "GIT_COMMITTER_NAME": "Danse Test",
+                        "GIT_COMMITTER_EMAIL": "danse-test@example.invalid",
+                    }
+                    side = subprocess.run(
+                        ["git", "-C", str(root), "commit-tree", tree, "-m", "side"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    ).stdout.strip()
+                    outer["subject"]["repository_head"] = side
+                    outer["subject"]["repository_tree"] = tree
+                    expected = "unavailable Git object or relationship"
+                elif case == "wrong-tree":
+                    outer["subject"]["repository_tree"] = "f" * 40
+                    expected = "tree disagrees with its head"
+                elif case == "before-commit":
+                    outer["recorded_at"] = "2000-01-01T00:00:00Z"
+                    expected = "predates its source commit"
+                else:
+                    outer["recorded_at"] = "2999-01-01T00:00:00Z"
+                    expected = "is in the future"
+                self._write_outer_receipt(root, manifest, gate_id, outer_path, outer)
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root)
+
+    def test_one_gate_cannot_substitute_a_different_package_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            self._rewrite_outer_subject_and_proofs(
+                root,
+                manifest,
+                "final-artistic-approval",
+                lambda subject: subject.update({"package_manifest_sha256": "0" * 64}),
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "package.*(?:binding|digest)"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_owner_comment_url_rejects_encoding_query_userinfo_and_loopback_aliases(
+        self,
+    ) -> None:
+        suffix = "/organvm/the-thing-without-a-name/issues/10#issuecomment-9000000001"
+        urls = {
+            "encoded": "https://github.com/%6Frganvm/the-thing-without-a-name/issues/10#issuecomment-9000000001",
+            "query": "https://github.com/organvm/the-thing-without-a-name/issues/10?token=value#issuecomment-9000000001",
+            "userinfo": "https://operator@github.com" + suffix,
+            "loopback": "https://127.0.0.1" + suffix,
+            "loopback-alias": "https://github.com.nip.io" + suffix,
+        }
+        for case, url in urls.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                self._rewrite_proof(
+                    root,
+                    manifest,
+                    "final-artistic-approval",
+                    "owner-attestation",
+                    lambda proof, value=url: proof["source"].update(
+                        {"comment_url": value}
+                    ),
+                    repin_source=True,
+                )
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "schema failure|encoded or malformed|immutable GitHub comment form",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_owner_source_time_must_follow_the_bound_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            self._rewrite_proof(
+                root,
+                manifest,
+                "final-artistic-approval",
+                "owner-attestation",
+                lambda proof: proof["source"].update(
+                    {
+                        "comment_created_at": "2000-01-01T00:00:00Z",
+                        "comment_updated_at": "2000-01-01T00:00:00Z",
+                    }
+                ),
+                repin_source=True,
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "predates its source commit"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_receipt_rejects_descendant_source_drift_outside_evidence_envelope(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            complete_manifest(root)
+            (root / "reviewed-source-drift.txt").write_text(
+                "not part of the reviewed source\n",
+                encoding="utf-8",
+            )
+            commit_git_fixture(root, "unreviewed source drift")
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "source drift is not limited to its tracked evidence envelope",
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_receipt_rejects_contact_and_encoded_private_data(self) -> None:
+        observations = {
+            "email": "Contact operator@example.com after the replay.",
+            "phone": "Call 212-555-0199 after the replay.",
+            "encoded-path": "Capture stored at %252FUsers%252Foperator%252Fprivate.mov.",
+        }
+        for case, observation in observations.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                self._rewrite_progressive(
+                    root,
+                    manifest,
+                    lambda receipt, value=observation: receipt["checks"][0].update(
+                        {"observation": value}
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "exposes private contact or path data",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_source_rejects_unavailable_wrong_tree_and_future_time(
+        self,
+    ) -> None:
+        cases = ("unavailable", "wrong-tree", "future")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                if case == "unavailable":
+                    expected = "unavailable Git object or relationship"
+                elif case == "wrong-tree":
+                    expected = "tree disagrees with its exact head"
+                else:
+                    expected = "is in the future"
+
+                def mutate(receipt: dict, selected: str = case) -> None:
+                    if selected == "unavailable":
+                        receipt["source"]["exact_head"] = "f" * 40
+                    elif selected == "wrong-tree":
+                        receipt["source"]["tree"] = "f" * 40
+                    else:
+                        receipt["observed_at"] = "2999-01-01T00:00:00Z"
+
+                self._rewrite_progressive(root, manifest, mutate)
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_renderer_cannot_negate_apple_metal_in_free_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            self._rewrite_progressive(
+                root,
+                manifest,
+                lambda receipt: receipt["runtime"]["graphics"].update(
+                    {
+                        "renderer": (
+                            "ANGLE (Apple, ANGLE Metal Renderer: "
+                            "not Apple and not Metal)"
+                        )
+                    }
+                ),
+            )
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "Apple Metal"):
+                CONTRACT.validate_release(root)
+
+    def test_claim_partition_and_summary_cannot_contradict_gate_scope(self) -> None:
+        cases = (
+            "missing-affirm",
+            "extra-affirm",
+            "double-claim",
+            "assertive-summary",
+            "free-form",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                gate_id = "final-artistic-approval"
+                outer_path, outer = self._outer_receipt(root, manifest, gate_id)
+                if case == "missing-affirm":
+                    outer["affirms"] = []
+                    expected = "contradictory claim boundary"
+                elif case == "extra-affirm":
+                    outer["affirms"].append("submission-complete")
+                    outer["does_not_affirm"].remove("submission-complete")
+                    expected = "contradictory claim boundary"
+                elif case == "double-claim":
+                    outer["does_not_affirm"].append("final-cut-approved")
+                    outer["does_not_affirm"].sort()
+                    expected = "contradictory claim boundary"
+                elif case == "assertive-summary":
+                    outer["evidence"][0]["summary"] = "Final cut approved by the owner."
+                    expected = "authoritative or unsafe summary"
+                else:
+                    outer["non_actions"] = [
+                        "This free-form field says submission is complete."
+                    ]
+                    expected = "schema failure"
+                self._write_outer_receipt(root, manifest, gate_id, outer_path, outer)
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root)
 
 
 class AdversarialArtifactTest(unittest.TestCase):

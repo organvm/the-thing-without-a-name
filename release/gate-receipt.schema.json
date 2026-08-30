@@ -1,98 +1,67 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://organvm.github.io/the-thing-without-a-name/release/gate-receipt.schema.json",
-  "title": "Danse release gate receipt",
+  "title": "Danse authenticated release gate receipt",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema",
-    "gate_id",
-    "issue",
-    "result",
-    "recorded_at",
-    "authority",
-    "subject",
-    "evidence",
-    "non_actions"
-  ],
+  "required": ["schema", "gate_id", "issue", "result", "recorded_at", "subject", "evidence", "affirms", "does_not_affirm"],
   "properties": {
-    "schema": {"const": "danse.release.gate.v1"},
+    "schema": {"const": "danse.release.gate.v2"},
     "gate_id": {"$ref": "#/$defs/id"},
     "issue": {"type": "integer", "minimum": 1},
     "result": {"const": "satisfied"},
-    "recorded_at": {
-      "type": "string",
-      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"
-    },
-    "authority": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["owner", "recorded_by"],
-      "properties": {
-        "owner": {"type": "string", "minLength": 1},
-        "recorded_by": {"type": "string", "minLength": 1}
-      }
-    },
-    "subject": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["release_id", "release_version", "repository_head"],
-      "properties": {
-        "release_id": {"$ref": "#/$defs/id"},
-        "release_version": {"type": "string", "minLength": 1},
-        "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
-      }
-    },
+    "recorded_at": {"$ref": "#/$defs/timestamp"},
+    "subject": {"$ref": "#/$defs/subject"},
     "evidence": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "kind", "receipt_sha256", "reference", "summary"],
+        "required": ["id", "kind", "receipt", "summary"],
         "properties": {
           "id": {"$ref": "#/$defs/id"},
-          "kind": {
-            "enum": [
-              "accessibility",
-              "contact",
-              "custody",
-              "final-cut",
-              "final-package",
-              "human-decision",
-              "identity",
-              "installation",
-              "machine-verification",
-              "presentation",
-              "publication",
-              "restore",
-              "rights",
-              "stills"
-            ]
-          },
-          "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-          "reference": {
-            "type": "string",
-            "anyOf": [
-              {"pattern": "^urn:sha256:[0-9a-f]{64}$"},
-              {"pattern": "^https://[^\\s]+$"}
-            ]
+          "kind": {"$ref": "#/$defs/proofKind"},
+          "receipt": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "schema"],
+            "properties": {
+              "path": {"$ref": "#/$defs/path"},
+              "sha256": {"$ref": "#/$defs/sha256"},
+              "schema": {"enum": ["danse.release.gate-proof.v1", "danse.release.owner-attestation.v1"]}
+            }
           },
           "summary": {"type": "string", "minLength": 1}
         }
       }
     },
-    "non_actions": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {"type": "string", "minLength": 1}
-    }
+    "affirms": {"$ref": "#/$defs/claims"},
+    "does_not_affirm": {"$ref": "#/$defs/claims"}
   },
   "$defs": {
-    "id": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
-    }
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"},
+    "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "release_version", "repository_head", "repository_tree", "package_manifest_sha256"],
+      "properties": {
+        "release_id": {"$ref": "#/$defs/id"},
+        "release_version": {"type": "string", "minLength": 1},
+        "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "repository_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "package_manifest_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]}
+      }
+    },
+    "proofKind": {
+      "enum": ["accessibility-review", "custody-completion", "installation-completion", "owner-attestation", "presentation-lifecycle", "restore-completion", "rights-release", "submission-package", "submission-validation"]
+    },
+    "claim": {
+      "enum": ["accessibility-approved", "archive-choice-made", "contact-approved", "custody-complete", "deployment-complete", "final-cut-approved", "identity-approved", "installation-complete", "package-ready", "presentation-complete", "publication-approved", "restore-complete", "rights-cleared", "stills-cleared", "submission-complete", "terms-accepted", "upload-complete"]
+    },
+    "claims": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/claim"}}
   }
 }

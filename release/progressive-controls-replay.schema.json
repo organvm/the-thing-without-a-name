@@ -56,10 +56,22 @@
           "required": ["name", "version"],
           "type": "object"
         },
-        "graphics_renderer": {"minLength": 1, "type": "string"},
+        "graphics": {
+          "additionalProperties": false,
+          "properties": {
+            "api": {"const": "Metal"},
+            "renderer": {
+              "pattern": "^ANGLE \\(Apple(?: Inc\\.)?, ANGLE Metal Renderer: [^\\r\\n()]+\\)$",
+              "type": "string"
+            },
+            "vendor": {"const": "Apple"}
+          },
+          "required": ["vendor", "api", "renderer"],
+          "type": "object"
+        },
         "platform": {"const": "darwin"}
       },
-      "required": ["platform", "browser", "graphics_renderer"],
+      "required": ["platform", "browser", "graphics"],
       "type": "object"
     },
     "schema": {"const": "danse.progressive-controls-replay.v1"},
