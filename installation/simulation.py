@@ -13,6 +13,7 @@ import copy
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -73,8 +74,24 @@ def _sha256(path: Path) -> str:
 def _fixture_release(root: Path, spec: dict[str, Any]) -> dict[str, Any]:
     (root / "bin").mkdir()
     (root / "config").mkdir()
+    configuration_sha256 = canonical_sha256(
+        {
+            "schema": "danse.installation.portable-configuration.v1",
+            "status": "not-physical-evidence",
+            "spec_contract_sha256": spec["identity"]["contract_sha256"],
+        }
+    )
     launcher = root / "bin/danse-launcher"
-    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.write_text(
+        "#!/bin/sh\n"
+        'test "$#" -eq 0 || exit 64\n'
+        f'test "$DANSE_INSTALLATION_CONTRACT_SHA256" = "{spec["identity"]["contract_sha256"]}" || exit 65\n'
+        f'test "$DANSE_INSTALLATION_CONFIGURATION_SHA256" = "{configuration_sha256}" || exit 66\n'
+        "test -r release-manifest.json || exit 67\n"
+        "test -r config/installation.json || exit 68\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     launcher.chmod(0o755)
     configuration = root / "config/installation.json"
     configuration.write_text(
@@ -117,17 +134,11 @@ def _fixture_release(root: Path, spec: dict[str, Any]) -> dict[str, Any]:
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
     }
     return {
-        "schema": "danse.installation.runtime-plan.v1",
+        "schema": "danse.installation.runtime-plan.v2",
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
         "evidence_id": "portable-simulation-not-evidence",
         "evidence_sha256": canonical_sha256(identity),
-        "configuration_sha256": canonical_sha256(
-            {
-                "schema": "danse.installation.portable-configuration.v1",
-                "status": "not-physical-evidence",
-                "spec_contract_sha256": spec["identity"]["contract_sha256"],
-            }
-        ),
+        "configuration_sha256": configuration_sha256,
         "release_manifest_sha256": hashlib.sha256(
             manifest_content.encode("utf-8")
         ).hexdigest(),
@@ -176,22 +187,38 @@ def _scenario(
     *,
     process_code: int | None,
     health: bool | None = None,
+    execute_launcher: bool = False,
 ) -> dict[str, Any]:
     scenario_plan = copy.deepcopy(plan)
     if health is not None:
         scenario_plan["health_url"] = "http://127.0.0.1:8787/health"
     clock = _Clock()
     output = io.StringIO()
+
+    def execute_and_wait(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        process = subprocess.Popen(*args, **kwargs)
+        process.wait(timeout=5)
+        return process
+
+    popen = (
+        execute_and_wait
+        if execute_launcher
+        else (lambda *_args, **_kwargs: _Process(process_code))
+    )
     result = supervise(
         scenario_plan,
         release,
         Telemetry(output, clock=clock),
         clock=clock,
         sleep=clock.sleep,
-        popen=lambda *_args, **_kwargs: _Process(process_code),
+        popen=popen,
         health_probe=lambda _url, _timeout: bool(health),
     )
-    return _summary(result, output)
+    summary = _summary(result, output)
+    summary["launcher_execution"] = (
+        "real-subprocess" if execute_launcher else "deterministic-process-double"
+    )
+    return summary
 
 
 def run_portable_simulation(spec: dict[str, Any]) -> dict[str, Any]:
@@ -201,7 +228,9 @@ def run_portable_simulation(spec: dict[str, Any]) -> dict[str, Any]:
         release = Path(name)
         plan = _fixture_release(release, spec)
         scenarios = {
-            "clean-exit": _scenario(plan, release, process_code=0),
+            "clean-exit": _scenario(
+                plan, release, process_code=0, execute_launcher=True
+            ),
             "crash-storm": _scenario(plan, release, process_code=1),
             "startup-health-failure": _scenario(
                 plan, release, process_code=None, health=False

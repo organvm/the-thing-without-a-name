@@ -18,7 +18,7 @@
     "restore_rehearsal"
   ],
   "properties": {
-    "schema": {"const": "danse.installation.evidence.v1"},
+    "schema": {"const": "danse.installation.evidence.v2"},
     "evidence_id": {"type": "string", "minLength": 1},
     "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
     "venue": {
@@ -305,6 +305,7 @@
         "manual_repair_required",
         "spec_contract_sha256",
         "configuration_sha256",
+        "runtime_telemetry_receipt",
         "runtime_telemetry_sha256",
         "receipt_sha256"
       ],
@@ -318,6 +319,26 @@
         "manual_repair_required": {"type": "boolean"},
         "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
         "configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_telemetry_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "evidence_id",
+            "proof_id",
+            "spec_contract_sha256",
+            "configuration_sha256",
+            "events_sha256"
+          ],
+          "properties": {
+            "schema": {"const": "danse.installation.runtime-telemetry-receipt.v2"},
+            "evidence_id": {"type": "string", "minLength": 1},
+            "proof_id": {"type": "string", "minLength": 1},
+            "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
+            "configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "events_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
         "runtime_telemetry_sha256": {"$ref": "#/$defs/sha256"},
         "receipt_sha256": {"$ref": "#/$defs/sha256"}
       }

@@ -26,17 +26,20 @@ from installation.contract import (  # noqa: E402
     ContractError,
     calibration_plan,
     canonical_sha256,
+    evidence_required_fields,
     frame_ticket,
     installation_workbook,
     installation_contract_sha256,
     load_json,
     load_reference_contracts,
     physical_configuration_sha256,
+    restore_phase_receipt_sha256,
     runtime_plan,
     validate_archive_disposition,
     validate_digital_twin,
     validate_evidence,
     validate_gates,
+    wall_plug_receipt_sha256,
 )
 from installation.runtime import Telemetry, supervise  # noqa: E402
 from installation.simulation import run_portable_simulation  # noqa: E402
@@ -104,6 +107,34 @@ def refresh_configuration(evidence: dict, spec: dict, release_root: Path) -> dic
     evidence["restore_rehearsal"]["configuration_sha256"] = configuration_sha256
     for proof in evidence["wall_plug_proofs"]:
         proof["configuration_sha256"] = configuration_sha256
+        proof["runtime_telemetry_receipt"] = {
+            "schema": "danse.installation.runtime-telemetry-receipt.v2",
+            "evidence_id": evidence["evidence_id"],
+            "proof_id": proof["id"],
+            "spec_contract_sha256": spec["identity"]["contract_sha256"],
+            "configuration_sha256": configuration_sha256,
+            "events_sha256": digest(f"events-{proof['id']}"),
+        }
+        proof["runtime_telemetry_sha256"] = canonical_sha256(
+            proof["runtime_telemetry_receipt"]
+        )
+        proof["receipt_sha256"] = wall_plug_receipt_sha256(
+            evidence["evidence_id"], proof
+        )
+    restore = evidence["restore_rehearsal"]
+    if all(
+        restore[key]
+        for key in (
+            "setup_passed",
+            "strike_passed",
+            "restore_passed",
+            "canonical_release_restored",
+        )
+    ):
+        for phase in ("setup", "strike", "restore"):
+            restore[f"{phase}_receipt_sha256"] = restore_phase_receipt_sha256(
+                evidence["evidence_id"], restore, phase
+            )
     return evidence
 
 
@@ -128,7 +159,7 @@ def evidence_for(spec: dict, release_root: Path, *, complete: bool = False) -> d
             for index in range(1, 4)
         ]
     evidence = {
-        "schema": "danse.installation.evidence.v1",
+        "schema": "danse.installation.evidence.v2",
         "evidence_id": "synthetic-test-evidence",
         "spec_contract_sha256": contract_sha,
         "venue": {
@@ -316,6 +347,10 @@ class InstallationContractTest(unittest.TestCase):
             )
             self.assertFalse(schema["additionalProperties"])
         evidence_schema = load_json(ROOT / "installation/evidence.schema.json")
+        self.assertEqual(
+            evidence_schema["properties"]["schema"]["const"],
+            "danse.installation.evidence.v2",
+        )
         restore = evidence_schema["properties"]["restore_rehearsal"]["properties"]
         self.assertEqual(
             restore["observed_at"]["anyOf"][0]["$ref"], "#/$defs/timestamp"
@@ -329,6 +364,7 @@ class InstallationContractTest(unittest.TestCase):
             self.assertEqual(restore[field]["anyOf"][0]["$ref"], "#/$defs/sha256")
         wall_plug = evidence_schema["$defs"]["wall_plug_proof"]
         self.assertIn("configuration_sha256", wall_plug["required"])
+        self.assertIn("runtime_telemetry_receipt", wall_plug["required"])
         self.assertEqual(
             wall_plug["properties"]["configuration_sha256"]["$ref"],
             "#/$defs/sha256",
@@ -341,6 +377,24 @@ class InstallationContractTest(unittest.TestCase):
         self.assertIsNone(re.fullmatch(timestamp_pattern, "garbageZ"))
         self.assertIsNone(re.fullmatch(timestamp_pattern, "2026-02-31T12:34:56Z"))
         self.assertIsNone(re.fullmatch(timestamp_pattern, "1900-02-29T12:34:56Z"))
+
+        workbook = installation_workbook(self.spec, self.gates)
+        self.assertEqual(
+            workbook["evidence_contract"]["required_fields"],
+            evidence_required_fields(evidence_schema),
+        )
+        required = set(workbook["evidence_contract"]["required_fields"])
+        self.assertTrue(
+            {
+                "hardware.assets[].asset_id",
+                "hardware.assets[].verified",
+                "hardware.assets[].receipt_sha256",
+                "hardware.cabling_receipt_sha256",
+                "hardware.power_receipt_sha256",
+                "hardware.ventilation_receipt_sha256",
+                "wall_plug_proofs[].runtime_telemetry_receipt.configuration_sha256",
+            }.issubset(required)
+        )
 
     def test_source_documents_are_reused_from_authenticated_buffers(self) -> None:
         with patch(
@@ -445,6 +499,10 @@ class InstallationContractTest(unittest.TestCase):
         self.assertFalse(first["logical_sync"]["hardware_sync_measured"])
         self.assertEqual(
             first["scenarios"]["clean-exit"]["terminal_event"], "launcher-exit"
+        )
+        self.assertEqual(
+            first["scenarios"]["clean-exit"]["launcher_execution"],
+            "real-subprocess",
         )
         for name in ("crash-storm", "startup-health-failure"):
             self.assertEqual(first["scenarios"][name]["exit_code"], 75)
@@ -588,6 +646,28 @@ class InstallationContractTest(unittest.TestCase):
                     validate_evidence(
                         evidence, self.spec, phase="runtime", release_root=release
                     )
+
+    def test_physical_configuration_is_invariant_to_keyed_array_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary)
+            make_release(release, self.spec)
+            evidence = evidence_for(self.spec, release)
+            expected = physical_configuration_sha256(
+                evidence,
+                self.spec,
+                file_digest(release / "bin/danse-launcher"),
+            )
+            evidence["geometry"]["surfaces"].reverse()
+            evidence["geometry"]["projectors"].reverse()
+            evidence["hardware"]["assets"].reverse()
+            self.assertEqual(
+                physical_configuration_sha256(
+                    evidence,
+                    self.spec,
+                    file_digest(release / "bin/danse-launcher"),
+                ),
+                expected,
+            )
 
     def test_release_and_launcher_paths_reject_developer_roots_symlinks_and_stale_bytes(
         self,
@@ -742,7 +822,9 @@ class InstallationContractTest(unittest.TestCase):
             duplicate["wall_plug_proofs"][1]["runtime_telemetry_sha256"] = duplicate[
                 "wall_plug_proofs"
             ][0]["runtime_telemetry_sha256"]
-            with self.assertRaisesRegex(ContractError, "distinct telemetry"):
+            with self.assertRaisesRegex(
+                ContractError, "telemetry receipt digest does not match"
+            ):
                 validate_evidence(
                     duplicate, self.spec, phase="complete", release_root=release
                 )
@@ -764,7 +846,9 @@ class InstallationContractTest(unittest.TestCase):
             duplicate_proof_receipt["wall_plug_proofs"][1]["receipt_sha256"] = (
                 duplicate_proof_receipt["wall_plug_proofs"][0]["receipt_sha256"]
             )
-            with self.assertRaisesRegex(ContractError, "distinct observation receipts"):
+            with self.assertRaisesRegex(
+                ContractError, "receipt digest does not match its payload"
+            ):
                 validate_evidence(
                     duplicate_proof_receipt,
                     self.spec,
@@ -800,11 +884,35 @@ class InstallationContractTest(unittest.TestCase):
                     release_root=release,
                 )
 
+            relabeled_receipts = copy.deepcopy(evidence)
+            relabeled_receipts["venue"]["id"] = "another-approved-venue"
+            relabeled_configuration = physical_configuration_sha256(
+                relabeled_receipts,
+                self.spec,
+                file_digest(release / "bin/danse-launcher"),
+            )
+            for proof in relabeled_receipts["wall_plug_proofs"]:
+                proof["configuration_sha256"] = relabeled_configuration
+            relabeled_receipts["restore_rehearsal"]["configuration_sha256"] = (
+                relabeled_configuration
+            )
+            with self.assertRaisesRegex(
+                ContractError, "telemetry belongs to another admitted"
+            ):
+                validate_evidence(
+                    relabeled_receipts,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
             duplicate_restore_receipt = copy.deepcopy(evidence)
             duplicate_restore_receipt["restore_rehearsal"]["strike_receipt_sha256"] = (
                 duplicate_restore_receipt["restore_rehearsal"]["setup_receipt_sha256"]
             )
-            with self.assertRaisesRegex(ContractError, "receipts must be distinct"):
+            with self.assertRaisesRegex(
+                ContractError, "digest does not match its payload"
+            ):
                 validate_evidence(
                     duplicate_restore_receipt,
                     self.spec,
@@ -845,6 +953,18 @@ class InstallationContractTest(unittest.TestCase):
                     phase="runtime",
                     release_root=release,
                 )
+
+    def test_obsolete_runtime_plan_fails_closed_without_key_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = Path(temporary)
+            make_release(release, self.spec)
+            plan = runtime_plan(evidence_for(self.spec, release), self.spec, release)
+            plan["schema"] = "danse.installation.runtime-plan.v1"
+            plan.pop("configuration_sha256")
+            output = io.StringIO()
+            self.assertEqual(supervise(plan, release, Telemetry(output)), 78)
+            records = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(records[-1]["event"], "runtime-plan-invalid")
 
     def test_foreground_supervisor_exhausts_a_bounded_restart_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

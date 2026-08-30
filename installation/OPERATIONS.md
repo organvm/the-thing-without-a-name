@@ -47,9 +47,12 @@ insurance, and public-operation decisions.
 7. Verify release bytes and run `scripts/check-installation.py --phase runtime`
    against the external evidence before the launcher is allowed to start.
 8. Before claiming recovery or restore, run the runtime phase with
-   `--emit runtime-plan`. Copy its exact `configuration_sha256` into each of the
-   three wall-plug proof objects and the restore rehearsal. The restore binding
-   may be `null` only while no restore result or receipt is claimed.
+   `--emit runtime-plan`. Use its exact `configuration_sha256` in each v2
+   wall-plug telemetry envelope, canonical observation receipt payload, and the
+   three canonical setup/strike/restore receipt payloads. A sibling digest is not
+   sufficient: the validator recomputes every supplied receipt hash from the
+   payload. The restore binding may be `null` only while no restore result or
+   receipt is claimed.
 
 Before transport or venue work, the portable control-plane preflight may be run:
 
@@ -120,7 +123,8 @@ For each of three distinct cycles:
 
 1. Start a new telemetry receipt and record the exact spec, release, evidence,
    hardware, calibration, river, and observer identities. Record the validator's
-   exact `configuration_sha256`; it must be identical across the three proofs and
+   exact `configuration_sha256`; it must be embedded in the telemetry envelope
+   and canonical observation payload, and identical across the three proofs and
    the restore rehearsal.
 2. Observe the generative display and visible plane/cue relationship before
    power removal.
@@ -175,9 +179,10 @@ satisfy this predicate.
 3. Repeat setup and every calibration stage from the tracked instructions.
 4. Run the exact approved foreground launcher and human-visible plane/cue test.
 5. Perform a documented setup, strike, and second restore. Preserve distinct
-   SHA-256 receipts for all three phases and one named observer/timestamp. Bind
-   the rehearsal to the same `configuration_sha256` used by all three wall-plug
-   proofs; a copied receipt from another release or hardware set fails admission.
+   canonical SHA-256 receipt payloads for all three phases and one named
+   observer/timestamp. Embed the same `configuration_sha256` used by all three
+   wall-plug proofs; the validator recomputes each phase receipt, so retaining a
+   copied hash from another release or hardware set fails admission.
 
 Issue #14 remains open until this restore and the three physical wall-plug cycles
 validate together against one exact digital-twin digest.

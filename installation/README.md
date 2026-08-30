@@ -82,7 +82,10 @@ worksheet directly from the authenticated twin. It inventories every private
 receipt, hardware role, surface/output assignment, calibration stage, runtime
 constraint, and completion proof without inventing a venue value. Its explicit
 `worksheet-not-evidence` status prevents the worksheet itself from satisfying a
-physical gate.
+physical gate. The `evidence_contract.required_fields` list is derived directly
+from the evidence schema, including per-asset identity/verification/receipt
+fields and aggregate cabling, power, and ventilation receipts; schema additions
+therefore cannot silently disappear from the setup checklist.
 
 ## Runtime boundary
 
@@ -139,13 +142,22 @@ tickets, and the declared safety thresholds. Its receipt is deliberately marked
 `passed-not-physical-evidence`; it cannot stand in for hardware sync, calibration,
 wall-plug, or restore observations.
 
-Every external wall-plug and restore receipt must repeat the configuration digest
+Evidence v2 replaces v1 because physical-receipt binding is not backward
+inferable. Do not relabel a v1 receipt: re-collect or re-envelope the original
+venue-owned telemetry and observations under v2, preserving their original
+bytes and timestamps. Runtime-plan v2 is likewise required; obsolete or missing
+plan fields fail with a `runtime-plan-invalid` telemetry event instead of an
+uncaught field error.
+
+Every external wall-plug telemetry envelope and observation receipt, plus each
+setup/strike/restore receipt payload, must include the configuration digest
 computed from the exact venue, geometry, release manifest and launcher, hardware,
 calibration, runtime approval/arguments/health contract, river, and output set.
-The validator rejects a receipt copied from any other admitted configuration.
-Before any recovery or restore claim exists, the restore binding may remain `null`;
+Their supplied SHA-256 values are recomputed from those canonical payloads. A
+stale hash placed beside a new configuration therefore fails validation. Before
+any recovery or restore claim exists, the restore binding may remain `null`;
 `--phase runtime --emit runtime-plan` returns the exact `configuration_sha256`
-that must then be copied into all three wall-plug proofs and the restore rehearsal.
+used to build the three telemetry/observation envelopes and restore receipts.
 
 ## Current blockers
 

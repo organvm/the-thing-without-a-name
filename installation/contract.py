@@ -25,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 SPEC = HERE / "digital-twin.json"
 GATES = HERE / "gates.json"
 ARCHIVE_DISPOSITION = HERE / "archive-disposition.json"
+EVIDENCE_SCHEMA = HERE / "evidence.schema.json"
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
@@ -1035,6 +1036,61 @@ def calibration_plan(spec: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def evidence_required_fields(schema: dict[str, Any]) -> list[str]:
+    """Return every required leaf in the evidence schema as a JSON-style path."""
+
+    def resolve(node: dict[str, Any]) -> dict[str, Any]:
+        reference = node.get("$ref")
+        if not isinstance(reference, str):
+            return node
+        if not reference.startswith("#/"):
+            raise ContractError(
+                "installation evidence schema has an external reference"
+            )
+        value: Any = schema
+        for part in reference[2:].split("/"):
+            value = value[part.replace("~1", "/").replace("~0", "~")]
+        if not isinstance(value, dict):
+            raise ContractError(
+                "installation evidence schema reference is not an object"
+            )
+        return value
+
+    fields: list[str] = []
+
+    def visit(node: dict[str, Any], path: str) -> None:
+        node = resolve(node)
+        alternatives = node.get("anyOf")
+        if isinstance(alternatives, list):
+            selected = next(
+                (
+                    child
+                    for child in alternatives
+                    if isinstance(child, dict) and child.get("type") != "null"
+                ),
+                None,
+            )
+            if selected is None:
+                fields.append(path)
+            else:
+                visit(selected, path)
+            return
+        required = node.get("required")
+        properties = node.get("properties")
+        if isinstance(required, list) and isinstance(properties, dict):
+            for key in required:
+                visit(properties[key], f"{path}.{key}" if path else key)
+            return
+        items = node.get("items")
+        if isinstance(items, dict):
+            visit(items, f"{path}[]")
+            return
+        fields.append(path)
+
+    visit(schema, "")
+    return sorted(fields)
+
+
 def installation_workbook(
     spec: dict[str, Any], gates: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1047,6 +1103,7 @@ def installation_workbook(
     """
     validate_digital_twin(spec)
     validate_gates(gates, spec)
+    evidence_schema = load_json(EVIDENCE_SCHEMA)
     meters = float(spec["coordinate_system"]["meters_per_unit"])
     surfaces = {surface["id"]: surface for surface in spec["surfaces"]}
     workbook = {
@@ -1054,6 +1111,12 @@ def installation_workbook(
         "status": "worksheet-not-evidence",
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
         "private_values": "collect-externally-never-commit",
+        "evidence_contract": {
+            "schema": evidence_schema["properties"]["schema"]["const"],
+            "required_fields": evidence_required_fields(evidence_schema),
+            "all_required_fields_must_be_collected": True,
+            "worksheet_values_are_evidence": False,
+        },
         "blocked_gates": [
             gate["id"] for gate in gates["gates"] if gate["status"] == "blocked"
         ],
@@ -1065,6 +1128,20 @@ def installation_workbook(
             "ventilation",
         ],
         "hardware_roles": list(spec["hardware_roles"]),
+        "hardware": {
+            "assets": [
+                {
+                    "role": role,
+                    "private_asset_id": "required",
+                    "verified": "required-true",
+                    "private_receipt_sha256": "required",
+                }
+                for role in spec["hardware_roles"]
+            ],
+            "private_cabling_receipt_sha256": "required",
+            "private_power_receipt_sha256": "required",
+            "private_ventilation_receipt_sha256": "required",
+        },
         "surfaces": [
             {
                 "reference_surface": surface_id,
@@ -1130,21 +1207,31 @@ def physical_configuration_sha256(
 ) -> str:
     """Bind a physical proof to the exact admitted configuration.
 
-    Wall-plug and restore receipts live outside the repository. A bare telemetry
-    digest cannot show that those observations used the same venue, geometry,
-    release, hardware, calibration, launcher, health contract, and river. This
-    fingerprint closes that substitution gap without embedding private receipts.
+    Wall-plug and restore receipts live outside the repository. This fingerprint
+    gives their canonical receipt payloads one stable identity for the venue,
+    geometry, release, hardware, calibration, launcher, health contract, river,
+    and output set. Semantically keyed arrays are sorted so serializer order does
+    not change that identity.
     """
     launcher = _sha256(launcher_sha256, "runtime launcher digest")
+    geometry = copy.deepcopy(value["geometry"])
+    geometry["surfaces"] = sorted(
+        geometry["surfaces"], key=lambda item: item["reference_surface"]
+    )
+    geometry["projectors"] = sorted(
+        geometry["projectors"], key=lambda item: item["output"]
+    )
+    hardware = copy.deepcopy(value["hardware"])
+    hardware["assets"] = sorted(hardware["assets"], key=lambda item: item["role"])
     binding = {
         "schema": "danse.installation.physical-configuration.v1",
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
         "evidence_id": value["evidence_id"],
         "venue_sha256": canonical_sha256(value["venue"]),
-        "geometry_sha256": canonical_sha256(value["geometry"]),
+        "geometry_sha256": canonical_sha256(geometry),
         "release_sha256": canonical_sha256(value["release"]),
         "launcher_sha256": launcher,
-        "hardware_sha256": canonical_sha256(value["hardware"]),
+        "hardware_sha256": canonical_sha256(hardware),
         "calibration_sha256": canonical_sha256(value["calibration"]),
         "runtime_sha256": canonical_sha256(value["runtime"]),
         "outputs": [
@@ -1155,6 +1242,46 @@ def physical_configuration_sha256(
         ],
     }
     return canonical_sha256(binding)
+
+
+def wall_plug_receipt_sha256(evidence_id: str, proof: dict[str, Any]) -> str:
+    """Hash the complete wall-plug observation rather than an opaque sibling.
+
+    The supplied runtime telemetry receipt is part of this payload. Changing the
+    admitted configuration, telemetry digest, observer, timing, or result while
+    retaining an older receipt hash therefore fails closed.
+    """
+    payload = {
+        "schema": "danse.installation.wall-plug-receipt.v2",
+        "evidence_id": evidence_id,
+        "proof": {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "receipt_sha256"
+        },
+    }
+    return canonical_sha256(payload)
+
+
+def restore_phase_receipt_sha256(
+    evidence_id: str, restore: dict[str, Any], phase: str
+) -> str:
+    """Hash one setup/strike/restore observation with its configuration."""
+    if phase not in {"setup", "strike", "restore"}:
+        raise ContractError(f"unknown restore receipt phase {phase!r}")
+    payload = {
+        "schema": "danse.installation.restore-phase-receipt.v2",
+        "evidence_id": evidence_id,
+        "phase": phase,
+        "configuration_sha256": restore["configuration_sha256"],
+        "observer": restore["observer"],
+        "observed_at": restore["observed_at"],
+        "passed": restore[f"{phase}_passed"],
+        "canonical_release_restored": (
+            restore["canonical_release_restored"] if phase == "restore" else None
+        ),
+    }
+    return canonical_sha256(payload)
 
 
 def _receipt_sha(value: Any, label: str) -> str:
@@ -1380,7 +1507,7 @@ def validate_evidence(
         },
         "installation evidence",
     )
-    if value["schema"] != "danse.installation.evidence.v1":
+    if value["schema"] != "danse.installation.evidence.v2":
         raise ContractError("unknown installation evidence schema")
     _nonempty(value["evidence_id"], "evidence_id")
     if value["spec_contract_sha256"] != spec["identity"]["contract_sha256"]:
@@ -1815,6 +1942,7 @@ def validate_evidence(
                     "manual_repair_required",
                     "spec_contract_sha256",
                     "configuration_sha256",
+                    "runtime_telemetry_receipt",
                     "runtime_telemetry_sha256",
                     "receipt_sha256",
                 },
@@ -1869,10 +1997,51 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} belongs to another admitted physical configuration"
                 )
+            telemetry_receipt = _exact_keys(
+                proof["runtime_telemetry_receipt"],
+                {
+                    "schema",
+                    "evidence_id",
+                    "proof_id",
+                    "spec_contract_sha256",
+                    "configuration_sha256",
+                    "events_sha256",
+                },
+                f"wall-plug proof {proof_id} runtime telemetry receipt",
+            )
+            if (
+                telemetry_receipt["schema"]
+                != "danse.installation.runtime-telemetry-receipt.v2"
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} has an unknown runtime telemetry receipt schema"
+                )
+            if (
+                telemetry_receipt["evidence_id"] != value["evidence_id"]
+                or telemetry_receipt["proof_id"] != proof_id
+                or telemetry_receipt["spec_contract_sha256"]
+                != spec["identity"]["contract_sha256"]
+                or _sha256(
+                    telemetry_receipt["configuration_sha256"],
+                    f"wall-plug proof {proof_id} telemetry configuration_sha256",
+                )
+                != configuration_sha256
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry belongs to another admitted physical configuration"
+                )
+            _sha256(
+                telemetry_receipt["events_sha256"],
+                f"wall-plug proof {proof_id} telemetry events digest",
+            )
             telemetry_sha = _receipt_sha(
                 proof["runtime_telemetry_sha256"],
                 f"wall-plug proof {proof_id} telemetry",
             )
+            if telemetry_sha != canonical_sha256(telemetry_receipt):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry receipt digest does not match its payload"
+                )
             if telemetry_sha in telemetry:
                 raise ContractError(
                     "wall-plug proofs must preserve distinct telemetry receipts"
@@ -1881,6 +2050,10 @@ def validate_evidence(
             proof_receipt = _receipt_sha(
                 proof["receipt_sha256"], f"wall-plug proof {proof_id} receipt"
             )
+            if proof_receipt != wall_plug_receipt_sha256(value["evidence_id"], proof):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} receipt digest does not match its payload"
+                )
             if proof_receipt in proof_receipts:
                 raise ContractError(
                     "wall-plug proofs must preserve distinct observation receipts"
@@ -1892,10 +2065,17 @@ def validate_evidence(
         _nonempty(restore["observer"], "restore_rehearsal.observer")
         _timestamp(restore["observed_at"], "restore_rehearsal.observed_at")
         receipt_values: list[str] = []
-        for receipt in restore_receipts:
-            receipt_values.append(
-                _receipt_sha(restore[receipt], f"restore rehearsal {receipt}")
-            )
+        for phase_name, receipt in zip(
+            ("setup", "strike", "restore"), restore_receipts, strict=True
+        ):
+            receipt_sha = _receipt_sha(restore[receipt], f"restore rehearsal {receipt}")
+            if receipt_sha != restore_phase_receipt_sha256(
+                value["evidence_id"], restore, phase_name
+            ):
+                raise ContractError(
+                    f"restore rehearsal {receipt} digest does not match its payload"
+                )
+            receipt_values.append(receipt_sha)
         if len(set(receipt_values)) != len(receipt_values):
             raise ContractError("setup, strike, and restore receipts must be distinct")
     return value
@@ -1911,7 +2091,7 @@ def runtime_plan(
     )
     launcher = release_files[runtime["argv"][0]]
     return {
-        "schema": "danse.installation.runtime-plan.v1",
+        "schema": "danse.installation.runtime-plan.v2",
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
         "evidence_id": value["evidence_id"],
         "evidence_sha256": canonical_sha256(value),

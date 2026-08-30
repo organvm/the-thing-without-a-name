@@ -45,6 +45,7 @@ except ImportError:  # Direct `python3 installation/runtime.py` execution.
     )
 
 TELEMETRY_SCHEMA = "danse.installation.telemetry.v1"
+RUNTIME_PLAN_SCHEMA = "danse.installation.runtime-plan.v2"
 
 
 def canonical_relative_path(value: Any, label: str) -> PurePosixPath:
@@ -93,6 +94,44 @@ def probe_health(url: str, timeout: float) -> bool:
             return 200 <= response.status < 300
     except (OSError, urllib.error.URLError, ValueError):
         return False
+
+
+def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
+    """Reject obsolete or incomplete plan contracts before field access."""
+    if not isinstance(plan, dict) or plan.get("schema") != RUNTIME_PLAN_SCHEMA:
+        raise ContractError("unknown installation runtime plan schema")
+    required = {
+        "schema",
+        "spec_contract_sha256",
+        "evidence_id",
+        "evidence_sha256",
+        "release_manifest_sha256",
+        "release_manifest",
+        "release_files",
+        "launcher",
+        "configuration_sha256",
+        "argv",
+        "health_url",
+        "river",
+        "outputs",
+        "policy",
+    }
+    if set(plan) != required:
+        raise ContractError("installation runtime plan fields do not match v2")
+    for key in (
+        "spec_contract_sha256",
+        "evidence_sha256",
+        "release_manifest_sha256",
+        "configuration_sha256",
+    ):
+        value = plan[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ContractError(f"installation runtime plan {key} is not SHA-256")
+    return plan
 
 
 def terminate(process: subprocess.Popen[Any]) -> None:
@@ -344,6 +383,11 @@ def supervise(
     health_probe: Callable[[str, float], bool] = probe_health,
 ) -> int:
     """Run one admitted launcher and recover only within its declared budget."""
+    try:
+        plan = validate_runtime_plan_contract(plan)
+    except ContractError:
+        telemetry.emit("runtime-plan-invalid", attempt=0)
+        return 78
     policy = plan["policy"]
     health = policy["health"]
     recovery = policy["recovery"]
