@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_TMP_ROOT = ROOT / ".work" / "test-fixtures"
 sys.path.insert(0, str(ROOT / "music"))
 sys.path.insert(0, str(ROOT / "sound"))
 sys.path.insert(0, str(ROOT / "render"))
@@ -95,7 +96,11 @@ class MusicScoreContractTest(unittest.TestCase):
         cls.production_register = load_register()
         cls.register = load_register(ROOT / "music/fixtures/repertoire.yaml")
         cls.score = compile_contract(copy.deepcopy(cls.register), cls.program, "generated-contract-study")
-        cls._fixture_directory = tempfile.TemporaryDirectory(dir=ROOT / "music/fixtures")
+        # Keep ephemeral score bytes under the ignored work root. Workspace
+        # synchronizers may briefly resurrect deleted paths under tracked source
+        # directories, which would dirty the repository after a successful run.
+        FIXTURE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        cls._fixture_directory = tempfile.TemporaryDirectory(dir=FIXTURE_TMP_ROOT)
         cls.fixture_score_path = Path(cls._fixture_directory.name) / "score.json"
         cls.fixture_score_path.write_bytes(output_bytes(cls.score))
         cls._prior_fixture_env = os.environ.get("DANSE_FIXTURE_SCORE")
@@ -834,6 +839,8 @@ class MusicScoreContractTest(unittest.TestCase):
             self.assertEqual(fresh_md, tracked_md, "A/B evidence markdown drifted — regenerate it")
 
         evidence = json.loads(tracked_json)
+        self.assertEqual(evidence["schema"], "danse.evidence.score-to-motion-ab.fixture.v1")
+        self.assertEqual(evidence["evidence_scope"], "historical-fixture-only")
         self.assertEqual(evidence["contract"], self.score["identity"]["contract_sha256"])
         structural = [row for row in evidence["rows"] if row["kind"] != "downbeat"]
         moved = [row for row in structural if any(abs(v) > 0.0005 for v in row["visual"]["score_transition"].values())]
@@ -861,6 +868,7 @@ class MusicScoreContractTest(unittest.TestCase):
         frames = json.loads((evidence_dir / "score-to-motion-frames.json").read_text())
         ab = json.loads((evidence_dir / "score-to-motion-ab.json").read_text())
         self.assertEqual(frames["schema"], "danse.evidence.score-to-motion-frames.v1")
+        self.assertEqual(frames["evidence_scope"], "historical-fixture-only")
         self.assertEqual(frames["contract"], ab["contract"])
         self.assertEqual(frames["source"], "score-to-motion-ab.json")
         self.assertEqual(frames["determinism"]["identical"], True)
@@ -899,6 +907,10 @@ class MusicScoreContractTest(unittest.TestCase):
             self.assertGreaterEqual(row["psnr_db"], 0.0)
             self.assertLess(row["psnr_db"], 40.0, "an observable difference must not look identical")
             self.assertTrue(row["with_sha256"] and row["without_sha256"])
+
+    def test_production_score_motion_contract_fails_closed_portably(self) -> None:
+        result = run(sys.executable, "scripts/tests/score-motion-production.test.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

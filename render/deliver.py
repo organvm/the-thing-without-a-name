@@ -71,6 +71,13 @@ AUDIO_USES = DANSE / "sound" / "audio-uses.json"
 AUDIO_RENDER_SCHEMA = DANSE / "music" / "audio-render.schema.json"
 AUDIO_RENDER_RECEIPT = DANSE / ".work" / "music" / "competition" / "audio-render.json"
 AUDIO_MASTER = DANSE / ".work" / "music" / "competition" / "delibes-master.wav"
+SCORE_MOTION_EVIDENCE = (
+    DANSE
+    / ".work"
+    / "evidence"
+    / "score-to-motion-production"
+    / "score-to-motion-production.json"
+)
 MUSIC_CREDIT = (
     "Music by Léo Delibes. Source arrangements by Paul De Bra, adapted and "
     "re-orchestrated for Danse under CC BY 4.0. Changes include instrumentation, "
@@ -111,6 +118,8 @@ SCORE_SOURCE_ITEM = "provenance/passage-score.wav"
 AUDIO_RENDER_SOURCE_ITEM = "provenance/audio-render.json"
 PRODUCTION_RECEIPT = "provenance/production.json"
 PRODUCER_RECEIPTS = "provenance/producer-receipts"
+SCORE_MOTION_EVIDENCE_DIR = "provenance/score-to-motion"
+SCORE_MOTION_EVIDENCE_ITEM = f"{SCORE_MOTION_EVIDENCE_DIR}/score-to-motion-production.json"
 PASSAGE_SELECTORS = {"master", "derived", "reel", "stills"}
 FIXED_WINDOW_ITEMS = {"midnight-moment.mov", "trailer.mp4", REEL_ITEM}
 
@@ -1024,6 +1033,65 @@ def write_production_receipt(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(production, indent=2) + "\n")
     return {"path": PRODUCTION_RECEIPT, "sha256": digest(path)}
+
+
+@functools.lru_cache(maxsize=1)
+def score_motion_contract():
+    """Load the portable A/B authenticator without making delivery import scripts."""
+    path = DANSE / "scripts" / "score_motion_production.py"
+    spec = importlib.util.spec_from_file_location("danse_delivery_score_motion_contract", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit("cannot load the production score-to-motion evidence contract")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stage_score_motion_evidence(
+    package: Path,
+    span: dict,
+    repository_head: str,
+) -> tuple[dict | None, list[Path]]:
+    """Copy only a complete, current evidence graph; absence stays a later gate."""
+    if not SCORE_MOTION_EVIDENCE.is_file():
+        return None, []
+    contract = score_motion_contract()
+    errors = contract.production_receipt_errors(SCORE_MOTION_EVIDENCE)
+    if errors:
+        raise SystemExit("production score-to-motion evidence is stale: " + "; ".join(errors[:6]))
+    receipt = json.loads(SCORE_MOTION_EVIDENCE.read_text(encoding="utf-8"))
+    expected_span = {
+        "river_seed": 20170620,
+        "stream": 0,
+        "passage": span["passage"],
+        "t0": span["t0"],
+        "t1": span["t1"],
+        "duration_seconds": span["duration"],
+    }
+    if receipt.get("repository_head") != repository_head or receipt.get("span") != expected_span:
+        raise SystemExit("production score-to-motion evidence belongs to a different package span or Git HEAD")
+    source_root = SCORE_MOTION_EVIDENCE.parent.resolve(strict=True)
+    destination_root = package / SCORE_MOTION_EVIDENCE_DIR
+    if destination_root.is_symlink() or (destination_root.exists() and not destination_root.is_dir()):
+        raise SystemExit("package score-to-motion evidence boundary is not a regular directory")
+    destination_root.mkdir(parents=True, exist_ok=True)
+    staged = []
+    for source in contract.evidence_artifact_paths(SCORE_MOTION_EVIDENCE):
+        relative = source.relative_to(source_root)
+        destination = destination_root / relative
+        if destination.parent.is_symlink() or (
+            destination.parent.exists() and not destination.parent.is_dir()
+        ):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        shutil.copy2(source, destination)
+        if digest(destination) != digest(source):
+            raise SystemExit("package score-to-motion evidence copy changed bytes")
+        staged.append(destination)
+    receipt_copy = package / SCORE_MOTION_EVIDENCE_ITEM
+    return {"path": SCORE_MOTION_EVIDENCE_ITEM, "sha256": digest(receipt_copy)}, staged
 
 
 def capture_root(root: Path, span: dict, start: float) -> Path:
@@ -1962,6 +2030,14 @@ def main() -> int:
     print()
     manifest_path = PACKAGE / "manifest.json"
     previous = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    score_motion_evidence = None
+    if span is not None:
+        score_motion_evidence, evidence_files = stage_score_motion_evidence(
+            PACKAGE,
+            span,
+            repository["head"],
+        )
+        made.extend(evidence_files)
     previous_items = {
         item["name"]: item
         for item in previous.get("items", [])
@@ -2037,6 +2113,8 @@ def main() -> int:
     production = write_production_receipt(PACKAGE, OUT, manifest, previous)
     if production is not None:
         manifest["production"] = production
+    if score_motion_evidence is not None:
+        manifest["score_motion_evidence"] = score_motion_evidence
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     total = sum(i["bytes"] for i in manifest["items"])
     print(f"\n  {len(manifest['items'])} items · {total / 1e9:.2f} GB · {PACKAGE}")

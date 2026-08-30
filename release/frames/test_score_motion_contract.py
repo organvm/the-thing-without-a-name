@@ -19,6 +19,7 @@ class ScoreMotionContract(unittest.TestCase):
     def test_receipt_schema(self):
         r = json.loads(RECEIPT.read_text())
         self.assertEqual(r["schema"], "danse.evidence.score-to-motion-frames.v1")
+        self.assertEqual(r["evidence_scope"], "historical-fixture-only")
         self.assertIn("contract", r)
         self.assertIn("seed", r)
         self.assertIn("stream", r)

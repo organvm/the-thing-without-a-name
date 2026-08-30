@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURE_TMP_ROOT = ROOT / ".work" / "test-fixtures"
 sys.path.insert(0, str(ROOT / "music"))
 sys.path.insert(0, str(ROOT / "sound"))
 
@@ -76,7 +77,10 @@ def node_json(script: str) -> object:
 class RoomEventContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._temporary = tempfile.TemporaryDirectory(dir=ROOT / "music/fixtures")
+        # Keep ephemeral buses under the ignored work root so filesystem sync
+        # cannot resurrect deleted test artifacts inside tracked source trees.
+        FIXTURE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        cls._temporary = tempfile.TemporaryDirectory(dir=FIXTURE_TMP_ROOT)
         temporary = Path(cls._temporary.name)
         cls.fixture_score_path = temporary / "score.json"
         cls.production_bus_path = temporary / "production-room-bus.json"

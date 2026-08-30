@@ -19,11 +19,11 @@
 
 schema: danse.submission.v2
 opportunity_snapshot:
-  snapshot_id: omega-20260826-2
-  path: opportunities/omega-20260826-2.json
-  sha256: "f5bb090a2cc1491055124d5e422b2e148f2e0327f9e096ead204eda86893c7af"
-  receipt: opportunities/omega-20260826-2.receipt.json
-  frozen_at: "2026-08-26T19:54:24Z"
+  snapshot_id: omega-20260829
+  path: opportunities/omega-20260829.json
+  sha256: "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294"
+  receipt: opportunities/omega-20260829.receipt.json
+  frozen_at: "2026-08-29T22:12:19Z"
   opportunity_id: screendance-miami-2027
   timezone: America/New_York
 call: ScreenDance Miami Festival 2027
@@ -55,9 +55,9 @@ decision:
 eligibility:
   status: verified
   scope: worldwide
-  who: "choreographers, directors, movers, and filmmakers"
-  # No geography, age, or residency gate. Where the artist lives is not a factor in
-  # this call and must not be reasoned about as if it were.
+  who: "dancers, choreographers, movers, and filmmakers"
+  # The published invitation is worldwide. It does not state age eligibility, so
+  # this register makes no claim that an age gate does or does not exist.
   source: submittable
   checked: 2026-07-30
 
@@ -120,6 +120,24 @@ terms:
     rule: "After official selection, publicity material such as still images must be supplied free of rights and may be used to promote ScreenDance Miami without time or place limits."
     source: https://miamilightproject.submittable.com/submit
     checked: 2026-08-03
+    check: manual
+
+  - id: submission-rights-warranty
+    phase: submitted
+    status: verified
+    trigger: filing
+    rule: "By submitting the film, the applicant declares that they hold all rights to share every aspect of the film and have cleared rights with the composer, musicians, dancers, and all other film collaborators."
+    source: https://miamilightproject.submittable.com/submit
+    checked: 2026-08-26
+    check: manual
+
+  - id: festival-scheduling-discretion
+    phase: submitted
+    status: verified
+    trigger: filing
+    rule: "General scheduling and the timetable of screenings are at the festival's discretion."
+    source: https://miamilightproject.submittable.com/submit
+    checked: 2026-08-26
     check: manual
 
   - id: archive-library-choice
@@ -212,6 +230,9 @@ unstated:
 # ── The package. What check.py validates on disk. ───────────────────────────────
 
 package:
+  classification: internal-delivery-spec
+  published_requirement: false
+  note: "Project-owned production and delivery targets; the call does not publish these codec, raster, frame-rate, aspect, audio, still, or text specifications."
   master:
     required: true
     min_width: 3840
@@ -235,7 +256,7 @@ package:
     max_true_peak_dbtp: -1.0
     usage_contract:
       path: sound/audio-uses.json
-      sha256: "3ff7afe4f41c6035b1bee3361ef31ec9fe0c4d8cbc06752eb917b3d6af9e1831"
+      sha256: "d312487481ca456c4f26357b18fef7f0f58b5d8ae4a3dc5e687895d9c98f53e4"
       schema: danse.audio.uses.v1
       profile: competition-classical
     score_source: provenance/passage-score.wav

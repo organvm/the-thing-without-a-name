@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://danse.example/schemas/score-to-motion-production.v1.json",
+  "title": "Danse production score-to-motion A/B machine receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "evidence_scope",
+    "repository_head",
+    "source_tree_sha256",
+    "span",
+    "score",
+    "choreography",
+    "audio_render_receipt",
+    "audio_master",
+    "sample_receipt",
+    "frame_receipt",
+    "review_media",
+    "human_review"
+  ],
+  "properties": {
+    "schema": {"const": "danse.evidence.score-to-motion.production.v1"},
+    "evidence_scope": {"const": "production-machine-evidence-only"},
+    "repository_head": {"$ref": "#/$defs/gitOid"},
+    "source_tree_sha256": {"$ref": "#/$defs/sha256"},
+    "span": {"$ref": "#/$defs/span"},
+    "score": {"$ref": "#/$defs/scoreSource"},
+    "choreography": {"$ref": "#/$defs/contractSource"},
+    "audio_render_receipt": {"$ref": "#/$defs/repositoryArtifact"},
+    "audio_master": {"$ref": "#/$defs/audioMaster"},
+    "sample_receipt": {"$ref": "#/$defs/localArtifact"},
+    "frame_receipt": {"$ref": "#/$defs/localArtifact"},
+    "review_media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["with_score", "control"],
+      "properties": {
+        "with_score": {"$ref": "#/$defs/reviewMedia"},
+        "control": {"$ref": "#/$defs/reviewMedia"}
+      }
+    },
+    "human_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {"status": {"const": "not-attested"}}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitOid": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "safePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["river_seed", "stream", "passage", "t0", "t1", "duration_seconds"],
+      "properties": {
+        "river_seed": {"const": 20170620},
+        "stream": {"const": 0},
+        "passage": {"const": 0},
+        "t0": {"const": 0},
+        "t1": {"type": "number", "exclusiveMinimum": 0},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "repositoryArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "localArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contractSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "file_sha256", "contract_sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "file_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "scoreSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "file_sha256", "contract_sha256", "duration_seconds"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "file_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "audioMaster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "pcm_sha256", "frames", "sample_rate", "channels", "duration_seconds"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "pcm_sha256": {"$ref": "#/$defs/sha256"},
+        "frames": {"type": "integer", "minimum": 1},
+        "sample_rate": {"const": 48000},
+        "channels": {"const": 2},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "reviewMedia": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "mode",
+        "sha256",
+        "bytes",
+        "duration_seconds",
+        "fps",
+        "width",
+        "height",
+        "video_frames",
+        "video_streams",
+        "audio_streams",
+        "audio_pcm_sha256",
+        "audio_frames",
+        "audio_sample_rate",
+        "audio_channels",
+        "video_framehash_sha256",
+        "decoded_video_frames",
+        "anchors"
+      ],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"},
+        "mode": {"enum": ["with_score", "control"]},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "fps": {"const": 30},
+        "width": {"const": 1920},
+        "height": {"const": 1080},
+        "video_frames": {"type": "integer", "minimum": 1},
+        "video_streams": {"const": 1},
+        "audio_streams": {"const": 1},
+        "audio_pcm_sha256": {"$ref": "#/$defs/sha256"},
+        "audio_frames": {"type": "integer", "minimum": 1},
+        "audio_sample_rate": {"const": 48000},
+        "audio_channels": {"const": 2},
+        "video_framehash_sha256": {"$ref": "#/$defs/sha256"},
+        "decoded_video_frames": {"type": "integer", "minimum": 1},
+        "anchors": {
+          "type": "array", "minItems": 3,
+          "items": {"$ref": "#/$defs/reviewAnchor"}
+        }
+      }
+    },
+    "reviewAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_id", "frame_index", "review_second", "source_frame_sha256",
+        "decoded_rgb_sha256", "psnr_db"
+      ],
+      "properties": {
+        "sample_id": {"type": "string", "pattern": "^sample-[0-9]{3}$"},
+        "frame_index": {"type": "integer", "minimum": 0},
+        "review_second": {"type": "number", "minimum": 0},
+        "source_frame_sha256": {"$ref": "#/$defs/sha256"},
+        "decoded_rgb_sha256": {"$ref": "#/$defs/sha256"},
+        "psnr_db": {"type": "number", "minimum": 30, "maximum": 120}
+      }
+    }
+  }
+}

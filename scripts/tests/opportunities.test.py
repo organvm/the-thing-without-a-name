@@ -33,9 +33,9 @@ class RegistryFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "repo"
-        self.snapshot = self.root / "opportunities/omega-20260826-2.json"
+        self.snapshot = self.root / "opportunities/omega-20260829.json"
         self.schema = self.root / "opportunities/opportunity.schema.json"
-        self.receipt = self.root / "opportunities/omega-20260826-2.receipt.json"
+        self.receipt = self.root / "opportunities/omega-20260829.receipt.json"
         self.evidence = self.root / "opportunities/source-evidence-20260826.json"
         self.consumer = self.root / "submission/screendance-2027.yaml"
         for source, target in (
@@ -59,6 +59,30 @@ class RegistryFixture:
 
 
 class ProductionRegistryTest(unittest.TestCase):
+    def test_original_august_4_freeze_remains_byte_for_byte_historical_evidence(self) -> None:
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260804.json"),
+            "3aeb84a8c919c6866272138e3ce1bd7d9222af77ad618d810ba69f6159544b3e",
+        )
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260804.receipt.json"),
+            "3a2d3b9eaed6f14f869fc08fa2e0baf02b868116ec0e1b206f23c1ec3e2a94ee",
+        )
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/source-evidence-20260804.json"),
+            "0b28e98f151e8ea940c6c047fff91afc79f6b0df0343e623da79952b9aa87c37",
+        )
+
+    def test_immediate_predecessor_remains_byte_for_byte_historical_evidence(self) -> None:
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260826-2.json"),
+            "f5bb090a2cc1491055124d5e422b2e148f2e0327f9e096ead204eda86893c7af",
+        )
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260826-2.receipt.json"),
+            "f8926f5777eb1d50d3d997493fa592a3c19004ebe5532803ea76f983f348756f",
+        )
+
     def test_same_day_predecessor_remains_byte_for_byte_historical_evidence(self) -> None:
         self.assertEqual(
             CHECK.digest(ROOT / "opportunities/omega-20260826.json"),
@@ -213,6 +237,16 @@ class RegistryFailureTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECK.RegistryError, "complete operational ScreenDance register"):
             self.validate_all()
 
+    def test_verified_term_cannot_postdate_its_frozen_source_evidence(self) -> None:
+        text = self.fixture.consumer.read_text(encoding="utf-8")
+        text = text.replace(
+            "checked: 2026-08-26\n    check: manual\n\n  - id: festival-scheduling-discretion",
+            "checked: 2026-08-27\n    check: manual\n\n  - id: festival-scheduling-discretion",
+        )
+        self.fixture.consumer.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(CHECK.RegistryError, "postdates its frozen source check"):
+            self.validate_all()
+
     def test_submission_named_timezone_must_match_the_frozen_deadline(self) -> None:
         text = self.fixture.consumer.read_text(encoding="utf-8")
         text = text.replace("timezone: America/New_York", "timezone: America/Toronto")
@@ -267,7 +301,7 @@ class RegistryFailureTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECK.RegistryError, "traverses a symlink"):
             CHECK.safe_file(
                 self.fixture.root,
-                "opportunities/omega-20260826-2.json",
+                "opportunities/omega-20260829.json",
                 "receipt snapshot path",
             )
 

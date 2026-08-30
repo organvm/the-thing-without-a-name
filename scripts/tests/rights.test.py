@@ -802,6 +802,8 @@ class RightsContractTest(unittest.TestCase):
             "submitted-via-submittable",
             "accepted-film-no-withdrawal",
             "publicity-stills-free-of-rights",
+            "submission-rights-warranty",
+            "festival-scheduling-discretion",
             "archive-library-choice",
             "regulations-accepted",
         ):

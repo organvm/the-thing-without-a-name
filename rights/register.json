@@ -47,13 +47,15 @@
     "submission": {
       "source": {
         "path": "submission/screendance-2027.yaml",
-        "sha256": "52923932cefc4980d52d239465ee99acf8d4650def4148572a2275e2309e949b",
+        "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0",
         "summary": "Frozen ScreenDance package requirements, approvals, and published legal terms."
       },
       "schema": "danse.submission.v2",
       "required_terms": [
         "accepted-film-no-withdrawal",
         "publicity-stills-free-of-rights",
+        "submission-rights-warranty",
+        "festival-scheduling-discretion",
         "archive-library-choice",
         "regulations-accepted"
       ]
@@ -94,7 +96,7 @@
       "id": "biography-text",
       "source": {
         "path": "submission/text/bio.txt",
-        "sha256": "82fc477f95b586bae2747844d8852fd3f5cbb11cc9529d108eb8e4322a2a7f45",
+        "sha256": "a9c8ca24ee4e77d61f606a2f3371a1fbbefd971ace6c52dc524e9426a5d4c3da",
         "summary": "Tracked biography copied byte-for-byte into a staged package."
       },
       "destination": "text/bio.txt",
@@ -114,7 +116,7 @@
       "id": "technical-note-text",
       "source": {
         "path": "submission/text/technical_note.txt",
-        "sha256": "c744c75db4e739e468630b6a9f26ccc69b640893288ba4677af97fb9c1d84f05",
+        "sha256": "db1b089153ec452538b7001b799350b24c527a44d48d7e9333513720f2a521c2",
         "summary": "Tracked technical note copied byte-for-byte into a staged package."
       },
       "destination": "text/technical_note.txt",
@@ -273,6 +275,26 @@
       "note": "Selected material must support promotion without time or place limits after official selection."
     },
     {
+      "id": "submission-rights-warranty",
+      "label": "ScreenDance submission-rights warranty acknowledged",
+      "required_for": ["submitted"],
+      "authority": "Anthony J. Padavano as the applicant",
+      "state": "pending",
+      "evidence": null,
+      "attestation": {"key": "submission-rights-warranty", "kind": "boolean", "values": [true]},
+      "note": "Only the applicant may make the published warranty that every film and collaborator right has been cleared."
+    },
+    {
+      "id": "festival-scheduling-discretion",
+      "label": "Festival scheduling discretion acknowledged",
+      "required_for": ["submitted"],
+      "authority": "Anthony J. Padavano as the applicant",
+      "state": "pending",
+      "evidence": null,
+      "attestation": {"key": "festival-scheduling-discretion", "kind": "boolean", "values": [true]},
+      "note": "Acknowledgement at filing does not select, promise, or attest any screening schedule."
+    },
+    {
       "id": "archive-library-choice",
       "label": "ScreenDance archive-library choice",
       "required_for": ["submitted"],
@@ -402,7 +424,7 @@
       "public_credit": {"state": "not-required", "label": null, "note": "This row records a use choice rather than a contributor credit."},
       "private_evidence": {"state": "not-required", "custodian": null, "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "52923932cefc4980d52d239465ee99acf8d4650def4148572a2275e2309e949b", "summary": "Published archive-library opt-in or opt-out choice."}
+        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Published archive-library opt-in or opt-out choice."}
       ],
       "uses": [
         {"id": "festival-archive", "medium": "festival-archive", "required_for": ["submitted"], "territory": "pending", "term": "pending", "expires": null, "promotion": "not-applicable", "archive": "pending", "status": "blocked", "evidence": null, "conditional_exclusion": {"gate": "archive-library-choice", "value": "opt-out"}, "note": "Include requires cleared archive scope; the registered opt-out decision excludes this use."}
@@ -453,7 +475,7 @@
       "public_credit": {"state": "pending", "label": "Optional apartment source recordings — Anthony J. Padavano", "note": "This hybrid-only source credit and ownership claim remain unapproved."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "52923932cefc4980d52d239465ee99acf8d4650def4148572a2275e2309e949b", "summary": "Hybrid-only private source names and byte digests, explicitly package-ineligible and without private locations."},
+        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Hybrid-only private source names and byte digests, explicitly package-ineligible and without private locations."},
         {"path": "submission/text/rights_declaration.txt", "sha256": "86532bceb79f745cf24e1f579c0dd00108afb39e86696208668f9b62ab0801a5", "summary": "Unapproved tracked ownership claim; not completion evidence."},
         {"path": "sound/audio-uses.json", "sha256": "d312487481ca456c4f26357b18fef7f0f58b5d8ae4a3dc5e687895d9c98f53e4", "summary": "Usage manifest confines the private grain bank to the package-ineligible hybrid-apartment profile."}
       ],
@@ -472,7 +494,7 @@
       "public_credit": {"state": "pending", "label": null, "note": "No still selection or final caption and credit package exists."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "52923932cefc4980d52d239465ee99acf8d4650def4148572a2275e2309e949b", "summary": "Still dimensions and unlimited official-selection promotional term."}
+        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Still dimensions and unlimited official-selection promotional term."}
       ],
       "uses": [
         {"id": "press", "medium": "press", "required_for": ["public", "release"], "territory": "pending", "term": "pending", "expires": null, "promotion": "pending", "archive": "pending", "status": "blocked", "evidence": null, "note": "No selected source digest or clearance receipt."},
@@ -613,7 +635,7 @@
       "public_credit": {"state": "not-required", "label": null, "note": "Author credit is represented by the project credit rather than repeated for each text file."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "submission/text/bio.txt", "sha256": "82fc477f95b586bae2747844d8852fd3f5cbb11cc9529d108eb8e4322a2a7f45", "summary": "Tracked biography source."},
+        {"path": "submission/text/bio.txt", "sha256": "a9c8ca24ee4e77d61f606a2f3371a1fbbefd971ace6c52dc524e9426a5d4c3da", "summary": "Tracked biography source."},
         {"path": "submission/text/rights_declaration.txt", "sha256": "86532bceb79f745cf24e1f579c0dd00108afb39e86696208668f9b62ab0801a5", "summary": "Tracked rights declaration source."}
       ],
       "uses": [

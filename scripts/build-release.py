@@ -855,7 +855,7 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
             str(root),
             "status",
             "--porcelain=v1",
-            "--untracked-files=no",
+            "--untracked-files=all",
             "--ignore-submodules=none",
         ],
         capture_output=True,
@@ -865,7 +865,7 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
     if status.returncode != 0:
         raise ReleaseError(f"cannot inspect source checkout: {status.stderr.strip()}")
     if status.stdout:
-        raise ReleaseError("source checkout has tracked changes")
+        raise ReleaseError("source checkout has tracked changes or untracked files")
 
 
 def verify_project_links(
@@ -1020,9 +1020,9 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             or record["bytes"] < 0
         ):
             raise ReleaseError(f"release artifact installation {key} binding is invalid")
-    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260826-2.json":
+    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260829.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity snapshot")
-    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260826-2.receipt.json":
+    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260829.receipt.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity receipt")
     if release["source_evidence"]["path"] != "opportunities/source-evidence-20260826.json":
         raise ReleaseError("release artifact points at a non-canonical source-evidence manifest")

@@ -15,7 +15,7 @@ import tempfile
 import unittest
 import wave
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -156,6 +156,152 @@ def bind_submission_score_receipt(package: Path, manifest: dict, sound: dict) ->
         "path": "provenance/production.json",
         "sha256": CHECK.sha256(production_path),
     }
+
+
+def submission_attestation_values(register: dict) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for section in CHECK.OWNED_SECTIONS:
+        for item in register.get(section, []):
+            if item.get("check") == "manual":
+                values[item["id"]] = None
+            elif item.get("check") == "choice":
+                values[item["id"]] = None
+    return values
+
+
+def affirm_submission_phase(register: dict, values: dict[str, object], phase: str) -> None:
+    selected = CHECK.PHASES.index(phase)
+    for section in CHECK.OWNED_SECTIONS:
+        for item in register.get(section, []):
+            owner = item.get("phase")
+            if owner not in CHECK.PHASES or CHECK.PHASES.index(owner) > selected:
+                continue
+            if item.get("check") == "manual":
+                values[item["id"]] = True
+            elif item.get("check") == "choice":
+                values[item["id"]] = item["values"][0]
+
+
+def write_submission_attestation(package: Path, values: dict[str, object]) -> Path:
+    path = package / "attest.yaml"
+    path.write_text(yaml.safe_dump(values, sort_keys=True))
+    return path
+
+
+def submission_package_binding(package: Path) -> dict[str, str]:
+    return {
+        "manifest": "manifest.json",
+        "manifest_sha256": CHECK.sha256(package / "manifest.json"),
+        "repository_head": SUBMISSION_REPOSITORY_HEAD,
+    }
+
+
+def write_submission_phase_receipt(
+    package: Path,
+    register: dict,
+    values: dict[str, object],
+    phase: str,
+    recorded_at: str,
+    *,
+    event_at: str | None = None,
+) -> Path:
+    attest = write_submission_attestation(package, values)
+    assertions, _ = CHECK.attestation_snapshot(register, values, phase)
+    payload: dict[str, object] = {
+        "schema": CHECK.PHASE_RECEIPT_SCHEMAS[phase],
+        "receipt_id": f"screendance-{phase}-001",
+        "recorded_at": recorded_at,
+        "signer": {
+            "name": CHECK.canonical_phase_signer(phase),
+            "role": CHECK.PHASE_SIGNER_ROLES[phase],
+        },
+        "package": submission_package_binding(package),
+        "opportunity": {
+            "snapshot_id": register["opportunity_snapshot"]["snapshot_id"],
+            "sha256": register["opportunity_snapshot"]["sha256"],
+        },
+        "deadline": CHECK.deadline_binding(register)[0],
+        "attestation": {
+            "path": "attest.yaml",
+            "sha256": CHECK.sha256(attest),
+            "canonical_sha256": CHECK.canonical_json_sha256(values),
+            "document": attest.read_text(),
+        },
+        "assertions": {
+            "sha256": CHECK.canonical_json_sha256(assertions),
+            "values": assertions,
+        },
+    }
+    if phase != "package":
+        prior = CHECK.PHASES[CHECK.PHASES.index(phase) - 1]
+        prior_path = package / CHECK.PHASE_RECEIPTS[prior]
+        prior_value = json.loads(prior_path.read_text())
+        payload["prior_receipt"] = {
+            "phase": prior,
+            "path": CHECK.PHASE_RECEIPTS[prior],
+            "sha256": CHECK.sha256(prior_path),
+            "receipt_id": prior_value["receipt_id"],
+        }
+    if phase == "uploaded":
+        manifest = json.loads((package / "manifest.json").read_text())
+        screener = next(item for item in manifest["items"] if item["name"].startswith("screener."))
+        payload["upload"] = {
+            "provider": "vimeo.com",
+            "asset_id": "123456789",
+            "url": "https://vimeo.com/123456789",
+            "uploaded_at": event_at or recorded_at,
+            "manifest_item": screener["name"],
+            "sha256": screener["sha256"],
+        }
+    elif phase == "submitted":
+        payload["submission"] = {
+            "portal": register["portal"],
+            "confirmation_id": "submission-123456",
+            "submitted_at": event_at or recorded_at,
+        }
+    path = package / CHECK.PHASE_RECEIPTS[phase]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
+def build_submission_receipt_chain(
+    package: Path,
+    register: dict,
+    through: str = "submitted",
+) -> dict[str, object]:
+    item = package / "screener.mp4"
+    item.write_text("exact package bytes\n")
+    manifest = {
+        "schema": "danse.delivery.manifest.v1",
+        "title": "THE THING WITHOUT A NAME",
+        "seed": "0x0133D62C",
+        "repository_head": SUBMISSION_REPOSITORY_HEAD,
+        "items": [
+            {
+                "name": item.name,
+                "bytes": item.stat().st_size,
+                "sha256": CHECK.sha256(item),
+            }
+        ],
+    }
+    (package / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    values = submission_attestation_values(register)
+    timestamps = {
+        "package": "2026-08-31T20:00:00Z",
+        "uploaded": "2026-08-31T21:59:00Z",
+        "submitted": "2026-09-01T01:59:00Z",
+    }
+    for phase in CHECK.PHASES[: CHECK.PHASES.index(through) + 1]:
+        affirm_submission_phase(register, values, phase)
+        write_submission_phase_receipt(
+            package,
+            register,
+            values,
+            phase,
+            timestamps[phase],
+        )
+    return values
 
 
 def corpus_fixture(root: Path) -> tuple[Path, Path]:
@@ -2878,12 +3024,672 @@ class DeliveryContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "attest.yaml").write_text("final-cut-only: true\n")
-            expected = {"package": 3, "uploaded": 5, "submitted": 10}
+            expected = {"package": 3, "uploaded": 5, "submitted": 12}
             for phase, count in expected.items():
                 report = CHECK.Report()
                 CHECK.check_attestations(reg, root, phase, report)
                 self.assertEqual(len(report.rows), count)
                 self.assertEqual(report.failures, count - 1)
+
+    def test_phase_receipts_are_cumulative_exact_and_close_elapsed_deadlines(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg)
+            attested, attest_path = CHECK.read_attestations(package)
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                binding, _, identity_errors = CHECK.validate_package_identity(package)
+            self.assertEqual(identity_errors, [])
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "submitted",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            self.assertEqual(set(records), set(CHECK.PHASES))
+
+            deadline = CHECK.Report()
+            CHECK.check_deadline(reg, "submitted", deadline, now=now, receipts=records)
+            self.assertEqual(deadline.failures, 0)
+            self.assertIn(
+                "18:00 EDT",
+                next(row for row in deadline.rows if row[1] == "upload target")[3],
+            )
+
+    def test_missing_stale_or_replayed_phase_receipts_fail_closed(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="uploaded")
+            attested, attest_path = CHECK.read_attestations(package)
+            binding = submission_package_binding(package)
+
+            missing = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "submitted",
+                binding,
+                attested,
+                attest_path,
+                missing,
+                now=now,
+            )
+            self.assertEqual(missing.rows[-1][2], CHECK.FAIL)
+            self.assertIn("missing", missing.rows[-1][3])
+
+            package_receipt = package / CHECK.PHASE_RECEIPTS["package"]
+            package_receipt.write_text(package_receipt.read_text() + "\n")
+            stale = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "uploaded",
+                binding,
+                attested,
+                attest_path,
+                stale,
+                now=now,
+            )
+            self.assertEqual(stale.rows[-1][2], CHECK.FAIL)
+            self.assertIn("prior-phase receipt binding", stale.rows[-1][3])
+
+            manifest = json.loads((package / "manifest.json").read_text())
+            manifest["title"] = "replayed package"
+            (package / "manifest.json").write_text(json.dumps(manifest) + "\n")
+            replay = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                replay,
+                now=now,
+            )
+            self.assertGreaterEqual(replay.failures, 1)
+            replay_package = next(row for row in replay.rows if row[1] == "package receipt")
+            self.assertIn("different package", replay_package[3])
+
+    def test_prior_receipt_embedded_attestation_is_independently_authenticated(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="uploaded")
+            prior_path = package / CHECK.PHASE_RECEIPTS["package"]
+            prior = json.loads(prior_path.read_text())
+            prior["attestation"]["sha256"] = "1" * 64
+            prior["attestation"]["canonical_sha256"] = "2" * 64
+            prior_path.write_text(json.dumps(prior, indent=2) + "\n")
+            uploaded_path = package / CHECK.PHASE_RECEIPTS["uploaded"]
+            uploaded = json.loads(uploaded_path.read_text())
+            uploaded["prior_receipt"]["sha256"] = CHECK.sha256(prior_path)
+            uploaded_path.write_text(json.dumps(uploaded, indent=2) + "\n")
+
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "uploaded",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            package_row = next(row for row in report.rows if row[1] == "package receipt")
+            uploaded_row = next(row for row in report.rows if row[1] == "uploaded receipt")
+            self.assertEqual(package_row[2], CHECK.FAIL)
+            self.assertIn("digest is stale", package_row[3])
+            self.assertEqual(uploaded_row[2], CHECK.FAIL)
+            self.assertIn("invalid prior-phase", uploaded_row[3])
+
+    def test_phase_receipt_rejects_an_arbitrary_signer_with_the_right_role(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            receipt_path = package / CHECK.PHASE_RECEIPTS["package"]
+            receipt = json.loads(receipt_path.read_text())
+            receipt["signer"]["name"] = "Mallory Impostor"
+            receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=datetime(2026, 9, 2, tzinfo=timezone.utc),
+            )
+            self.assertEqual(report.rows[0][2], CHECK.FAIL)
+            self.assertIn("canonical phase authority", report.rows[0][3])
+
+    def test_upload_receipt_binds_host_asset_and_manifested_screener_digest(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        mutations = {
+            "provider": lambda upload: upload.__setitem__("provider", "example.com"),
+            "asset": lambda upload: upload.__setitem__("asset_id", "unrelated.asset"),
+            "digest": lambda upload: upload.__setitem__("sha256", "9" * 64),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                build_submission_receipt_chain(package, reg, through="uploaded")
+                receipt_path = package / CHECK.PHASE_RECEIPTS["uploaded"]
+                receipt = json.loads(receipt_path.read_text())
+                mutate(receipt["upload"])
+                receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+                attested, attest_path = CHECK.read_attestations(package)
+                report = CHECK.Report()
+                CHECK.check_phase_receipts(
+                    reg,
+                    package,
+                    "uploaded",
+                    submission_package_binding(package),
+                    attested,
+                    attest_path,
+                    report,
+                    now=datetime(2026, 9, 2, tzinfo=timezone.utc),
+                )
+                self.assertEqual(report.rows[-1][2], CHECK.FAIL)
+
+    def test_receipt_deadline_events_enforce_exact_target_and_wall_boundaries(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
+        cases = (
+            ("uploaded", "2026-08-31T22:00:00Z", CHECK.PASS),
+            ("uploaded", "2026-08-31T22:00:01Z", CHECK.PASS),
+            ("submitted", "2026-09-01T02:00:00Z", CHECK.PASS),
+            ("submitted", "2026-09-01T02:00:01Z", CHECK.PASS),
+        )
+        for phase, event_at, expected in cases:
+            with self.subTest(phase=phase, event_at=event_at), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                values = build_submission_receipt_chain(package, reg, through=phase)
+                write_submission_phase_receipt(
+                    package,
+                    reg,
+                    values,
+                    phase,
+                    event_at,
+                    event_at=event_at,
+                )
+                attested, attest_path = CHECK.read_attestations(package)
+                report = CHECK.Report()
+                CHECK.check_phase_receipts(
+                    reg,
+                    package,
+                    phase,
+                    submission_package_binding(package),
+                    attested,
+                    attest_path,
+                    report,
+                    now=now,
+                )
+                self.assertEqual(report.rows[-1][2], expected)
+
+                if phase == "uploaded" and event_at.endswith("01Z"):
+                    deadline = CHECK.Report()
+                    CHECK.check_deadline(
+                        reg,
+                        phase,
+                        deadline,
+                        now=now,
+                        receipts={
+                            phase: {
+                                "event_at": datetime.fromisoformat(event_at.replace("Z", "+00:00"))
+                            }
+                        },
+                    )
+                    target = next(row for row in deadline.rows if row[1] == "upload target")
+                    self.assertEqual(target[2], CHECK.FAIL)
+                if phase == "submitted" and event_at.endswith("01Z"):
+                    deadline = CHECK.Report()
+                    CHECK.check_deadline(
+                        reg,
+                        phase,
+                        deadline,
+                        now=now,
+                        receipts={
+                            phase: {
+                                "event_at": datetime.fromisoformat(event_at.replace("Z", "+00:00"))
+                            }
+                        },
+                    )
+                    wall = next(row for row in deadline.rows if row[1] == "hard wall")
+                    self.assertEqual(wall[2], CHECK.FAIL)
+
+    def test_receipt_parsers_reject_duplicate_keys_bad_urls_and_duplicate_yaml(self) -> None:
+        schema = json.loads((ROOT / "submission/receipt.schema.json").read_text())
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(
+            {
+                phase: schema["$defs"][phase + "Receipt"]["properties"]["schema"]["const"]
+                for phase in CHECK.PHASES
+            },
+            CHECK.PHASE_RECEIPT_SCHEMAS,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            receipt = package / "receipt.json"
+            receipt.write_text('{"schema":"first","schema":"second"}\n')
+            with self.assertRaisesRegex(ValueError, "repeats JSON field"):
+                CHECK.read_contract_json(package, "receipt.json", "receipt")
+
+            (package / "attest.yaml").write_text("final-cut-only: false\nfinal-cut-only: true\n")
+            with self.assertRaisesRegex(ValueError, "unique-key YAML"):
+                CHECK.read_attestations(package)
+
+            (package / "attest.yaml").write_text("? [a, b]\n: true\n")
+            with self.assertRaisesRegex(ValueError, "unique-key YAML"):
+                CHECK.read_attestations(package)
+
+        for url in (
+            "http://vimeo.com/123",
+            "https://user:secret@vimeo.com/123",
+            "https://127.0.0.1/123",
+            "https://vimeo.com/123?password=secret",
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                CHECK.https_url(url, "upload")
+
+    def test_receipt_schema_is_executed_and_fails_closed_on_drift(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            receipt = json.loads((package / CHECK.PHASE_RECEIPTS["package"]).read_text())
+            self.assertEqual(CHECK.receipt_schema_errors(receipt, "package receipt"), [])
+            receipt["unexpected"] = True
+            self.assertTrue(CHECK.receipt_schema_errors(receipt, "package receipt"))
+
+            schema_path = package / "invalid-receipt.schema.json"
+            schema_path.write_text('{"$schema":"https://json-schema.org/draft/2020-12/schema","type":5}\n')
+            with mock.patch.object(CHECK, "RECEIPT_SCHEMA", schema_path):
+                errors = CHECK.receipt_schema_errors(receipt, "package receipt")
+            self.assertTrue(any("SchemaError" in error for error in errors))
+
+    def test_destination_safe_https_rejects_ambiguous_or_nonpublic_authorities(self) -> None:
+        for url in (
+            "https://vimeo.com/123",
+            "https://vimeo.com:443/123",
+            "https://media.example.org:8443/upload",
+        ):
+            with self.subTest(valid=url):
+                self.assertEqual(CHECK.destination_safe_https(url, "destination"), url)
+
+        invalid = (
+            "https://vimeo.com\\@127.0.0.1/123",
+            "https://example..org/upload",
+            "https://-example.org/upload",
+            "https://example-.org/upload",
+            "https://exa_mple.org/upload",
+            "https://%65xample.org/upload",
+            "https://example.org./upload",
+            "https://éxample.org/upload",
+            "https://xn--xample-9ua.org/upload",
+            "https://[v1.fe80]/upload",
+            "https://[2606:4700:4700::1111%25eth0]/upload",
+            "https://example.org:/upload",
+            "https://example.org:not-a-port/upload",
+            "https://example.org:0/upload",
+            "https://example.org:65536/upload",
+            "https://vimeo.com:99999/upload",
+            "https://@example.org/upload",
+            "https://user@example.org/upload",
+            "https://user:secret@example.org/upload",
+            "https://example.org/upload?",
+            "https://example.org/upload?token=secret",
+            "https://example.org/upload#",
+            "https://example.org/upload#confirmation",
+            "https://127.0.0.1/upload",
+            "https://127.1/upload",
+            "https://2130706433/upload",
+            "https://0177.0.0.1/upload",
+            "https://0x7f.0x0.0x0.0x1/upload",
+            "https://10.0.0.1/upload",
+            "https://[::1]/upload",
+            "https://localhost./upload",
+            "https://portal.local/upload",
+            "https://portal.internal/upload",
+            "https://intranet/upload",
+        )
+        for url in invalid:
+            with self.subTest(invalid=url), self.assertRaises(ValueError):
+                CHECK.destination_safe_https(url, "destination")
+
+    def test_package_identity_rejects_empty_dirty_stale_and_duplicate_manifests(self) -> None:
+        cases = ("empty", "dirty", "stale")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                item = package / "item.txt"
+                item.write_text("bytes\n")
+                manifest = {
+                    "schema": "danse.delivery.manifest.v1",
+                    "title": "THE THING WITHOUT A NAME",
+                    "seed": "0x0133D62C",
+                    "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                    "items": []
+                    if case == "empty"
+                    else [
+                        {
+                            "name": item.name,
+                            "bytes": item.stat().st_size,
+                            "sha256": "0" * 64 if case == "stale" else CHECK.sha256(item),
+                        }
+                    ],
+                }
+                (package / "manifest.json").write_text(json.dumps(manifest))
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, case != "dirty"),
+                ):
+                    _, _, errors = CHECK.validate_package_identity(package)
+                self.assertTrue(errors)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            (package / "manifest.json").write_text(
+                '{"schema":"danse.delivery.manifest.v1","items":[],"items":[]}\n'
+            )
+            _, _, errors = CHECK.validate_package_identity(package)
+            self.assertIn("repeats JSON field", errors[0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            manifest = {
+                "schema": "danse.delivery.manifest.v1",
+                "title": "THE THING WITHOUT A NAME",
+                "seed": "0x0133D62C",
+                "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                "items": [{"name": "/absolute.mp4", "bytes": 1, "sha256": "0" * 64}],
+            }
+            (package / "manifest.json").write_text(json.dumps(manifest) + "\n")
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                _, _, errors = CHECK.validate_package_identity(package)
+            self.assertTrue(any("contract root" in error for error in errors), errors)
+
+    def test_package_identity_rejects_unmanifested_files_directories_and_symlinks(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        cases = ("file", "directory", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                build_submission_receipt_chain(package, reg, through="package")
+                if case == "file":
+                    (package / "PRIVATE-UNMANIFESTED.txt").write_text("must not escape\n")
+                elif case == "directory":
+                    (package / "unknown-empty-directory").mkdir()
+                else:
+                    (package / "unmanifested-link").symlink_to(package / "screener.mp4")
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    _, _, errors = CHECK.validate_package_identity(package)
+                self.assertTrue(any("package surface" in error for error in errors), errors)
+
+    def test_package_identity_rejects_arbitrary_bytes_at_known_receipt_paths(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        for relative in (
+            CHECK.PHASE_RECEIPTS["submitted"],
+            CHECK.DONE_RECEIPTS["package"],
+            CHECK.DONE_RECEIPTS["submitted"],
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                build_submission_receipt_chain(package, reg, through="package")
+                receipt_path = package / relative
+                receipt_path.parent.mkdir(exist_ok=True)
+                receipt_path.write_bytes(b"PRIVATE ARBITRARY RECEIPT BYTES\n")
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    _, _, errors = CHECK.validate_package_identity(package)
+                self.assertTrue(any("not readable unique-key JSON" in error for error in errors), errors)
+
+    def test_selected_phase_rejects_later_receipts_and_semantically_checks_local_receipts(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="submitted")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            bounded = next(row for row in report.rows if row[1] == "phase-bounded receipt surface")
+            self.assertEqual(bounded[2], CHECK.FAIL)
+            self.assertIn(CHECK.PHASE_RECEIPTS["submitted"], bounded[3])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            records_report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                records_report,
+                now=now,
+            )
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                done_path, _ = CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            done = json.loads(done_path.read_text())
+            done["package"]["manifest_sha256"] = "0" * 64
+            done_path.write_text(json.dumps(done, indent=2) + "\n")
+            report = CHECK.Report()
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                CHECK.check_phase_receipts(
+                    reg,
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    attested,
+                    attest_path,
+                    report,
+                    now=now,
+                )
+            local = next(row for row in report.rows if row[1] == "validated-package receipt")
+            self.assertEqual(local[2], CHECK.FAIL)
+            self.assertIn("different package", local[3])
+
+    def test_machine_done_receipt_binds_and_rechecks_the_human_chain(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                done_path, done_digest = CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            self.assertEqual(done_digest, CHECK.sha256(done_path))
+            value = json.loads(done_path.read_text())
+            self.assertEqual(value["scope"], CHECK.DONE_RECEIPT_SCOPE)
+            self.assertEqual(len(value["predicates"]), 1)
+            self.assertNotIn("check-danse", value["predicates"][0])
+            self.assertNotIn("browser.py", value["predicates"][0])
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                self.assertEqual(
+                    CHECK.validate_done_receipt(
+                        value,
+                        done_path,
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    ),
+                    [],
+                )
+            phase_receipt = package / CHECK.PHASE_RECEIPTS["package"]
+            phase_receipt.write_text(phase_receipt.read_text() + "\n")
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                errors = CHECK.validate_done_receipt(
+                    value,
+                    done_path,
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            self.assertTrue(any("changed" in error for error in errors))
+
+    def test_done_receipt_revalidates_manifested_bytes_and_repository_state(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            records_report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                records_report,
+                now=now,
+            )
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                done_path, _ = CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            value = json.loads(done_path.read_text())
+            (package / "screener.mp4").write_bytes(b"mutated after phase validation")
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                errors = CHECK.validate_done_receipt(
+                    value,
+                    done_path,
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+                with self.assertRaisesRegex(ValueError, "invalid current package"):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+            self.assertTrue(any("package identity is no longer valid" in error for error in errors))
+
+            (package / "screener.mp4").write_text("exact package bytes\n")
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, False),
+            ):
+                with self.assertRaisesRegex(ValueError, "repository"):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
 
     def test_package_phase_includes_the_redacted_exact_manifest_rights_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2911,6 +3717,17 @@ class DeliveryContractTest(unittest.TestCase):
 
     def test_published_terms_keep_provenance_and_explicit_archive_choice(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        self.assertEqual(
+            {row["id"] for row in reg["terms"]},
+            {
+                "accepted-film-no-withdrawal",
+                "publicity-stills-free-of-rights",
+                "submission-rights-warranty",
+                "festival-scheduling-discretion",
+                "archive-library-choice",
+                "regulations-accepted",
+            },
+        )
         report = CHECK.Report()
         CHECK.check_requirement_phases(reg, report)
         term_row = next(row for row in report.rows if row[1] == "published term provenance and choice contract")
@@ -2947,20 +3764,95 @@ class DeliveryContractTest(unittest.TestCase):
         )
         self.assertEqual(broken_term_row[2], CHECK.FAIL)
 
-    def test_submitted_phase_explains_elapsed_target_without_reopening_it(self) -> None:
+    def test_register_preflight_binds_internal_delivery_label_and_audio_use_bytes(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        report = CHECK.Report()
+        CHECK.check_requirement_phases(reg, report)
+        contract = next(
+            row for row in report.rows if row[1] == "internal delivery and audio-use contract"
+        )
+        self.assertEqual(contract[2], CHECK.PASS)
+
+        stale = copy.deepcopy(reg)
+        stale["package"]["audio"]["usage_contract"]["sha256"] = "0" * 64
+        stale_report = CHECK.Report()
+        CHECK.check_requirement_phases(stale, stale_report)
+        stale_contract = next(
+            row for row in stale_report.rows if row[1] == "internal delivery and audio-use contract"
+        )
+        self.assertEqual(stale_contract[2], CHECK.FAIL)
+        self.assertIn("digest is missing or stale", stale_contract[3])
+
+        mislabelled = copy.deepcopy(reg)
+        mislabelled["package"]["published_requirement"] = True
+        mislabelled_report = CHECK.Report()
+        CHECK.check_requirement_phases(mislabelled, mislabelled_report)
+        mislabelled_contract = next(
+            row
+            for row in mislabelled_report.rows
+            if row[1] == "internal delivery and audio-use contract"
+        )
+        self.assertEqual(mislabelled_contract[2], CHECK.FAIL)
+        self.assertIn("misrepresented as published", mislabelled_contract[3])
+
+    def test_malformed_register_shapes_fail_cleanly_in_checks_and_cli(self) -> None:
+        source = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        malformed: list[tuple[str, dict]] = []
+        for section in CHECK.OWNED_SECTIONS:
+            for label, value in (("null", None), ("non-list", {}), ("non-mapping row", [None])):
+                register = copy.deepcopy(source)
+                register[section] = value
+                malformed.append((f"{section} {label}", register))
+
+        for field in ("deadline", "opportunity_snapshot", "package"):
+            register = copy.deepcopy(source)
+            del register[field]
+            malformed.append((f"missing {field}", register))
+
+        register = copy.deepcopy(source)
+        del register["package"]["master"]
+        malformed.append(("missing package.master", register))
+
+        for label, register in malformed:
+            with self.subTest(check=label):
+                report = CHECK.Report()
+                CHECK.check_requirement_phases(register, report)
+                self.assertGreater(report.failures, 0)
+
+            with self.subTest(cli=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "register.yaml"
+                path.write_text(yaml.safe_dump(register, sort_keys=False))
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", ["check.py", "--register", str(path)]),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    result = CHECK.main()
+                self.assertEqual(result, 1)
+                output = stdout.getvalue() + stderr.getvalue()
+                self.assertIn("submission register has malformed structure", output)
+                self.assertNotIn("Traceback", output)
+
+    def test_submitted_phase_name_alone_cannot_close_elapsed_targets(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
         report = CHECK.Report()
         CHECK.check_deadline(reg, "submitted", report, now=now)
-        target = next(row for row in report.rows if row[1] == "target file date")
-        self.assertEqual(target[2], CHECK.PASS)
-        self.assertIn("submitted-phase receipt", target[3])
+        target = next(row for row in report.rows if row[1] == "upload target")
+        self.assertEqual(target[2], CHECK.FAIL)
+        self.assertIn("no timely uploaded receipt", target[3])
 
-    def test_submitted_phase_remains_verifiable_after_the_hard_wall(self) -> None:
+    def test_submitted_phase_after_the_hard_wall_requires_timed_receipts(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
         submitted = CHECK.Report()
-        CHECK.check_deadline(reg, "submitted", submitted, now=now)
+        receipts = {
+            "uploaded": {"event_at": datetime(2026, 8, 31, 21, 59, tzinfo=timezone.utc)},
+            "submitted": {"event_at": datetime(2026, 9, 1, 1, 59, tzinfo=timezone.utc)},
+        }
+        CHECK.check_deadline(reg, "submitted", submitted, now=now, receipts=receipts)
         hard_wall = next(row for row in submitted.rows if row[1] == "hard wall")
         self.assertEqual(hard_wall[2], CHECK.PASS)
         package = CHECK.Report()
@@ -3043,6 +3935,67 @@ class DeliveryContractTest(unittest.TestCase):
             BROWSER.main()
         self.assertEqual(raised.exception.code, 2)
         self.assertFalse(forbidden.called)
+
+    def test_delivery_stages_only_the_verified_score_motion_evidence_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "evidence"
+            source.mkdir()
+            receipt = source / "score-to-motion-production.json"
+            sample = source / "score-to-motion-samples.json"
+            sample.write_text('{"sample":true}\n')
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                        "span": {
+                            "river_seed": 20170620,
+                            "stream": 0,
+                            "passage": SPAN["passage"],
+                            "t0": SPAN["t0"],
+                            "t1": SPAN["t1"],
+                            "duration_seconds": SPAN["duration"],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            contract = SimpleNamespace(
+                production_receipt_errors=lambda path: [],
+                evidence_artifact_paths=lambda path: [receipt, sample],
+            )
+            package = root / "package"
+            package.mkdir()
+            with (
+                mock.patch.object(DELIVER, "SCORE_MOTION_EVIDENCE", receipt),
+                mock.patch.object(DELIVER, "score_motion_contract", return_value=contract),
+            ):
+                reference, staged = DELIVER.stage_score_motion_evidence(
+                    package,
+                    SPAN,
+                    SUBMISSION_REPOSITORY_HEAD,
+                )
+            self.assertEqual(reference["path"], DELIVER.SCORE_MOTION_EVIDENCE_ITEM)
+            self.assertEqual(len(staged), 2)
+            self.assertEqual(
+                (package / DELIVER.SCORE_MOTION_EVIDENCE_DIR / sample.name).read_bytes(),
+                sample.read_bytes(),
+            )
+
+    def test_submission_score_motion_row_never_substitutes_for_human_acceptance(self) -> None:
+        contract = SimpleNamespace(packaged_receipt_errors=lambda *args, **kwargs: [])
+        loader = SimpleNamespace(exec_module=lambda module: None)
+        spec = SimpleNamespace(loader=loader)
+        with (
+            mock.patch.object(CHECK.importlib.util, "spec_from_file_location", return_value=spec),
+            mock.patch.object(CHECK.importlib.util, "module_from_spec", return_value=contract),
+        ):
+            report = CHECK.Report()
+            CHECK.check_score_motion(Path("unused"), report)
+        self.assertEqual(report.rows[0][2], CHECK.PASS)
+        self.assertIn("machine evidence", report.rows[0][1])
+        self.assertIn("human review not attested", report.rows[0][3])
+        self.assertNotIn("accepted", report.rows[0][3])
 
 
 if __name__ == "__main__":
