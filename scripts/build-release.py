@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import html
 import io
+import json
 import os
 import platform
 import posixpath
@@ -1361,7 +1362,48 @@ def _read_utf8_artifact(output: Path, relative: str, label: str) -> str:
         raise ReleaseError(f"{label} is not readable UTF-8: {exc}") from exc
 
 
-def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
+def source_release_manifest(
+    root: Path,
+    commit: str,
+    *,
+    allow_worktree_fallback: bool = False,
+) -> tuple[dict, str]:
+    """Read the release manifest from the declared commit, or an explicit fixture."""
+    root = root.absolute().resolve()
+    committed = subprocess.run(
+        ["git", "-C", str(root), "show", f"{commit}:{MANIFEST.as_posix()}"],
+        capture_output=True,
+        check=False,
+    )
+    if committed.returncode == 0:
+        data = committed.stdout
+    elif allow_worktree_fallback:
+        path = source_file(root, MANIFEST.as_posix(), "release manifest")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"release manifest cannot be read: {exc}") from exc
+    else:
+        detail = committed.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(
+            f"cannot resolve release manifest at source commit {commit}: {detail}"
+        )
+    try:
+        manifest = json.loads(data)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"source-commit release manifest is invalid JSON: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ReleaseError("source-commit release manifest must be an object")
+    return manifest, hashlib.sha256(data).hexdigest()
+
+
+def verify_artifact(
+    output: Path,
+    expected_commit: str | None = None,
+    *,
+    source_root: Path = ROOT,
+    allow_worktree_manifest: bool = True,
+) -> dict:
     output = output.absolute()
     if output.is_symlink() or not output.is_dir():
         raise ReleaseError(f"release artifact root must be a regular directory: {output}")
@@ -1410,6 +1452,18 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         raise ReleaseError("release artifact opportunity_snapshot digest is invalid")
     if release["manifest"]["path"] != MANIFEST.as_posix():
         raise ReleaseError("release artifact points at a non-canonical release manifest")
+    source_manifest, source_manifest_sha256 = source_release_manifest(
+        source_root,
+        commit,
+        allow_worktree_fallback=allow_worktree_manifest,
+    )
+    if release["manifest"]["sha256"] != source_manifest_sha256:
+        raise ReleaseError("release artifact manifest digest does not match its source commit")
+    expected_project_security = project_security_contract(source_manifest)
+    if release["project_security"] != expected_project_security:
+        raise ReleaseError(
+            "release artifact project security binding drifted from its source manifest"
+        )
     installation_reference = release["installation_reference"]
     if not isinstance(installation_reference, dict) or set(installation_reference) != {
         "schema",
@@ -1506,9 +1560,16 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
     verify_project_links(output, set(paths))
     verify_project_security(
         project,
-        release["project_security"],
+        expected_project_security,
         delivered_records,
     )
+    expected_project = project_html(source_manifest, receipt["phase"], commit).decode(
+        "utf-8"
+    )
+    if project != expected_project:
+        raise ReleaseError(
+            "project page does not reproduce the source-manifest public claims"
+        )
     draft = receipt["phase"] == "draft"
     if ('name="robots" content="noindex,nofollow"' in project) != draft:
         raise ReleaseError("project-page robot policy does not match artifact phase")
@@ -1686,7 +1747,12 @@ def build(
     if require_git_source:
         validate_git_source(root, commit)
     write_bytes(output, ARTIFACT_MANIFEST, canonical_json(receipt))
-    return verify_artifact(output, commit)
+    return verify_artifact(
+        output,
+        commit,
+        source_root=root,
+        allow_worktree_manifest=True,
+    )
 
 
 def main() -> int:
@@ -1708,7 +1774,12 @@ def main() -> int:
                 require_git_source=True,
             )
         else:
-            receipt = verify_artifact(args.verify, args.source_commit)
+            receipt = verify_artifact(
+                args.verify,
+                args.source_commit,
+                source_root=args.root,
+                allow_worktree_manifest=False,
+            )
             if receipt["phase"] != args.phase:
                 raise ReleaseError(
                     f"artifact phase {receipt['phase']} does not match expected {args.phase}"

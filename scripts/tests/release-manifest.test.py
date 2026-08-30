@@ -1206,6 +1206,99 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "opening document attributes"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_self_rehashed_project_cannot_change_public_claims(self) -> None:
+        attacks = {
+            "title": lambda value: value.replace(
+                "<title>Danse - a room that never repeats | Project</title>",
+                "<title>Unreceipted exhibition claim</title>",
+            ),
+            "description": lambda value: value.replace(
+                'name="description" content="',
+                'name="description" content="Unreceipted synopsis. ',
+                1,
+            ),
+            "heading": lambda value: value.replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted public title</h1>",
+            ),
+            "status-copy": lambda value: value.replace(
+                "Draft - not for publication",
+                "Approved and already published",
+            ),
+        }
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / f"claims-{label}"
+                shutil.copytree(self.output, case)
+                project = case / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_at(case)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "does not reproduce the source-manifest public claims",
+                ):
+                    BUILD.verify_artifact(case, TEST_COMMIT)
+
+    def test_coherently_rehashed_social_claim_still_fails_source_binding(self) -> None:
+        root = fixture_root(self.base / "social-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "social-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        social_path = output / "media/assets/project-social-card.bin"
+        social_path.write_bytes(social_path.read_bytes() + b"tampered social bytes\n")
+        social_sha = CONTRACT.sha256(social_path)
+
+        inventory_path = output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        social_row = next(
+            row for row in inventory["media"] if row["id"] == "project-social-card"
+        )
+        social_row["released"]["bytes"] = social_path.stat().st_size
+        social_row["released"]["sha256"] = social_sha
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        project = output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted social-preview claim</h1>",
+            ),
+            encoding="utf-8",
+        )
+
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        records = {record["path"]: record for record in receipt["files"]}
+        for relative in (
+            "media/assets/project-social-card.bin",
+            "media/release-media.json",
+            "project/index.html",
+        ):
+            path = output / relative
+            records[relative]["bytes"] = path.stat().st_size
+            records[relative]["sha256"] = CONTRACT.sha256(path)
+        binding = receipt["release"]["project_security"]["social_image"]
+        binding["bytes"] = social_path.stat().st_size
+        binding["sha256"] = social_sha
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "project security binding drifted from its source manifest",
+        ):
+            BUILD.verify_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
     def test_self_rehashed_project_with_security_metadata_outside_head_fails(self) -> None:
         project = self.output / "project/index.html"
         original = project.read_text(encoding="utf-8")
@@ -1253,6 +1346,17 @@ class AdversarialArtifactTest(unittest.TestCase):
         receipt["release"]["manifest"]["path"] = "release/other-manifest.json"
         receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-canonical release manifest"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_manifest_digest_cannot_leave_source_commit(self) -> None:
+        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["release"]["manifest"]["sha256"] = "f" * 64
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "manifest digest does not match its source commit",
+        ):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_duplicate_receipt_key_fails(self) -> None:

@@ -260,6 +260,8 @@ def _load_release_builder():
 def public_release_files(
     release_artifact: Path,
     expected_commit: str,
+    *,
+    source_root: Path = ROOT,
 ) -> tuple[dict[str, tuple[Path, dict]], dict]:
     """Verify one public release artifact and select only declared public outputs."""
     release_artifact = release_artifact.absolute()
@@ -268,7 +270,12 @@ def public_release_files(
     release_artifact = release_artifact.resolve()
     builder = _load_release_builder()
     try:
-        receipt = builder.verify_artifact(release_artifact, expected_commit)
+        receipt = builder.verify_artifact(
+            release_artifact,
+            expected_commit,
+            source_root=source_root,
+            allow_worktree_manifest=True,
+        )
     except Exception as exc:
         raise ArtifactError(f"public release artifact failed verification: {exc}") from exc
     if receipt.get("phase") != "public":
@@ -391,6 +398,8 @@ def public_release_files(
         "release_id": receipt["release"]["id"],
         "version": receipt["release"]["version"],
         "receipt_sha256": sha256(release_receipt),
+        "manifest_sha256": receipt["release"]["manifest"]["sha256"],
+        "project_sha256": receipt_files["project/index.html"]["sha256"],
         "project_security": receipt["release"]["project_security"],
     }
     return selected, binding
@@ -507,7 +516,12 @@ def artifact_inventory(root: Path) -> set[str]:
     return files
 
 
-def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
+def verify_artifact(
+    output: Path,
+    expected_commit: str | None = None,
+    *,
+    require_source_manifest: bool = False,
+) -> dict:
     output = output.absolute()
     if output.is_symlink():
         raise ArtifactError(f"artifact root must not be a symlink: {output}")
@@ -539,6 +553,8 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             "release_id",
             "version",
             "receipt_sha256",
+            "manifest_sha256",
+            "project_sha256",
             "project_security",
         }:
             raise ArtifactError("artifact release binding has an unknown shape")
@@ -550,6 +566,8 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             or not isinstance(release["version"], str)
             or not release["version"]
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["receipt_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(release["manifest_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(release["project_sha256"]))
         ):
             raise ArtifactError("artifact release binding is invalid")
 
@@ -610,6 +628,44 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             )
         except Exception as exc:
             raise ArtifactError(f"artifact project security failed verification: {exc}") from exc
+        if delivered_records["project/index.html"]["sha256"] != release["project_sha256"]:
+            raise ArtifactError(
+                "artifact project bytes drifted from the verified release receipt"
+            )
+        if require_source_manifest:
+            try:
+                source_manifest, manifest_sha256 = builder.source_release_manifest(
+                    ROOT,
+                    source["commit"],
+                    allow_worktree_fallback=False,
+                )
+                if manifest_sha256 != release["manifest_sha256"]:
+                    raise ArtifactError(
+                        "artifact release manifest drifted from the source commit"
+                    )
+                if builder.project_security_contract(source_manifest) != release[
+                    "project_security"
+                ]:
+                    raise ArtifactError(
+                        "artifact project security drifted from the source manifest"
+                    )
+                expected_project = builder.project_html(
+                    source_manifest,
+                    "public",
+                    source["commit"],
+                )
+                if hashlib.sha256(expected_project).hexdigest() != release[
+                    "project_sha256"
+                ]:
+                    raise ArtifactError(
+                        "artifact project bytes drifted from the source manifest"
+                    )
+            except ArtifactError:
+                raise
+            except Exception as exc:
+                raise ArtifactError(
+                    f"artifact source-manifest binding failed verification: {exc}"
+                ) from exc
     return manifest
 
 
@@ -619,6 +675,7 @@ def build(
     commit: str,
     release_artifact: Path | None = None,
     *,
+    release_source_root: Path | None = None,
     require_git_source: bool = False,
 ) -> dict:
     root = root.absolute()
@@ -642,7 +699,11 @@ def build(
     release_files: dict[str, tuple[Path, dict]] = {}
     release_binding = None
     if release_artifact is not None:
-        release_files, release_binding = public_release_files(release_artifact, commit)
+        release_files, release_binding = public_release_files(
+            release_artifact,
+            commit,
+            source_root=release_source_root or root,
+        )
     collisions = set(files) & set(release_files)
     if collisions:
         raise ArtifactError(f"public release outputs collide with the artwork: {sorted(collisions)}")
@@ -684,7 +745,11 @@ def build(
     )
     manifest_path.chmod(0o644)
     os.utime(manifest_path, (0, 0), follow_symlinks=False)
-    return verify_artifact(output, commit)
+    return verify_artifact(
+        output,
+        commit,
+        require_source_manifest=require_git_source,
+    )
 
 
 def main() -> int:
@@ -712,7 +777,11 @@ def main() -> int:
                 require_git_source=True,
             )
         else:
-            manifest = verify_artifact(args.verify, args.source_commit)
+            manifest = verify_artifact(
+                args.verify,
+                args.source_commit,
+                require_source_manifest=True,
+            )
     except ArtifactError as exc:
         parser.exit(1, f"pages artifact: {exc}\n")
     print(

@@ -83,9 +83,13 @@ every displayed source to the release-media receipt. The opening document attrib
 and first two head records are exact, so no attribute can initiate a request before the
 CSP and referrer policy. Canonical and Open Graph discovery metadata are bound to the
 manifest-derived project URL and, when cleared, the exact receipted social-card bytes.
-Generated outputs are not committed from the draft phase. The Pages verifier reapplies
-the same policy and discovery binding after composing the artwork and public release,
-so rehashing the outer Pages manifest cannot admit weakened project markup.
+Verification also resolves the release manifest at the declared source commit and
+reproduces the complete project page byte-for-byte, so titles, synopsis, credits,
+statuses, links, and other passive public claims cannot be changed by rehashing an
+artifact receipt. Generated outputs are not committed from the draft phase. The Pages
+receipt retains the source-manifest, release-receipt, project-byte, and discovery
+bindings and reapplies the same policy after composition, so rehashing the outer Pages
+manifest cannot admit weakened project markup.
 
 ## Closing a gate
 

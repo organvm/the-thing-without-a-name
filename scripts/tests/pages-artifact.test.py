@@ -157,7 +157,7 @@ def public_fixture(root: Path) -> None:
     write(root / "project/index.html", b"unapproved project route\n")
 
 
-def release_artifact_fixture(base: Path, phase: str) -> Path:
+def release_artifact_fixture(base: Path, phase: str) -> tuple[Path, Path]:
     source = RELEASE_SUPPORT.fixture_root(base / f"{phase}-release-source")
     if phase == "public":
         manifest = RELEASE_SUPPORT.complete_manifest(source)
@@ -165,7 +165,7 @@ def release_artifact_fixture(base: Path, phase: str) -> Path:
         RELEASE_SUPPORT.write_manifest(source, manifest)
     output = base / f"{phase}-release-artifact"
     RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
-    return output
+    return output, source
 
 
 class ProductionArtifactTest(unittest.TestCase):
@@ -395,14 +395,19 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(dirty_output.exists())
 
     def test_verified_public_release_adds_only_declared_outputs_and_keeps_artwork_at_root(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
-        selected, binding = PAGES.public_release_files(release, TEST_COMMIT)
+        release, release_source = release_artifact_fixture(self.base, "public")
+        selected, binding = PAGES.public_release_files(
+            release,
+            TEST_COMMIT,
+            source_root=release_source,
+        )
         root_index = (self.root / "index.html").read_bytes()
         manifest = PAGES.build(
             self.root,
             self.output,
             TEST_COMMIT,
             release_artifact=release,
+            release_source_root=release_source,
         )
         paths = {record["path"] for record in manifest["files"]}
         self.assertEqual(manifest["release"], binding)
@@ -457,12 +462,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("submission/") for path in paths))
 
     def test_receipted_project_link_outside_pages_boundary_fails(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         PAGES.build(
             self.root,
             self.output,
             TEST_COMMIT,
             release_artifact=release,
+            release_source_root=release_source,
         )
         project = self.output / "project/index.html"
         project.write_text(
@@ -477,12 +483,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
             PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_rehashed_pages_manifest_cannot_admit_weakened_project_security(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         PAGES.build(
             self.root,
             self.output,
             TEST_COMMIT,
             release_artifact=release,
+            release_source_root=release_source,
         )
         project = self.output / "project/index.html"
         project.write_text(
@@ -551,12 +558,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
             with self.subTest(attack=label):
                 case = self.base / label
                 output = case / "pages"
-                release = release_artifact_fixture(case, "public")
+                release, release_source = release_artifact_fixture(case, "public")
                 PAGES.build(
                     self.root,
                     output,
                     TEST_COMMIT,
                     release_artifact=release,
+                    release_source_root=release_source,
                 )
                 self.output = output
                 project = output / "project/index.html"
@@ -571,6 +579,53 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 ):
                     PAGES.verify_artifact(output, TEST_COMMIT)
 
+    def test_rehashed_pages_manifest_cannot_change_public_claims(self) -> None:
+        release, release_source = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
+            release_source_root=release_source,
+        )
+        attacks = {
+            "title": lambda value: value.replace(
+                "<title>Danse - a room that never repeats | Project</title>",
+                "<title>Unreceipted exhibition claim</title>",
+            ),
+            "description": lambda value: value.replace(
+                'name="description" content="',
+                'name="description" content="Unreceipted synopsis. ',
+                1,
+            ),
+            "heading": lambda value: value.replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted public title</h1>",
+            ),
+            "status-copy": lambda value: value.replace(
+                "8 gates remain blocked in the bound reference ledger",
+                "Every installation gate is approved worldwide",
+            ),
+        }
+        baseline = self.output
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / f"pages-claims-{label}"
+                shutil.copytree(baseline, case)
+                self.output = case
+                project = case / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_manifest()
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "project bytes drifted from the verified release receipt",
+                ):
+                    PAGES.verify_artifact(case, TEST_COMMIT)
+        self.output = baseline
+
     def test_missing_or_draft_release_artifact_fails_before_pages_bytes(self) -> None:
         missing = self.base / "missing-release"
         with self.assertRaisesRegex(PAGES.ArtifactError, "missing or symlinked"):
@@ -582,24 +637,26 @@ class ArtifactBoundaryTest(unittest.TestCase):
             )
         self.assertFalse(self.output.exists())
 
-        draft = release_artifact_fixture(self.base, "draft")
+        draft, draft_source = release_artifact_fixture(self.base, "draft")
         with self.assertRaisesRegex(PAGES.ArtifactError, "public-phase"):
             PAGES.build(
                 self.root,
                 self.output,
                 TEST_COMMIT,
                 release_artifact=draft,
+                release_source_root=draft_source,
             )
         self.assertFalse(self.output.exists())
 
     def test_release_artifact_wrong_sha_tamper_and_extra_file_fail_closed(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         with self.assertRaisesRegex(PAGES.ArtifactError, "does not match expected"):
             PAGES.build(
                 self.root,
                 self.output,
                 "b" * 40,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
@@ -610,10 +667,11 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
-        release = release_artifact_fixture(self.base / "extra", "public")
+        release, release_source = release_artifact_fixture(self.base / "extra", "public")
         write(release / "unrecorded-private.txt")
         with self.assertRaisesRegex(PAGES.ArtifactError, "inventory mismatch"):
             PAGES.build(
@@ -621,12 +679,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
     def test_symlinked_release_artifact_or_file_fails_closed(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         alias = self.base / "release-alias"
         alias.symlink_to(release, target_is_directory=True)
         with self.assertRaisesRegex(PAGES.ArtifactError, "missing or symlinked"):
@@ -635,6 +694,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=alias,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
@@ -649,6 +709,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
