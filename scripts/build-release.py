@@ -84,6 +84,7 @@ class _ProjectMarkup(HTMLParser):
         self.metas: list[dict[str, str | None]] = []
         self.active_elements: set[str] = set()
         self.event_handlers: set[str] = set()
+        self.duplicate_attributes: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -100,6 +101,15 @@ class _ProjectMarkup(HTMLParser):
         self.event_handlers.update(
             name for name, _value in attrs if name.lower().startswith("on")
         )
+        names = [name.lower() for name, _value in attrs]
+        self.duplicate_attributes.update(
+            name for name in names if names.count(name) > 1
+        )
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
 
 
 def _h(value: object) -> str:
@@ -945,6 +955,19 @@ def verify_project_security(project: str) -> None:
     ]
     if referrers != ["no-referrer"]:
         raise ReleaseError("project page lacks the exact no-referrer policy")
+    unexpected_http_equiv = sorted(
+        {
+            value
+            for meta in parser.metas
+            if (value := (meta.get("http-equiv") or "").lower())
+            and value != "content-security-policy"
+        }
+    )
+    if unexpected_http_equiv:
+        raise ReleaseError(
+            "project page contains prohibited HTTP-equivalent metadata: "
+            + ", ".join(unexpected_http_equiv)
+        )
     if parser.active_elements:
         raise ReleaseError(
             "project page contains prohibited active elements: "
@@ -954,6 +977,11 @@ def verify_project_security(project: str) -> None:
         raise ReleaseError(
             "project page contains prohibited inline event handlers: "
             + ", ".join(sorted(parser.event_handlers))
+        )
+    if parser.duplicate_attributes:
+        raise ReleaseError(
+            "project page contains duplicate attributes: "
+            + ", ".join(sorted(parser.duplicate_attributes))
         )
 
 

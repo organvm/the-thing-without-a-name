@@ -75,8 +75,9 @@ version, and source commit. The generated project page is passive by contract: a
 fail-closed Content Security Policy blocks scripts, connections, frames, objects, forms,
 workers, and remote media, while a no-referrer policy prevents outbound link
 navigation from disclosing the project path. Artifact verification rejects a weakened
-policy, active elements, or inline event handlers even if a modified artifact is
-self-rehashed. Generated outputs are not committed from the draft phase.
+policy, active elements, redirect metadata, duplicate attributes, or inline event
+handlers even if a modified artifact is self-rehashed. Generated outputs are not
+committed from the draft phase.
 
 ## Closing a gate
 

@@ -983,6 +983,32 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: script"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_self_rehashed_project_with_self_closing_event_handler_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<img src="data:," onerror="document.body.dataset.changed = true"/></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "inline event handlers: onerror"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_meta_refresh_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<meta http-equiv="refresh" content="0;url=https://example.invalid/"></head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTP-equivalent metadata: refresh"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_symlinked_project_file_fails(self) -> None:
         outside = self.base / "outside.html"
