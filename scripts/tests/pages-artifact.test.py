@@ -34,6 +34,19 @@ PAGES = load_pages_builder()
 TEST_COMMIT = "a" * 40
 
 
+def load_browser_runner():
+    spec = importlib.util.spec_from_file_location(
+        "danse_browser_runner_test", ROOT / "render/browser.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+BROWSER = load_browser_runner()
+
+
 def load_release_support():
     spec = importlib.util.spec_from_file_location(
         "danse_pages_release_test_support",
@@ -786,6 +799,34 @@ class InterfaceContractTest(unittest.TestCase):
         cls.markup.feed(cls.html)
         cls.script = "\n".join(cls.markup.scripts)
         cls.styles = (ROOT / "interface/styles.css").read_text(encoding="utf-8")
+
+    def test_browser_launcher_requires_the_canonical_apple_metal_identity(self) -> None:
+        runner = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        self.assertIn("if APPLE_ANGLE_METAL_RENDERER.fullmatch(name) is None:", runner)
+        self.assertNotIn("any(w in name.lower() for w in WANTED)", runner)
+        self.assertEqual(
+            BROWSER.APPLE_ANGLE_METAL_RENDERER.pattern,
+            RELEASE_SUPPORT.CONTRACT.APPLE_ANGLE_METAL_RENDERER.pattern,
+        )
+        accepted = (
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+        )
+        rejected = (
+            "Apple Metal Renderer",
+            "ANGLE (Apple, OpenGL Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Google, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, SwiftShader software rasterizer)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)\n",
+            "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device), SwiftShader driver)",
+        )
+        for renderer in accepted:
+            with self.subTest(renderer=renderer):
+                self.assertIsNotNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
+        for renderer in rejected:
+            with self.subTest(renderer=renderer):
+                self.assertIsNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
 
     def test_five_category_surface_and_advanced_sheet_are_accessible(self) -> None:
         tag, hud = self.markup.by_id["hud"]

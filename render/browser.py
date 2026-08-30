@@ -28,6 +28,7 @@ import contextlib
 import functools
 import http.server
 import json
+import re
 import socket
 import socketserver
 import sys
@@ -37,10 +38,13 @@ from pathlib import Path
 
 APP = Path(__file__).resolve().parent.parent
 
-# ANGLE on macOS reports e.g. "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, …)".
-# SwiftShader reports "SwiftShader" and llvmpipe reports "llvmpipe" — either means
-# the frame is being drawn on the CPU.
-WANTED = ("metal", "apple")
+# The machine-bound receipt contract accepts only system Chrome's structured
+# ANGLE identity. Reuse the same anchored format here so an Apple-only or
+# Metal-only label cannot enter the browser that generates the receipt.
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
 
 READ_RENDERER = """
 () => {
@@ -142,11 +146,12 @@ def browser(headless: bool = True, width: int = 1024, height: int = 768):
             if not gpu["ok"]:
                 raise SystemExit(f"no WebGL2: {gpu['renderer']}")
             name = str(gpu["renderer"])
-            if not any(w in name.lower() for w in WANTED):
+            if APPLE_ANGLE_METAL_RENDERER.fullmatch(name) is None:
                 raise SystemExit(
                     f"refusing to render on {name!r}.\n"
-                    "This is a software rasteriser. The film would take a day and come out wrong.\n"
-                    "Check that Google Chrome is installed and that channel='chrome' resolved to it."
+                    "The renderer is not the canonical system-Chrome ANGLE Apple-Metal backend.\n"
+                    "Check that Google Chrome is installed, channel='chrome' resolved to it, "
+                    "and ANGLE reports the Apple Metal device identity."
                 )
             page.gl_renderer = name
             yield page
