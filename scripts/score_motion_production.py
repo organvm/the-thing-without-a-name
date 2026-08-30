@@ -1099,6 +1099,8 @@ def _producer_receipt_errors(
             if inputs.get(field) != value:
                 errors.append(f"{mode} render segment {ordinal} has stale {field}")
         if mode == "with_score":
+            if "duration_seconds" in inputs:
+                errors.append("with_score render segment span is not owned by its score")
             if inputs.get("source_tree_sha256") != expected["source_tree_sha256"]:
                 errors.append(f"{mode} render segment {ordinal} has a stale source tree")
             score = inputs.get("music_score") if isinstance(inputs.get("music_score"), dict) else {}
@@ -1113,6 +1115,16 @@ def _producer_receipt_errors(
         else:
             if "music_score" in inputs or "choreography" in inputs:
                 errors.append(f"control render segment {ordinal} is not score-free")
+            duration_seconds = inputs.get("duration_seconds")
+            if (
+                not isinstance(duration_seconds, (int, float))
+                or isinstance(duration_seconds, bool)
+                or not math.isfinite(float(duration_seconds))
+                or duration_seconds != expected["span"]["duration_seconds"]
+            ):
+                errors.append(
+                    f"control render segment {ordinal} does not bind the selected production span"
+                )
             if control_source is not None and inputs.get("source_tree_sha256") != control_source:
                 errors.append(f"control render segment {ordinal} has a stale no-score source tree")
         capture = segment.get("capture") if isinstance(segment.get("capture"), dict) else {}

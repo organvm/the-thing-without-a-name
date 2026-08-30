@@ -223,6 +223,7 @@ def film_url(base: str, args) -> str:
         ("width", args.width),
         ("height", args.height),
         ("fps", args.fps),
+        ("duration", getattr(args, "duration_seconds", None)),
         ("score", score["path"] if score else None),
         ("choreography", choreography["path"] if choreography else None),
     ):
@@ -256,6 +257,9 @@ def segment_identity(args, segment: int, frames: int) -> dict:
     choreography = choreography_identity(args)
     if choreography:
         payload["inputs"]["choreography"] = choreography
+    duration_seconds = getattr(args, "duration_seconds", None)
+    if duration_seconds is not None:
+        payload["inputs"]["duration_seconds"] = duration_seconds
     return payload
 
 
@@ -668,6 +672,11 @@ def main() -> int:
     ap.add_argument("--height", type=int, help="override the window's height")
     ap.add_argument("--fps", type=float, help="override the window's frame rate")
     ap.add_argument(
+        "--duration-seconds",
+        type=float,
+        help="fix a score-free capture to an exact positive span in seconds",
+    )
+    ap.add_argument(
         "--score",
         help="opt into a compiled score contract (for example music/score.json); omitted keeps the current artwork",
     )
@@ -698,6 +707,11 @@ def main() -> int:
 
     score = music_score_identity(args)
     choreography = choreography_identity(args)
+    if args.duration_seconds is not None:
+        if not math.isfinite(args.duration_seconds) or args.duration_seconds <= 0:
+            ap.error("--duration-seconds must be finite and positive")
+        if score:
+            ap.error("--duration-seconds is only valid for a score-free capture")
     if score and args._music_score_contract["release_status"] != "fixture-only" and not choreography:
         ap.error("a production --score requires --choreography")
 

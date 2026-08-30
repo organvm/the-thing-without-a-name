@@ -280,6 +280,8 @@ class EvidenceFixture:
                     for field in ("path", "file_sha256", "contract_sha256")
                 }
                 inputs["choreography"] = copy.deepcopy(self.context["choreography"])
+            else:
+                inputs["duration_seconds"] = self.context["span"]["duration_seconds"]
             segment_receipt.write_text(
                 json.dumps(
                     {
@@ -531,11 +533,22 @@ class ProductionScoreMotionTest(unittest.TestCase):
             )
 
     def test_producer_modes_and_segment_chain_fail_closed(self) -> None:
-        cases = ("scored-control", "missing-choreography", "short-segment")
+        cases = (
+            "scored-control",
+            "missing-control-span",
+            "stale-control-span",
+            "overridden-with-score-span",
+            "missing-choreography",
+            "short-segment",
+        )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 fixture = EvidenceFixture(Path(temporary))
-                mode = "control" if case == "scored-control" else "with_score"
+                mode = (
+                    "control"
+                    if case in {"scored-control", "missing-control-span", "stale-control-span"}
+                    else "with_score"
+                )
                 concat_path = fixture.producer_paths[mode]
                 concat = json.loads(concat_path.read_text())
                 segment_path = concat_path.parent / f"{concat['segments'][0]['name']}.receipt.json"
@@ -545,6 +558,14 @@ class ProductionScoreMotionTest(unittest.TestCase):
                         field: fixture.context["score"][field]
                         for field in ("path", "file_sha256", "contract_sha256")
                     }
+                elif case == "missing-control-span":
+                    segment["inputs"].pop("duration_seconds")
+                elif case == "stale-control-span":
+                    segment["inputs"]["duration_seconds"] = 312.540051998
+                elif case == "overridden-with-score-span":
+                    segment["inputs"]["duration_seconds"] = fixture.context["span"][
+                        "duration_seconds"
+                    ]
                 elif case == "missing-choreography":
                     segment["inputs"].pop("choreography")
                 else:
@@ -565,6 +586,15 @@ class ProductionScoreMotionTest(unittest.TestCase):
                     )
                 expected_error = {
                     "scored-control": "control render segment 0 is not score-free",
+                    "missing-control-span": (
+                        "control render segment 0 does not bind the selected production span"
+                    ),
+                    "stale-control-span": (
+                        "control render segment 0 does not bind the selected production span"
+                    ),
+                    "overridden-with-score-span": (
+                        "with_score render segment span is not owned by its score"
+                    ),
                     "missing-choreography": "with_score render segment 0 has stale choreography",
                     "short-segment": "with_score render segment 0 does not own its exact frame range",
                 }[case]

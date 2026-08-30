@@ -452,6 +452,7 @@ class DeliveryContractTest(unittest.TestCase):
             width=3840,
             height=2160,
             fps=24,
+            duration_seconds=350.896343125,
         )
         query = parse_qs(urlparse(OFFLINE.film_url("http://render.test", args)).query)
         self.assertEqual(
@@ -465,6 +466,7 @@ class DeliveryContractTest(unittest.TestCase):
                 "width": ["3840"],
                 "height": ["2160"],
                 "fps": ["24"],
+                "duration": ["350.896343125"],
             },
         )
 
@@ -563,6 +565,7 @@ class DeliveryContractTest(unittest.TestCase):
             height=2160,
             fps=30,
             segment_frames=900,
+            duration_seconds=350.896343125,
         )
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             OFFLINE, "source_tree_sha256", return_value="source-tree"
@@ -604,7 +607,11 @@ class DeliveryContractTest(unittest.TestCase):
                     },
                 )
                 expected = OFFLINE.segment_identity(args, 0, 30)
+                self.assertEqual(expected["inputs"]["duration_seconds"], 350.896343125)
                 self.assertTrue(OFFLINE.complete(dest, 30, expected))
+                args.duration_seconds = 312.540051998
+                self.assertFalse(OFFLINE.complete(dest, 30, OFFLINE.segment_identity(args, 0, 30)))
+                args.duration_seconds = 350.896343125
                 args.start = 1.0
                 self.assertFalse(OFFLINE.complete(dest, 30, OFFLINE.segment_identity(args, 0, 30)))
                 args.start = 0.0
@@ -3157,6 +3164,58 @@ class DeliveryContractTest(unittest.TestCase):
                 next(row for row in deadline.rows if row[1] == "upload target")[3],
             )
 
+    def test_phase_receipt_chain_cannot_predate_the_frozen_opportunity(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
+        historical = {
+            "package": "2020-08-31T20:00:00Z",
+            "uploaded": "2020-08-31T21:00:00Z",
+            "submitted": "2020-08-31T22:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg)
+            for phase in CHECK.PHASES:
+                path = package / CHECK.PHASE_RECEIPTS[phase]
+                receipt = json.loads(path.read_text())
+                receipt["recorded_at"] = historical[phase]
+                if phase == "uploaded":
+                    receipt["upload"]["uploaded_at"] = historical[phase]
+                elif phase == "submitted":
+                    receipt["submission"]["submitted_at"] = historical[phase]
+                if phase != "package":
+                    prior = CHECK.PHASES[CHECK.PHASES.index(phase) - 1]
+                    prior_path = package / CHECK.PHASE_RECEIPTS[prior]
+                    prior_receipt = json.loads(prior_path.read_text())
+                    receipt["prior_receipt"] = {
+                        "phase": prior,
+                        "path": CHECK.PHASE_RECEIPTS[prior],
+                        "sha256": CHECK.sha256(prior_path),
+                        "receipt_id": prior_receipt["receipt_id"],
+                    }
+                path.write_text(json.dumps(receipt, indent=2) + "\n")
+
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "submitted",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            package_row = next(row for row in report.rows if row[1] == "package receipt")
+            self.assertEqual(package_row[2], CHECK.FAIL)
+            self.assertIn("predates the frozen opportunity snapshot", package_row[3])
+            self.assertEqual(records, {})
+
+            deadline = CHECK.Report()
+            CHECK.check_deadline(reg, "submitted", deadline, now=now, receipts=records)
+            self.assertEqual(deadline.failures, 2)
+
     def test_generated_full_attestation_binds_package_and_rejects_premature_rights_values(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         generated = CHECK.parse_attestation_document(
@@ -3841,6 +3900,87 @@ class DeliveryContractTest(unittest.TestCase):
                     now=now,
                 )
             self.assertTrue(any("changed" in error for error in errors))
+
+    def test_done_receipt_fullsyncs_on_darwin_before_atomic_publication(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+
+        def ready_package(root: Path) -> dict[str, dict[str, object]]:
+            build_submission_receipt_chain(root, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(root)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                root,
+                "package",
+                submission_package_binding(root),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            return records
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            records = ready_package(package)
+            events: list[object] = []
+            fullsync = mock.Mock()
+            fullsync.fcntl.side_effect = lambda _descriptor, operation: events.append(
+                ("fullsync", operation)
+            )
+            real_replace = os.replace
+
+            def replace(source, destination):
+                events.append("replace")
+                return real_replace(source, destination)
+
+            with (
+                mock.patch.object(CHECK.sys, "platform", "darwin"),
+                mock.patch.object(CHECK, "fcntl", fullsync),
+                mock.patch.object(CHECK.os, "replace", side_effect=replace),
+                mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ),
+            ):
+                CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            self.assertEqual(events[0], ("fullsync", CHECK.F_FULLFSYNC))
+            self.assertEqual(events[1], "replace")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            records = ready_package(package)
+            blocked_fullsync = mock.Mock()
+            blocked_fullsync.fcntl.side_effect = OSError("injected fullsync failure")
+            with (
+                mock.patch.object(CHECK.sys, "platform", "darwin"),
+                mock.patch.object(CHECK, "fcntl", blocked_fullsync),
+                mock.patch.object(CHECK.os, "replace") as replace,
+                mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ),
+                self.assertRaisesRegex(OSError, "injected fullsync failure"),
+            ):
+                CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            replace.assert_not_called()
+            self.assertFalse((package / CHECK.DONE_RECEIPTS["package"]).exists())
 
     def test_done_receipt_revalidates_manifested_bytes_and_repository_state(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())

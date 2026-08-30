@@ -47,6 +47,15 @@ const choreographyUrl = q.get("choreography");
 if (musicalScore?.release_status !== "fixture-only" && musicalScore && !choreographyUrl) {
   throw new Error("a production music score requires ?choreography=<contract>");
 }
+const durationOverride = q.has("duration")
+  ? numericParam(q, "duration", 0, { min: Number.EPSILON })
+  : null;
+if (q.has("duration") && !(durationOverride > 0)) {
+  throw new Error("duration override must be finite and positive");
+}
+if (durationOverride !== null && musicalScore) {
+  throw new Error("duration override is only valid for a score-free capture");
+}
 const cap = Program.captureOf(program, q.get("capture") ?? q.get("window") ?? "passage");
 const seed = numericParam(q, "s", program.seed, { integer: true, min: 0, max: 0xFFFFFFFF });
 const stream = numericParam(q, "u", 0, { integer: true, min: 0, max: 0xFFFFFFFF });
@@ -65,6 +74,7 @@ const height = numericParam(q, "height", cap.h, { integer: true, min: 1 });
 const from = numericParam(q, "from", 0, { min: 0 });
 const span = (() => {
   const fps = numericParam(q, "fps", cap.fps, { min: Number.EPSILON });
+  if (durationOverride !== null) return { t0: from, t1: from + durationOverride, fps };
   if (cap.seconds > 0) return { t0: from, t1: from + cap.seconds, fps };
   let at = Program.passageAt(program, seed, from, stream, musicalScore);
   const t0 = at.t0;

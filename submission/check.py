@@ -39,6 +39,11 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl module.
+    fcntl = None
+
 import jsonschema
 import yaml
 
@@ -63,6 +68,7 @@ DESTINATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
 UTC_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
+F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", 51) if fcntl is not None else 51
 PHASE_RECEIPTS = {
     "package": "receipts/package.json",
     "uploaded": "receipts/uploaded.json",
@@ -512,6 +518,22 @@ def register_timestamp(value: object, label: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{label} has no UTC offset")
     return parsed
+
+
+def sync_regular_descriptor(descriptor: int) -> None:
+    """Flush a receipt through the repository's strongest file boundary.
+
+    Darwin's ``fsync`` does not force volatile drive caches to stable storage.
+    Match the private-custody publication rail: use ``F_FULLFSYNC`` for regular
+    files on macOS and retain ``fsync`` on other platforms. Directory entries
+    are synchronized separately after the atomic rename.
+    """
+    if sys.platform == "darwin":
+        if fcntl is None:
+            raise OSError("macOS full-file synchronization is unavailable")
+        fcntl.fcntl(descriptor, F_FULLFSYNC)
+    else:
+        os.fsync(descriptor)
 
 
 def typed_id(value: object, label: str) -> str:
@@ -1314,6 +1336,18 @@ def phase_receipt_contract(
     else:
         if recorded_at > now.astimezone(timezone.utc):
             errors.append(f"{label} is dated in the future")
+    if prior_phase is None:
+        snapshot = reg.get("opportunity_snapshot")
+        try:
+            frozen_at = register_timestamp(
+                snapshot.get("frozen_at") if isinstance(snapshot, dict) else None,
+                "submission register opportunity freeze",
+            ).astimezone(timezone.utc)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            if recorded_at is not None and recorded_at < frozen_at:
+                errors.append(f"{label} predates the frozen opportunity snapshot")
     errors.extend(signer_errors(value.get("signer"), phase, label))
     errors.extend(package_binding_errors(value.get("package"), package, label))
     errors.extend(opportunity_binding_errors(value.get("opportunity"), reg, label))
@@ -1774,7 +1808,7 @@ def write_done_receipt(
             temporary_name = temporary.name
             temporary.write(rendered)
             temporary.flush()
-            os.fsync(temporary.fileno())
+            sync_regular_descriptor(temporary.fileno())
         os.replace(temporary_name, destination)
         temporary_name = None
         try:
