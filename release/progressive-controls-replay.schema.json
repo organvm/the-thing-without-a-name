@@ -57,7 +57,7 @@
           "type": "object"
         },
         "graphics_renderer": {
-          "pattern": "^ANGLE \\(Apple, ANGLE Metal Renderer: Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, [^()\\r\\n]+\\)$",
+          "pattern": "^ANGLE \\(Apple, ANGLE Metal Renderer: Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\\)(?![\\s\\S])",
           "type": "string"
         },
         "platform": {"const": "darwin"}

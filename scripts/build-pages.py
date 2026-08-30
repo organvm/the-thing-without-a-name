@@ -53,6 +53,16 @@ INTERFACE_FILES = (
     "interface/map.v1.json",
 )
 PROJECT_MAP = "interface/map.v1.json"
+LIVE_PROJECT_NODE = {
+    "id": "live",
+    "label": "Live artwork",
+    "product_id": None,
+    "route": "./",
+    "fragment": None,
+    "href": "./",
+    "status": "admitted",
+    "availability": "available",
+}
 VENDOR_BASE = "interaction/vendor/mediapipe"
 VENDOR_MANIFEST = f"{VENDOR_BASE}/manifest.json"
 RUNTIME_FILES = (
@@ -114,11 +124,25 @@ def project_map(root: Path, *, admit_study: bool = False, allow_resolved: bool =
     for node in nodes:
         if not isinstance(node, dict) or set(node) != expected_keys:
             raise ArtifactError("project map contains a malformed node")
+        if (
+            any(
+                not isinstance(node[key], str) or not node[key]
+                for key in ("id", "label", "route", "status", "availability")
+            )
+            or not (node["product_id"] is None or isinstance(node["product_id"], str))
+            or not (node["fragment"] is None or isinstance(node["fragment"], str))
+            or not (node["href"] is None or isinstance(node["href"], str))
+        ):
+            raise ArtifactError("project map contains a malformed node field")
         ids.append(node["id"])
-        if node["product_id"] is None:
-            if node["status"] != "admitted" or node["href"] != node["route"]:
-                raise ArtifactError("unbound project-map nodes must be admitted source routes")
+        if node["id"] == "live":
+            if node != LIVE_PROJECT_NODE:
+                raise ArtifactError(
+                    "live project-map node must remain the canonical local artwork route"
+                )
             continue
+        if node["product_id"] is None:
+            raise ArtifactError("only the canonical live project-map node may be unbound")
         if node["product_id"] != "project-page-copy":
             raise ArtifactError("study map nodes name an unknown product")
         if node["route"] != "./project/":

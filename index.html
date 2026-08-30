@@ -85,7 +85,8 @@
   }
   .control-row button:hover, .file-control:hover { background: #292930; }
   .control-row button:focus-visible, .file-control:focus-within,
-  .fallback-grid input:focus-visible { outline: 2px solid #e8e8ee; outline-offset: 2px; }
+  .fallback-grid input:focus-visible, .fallback-grid select:focus-visible,
+  #hud summary:focus-visible { outline: 2px solid #e8e8ee; outline-offset: 2px; }
   .control-row button[hidden] { display: none; }
   .control-row button:disabled { color: #777783; cursor: default; }
   .file-control { position: relative; display: inline-flex; align-items: center; }
@@ -95,7 +96,9 @@
     margin-top: 9px;
   }
   .fallback-grid label { display: grid; grid-template-columns: 72px 1fr; align-items: center; gap: 8px; }
-  .fallback-grid input { width: 100%; min-height: 44px; accent-color: #cfcfe0; touch-action: pan-x; }
+  .fallback-grid input, .fallback-grid select { width: 100%; min-height: 44px; }
+  .fallback-grid input { accent-color: #cfcfe0; touch-action: pan-x; }
+  #hud summary { box-sizing: border-box; min-height: 44px; padding: 12px 0; cursor: pointer; }
   .privacy-note { color: #9a9aa8; }
 
   #hud-toggle {
@@ -428,18 +431,17 @@ function frame() {
     conductor,
     matteK,
   });
-  if (program && controlBus) {
-    const liveMovement = program.movements.findIndex((movement) => movement.id === r.state.movement) + 1;
-    if (liveMovement > 0 && controlBus.getState().movement !== liveMovement) {
-      controlBus.actions.sync({ type: ACTIONS.SET_MOVEMENT, value: liveMovement });
-    }
-  }
-
   renderDetails(t, r.state, r);
   requestAnimationFrame(frame);
 }
 
 function renderDetails(t, state, rendered = null) {
+  if (program && controlBus) {
+    const liveMovement = program.movements.findIndex((movement) => movement.id === state.movement) + 1;
+    if (liveMovement > 0 && controlBus.getState().movement !== liveMovement) {
+      controlBus.actions.sync({ type: ACTIONS.SET_MOVEMENT, value: liveMovement });
+    }
+  }
   // Elapsed within the current passage, so the readout says where you are in
   // this one rather than counting up forever into a number nobody can hold.
   const local = t - (state.passageT0 ?? 0);

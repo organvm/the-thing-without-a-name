@@ -339,6 +339,46 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
         }""")
         page.screenshot(path=str(screenshot_dir / f"{name}.png"), full_page=False)
 
+    def touch_targets(scope: str, label: str) -> None:
+        targets = page.evaluate(
+            """(scope) => {
+              const root = document.querySelector(scope);
+              if (!root) return [];
+              const selector = [
+                'button:not([disabled])',
+                'a[href]:not([aria-disabled="true"])',
+                'input:not([disabled]):not([type="hidden"])',
+                'select:not([disabled])',
+                'summary',
+                'label.file-control',
+              ].join(',');
+              return [...root.querySelectorAll(selector)].flatMap((target) => {
+                const style = getComputedStyle(target);
+                const box = target.getBoundingClientRect();
+                if (
+                  target.hidden || target.closest('[hidden]') ||
+                  style.display === 'none' || style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+                  box.width <= 0 || box.height <= 0
+                ) return [];
+                return [{
+                  name: target.id || target.dataset.category ||
+                    target.getAttribute('aria-label') || target.textContent.trim().slice(0, 48),
+                  width: box.width,
+                  height: box.height,
+                }];
+              });
+            }""",
+            scope,
+        )
+        want(bool(targets), f"{label} exposed no visible interactive targets")
+        undersized = [
+            target
+            for target in targets
+            if target["width"] < 44 or target["height"] < 44
+        ]
+        want(not undersized, f"{label} has targets below 44px: {undersized}")
+
     page.set_viewport_size({"width": 1024, "height": 768})
     page.emulate_media(reduced_motion="no-preference")
     page.goto(f"{base}/index.html?score=", wait_until="load")
@@ -352,10 +392,12 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#danse-dock button").count() == 5, "five-category dock is incomplete")
     want(page.locator("#danse-dock").is_visible(), "initialized dock stayed hidden")
     want(page.locator("#hud-toggle").is_visible(), "initialized Details control stayed hidden")
+    touch_targets("#danse-dock", "desktop dock")
     shot("desktop-closed")
 
     page.click('[data-category="river"]')
     want(page.locator('#surface-tray[data-open="river"]').is_visible(), "River tray did not open")
+    touch_targets("#surface-tray", "River tray")
     first_seed = page.evaluate("() => danse.seed")
     page.click("#river-new")
     second_seed = page.evaluate("() => danse.seed")
@@ -412,6 +454,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     shot("desktop-river-tray")
 
     page.click('[data-category="score"]')
+    touch_targets("#surface-tray", "Score tray")
     page.click("#program-free")
     want(page.evaluate("() => danse.controlState.program") == "free", "Free did not change the shared program state")
     page.click("#program-score")
@@ -423,6 +466,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want("cutout=1" in page.url, "Figure cutout did not enter shareable presentation state")
     page.click("#score-details")
     want(page.locator("#hud").is_visible(), "visual audition sheet did not open")
+    touch_targets("#hud", "Score Details")
     page.select_option("#conductor-model", "waltz")
     want(page.evaluate("() => danse.controlState.audition") == "override-active", "conductor override did not become active")
     shared = page.evaluate("""async () => {
@@ -458,7 +502,9 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => document.activeElement?.dataset.category") == "score", "advanced-sheet focus did not return to the Score control")
 
     page.click('[data-category="presence"]')
+    touch_targets("#surface-tray", "Presence tray")
     page.click("#presence-details")
+    touch_targets("#hud", "Presence Details")
     page.focus("#fallback-x")
     page.press("#fallback-x", "ArrowRight")
     want(page.evaluate("() => danse.interaction.snapshot().mode") == "off", "a slider activated Presence implicitly")
@@ -553,6 +599,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     )
     page.evaluate("() => window.__projectMapRace.restore()")
     want(page.locator("#project-map").is_visible(), "Map did not open")
+    touch_targets("#project-map", "Map")
     want(page.locator('#project-map-list a[href="./project/"]').count() == 0, "gated Study was rendered as a link")
     want("unavailable" in page.locator("#project-map-list").inner_text().lower(), "gated Study was not visibly unavailable")
     native_before = page.evaluate("() => ({ seed:danse.seed, playback:danse.controlState.playback, program:danse.controlState.program, cutout:danse.controlState.cutout, movement:danse.controlState.movement })")
@@ -580,6 +627,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     for width in (320, 390):
         page.set_viewport_size({"width": width, "height": 780})
         page.click('[data-category="score"]')
+        touch_targets("#surface-tray", f"{width}px Score tray")
         metrics = page.evaluate("""() => ({
           overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
           targets: [...document.querySelectorAll('#danse-dock button')].map((button) => ({ width:button.getBoundingClientRect().width, height:button.getBoundingClientRect().height })),
@@ -633,9 +681,22 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#danse-dock").is_visible(), "no-WebGL visit did not initialize the primary controls")
     page.press("body", "h")
     want(page.locator("#hud").is_visible(), "H did not open Details without WebGL")
+    touch_targets("#hud", "no-WebGL Details")
     page.wait_for_function("() => document.getElementById('river').textContent !== '—'")
     want(page.locator("#planes").inner_text() == "unavailable", "renderer fallback reported a fake plane count")
     want(page.locator("#cut").inner_text() != "—", "renderer fallback left the deterministic cut unknown")
+    page.evaluate("() => { danse.seed = 0x12345678; danse.t = 60; }")
+    page.wait_for_function("() => danse.controlState.movement === 2")
+    want(
+        page.locator('[data-movement="2"]').get_attribute("aria-pressed") == "true",
+        "no-WebGL movement 2 did not update its pressed Score control",
+    )
+    page.evaluate("() => { danse.t = 90; }")
+    page.wait_for_function("() => danse.controlState.movement === 3")
+    want(
+        page.locator('[data-movement="3"]').get_attribute("aria-pressed") == "true",
+        "no-WebGL movement 3 did not update its pressed Score control",
+    )
     page.click("#fallback-start")
     page.wait_for_function("() => document.getElementById('interaction-summary').textContent === 'fallback'")
     want(page.locator("#interaction-summary").inner_text() == "fallback", "renderer fallback left Details interaction stale")
@@ -645,6 +706,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.click('[data-category="map"]')
     page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
     want(page.locator("#project-map").is_visible(), "Map did not open without WebGL")
+    touch_targets("#project-map", "no-WebGL Map")
     page.press("#map-close", "Escape")
 
     if console_errors:

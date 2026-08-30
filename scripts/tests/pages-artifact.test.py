@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -164,6 +165,7 @@ def release_artifact_fixture(base: Path, phase: str) -> Path:
         manifest = RELEASE_SUPPORT.complete_manifest(source)
         manifest["status"] = "public-approved"
         RELEASE_SUPPORT.write_manifest(source, manifest)
+        RELEASE_SUPPORT.rebind_progressive_receipt(source, manifest)
     output = base / f"{phase}-release-artifact"
     RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
     return output
@@ -334,6 +336,33 @@ class ArtifactBoundaryTest(unittest.TestCase):
         project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
         self.assertEqual(project_map["schema"], "danse.map.v1")
         self.assertTrue(all(node["href"] is None for node in project_map["nodes"] if node["product_id"]))
+
+    def test_live_project_map_node_is_exactly_the_local_artwork_route(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        mutations = (
+            {"route": "javascript:alert(1)", "href": "javascript:alert(1)"},
+            {"route": "https://example.invalid/", "href": "https://example.invalid/"},
+            {"route": "../private/", "href": "../private/"},
+            {"route": "//example.invalid/live", "href": "//example.invalid/live"},
+            {"product_id": "project-page-copy"},
+            {"fragment": "live"},
+            {"availability": "unavailable"},
+            {"route": 1, "href": 1},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][0].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "canonical local artwork route|malformed node field",
+                ):
+                    PAGES.project_map(self.root)
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
@@ -788,10 +817,12 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
 
     def test_live_frame_synchronizes_the_pressed_score_movement(self) -> None:
-        frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
-        self.assertIn("movement.id === r.state.movement", frame)
-        self.assertIn("controlBus.getState().movement !== liveMovement", frame)
-        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", frame)
+        details = self.script.split(
+            "function renderDetails(t, state, rendered = null) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("movement.id === state.movement", details)
+        self.assertIn("controlBus.getState().movement !== liveMovement", details)
+        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", details)
 
     def test_map_atomically_replaces_the_visual_details_sheet(self) -> None:
         helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
@@ -905,9 +936,18 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
         self.assertIn('#project-map [aria-disabled="true"]', self.styles)
+        self.assertIn(
+            '#project-map a:not([aria-disabled="true"]) { display:inline-flex;',
+            self.styles,
+        )
+        self.assertIn(".fallback-grid input, .fallback-grid select", self.html)
+        self.assertIn("#hud summary { box-sizing: border-box; min-height: 44px", self.html)
         browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
         self.assertIn("presence-receipt')?.textContent", browser)
         self.assertIn("document.getElementById('veil').hidden", browser)
+        self.assertIn("def touch_targets(scope: str, label: str)", browser)
+        self.assertIn('touch_targets("#project-map", "Map")', browser)
+        self.assertIn('touch_targets("#hud", "no-WebGL Details")', browser)
 
     def test_share_feedback_has_its_own_polite_live_region(self) -> None:
         tag, toast = self.markup.by_id["toast"]

@@ -178,21 +178,6 @@ def _release_copy(value):
 
 
 def complete_manifest(root: Path) -> dict:
-    if not (root / ".git").exists():
-        progressive_head = initialize_git_fixture(root)
-    else:
-        progressive_head = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    progressive_tree = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
     manifest = _release_copy(read_manifest(root))
     manifest["version"] = "1.0.0"
     manifest["status"] = "released"
@@ -208,39 +193,6 @@ def complete_manifest(root: Path) -> dict:
         "sha256": CONTRACT.sha256(evidence_path),
         "summary": "Synthetic public-safe evidence fixture.",
     }
-    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
-    progressive_path.write_bytes(CONTRACT.canonical_json({
-        "schema": "danse.progressive-controls-replay.v1",
-        "gate_id": "progressive-controls-replay",
-        "result": "satisfied",
-        "observed_at": "2026-08-30T20:00:00Z",
-        "source": {
-            "repository": "organvm/the-thing-without-a-name",
-            "pull_request": 43,
-            "exact_head": progressive_head,
-            "tree": progressive_tree,
-        },
-        "runtime": {
-            "platform": "darwin",
-            "browser": {"name": "Google Chrome", "version": "fixture"},
-            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
-        },
-        "checks": [
-            {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
-            for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
-        ],
-        "non_actions": [
-            "No deployment, upload, submission, or publication action was performed by this receipt.",
-            "No rights, biography, final-cut, or archive-participation claim was made.",
-            "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
-        ],
-    }))
-    progressive_evidence = {
-        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
-        "sha256": CONTRACT.sha256(progressive_path),
-        "summary": "Synthetic exact-head progressive-controls replay fixture.",
-    }
-
     for claim in manifest["claims"]:
         claim["status"] = "verified"
         claim["evidence"] = copy.deepcopy(evidence)
@@ -268,11 +220,14 @@ def complete_manifest(root: Path) -> dict:
     for product in manifest["products"]:
         product["status"] = "ready"
     for gate in manifest["gates"]:
-        gate["state"] = "satisfied"
         if gate["id"] == "progressive-controls-replay":
-            gate["evidence"] = copy.deepcopy(progressive_evidence)
+            gate["state"] = "pending"
+            gate["evidence"] = None
         elif gate["id"] != "live-interaction-replay":
+            gate["state"] = "satisfied"
             gate["evidence"] = copy.deepcopy(evidence)
+        else:
+            gate["state"] = "satisfied"
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
             requirement["status"] = "verified"
@@ -300,8 +255,141 @@ def complete_manifest(root: Path) -> dict:
         "text": "No spoken dialogue. Ambient sound and image events are described in the caption track.",
         "reason": None,
     }
+    # The exact browser head contains every completed artifact except the
+    # progressive-controls receipt and its single manifest gate transition.
+    write_manifest(root, manifest)
+    if not (root / ".git").exists():
+        progressive_head = initialize_git_fixture(root)
+    else:
+        subprocess.run(
+            ["git", "-C", str(root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "progressive controls reviewed source",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        progressive_head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    progressive_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    progressive_path.write_bytes(CONTRACT.canonical_json({
+        "schema": "danse.progressive-controls-replay.v1",
+        "gate_id": "progressive-controls-replay",
+        "result": "satisfied",
+        "observed_at": "2026-08-30T20:00:00Z",
+        "source": {
+            "repository": "organvm/the-thing-without-a-name",
+            "pull_request": 43,
+            "exact_head": progressive_head,
+            "tree": progressive_tree,
+        },
+        "runtime": {
+            "platform": "darwin",
+            "browser": {"name": "Google Chrome", "version": "fixture"},
+            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+        },
+        "checks": [
+            {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
+            for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
+        ],
+        "non_actions": [
+            "No deployment, upload, submission, or publication action was performed by this receipt.",
+            "No rights, biography, final-cut, or archive-participation claim was made.",
+            "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
+        ],
+    }))
+    progressive_gate = next(
+        gate for gate in manifest["gates"] if gate["id"] == "progressive-controls-replay"
+    )
+    progressive_gate["state"] = "satisfied"
+    progressive_gate["evidence"] = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(progressive_path),
+        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+    }
     write_manifest(root, manifest)
     return manifest
+
+
+def rebind_progressive_receipt(root: Path, manifest: dict) -> None:
+    """Issue a synthetic replay after a test intentionally changes reviewed source."""
+    receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_path.unlink()
+    gate = next(
+        item for item in manifest["gates"] if item["id"] == "progressive-controls-replay"
+    )
+    gate["state"] = "pending"
+    gate["evidence"] = None
+    write_manifest(root, manifest)
+    subprocess.run(
+        ["git", "-C", str(root), "add", "-A"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Danse Test",
+            "-c",
+            "user.email=danse-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "rebind synthetic progressive replay",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    receipt["source"]["exact_head"] = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    receipt["source"]["tree"] = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+    gate["state"] = "satisfied"
+    gate["evidence"] = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(receipt_path),
+        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+    }
+    write_manifest(root, manifest)
 
 
 class ProductionManifestTest(unittest.TestCase):
@@ -684,6 +772,7 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
                 if gate["required_for"] == ["release"]:
                     manifest["gates"][index] = copy.deepcopy(original_gates[gate["id"]])
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
 
             CONTRACT.validate_release(root, phase="public")
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "release phase blocked"):
@@ -924,7 +1013,10 @@ class AdversarialManifestTest(unittest.TestCase):
             "not Apple and not Metal",
             "Apple software renderer without Metal",
             "ANGLE (Apple, ANGLE Metal Renderer: software rasterizer, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, SwiftShader software rasterizer)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, not a driver)",
             "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)\n",
         )
         for renderer in impostors:
             with self.subTest(renderer=renderer), tempfile.TemporaryDirectory() as temporary:
@@ -1103,6 +1195,110 @@ class AdversarialManifestTest(unittest.TestCase):
             )
             CONTRACT.validate_release(root)
 
+    def test_progressive_controls_receipt_rejects_dirty_reviewed_source(self) -> None:
+        def modify_tracked(root: Path) -> None:
+            (root / ".gitignore").write_text("# changed after replay\n", encoding="utf-8")
+
+        def delete_staged(root: Path) -> None:
+            (root / ".gitignore").unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-u", ".gitignore"],
+                check=True,
+                capture_output=True,
+            )
+
+        def modify_schema(root: Path) -> None:
+            path = root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
+            path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+        def add_untracked_ui(root: Path) -> None:
+            path = root / "interface/injected.js"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("throw new Error('unreviewed');\n", encoding="utf-8")
+
+        def add_untracked_schema(root: Path) -> None:
+            path = root / "release/alternate.schema.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def add_unbound_evidence(root: Path) -> None:
+            path = root / "release/evidence/unbound.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def add_unbound_media(root: Path) -> None:
+            path = root / "release/media/unbound.bin"
+            path.write_bytes(b"not digest-bound\n")
+
+        for label, mutate in (
+            ("modified tracked path", modify_tracked),
+            ("staged deletion", delete_staged),
+            ("modified renderer schema", modify_schema),
+            ("untracked interface source", add_untracked_ui),
+            ("untracked release schema", add_untracked_schema),
+            ("unbound release evidence", add_unbound_evidence),
+            ("unbound release media", add_unbound_media),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                complete_manifest(root)
+                mutate(root)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "reviewed source includes non-receipt changes",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_manifest_cannot_self_authorize_post_review_drift(self) -> None:
+        def change_copy(root: Path, manifest: dict) -> None:
+            manifest["press"]["synopsis_short"] += " Additional unreviewed copy."
+
+        def add_claim(root: Path, manifest: dict) -> None:
+            claim = copy.deepcopy(manifest["claims"][0])
+            claim["id"] = "post-review-claim"
+            manifest["claims"].append(claim)
+
+        def add_media(root: Path, manifest: dict) -> None:
+            source_path = root / "release/media/post-review.bin"
+            source_path.write_bytes(b"post-review media\n")
+            medium = copy.deepcopy(manifest["media"][0])
+            medium["id"] = "post-review-media"
+            medium["label"] = "Post-review media"
+            medium["source"] = {
+                "path": source_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(source_path),
+                "bytes": source_path.stat().st_size,
+                "destination": "media/assets/post-review.bin",
+            }
+            manifest["media"].append(medium)
+
+        def self_authorize_evidence(root: Path, manifest: dict) -> None:
+            evidence_path = root / "release/evidence/self-authorized.json"
+            evidence_path.write_text(
+                '{"schema":"danse.release-evidence.v1","result":"satisfied"}\n',
+                encoding="utf-8",
+            )
+            manifest["claims"][0]["evidence"] = {
+                "path": evidence_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(evidence_path),
+                "summary": "Manifest-authored evidence after the browser replay.",
+            }
+
+        for label, mutate in (
+            ("copy", change_copy),
+            ("claim", add_claim),
+            ("media", add_media),
+            ("self-authorized evidence", self_authorize_evidence),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                mutate(root, manifest)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "manifest changed outside the canonical replay gate transition",
+                ):
+                    CONTRACT.validate_release(root)
+
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
             manifest["media"][1]["id"] = manifest["media"][0]["id"]
@@ -1143,6 +1339,7 @@ class AdversarialManifestTest(unittest.TestCase):
             manifest = complete_manifest(root)
             manifest["accessibility"]["captions"]["cues"] = []
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "approved caption track contains no cues"):
                 CONTRACT.validate_release(root, phase="public")
 
@@ -1152,6 +1349,7 @@ class AdversarialManifestTest(unittest.TestCase):
             manifest = complete_manifest(root)
             manifest["accessibility"]["captions"]["cues"][0]["end"] = "00:00:00.000"
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "must end after it starts"):
                 CONTRACT.validate_release(root, phase="public")
 

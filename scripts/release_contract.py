@@ -56,7 +56,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 APPLE_ANGLE_METAL_RENDERER = re.compile(
     r"\AANGLE \(Apple, ANGLE Metal Renderer: "
-    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, [^()\r\n]+\)\Z"
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
 )
 PRIVATE_PREFIXES = (
     ".git/",
@@ -526,31 +526,98 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
     )
     if is_ancestor.returncode != 0:
         raise ReleaseError("progressive controls replay exact head is not an ancestor of the checkout")
-    source_diff = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "diff",
-            "--name-only",
-            "--diff-filter=ACDMRTUXB",
-            "-z",
-            exact_head,
-            "HEAD",
-            "--",
-        ],
+    completion_paths = {MANIFEST.as_posix(), PROGRESSIVE_CONTROLS_EVIDENCE_PATH}
+
+    manifest = load_json(root / MANIFEST, "release manifest")
+    exact_manifest_result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{exact_head}:{MANIFEST.as_posix()}"],
         capture_output=True,
         check=False,
     )
-    if source_diff.returncode != 0:
-        raise ReleaseError("cannot compare the progressive controls reviewed source tree")
+    if exact_manifest_result.returncode != 0:
+        raise ReleaseError("progressive controls exact head has no release manifest")
     try:
-        changed_paths = {
-            item.decode("utf-8") for item in source_diff.stdout.split(b"\0") if item
-        }
-    except UnicodeDecodeError as exc:
-        raise ReleaseError("progressive controls source diff contains a non-UTF-8 path") from exc
-    completion_paths = {MANIFEST.as_posix(), PROGRESSIVE_CONTROLS_EVIDENCE_PATH}
+        exact_manifest = json.loads(exact_manifest_result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("progressive controls exact-head manifest is invalid JSON") from exc
+
+    def progressive_gate(value: object, label: str) -> tuple[int, dict[str, Any]]:
+        gates = value.get("gates") if isinstance(value, dict) else None
+        if not isinstance(gates, list):
+            raise ReleaseError(f"progressive controls {label} manifest has no gate inventory")
+        matches = [
+            (index, gate)
+            for index, gate in enumerate(gates)
+            if isinstance(gate, dict) and gate.get("id") == "progressive-controls-replay"
+        ]
+        if len(matches) != 1:
+            raise ReleaseError(
+                f"progressive controls {label} manifest must contain exactly one replay gate"
+            )
+        return matches[0]
+
+    exact_gate_index, exact_gate = progressive_gate(exact_manifest, "exact-head")
+    current_gate_index, current_gate = progressive_gate(manifest, "current")
+    if (
+        exact_gate_index != current_gate_index
+        or exact_gate.get("state") != "pending"
+        or exact_gate.get("evidence") is not None
+        or current_gate.get("state") != "satisfied"
+        or any(
+            current_gate.get(key) != exact_gate.get(key)
+            for key in set(current_gate) | set(exact_gate)
+            if key not in {"state", "evidence"}
+        )
+    ):
+        raise ReleaseError("progressive controls manifest gate transition is not canonical")
+    gate_evidence = current_gate.get("evidence")
+    if (
+        not isinstance(gate_evidence, dict)
+        or gate_evidence.get("path") != PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+        or gate_evidence.get("sha256") != sha256(path)
+    ):
+        raise ReleaseError("progressive controls manifest gate evidence is not canonical")
+    projected_manifest = json.loads(canonical_json(manifest))
+    projected_manifest["gates"][current_gate_index] = exact_gate
+    if canonical_json(projected_manifest) != canonical_json(exact_manifest):
+        raise ReleaseError(
+            "progressive controls manifest changed outside the canonical replay gate transition"
+        )
+
+    def git_paths(arguments: list[str], label: str) -> set[str]:
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ReleaseError(f"cannot inspect progressive controls {label}")
+        try:
+            return {item.decode("utf-8") for item in result.stdout.split(b"\0") if item}
+        except UnicodeDecodeError as exc:
+            raise ReleaseError(
+                f"progressive controls {label} contains a non-UTF-8 path"
+            ) from exc
+
+    diff_arguments = ["--name-only", "--diff-filter=ACDMRTUXB", "-z"]
+    changed_paths = git_paths(
+        ["diff", *diff_arguments, exact_head, "HEAD", "--"],
+        "reviewed source diff",
+    )
+    changed_paths.update(
+        git_paths(["diff", "--cached", *diff_arguments, "HEAD", "--"], "staged source diff")
+    )
+    changed_paths.update(
+        git_paths(["diff", *diff_arguments, "HEAD", "--"], "unstaged source diff")
+    )
+    untracked_paths = git_paths(
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+        "untracked source inventory",
+    )
+    # The only post-review paths are the manifest's canonical gate transition
+    # and its exact receipt. No directory or mutable manifest record can confer
+    # trust on an additional source, evidence, or media path.
+    changed_paths.update(untracked_paths - completion_paths)
     unexpected_paths = sorted(changed_paths - completion_paths)
     if unexpected_paths:
         raise ReleaseError(
