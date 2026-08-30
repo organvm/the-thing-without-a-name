@@ -38,7 +38,8 @@ export function createControlActions(adapter, options = {}) {
     });
   };
   const setPresence = (value) => {
-    const intent = PRESENCE.includes(value) ? value : state.presence;
+    if (!PRESENCE.includes(value)) return Promise.resolve(state.presence);
+    const intent = value;
     const revision = ++presenceRevision;
     presenceIntent = intent;
     dispatch({ type: ACTIONS.SET_STATUS, category: "presence", message: "" });

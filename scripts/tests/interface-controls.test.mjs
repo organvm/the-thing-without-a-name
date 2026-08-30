@@ -78,6 +78,16 @@ await test("an invalid Presence transition is an identity-preserving no-op", () 
   assert.deepEqual([state.presence, state.status.presence], ["off", "Receipt rejected"]);
 });
 
+await test("an invalid Presence action does not clear status or reach the adapter", async () => {
+  let calls = 0;
+  const bus = createControlActions({ presence: () => { calls += 1; } });
+  bus.actions.status("presence", "Receipt rejected");
+  const before = bus.getState();
+  assert.equal(await bus.actions.presence("invalid"), "off");
+  assert.strictEqual(bus.getState(), before);
+  assert.equal(calls, 0);
+});
+
 await test("the primary Music action mirrors unavailable and available state", () => {
   const music = { disabled: false, textContent: "" };
   const doc = {
