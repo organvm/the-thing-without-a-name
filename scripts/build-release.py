@@ -21,11 +21,6 @@ from urllib.parse import quote, unquote, urlsplit
 import pypdf
 import reportlab
 from pypdf import PdfReader
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import LETTER
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.pdfgen import canvas
-
 from release_contract import (
     EXPECTED_OPPORTUNITY_FROZEN_AT,
     EXPECTED_OPPORTUNITY_RECEIPT_SHA256,
@@ -45,6 +40,10 @@ from release_contract import (
     source_file,
     validate_release,
 )
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import LETTER
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
 
 ARTIFACT_SCHEMA = "danse.release-build.v1"
 ARTIFACT_MANIFEST = "release-build.json"
@@ -289,8 +288,10 @@ def _status(value: str) -> str:
     return f'<span class="status status-{_h(value)}">{_h(value.replace("-", " "))}</span>'
 
 
-def project_security_contract(manifest: dict) -> dict:
+def project_security_contract(manifest: dict, phase: str) -> dict:
     """Bind project discovery metadata to the canonical site and cleared media."""
+    if phase not in PHASES:
+        raise ReleaseError(f"unknown project security phase: {phase}")
     identity = manifest["identity"]
     canonical = identity["canonical_url"] + identity["project_path"]
     if identity["canonical_url"] != PROJECT_SITE_URL or canonical != PROJECT_CANONICAL_URL:
@@ -300,6 +301,7 @@ def project_security_contract(manifest: dict) -> dict:
             medium
             for medium in manifest["media"]
             if medium["id"] == "project-social-card"
+            and phase in medium["required_for"]
             and medium["status"] == "ready"
             and medium["clearance"]["status"] == "cleared"
             and medium["source"] is not None
@@ -328,7 +330,7 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
     accessibility = manifest["accessibility"]
     press = manifest["press"]
     draft = phase == "draft"
-    security_contract = project_security_contract(manifest)
+    security_contract = project_security_contract(manifest, phase)
     canonical = security_contract["canonical_url"]
     reference = installation["reference_contract"]
     twin_url = _repo_evidence_url(commit, reference["digital_twin"]["path"])
@@ -1459,7 +1461,10 @@ def verify_artifact(
     )
     if release["manifest"]["sha256"] != source_manifest_sha256:
         raise ReleaseError("release artifact manifest digest does not match its source commit")
-    expected_project_security = project_security_contract(source_manifest)
+    expected_project_security = project_security_contract(
+        source_manifest,
+        receipt["phase"],
+    )
     if release["project_security"] != expected_project_security:
         raise ReleaseError(
             "release artifact project security binding drifted from its source manifest"
@@ -1714,7 +1719,7 @@ def build(
             "id": manifest["release_id"],
             "version": manifest["version"],
             "manifest": {"path": MANIFEST.as_posix(), "sha256": sha256(manifest_path)},
-            "project_security": project_security_contract(manifest),
+            "project_security": project_security_contract(manifest, phase),
             "installation_reference": {
                 "schema": installation_reference["schema"],
                 "status": installation_reference["status"],

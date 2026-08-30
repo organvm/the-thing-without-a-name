@@ -522,6 +522,7 @@ def verify_artifact(
     expected_commit: str | None = None,
     *,
     require_source_manifest: bool = False,
+    source_root: Path = ROOT,
 ) -> dict:
     output = output.absolute()
     if output.is_symlink():
@@ -636,7 +637,7 @@ def verify_artifact(
         if require_source_manifest:
             try:
                 source_manifest, manifest_sha256 = builder.source_release_manifest(
-                    ROOT,
+                    source_root,
                     source["commit"],
                     allow_worktree_fallback=False,
                 )
@@ -644,9 +645,10 @@ def verify_artifact(
                     raise ArtifactError(
                         "artifact release manifest drifted from the source commit"
                     )
-                if builder.project_security_contract(source_manifest) != release[
-                    "project_security"
-                ]:
+                if builder.project_security_contract(
+                    source_manifest,
+                    "public",
+                ) != release["project_security"]:
                     raise ArtifactError(
                         "artifact project security drifted from the source manifest"
                     )
@@ -751,6 +753,7 @@ def build(
         output,
         commit,
         require_source_manifest=require_git_source,
+        source_root=root,
     )
 
 
@@ -783,6 +786,7 @@ def main() -> int:
                 args.verify,
                 args.source_commit,
                 require_source_manifest=True,
+                source_root=args.root,
             )
     except ArtifactError as exc:
         parser.exit(1, f"pages artifact: {exc}\n")

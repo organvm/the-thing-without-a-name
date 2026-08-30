@@ -641,6 +641,29 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
             receipt = BUILD.build(root, base / "public-artifact", "public", TEST_COMMIT)
             self.assertEqual(receipt["phase"], "public")
 
+    def test_draft_omits_public_only_social_card_from_page_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            manifest = complete_manifest(root)
+            social = next(
+                medium
+                for medium in manifest["media"]
+                if medium["id"] == "project-social-card"
+            )
+            self.assertNotIn("draft", social["required_for"])
+
+            output = base / "draft-artifact"
+            receipt = BUILD.build(root, output, "draft", TEST_COMMIT)
+
+            self.assertIsNone(receipt["release"]["project_security"]["social_image"])
+            project = (output / "project/index.html").read_text(encoding="utf-8")
+            self.assertNotIn('property="og:image"', project)
+            self.assertFalse(
+                (output / social["source"]["destination"]).exists(),
+                "draft artifacts must not reference or copy public-only social media",
+            )
+
 
 class ProductionCliSourceTest(unittest.TestCase):
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:

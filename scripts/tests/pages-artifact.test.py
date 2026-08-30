@@ -779,6 +779,47 @@ class ArtifactBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(PAGES.ArtifactError, "does not match expected"):
             PAGES.verify_artifact(self.output, "b" * 40)
 
+    def test_source_manifest_verification_uses_requested_root(self) -> None:
+        release_root = RELEASE_SUPPORT.fixture_root(self.base / "release-source")
+        manifest = RELEASE_SUPPORT.complete_manifest(release_root)
+        manifest["status"] = "public-approved"
+        RELEASE_SUPPORT.write_manifest(release_root, manifest)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(release_root)
+        release_artifact = self.base / "public-release"
+        RELEASE_BUILD.build(
+            release_root,
+            release_artifact,
+            "public",
+            commit,
+            require_git_source=True,
+        )
+
+        PAGES.build(
+            self.root,
+            self.output,
+            commit,
+            release_artifact=release_artifact,
+            release_source_root=release_root,
+        )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts/build-pages.py"),
+            "--root",
+            str(release_root),
+            "--verify",
+            str(self.output),
+            "--source-commit",
+            commit,
+        ]
+        verified = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertIn(f"files from {commit} verified", verified.stdout)
+
     def test_tampered_pose_vendor_source_fails_closed(self) -> None:
         vendor = self.root / PAGES.VENDOR_BASE / "vision_bundle.mjs"
         vendor.write_bytes(b"tampered\n")
