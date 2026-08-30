@@ -7,19 +7,23 @@ insurance, and public-operation decisions.
 
 ## Before transport
 
-1. Freeze the exact `digital-twin.json` contract digest and canonical release
+1. Run `python3 scripts/check-installation.py --emit workbook` and retain the
+   resulting non-evidentiary worksheet with this procedure. Use its derived role,
+   geometry, calibration, runtime, and receipt inventory as the clean-room setup
+   checklist; do not edit it into a passing evidence file.
+2. Freeze the exact `digital-twin.json` contract digest and canonical release
    manifest. Preserve two checksum-verified release copies on independent media.
-2. Inventory every required hardware role. Keep model, serial, rental, insurance,
+3. Inventory every required hardware role. Keep model, serial, rental, insurance,
    and private location data in the external venue receipt, never this repository.
-3. Obtain written venue approval for measured room dimensions, egress, mounting,
+4. Obtain written venue approval for measured room dimensions, egress, mounting,
    surface material, projector/lens/throw, power distribution, ventilation,
    interface/speaker routing, cabling, level limits, and the foreground launcher.
    Keep every launcher file argument canonical and release-relative; absolute,
    parent-traversing, home-relative, and `file:` arguments fail admission.
-4. Confirm that the release contains no Git metadata or developer-only tooling,
+5. Confirm that the release contains no Git metadata or developer-only tooling,
    and that its manifest inventories every delivered file. The approved launcher
    path, bytes, digest, and executable mode must match that inventory exactly.
-5. Print or retain an offline copy of this procedure, the digital twin, release
+6. Print or retain an offline copy of this procedure, the digital twin, release
    manifest, calibration plan, and venue emergency contacts.
 
 ## Clean setup
@@ -42,6 +46,21 @@ insurance, and public-operation decisions.
    repository. Do not install a LaunchAgent or any persistent service.
 7. Verify release bytes and run `scripts/check-installation.py --phase runtime`
    against the external evidence before the launcher is allowed to start.
+8. Before claiming recovery or restore, run the runtime phase with
+   `--emit runtime-plan`. Copy its exact `configuration_sha256` into each of the
+   three wall-plug proof objects and the restore rehearsal. The restore binding
+   may be `null` only while no restore result or receipt is claimed.
+
+Before transport or venue work, the portable control-plane preflight may be run:
+
+```bash
+python3 scripts/check-installation.py --emit simulation
+```
+
+This exercises logical output tickets and the real supervisor's clean-exit,
+crash-budget, health-failure, and release-integrity paths. A passing portable
+receipt is prerequisite engineering evidence only. It is never a calibration,
+hardware-sync, power-cycle, or restore receipt.
 
 ## Calibration order
 
@@ -100,7 +119,9 @@ not perform it on this Mac as a substitute for venue evidence.
 For each of three distinct cycles:
 
 1. Start a new telemetry receipt and record the exact spec, release, evidence,
-   hardware, calibration, river, and observer identities.
+   hardware, calibration, river, and observer identities. Record the validator's
+   exact `configuration_sha256`; it must be identical across the three proofs and
+   the restore rehearsal.
 2. Observe the generative display and visible plane/cue relationship before
    power removal.
 3. Remove power through the venue-approved test point for at least one second.
@@ -154,7 +175,9 @@ satisfy this predicate.
 3. Repeat setup and every calibration stage from the tracked instructions.
 4. Run the exact approved foreground launcher and human-visible plane/cue test.
 5. Perform a documented setup, strike, and second restore. Preserve distinct
-   SHA-256 receipts for all three phases and one named observer/timestamp.
+   SHA-256 receipts for all three phases and one named observer/timestamp. Bind
+   the rehearsal to the same `configuration_sha256` used by all three wall-plug
+   proofs; a copied receipt from another release or hardware set fails admission.
 
 Issue #14 remains open until this restore and the three physical wall-plug cycles
 validate together against one exact digital-twin digest.

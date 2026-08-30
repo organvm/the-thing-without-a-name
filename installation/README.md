@@ -16,6 +16,7 @@ drop, or venue has been approved, installed, measured, or observed.
 | `evidence.schema.json` | Shape a venue-owned external evidence receipt must have. No completed evidence is committed here. |
 | `release-manifest.schema.json` | Exact canonical-release inventory, byte counts, digests, executable modes, and installation-contract binding. |
 | `runtime.py` | On-demand foreground supervisor for one exact venue-approved launcher in a canonical release. |
+| `simulation.py` | Executes the real supervisor against ephemeral fixture releases and receipts bounded crash, health, and integrity scenarios without claiming physical proof. |
 | `archive-disposition.json` | Claim-by-claim port/reject/defer record for the non-authoritative Limen proposal. |
 | `OPERATIONS.md` | Setup, calibration, operation, recovery, strike, transport, restore, troubleshooting, and conservation procedure. |
 
@@ -76,6 +77,13 @@ runtime recovery. Admission thresholds are:
 These are candidate acceptance thresholds. A venue must approve the exact twin
 before its measurements can satisfy them.
 
+`python3 scripts/check-installation.py --emit workbook` derives a clean-setup
+worksheet directly from the authenticated twin. It inventories every private
+receipt, hardware role, surface/output assignment, calibration stage, runtime
+constraint, and completion proof without inventing a venue value. Its explicit
+`worksheet-not-evidence` status prevents the worksheet itself from satisfying a
+physical gate.
+
 ## Runtime boundary
 
 The runtime is one foreground process supervising one exact argument vector from
@@ -110,6 +118,8 @@ captured in evidence. Do not install one on this Mac.
 python3 scripts/check-installation.py
 python3 scripts/check-installation.py --emit calibration
 python3 scripts/check-installation.py --emit frame --seed 20170620 --stream 0 --frame 120
+python3 scripts/check-installation.py --emit workbook
+python3 scripts/check-installation.py --emit simulation
 
 # Expected to fail until external evidence and a canonical release exist.
 python3 scripts/check-installation.py --phase complete
@@ -121,6 +131,21 @@ python3 installation/runtime.py --run \
   --evidence /external/evidence.json --release-root /external/release \
   --telemetry /external/recovery-session.jsonl
 ```
+
+The portable simulation executes the actual foreground supervisor against a
+temporary manifest-bound release. It covers clean exit, bounded crash recovery,
+startup-health exhaustion, release-integrity failure, seek-stable shared frame
+tickets, and the declared safety thresholds. Its receipt is deliberately marked
+`passed-not-physical-evidence`; it cannot stand in for hardware sync, calibration,
+wall-plug, or restore observations.
+
+Every external wall-plug and restore receipt must repeat the configuration digest
+computed from the exact venue, geometry, release manifest and launcher, hardware,
+calibration, runtime approval/arguments/health contract, river, and output set.
+The validator rejects a receipt copied from any other admitted configuration.
+Before any recovery or restore claim exists, the restore binding may remain `null`;
+`--phase runtime --emit runtime-plan` returns the exact `configuration_sha256`
+that must then be copied into all three wall-plug proofs and the restore rehearsal.
 
 ## Current blockers
 

@@ -1035,6 +1035,128 @@ def calibration_plan(spec: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def installation_workbook(
+    spec: dict[str, Any], gates: dict[str, Any]
+) -> dict[str, Any]:
+    """Emit a deterministic, non-evidentiary worksheet for a clean venue setup.
+
+    The workbook contains no invented hardware, venue, or measurement values. It
+    derives every logical assignment and threshold from the authenticated twin so
+    an operator can collect the private receipts needed by ``evidence.schema.json``
+    without copying a stale prose checklist.
+    """
+    validate_digital_twin(spec)
+    validate_gates(gates, spec)
+    meters = float(spec["coordinate_system"]["meters_per_unit"])
+    surfaces = {surface["id"]: surface for surface in spec["surfaces"]}
+    workbook = {
+        "schema": "danse.installation.workbook.v1",
+        "status": "worksheet-not-evidence",
+        "spec_contract_sha256": spec["identity"]["contract_sha256"],
+        "private_values": "collect-externally-never-commit",
+        "blocked_gates": [
+            gate["id"] for gate in gates["gates"] if gate["status"] == "blocked"
+        ],
+        "venue_safety_receipts": [
+            "venue-approval",
+            "egress",
+            "mounting",
+            "power",
+            "ventilation",
+        ],
+        "hardware_roles": list(spec["hardware_roles"]),
+        "surfaces": [
+            {
+                "reference_surface": surface_id,
+                "hardware_role": REFERENCE_SURFACE_HARDWARE_ROLES[surface_id],
+                "expected_center_m": [
+                    round(value * meters, 9) for value in surface["center"]
+                ],
+                "expected_rotation_radians": list(surface["rotation_radians"]),
+                "expected_size_m": [
+                    round(2 * value * meters, 9) for value in surface["half_extents"]
+                ],
+                "private_measurement_receipt": "required",
+            }
+            for surface_id, surface in sorted(surfaces.items())
+        ],
+        "projectors": [
+            {
+                "output": output["id"],
+                "hardware_role": output["id"],
+                "surface": output["surface"],
+                "channel": output["channel"],
+                "refresh_hz": spec["synchronization"]["fps"],
+                "edge_policy": output["edge_policy"],
+                "overlap_px": output["overlap_px"],
+                "private_pose_lens_receipt": "required",
+            }
+            for output in sorted(
+                spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ],
+        "calibration": calibration_plan(spec),
+        "runtime": {
+            "mode": spec["runtime"]["mode"],
+            "canonical_release_required": spec["release"]["canonical_release_required"],
+            "manifest_name": spec["release"]["manifest_name"],
+            "persistent_host_service": spec["runtime"]["persistent_host_service"],
+            "forbidden_host_mutations": sorted(
+                spec["runtime"]["forbidden_host_mutations"]
+            ),
+            "health": copy.deepcopy(spec["runtime"]["health"]),
+            "recovery": copy.deepcopy(spec["runtime"]["recovery"]),
+            "private_launcher_approval_receipt": "required",
+        },
+        "completion": {
+            "wall_plug_proofs_required": spec["runtime"]["recovery"][
+                "wall_plug_proofs_required"
+            ],
+            "wall_plug_return_timeout_seconds": spec["runtime"]["recovery"][
+                "wall_plug_return_timeout_seconds"
+            ],
+            "human_observation_required": True,
+            "configuration_binding_required": True,
+            "setup_strike_restore_receipts_required": 3,
+            "portable_simulation_is_physical_proof": False,
+        },
+    }
+    workbook["workbook_sha256"] = canonical_sha256(workbook)
+    return workbook
+
+
+def physical_configuration_sha256(
+    value: dict[str, Any], spec: dict[str, Any], launcher_sha256: str
+) -> str:
+    """Bind a physical proof to the exact admitted configuration.
+
+    Wall-plug and restore receipts live outside the repository. A bare telemetry
+    digest cannot show that those observations used the same venue, geometry,
+    release, hardware, calibration, launcher, health contract, and river. This
+    fingerprint closes that substitution gap without embedding private receipts.
+    """
+    launcher = _sha256(launcher_sha256, "runtime launcher digest")
+    binding = {
+        "schema": "danse.installation.physical-configuration.v1",
+        "spec_contract_sha256": spec["identity"]["contract_sha256"],
+        "evidence_id": value["evidence_id"],
+        "venue_sha256": canonical_sha256(value["venue"]),
+        "geometry_sha256": canonical_sha256(value["geometry"]),
+        "release_sha256": canonical_sha256(value["release"]),
+        "launcher_sha256": launcher,
+        "hardware_sha256": canonical_sha256(value["hardware"]),
+        "calibration_sha256": canonical_sha256(value["calibration"]),
+        "runtime_sha256": canonical_sha256(value["runtime"]),
+        "outputs": [
+            output["id"]
+            for output in sorted(
+                spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ],
+    }
+    return canonical_sha256(binding)
+
+
 def _receipt_sha(value: Any, label: str) -> str:
     return _sha256(value, label)
 
@@ -1610,6 +1732,10 @@ def validate_evidence(
             "runtime river epoch_ms must be a non-negative safe integer"
         )
 
+    configuration_sha256 = physical_configuration_sha256(
+        value, spec, launcher["sha256"]
+    )
+
     proofs = value["wall_plug_proofs"]
     required = spec["runtime"]["recovery"]["wall_plug_proofs_required"]
     if (
@@ -1632,9 +1758,41 @@ def validate_evidence(
             "setup_receipt_sha256",
             "strike_receipt_sha256",
             "restore_receipt_sha256",
+            "configuration_sha256",
         },
         "restore_rehearsal",
     )
+    restore_flags = (
+        "setup_passed",
+        "strike_passed",
+        "restore_passed",
+        "canonical_release_restored",
+    )
+    restore_receipts = (
+        "setup_receipt_sha256",
+        "strike_receipt_sha256",
+        "restore_receipt_sha256",
+    )
+    restore_claimed = any(restore[key] is not False for key in restore_flags) or any(
+        restore[key] is not None
+        for key in ("observer", "observed_at", *restore_receipts)
+    )
+    restore_configuration = restore["configuration_sha256"]
+    if restore_configuration is not None:
+        if (
+            _sha256(
+                restore_configuration,
+                "restore rehearsal configuration_sha256",
+            )
+            != configuration_sha256
+        ):
+            raise ContractError(
+                "restore rehearsal belongs to another admitted physical configuration"
+            )
+    elif phase == "complete" or restore_claimed:
+        raise ContractError(
+            "restore rehearsal must bind the admitted physical configuration"
+        )
     if phase == "complete" and len(proofs) != required:
         raise ContractError(
             f"physical completion requires exactly {required} wall-plug proofs"
@@ -1656,6 +1814,7 @@ def validate_evidence(
                     "generative_display_returned",
                     "manual_repair_required",
                     "spec_contract_sha256",
+                    "configuration_sha256",
                     "runtime_telemetry_sha256",
                     "receipt_sha256",
                 },
@@ -1700,6 +1859,16 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} belongs to another configuration"
                 )
+            if (
+                _sha256(
+                    proof["configuration_sha256"],
+                    f"wall-plug proof {proof_id} configuration_sha256",
+                )
+                != configuration_sha256
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} belongs to another admitted physical configuration"
+                )
             telemetry_sha = _receipt_sha(
                 proof["runtime_telemetry_sha256"],
                 f"wall-plug proof {proof_id} telemetry",
@@ -1717,21 +1886,6 @@ def validate_evidence(
                     "wall-plug proofs must preserve distinct observation receipts"
                 )
             proof_receipts.add(proof_receipt)
-    restore_flags = (
-        "setup_passed",
-        "strike_passed",
-        "restore_passed",
-        "canonical_release_restored",
-    )
-    restore_receipts = (
-        "setup_receipt_sha256",
-        "strike_receipt_sha256",
-        "restore_receipt_sha256",
-    )
-    restore_claimed = any(restore[key] is not False for key in restore_flags) or any(
-        restore[key] is not None
-        for key in ("observer", "observed_at", *restore_receipts)
-    )
     if phase == "complete" or restore_claimed:
         for key in restore_flags:
             _approved(restore[key], f"restore rehearsal {key}")
@@ -1768,6 +1922,9 @@ def runtime_plan(
         },
         "release_files": copy.deepcopy(list(release_files.values())),
         "launcher": copy.deepcopy(launcher),
+        "configuration_sha256": physical_configuration_sha256(
+            value, spec, launcher["sha256"]
+        ),
         "argv": list(runtime["argv"]),
         "health_url": runtime["health_url"],
         "river": copy.deepcopy(runtime["river"]),

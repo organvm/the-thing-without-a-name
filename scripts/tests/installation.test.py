@@ -27,9 +27,11 @@ from installation.contract import (  # noqa: E402
     calibration_plan,
     canonical_sha256,
     frame_ticket,
+    installation_workbook,
     installation_contract_sha256,
     load_json,
     load_reference_contracts,
+    physical_configuration_sha256,
     runtime_plan,
     validate_archive_disposition,
     validate_digital_twin,
@@ -37,6 +39,7 @@ from installation.contract import (  # noqa: E402
     validate_gates,
 )
 from installation.runtime import Telemetry, supervise  # noqa: E402
+from installation.simulation import run_portable_simulation  # noqa: E402
 
 
 def digest(label: str) -> str:
@@ -94,6 +97,16 @@ def make_release(root: Path, spec: dict) -> None:
     )
 
 
+def refresh_configuration(evidence: dict, spec: dict, release_root: Path) -> dict:
+    configuration_sha256 = physical_configuration_sha256(
+        evidence, spec, file_digest(release_root / "bin/danse-launcher")
+    )
+    evidence["restore_rehearsal"]["configuration_sha256"] = configuration_sha256
+    for proof in evidence["wall_plug_proofs"]:
+        proof["configuration_sha256"] = configuration_sha256
+    return evidence
+
+
 def evidence_for(spec: dict, release_root: Path, *, complete: bool = False) -> dict:
     contract_sha = spec["identity"]["contract_sha256"]
     argv = ["bin/danse-launcher", "--foreground"]
@@ -114,7 +127,7 @@ def evidence_for(spec: dict, release_root: Path, *, complete: bool = False) -> d
             }
             for index in range(1, 4)
         ]
-    return {
+    evidence = {
         "schema": "danse.installation.evidence.v1",
         "evidence_id": "synthetic-test-evidence",
         "spec_contract_sha256": contract_sha,
@@ -231,8 +244,10 @@ def evidence_for(spec: dict, release_root: Path, *, complete: bool = False) -> d
             "setup_receipt_sha256": digest("setup") if complete else None,
             "strike_receipt_sha256": digest("strike") if complete else None,
             "restore_receipt_sha256": digest("restore") if complete else None,
+            "configuration_sha256": "0" * 64,
         },
     }
+    return refresh_configuration(evidence, spec, release_root)
 
 
 class FakeClock:
@@ -309,8 +324,15 @@ class InstallationContractTest(unittest.TestCase):
             "setup_receipt_sha256",
             "strike_receipt_sha256",
             "restore_receipt_sha256",
+            "configuration_sha256",
         ):
             self.assertEqual(restore[field]["anyOf"][0]["$ref"], "#/$defs/sha256")
+        wall_plug = evidence_schema["$defs"]["wall_plug_proof"]
+        self.assertIn("configuration_sha256", wall_plug["required"])
+        self.assertEqual(
+            wall_plug["properties"]["configuration_sha256"]["$ref"],
+            "#/$defs/sha256",
+        )
         timestamp_pattern = evidence_schema["$defs"]["timestamp"]["pattern"]
         self.assertIsNotNone(
             re.fullmatch(timestamp_pattern, "2026-08-04T12:34:56.789Z")
@@ -391,6 +413,58 @@ class InstallationContractTest(unittest.TestCase):
             ),
         )
 
+    def test_clean_setup_workbook_is_derived_complete_and_never_evidence(self) -> None:
+        first = installation_workbook(self.spec, self.gates)
+        second = installation_workbook(
+            copy.deepcopy(self.spec), copy.deepcopy(self.gates)
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "worksheet-not-evidence")
+        self.assertEqual(first["private_values"], "collect-externally-never-commit")
+        self.assertEqual(first["hardware_roles"], self.spec["hardware_roles"])
+        self.assertEqual(len(first["surfaces"]), len(self.spec["surfaces"]))
+        self.assertEqual(
+            [row["output"] for row in first["projectors"]],
+            ["projection-a", "projection-b"],
+        )
+        self.assertEqual(first["calibration"], calibration_plan(self.spec))
+        self.assertFalse(first["completion"]["portable_simulation_is_physical_proof"])
+        self.assertEqual(
+            first["workbook_sha256"],
+            canonical_sha256(
+                {key: value for key, value in first.items() if key != "workbook_sha256"}
+            ),
+        )
+
+    def test_portable_simulation_executes_real_bounded_control_paths(self) -> None:
+        first = run_portable_simulation(self.spec)
+        second = run_portable_simulation(copy.deepcopy(self.spec))
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "passed-not-physical-evidence")
+        self.assertTrue(first["logical_sync"]["passed"])
+        self.assertFalse(first["logical_sync"]["hardware_sync_measured"])
+        self.assertEqual(
+            first["scenarios"]["clean-exit"]["terminal_event"], "launcher-exit"
+        )
+        for name in ("crash-storm", "startup-health-failure"):
+            self.assertEqual(first["scenarios"][name]["exit_code"], 75)
+            self.assertEqual(
+                first["scenarios"][name]["terminal_event"],
+                "recovery-budget-exhausted",
+            )
+            self.assertEqual(first["scenarios"][name]["launcher_starts"], 4)
+        self.assertEqual(
+            first["scenarios"]["release-integrity-failure"]["exit_code"], 78
+        )
+        self.assertEqual(first["physical_claims"]["power_cycles_observed"], 0)
+        self.assertFalse(first["physical_claims"]["issue_14_can_close"])
+        self.assertEqual(
+            first["receipt_sha256"],
+            canonical_sha256(
+                {key: value for key, value in first.items() if key != "receipt_sha256"}
+            ),
+        )
+
     def test_stale_identity_source_or_threshold_fails_closed(self) -> None:
         stale_identity = copy.deepcopy(self.spec)
         stale_identity["identity"]["contract_sha256"] = "f" * 64
@@ -452,6 +526,7 @@ class InstallationContractTest(unittest.TestCase):
             release = Path(temporary)
             make_release(release, self.spec)
             evidence = evidence_for(self.spec, release)
+            evidence["restore_rehearsal"]["configuration_sha256"] = None
             self.assertEqual(
                 validate_evidence(
                     evidence, self.spec, phase="runtime", release_root=release
@@ -460,6 +535,14 @@ class InstallationContractTest(unittest.TestCase):
             )
             plan = runtime_plan(evidence, self.spec, release)
             self.assertEqual(plan["argv"], ["bin/danse-launcher", "--foreground"])
+            self.assertEqual(
+                plan["configuration_sha256"],
+                physical_configuration_sha256(
+                    evidence,
+                    self.spec,
+                    file_digest(release / "bin/danse-launcher"),
+                ),
+            )
             self.assertEqual(plan["outputs"], ["projection-a", "projection-b"])
             self.assertEqual(plan["evidence_sha256"], canonical_sha256(evidence))
             self.assertEqual(
@@ -689,6 +772,34 @@ class InstallationContractTest(unittest.TestCase):
                     release_root=release,
                 )
 
+            stale_configuration = copy.deepcopy(evidence)
+            stale_configuration["wall_plug_proofs"][0]["configuration_sha256"] = digest(
+                "different-physical-configuration"
+            )
+            with self.assertRaisesRegex(
+                ContractError, "another admitted physical configuration"
+            ):
+                validate_evidence(
+                    stale_configuration,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            stale_restore_configuration = copy.deepcopy(evidence)
+            stale_restore_configuration["restore_rehearsal"]["configuration_sha256"] = (
+                digest("different-restore-configuration")
+            )
+            with self.assertRaisesRegex(
+                ContractError, "restore rehearsal belongs to another"
+            ):
+                validate_evidence(
+                    stale_restore_configuration,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
             duplicate_restore_receipt = copy.deepcopy(evidence)
             duplicate_restore_receipt["restore_rehearsal"]["strike_receipt_sha256"] = (
                 duplicate_restore_receipt["restore_rehearsal"]["setup_receipt_sha256"]
@@ -794,6 +905,13 @@ class InstallationContractTest(unittest.TestCase):
                 all(
                     call[1]["env"]["DANSE_INSTALLATION_EVIDENCE_SHA256"]
                     == plan["evidence_sha256"]
+                    for call in calls
+                )
+            )
+            self.assertTrue(
+                all(
+                    call[1]["env"]["DANSE_INSTALLATION_CONFIGURATION_SHA256"]
+                    == plan["configuration_sha256"]
                     for call in calls
                 )
             )
@@ -988,6 +1106,7 @@ print(f"RESULT={result}")
             make_release(release, self.spec)
             evidence = evidence_for(self.spec, release)
             evidence["runtime"]["health_url"] = "http://127.0.0.1:8787/health"
+            refresh_configuration(evidence, self.spec, release)
             plan = runtime_plan(evidence, self.spec, release)
             clock = FakeClock()
             output = io.StringIO()
@@ -1016,6 +1135,7 @@ print(f"RESULT={result}")
             make_release(release, self.spec)
             evidence = evidence_for(self.spec, release)
             evidence["runtime"]["health_url"] = "http://127.0.0.1:8787/health"
+            refresh_configuration(evidence, self.spec, release)
             plan = runtime_plan(evidence, self.spec, release)
             clock = FakeClock()
             output = io.StringIO()
@@ -1070,6 +1190,20 @@ print(f"RESULT={result}")
         )
         self.assertNotEqual(physical.returncode, 0)
         self.assertIn("BLOCKED", physical.stderr)
+
+        workbook = run("python3", "scripts/check-installation.py", "--emit", "workbook")
+        self.assertEqual(workbook.returncode, 0, workbook.stderr)
+        self.assertEqual(
+            json.loads(workbook.stdout)["status"], "worksheet-not-evidence"
+        )
+
+        simulation = run(
+            "python3", "scripts/check-installation.py", "--emit", "simulation"
+        )
+        self.assertEqual(simulation.returncode, 0, simulation.stderr)
+        self.assertEqual(
+            json.loads(simulation.stdout)["status"], "passed-not-physical-evidence"
+        )
 
 
 if __name__ == "__main__":

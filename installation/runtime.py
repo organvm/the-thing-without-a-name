@@ -360,6 +360,7 @@ def supervise(
             "DANSE_INSTALLATION_CONTRACT_SHA256": plan["spec_contract_sha256"],
             "DANSE_INSTALLATION_EVIDENCE_ID": plan["evidence_id"],
             "DANSE_INSTALLATION_EVIDENCE_SHA256": plan["evidence_sha256"],
+            "DANSE_INSTALLATION_CONFIGURATION_SHA256": plan["configuration_sha256"],
             "DANSE_INSTALLATION_RELEASE_MANIFEST_SHA256": plan[
                 "release_manifest_sha256"
             ],
@@ -555,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
             spec_contract_sha256=plan["spec_contract_sha256"],
             evidence_id=plan["evidence_id"],
             evidence_sha256=plan["evidence_sha256"],
+            configuration_sha256=plan["configuration_sha256"],
             release_manifest_sha256=plan["release_manifest_sha256"],
             launcher_sha256=plan["launcher"]["sha256"],
         )
