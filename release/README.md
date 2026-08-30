@@ -99,7 +99,9 @@ Generated outputs are not committed from the draft phase. The Pages
 receipt retains the source-manifest, release identity/payload, project-byte, and discovery
 bindings and reapplies the same policy after composition, so rehashing the outer Pages
 manifest cannot admit weakened project markup, unmanifested files, substituted public
-copy, or omitted required media/products.
+copy, or omitted required media/products. A public-eligible source manifest also makes
+the release binding and its complete file set mandatory; an outer receipt cannot
+downgrade the composition to a runtime-only Pages artifact.
 
 ## Closing a gate
 

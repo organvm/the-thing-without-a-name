@@ -921,6 +921,42 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 source_root=source_root,
             )
 
+    def test_self_rehashed_pages_manifest_cannot_omit_public_release(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "release-omission"
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        runtime_paths = set(PAGES.source_files(source_root))
+        release_paths = {
+            record["path"]
+            for record in manifest["files"]
+            if record["path"] not in runtime_paths
+        }
+        self.assertTrue(release_paths)
+        for relative in release_paths:
+            (output / relative).unlink()
+        manifest["files"] = [
+            record
+            for record in manifest["files"]
+            if record["path"] in runtime_paths
+        ]
+        manifest["release"] = None
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "admits public phase .* required release binding and files are absent",
+        ):
+            PAGES.verify_artifact(
+                output,
+                commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
+
     def test_tampered_pose_vendor_source_fails_closed(self) -> None:
         vendor = self.root / PAGES.VENDOR_BASE / "vision_bundle.mjs"
         vendor.write_bytes(b"tampered\n")

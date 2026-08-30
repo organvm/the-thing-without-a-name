@@ -621,20 +621,28 @@ def verify_artifact(
                 "bytes": path.stat().st_size,
                 "sha256": sha256(path),
             }
-        if release is not None:
-            builder = _load_release_builder()
+        builder = _load_release_builder()
+        try:
+            source_manifest, manifest_sha256 = builder.source_release_manifest(
+                source_root,
+                source["commit"],
+                allow_worktree_fallback=False,
+            )
             try:
-                source_manifest, manifest_sha256 = builder.source_release_manifest(
-                    source_root,
-                    source["commit"],
-                    allow_worktree_fallback=False,
-                )
                 blockers = builder.phase_blockers(source_manifest, "public")
-                if blockers:
-                    preview = "; ".join(blockers[:8])
-                    raise ArtifactError(
-                        "artifact source manifest blocks public phase: " + preview
-                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                blockers = [f"source manifest cannot prove public eligibility: {exc}"]
+            if not blockers and release is None:
+                raise ArtifactError(
+                    "artifact source manifest admits public phase but its required "
+                    "release binding and files are absent"
+                )
+            if blockers and release is not None:
+                preview = "; ".join(blockers[:8])
+                raise ArtifactError(
+                    "artifact source manifest blocks public phase: " + preview
+                )
+            if release is not None:
                 if manifest_sha256 != release["manifest_sha256"]:
                     raise ArtifactError(
                         "artifact release manifest drifted from the source commit"
@@ -666,12 +674,12 @@ def verify_artifact(
                         f"source and release records collide: {sorted(collisions)}"
                     )
                 expected_records.update(release_records)
-            except ArtifactError:
-                raise
-            except Exception as exc:
-                raise ArtifactError(
-                    f"artifact source-manifest binding failed verification: {exc}"
-                ) from exc
+        except ArtifactError:
+            raise
+        except Exception as exc:
+            raise ArtifactError(
+                f"artifact source-manifest binding failed verification: {exc}"
+            ) from exc
         if delivered_records != expected_records:
             extra = sorted(set(delivered_records) - set(expected_records))
             missing = sorted(set(expected_records) - set(delivered_records))
