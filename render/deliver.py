@@ -2651,7 +2651,12 @@ def stage_score_motion_evidence(
     )
     if not SCORE_MOTION_EVIDENCE.is_file():
         prune_score_motion_evidence(destination_root, set())
-        destination_root.rmdir()
+        try:
+            destination_root.rmdir()
+        except OSError as exc:
+            raise SystemExit(
+                "package score-to-motion evidence boundary could not be removed"
+            ) from exc
         return None, []
     contract = score_motion_contract()
     errors = contract.production_receipt_errors(SCORE_MOTION_EVIDENCE)

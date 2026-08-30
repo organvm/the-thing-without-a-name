@@ -7049,6 +7049,32 @@ class DeliveryContractTest(unittest.TestCase):
                     SUBMISSION_REPOSITORY_HEAD,
                 )
 
+    def test_absent_score_motion_wraps_boundary_removal_failure(self) -> None:
+        destination = SimpleNamespace(
+            rmdir=mock.Mock(side_effect=OSError("concurrent entry")),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            absent = Path(temporary) / "absent-production-receipt.json"
+            with (
+                mock.patch.object(DELIVER, "SCORE_MOTION_EVIDENCE", absent),
+                mock.patch.object(
+                    DELIVER,
+                    "safe_score_motion_directory",
+                    return_value=destination,
+                ),
+                mock.patch.object(DELIVER, "prune_score_motion_evidence") as prune,
+                self.assertRaisesRegex(
+                    SystemExit,
+                    "score-to-motion evidence boundary could not be removed",
+                ),
+            ):
+                DELIVER.stage_score_motion_evidence(
+                    Path(temporary) / "package",
+                    SPAN,
+                    SUBMISSION_REPOSITORY_HEAD,
+                )
+        prune.assert_called_once_with(destination, set())
+
     def test_score_motion_staging_rejects_every_symlink_ancestor(self) -> None:
         for attack in ("provenance", "nested"):
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
