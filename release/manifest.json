@@ -3,6 +3,10 @@
   "release_id": "danse-alpha-omega-20260804",
   "version": "0.1.0-draft",
   "status": "draft",
+  "artifact_contracts": {
+    "project_page": "danse.project-page.v1",
+    "release_payload": "danse.release-payload.v1"
+  },
   "opportunity_snapshot": {
     "path": "opportunities/omega-20260829.json",
     "snapshot_id": "omega-20260829",

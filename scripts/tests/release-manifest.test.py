@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -664,6 +665,44 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
                 "draft artifacts must not reference or copy public-only social media",
             )
 
+    def test_project_page_renderer_contract_is_versioned_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            manifest = CONTRACT.validate_release(root, phase="draft")
+            output = base / "draft-artifact"
+            receipt = BUILD.build(root, output, "draft", TEST_COMMIT)
+
+            self.assertEqual(
+                receipt["release"]["project_security"]["project_contract"],
+                BUILD.PROJECT_PAGE_CONTRACT,
+            )
+            expected = BUILD.project_html(manifest, "draft", TEST_COMMIT)
+            self.assertEqual(
+                expected,
+                BUILD.project_html(
+                    manifest,
+                    "draft",
+                    TEST_COMMIT,
+                    contract=BUILD.PROJECT_PAGE_CONTRACT,
+                ),
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "does not match the source manifest",
+            ):
+                BUILD.project_html(
+                    manifest,
+                    "draft",
+                    TEST_COMMIT,
+                    contract="danse.project-page.v2",
+                )
+
+            self.assertEqual(
+                receipt["release"]["payload_contract"],
+                BUILD.RELEASE_PAYLOAD_CONTRACT,
+            )
+
 
 class ProductionCliSourceTest(unittest.TestCase):
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
@@ -733,6 +772,50 @@ class ProductionCliSourceTest(unittest.TestCase):
             self.assertNotEqual(untracked.returncode, 0)
             self.assertIn("untracked files", untracked.stderr)
             self.assertFalse(untracked_output.exists())
+
+    def test_clean_crlf_checkout_hashes_the_committed_manifest_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = fixture_root(base / "source")
+            (source / ".gitattributes").write_text(
+                "release/manifest.json text eol=crlf\n",
+                encoding="utf-8",
+            )
+            commit = initialize_git_fixture(source)
+            root = base / "clean-crlf-checkout"
+            subprocess.run(
+                ["git", "clone", "-q", str(source), str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            manifest_path = root / "release/manifest.json"
+            self.assertIn(b"\r\n", manifest_path.read_bytes())
+            status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(status.stdout, "", status.stdout)
+            committed = subprocess.run(
+                ["git", "-C", str(root), "show", f"{commit}:release/manifest.json"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            committed_sha = hashlib.sha256(committed).hexdigest()
+            receipt = BUILD.build(
+                root,
+                base / "crlf-artifact",
+                "draft",
+                commit,
+                require_git_source=True,
+            )
+            self.assertEqual(
+                receipt["release"]["manifest"]["sha256"],
+                committed_sha,
+            )
+            self.assertNotEqual(CONTRACT.sha256(manifest_path), committed_sha)
 
 
 class AdversarialManifestTest(unittest.TestCase):
@@ -942,6 +1025,140 @@ class AdversarialArtifactTest(unittest.TestCase):
         (self.output / "private.txt").write_text("not allowlisted\n")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "inventory mismatch"):
             verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_coherently_rehashed_generated_press_claim_fails_source_binding(self) -> None:
+        press = self.output / "press/press-kit.md"
+        press.write_text(
+            "# Approved biography and rights\n\nFalse unreceipted public claims.\n",
+            encoding="utf-8",
+        )
+        press_record = {
+            "path": "press/press-kit.md",
+            "bytes": press.stat().st_size,
+            "sha256": CONTRACT.sha256(press),
+        }
+        inventory_path = self.output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        product = next(
+            row for row in inventory["products"] if row["id"] == "press-kit-copy"
+        )
+        product["artifact"] = {"id": "press-kit-copy", **press_record}
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        by_path = {record["path"]: record for record in receipt["files"]}
+        by_path["press/press-kit.md"].update(press_record)
+        by_path["media/release-media.json"].update(
+            {
+                "bytes": inventory_path.stat().st_size,
+                "sha256": CONTRACT.sha256(inventory_path),
+            }
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "release payload does not reproduce its source-manifest contract",
+        ):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_public_release_cannot_self_receipt_changed_external_media(self) -> None:
+        root = fixture_root(self.base / "public-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "public-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        medium = next(item for item in manifest["media"] if item["id"] == "press-still-primary")
+        relative = medium["source"]["destination"]
+        media_path = output / relative
+        media_path.write_bytes(b"unreceipted replacement pixels\n")
+        media_identity = {
+            "path": relative,
+            "bytes": media_path.stat().st_size,
+            "sha256": CONTRACT.sha256(media_path),
+        }
+        inventory_path = output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        row = next(item for item in inventory["media"] if item["id"] == medium["id"])
+        row["released"] = {"id": medium["id"], **media_identity}
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        by_path = {record["path"]: record for record in receipt["files"]}
+        by_path[relative].update(media_identity)
+        by_path["media/release-media.json"].update(
+            {
+                "bytes": inventory_path.stat().st_size,
+                "sha256": CONTRACT.sha256(inventory_path),
+            }
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "release payload does not reproduce its source-manifest contract",
+        ):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
+    def test_public_release_cannot_omit_a_required_generated_product(self) -> None:
+        root = fixture_root(self.base / "required-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "required-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        relative = "press/credits.txt"
+        (output / relative).unlink()
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["files"] = [
+            record for record in receipt["files"] if record["path"] != relative
+        ]
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing .*press/credits.txt"):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
+    def test_public_receipt_cannot_promote_a_draft_source_manifest(self) -> None:
+        root = fixture_root(self.base / "phase-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "phase-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        manifest["status"] = "draft"
+        write_manifest(root, manifest)
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["release"]["manifest"]["sha256"] = CONTRACT.sha256(
+            root / "release/manifest.json"
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "source-commit manifest blocks public phase",
+        ):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
 
     def test_receipt_omitting_required_output_fails_before_post_inventory_reads(self) -> None:
         for relative in (

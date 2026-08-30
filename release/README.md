@@ -86,10 +86,20 @@ manifest-derived project URL and, when cleared, the exact receipted social-card 
 Verification also resolves the release manifest at the declared source commit and
 reproduces the complete project page byte-for-byte, so titles, synopsis, credits,
 statuses, links, and other passive public claims cannot be changed by rehashing an
-artifact receipt. Generated outputs are not committed from the draft phase. The Pages
-receipt retains the source-manifest, release-receipt, project-byte, and discovery
+artifact receipt. The source manifest binds the historical renderers as
+`danse.project-page.v1` and `danse.release-payload.v1`; any future template must
+introduce a new source-manifest contract and retain the historical renderer so
+authentic earlier receipts remain verifiable. Verification regenerates and byte-compares
+every generated document and inventory, and binds every copied medium to its exact
+source-manifest destination, byte count, and digest. Production receipts hash the
+committed manifest blob rather than checkout-normalized bytes, so a clean CRLF checkout
+verifies against the same source object. Public/release verification also reruns the
+source-bound phase blockers; a self-rehashed receipt cannot promote a draft manifest.
+Generated outputs are not committed from the draft phase. The Pages
+receipt retains the source-manifest, release identity/payload, project-byte, and discovery
 bindings and reapplies the same policy after composition, so rehashing the outer Pages
-manifest cannot admit weakened project markup.
+manifest cannot admit weakened project markup, unmanifested files, substituted public
+copy, or omitted required media/products.
 
 ## Closing a gate
 

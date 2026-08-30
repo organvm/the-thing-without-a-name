@@ -392,13 +392,12 @@ def public_release_files(
 
     if "project/index.html" not in selected:
         raise ArtifactError("public release artifact does not declare project/index.html")
-    release_receipt = release_artifact / builder.ARTIFACT_MANIFEST
     binding = {
         "schema": receipt["schema"],
         "phase": receipt["phase"],
         "release_id": receipt["release"]["id"],
         "version": receipt["release"]["version"],
-        "receipt_sha256": sha256(release_receipt),
+        "payload_contract": receipt["release"]["payload_contract"],
         "manifest_sha256": receipt["release"]["manifest"]["sha256"],
         "project_sha256": receipt_files["project/index.html"]["sha256"],
         "project_security": receipt["release"]["project_security"],
@@ -554,7 +553,7 @@ def verify_artifact(
             "phase",
             "release_id",
             "version",
-            "receipt_sha256",
+            "payload_contract",
             "manifest_sha256",
             "project_sha256",
             "project_security",
@@ -567,7 +566,7 @@ def verify_artifact(
             or not release["release_id"]
             or not isinstance(release["version"], str)
             or not release["version"]
-            or not re.fullmatch(r"[0-9a-f]{64}", str(release["receipt_sha256"]))
+            or release["payload_contract"] != "danse.release-payload.v1"
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["manifest_sha256"]))
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["project_sha256"]))
         ):
@@ -608,11 +607,88 @@ def verify_artifact(
         extra = sorted(inventory - expected)
         missing = sorted(expected - inventory)
         raise ArtifactError(f"artifact inventory mismatch; extra={extra}, missing={missing}")
+
+    source_manifest = None
+    builder = None
+    if require_source_manifest:
+        source_root = source_root.absolute().resolve()
+        validate_git_source(source_root, source["commit"])
+        expected_records: dict[str, dict] = {}
+        for relative in source_files(source_root):
+            path = source_file(source_root, relative)
+            expected_records[relative] = {
+                "path": relative,
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+            }
+        if release is not None:
+            builder = _load_release_builder()
+            try:
+                source_manifest, manifest_sha256 = builder.source_release_manifest(
+                    source_root,
+                    source["commit"],
+                    allow_worktree_fallback=False,
+                )
+                blockers = builder.phase_blockers(source_manifest, "public")
+                if blockers:
+                    preview = "; ".join(blockers[:8])
+                    raise ArtifactError(
+                        "artifact source manifest blocks public phase: " + preview
+                    )
+                if manifest_sha256 != release["manifest_sha256"]:
+                    raise ArtifactError(
+                        "artifact release manifest drifted from the source commit"
+                    )
+                if (
+                    release["release_id"] != source_manifest["release_id"]
+                    or release["version"] != source_manifest["version"]
+                    or release["payload_contract"]
+                    != source_manifest["artifact_contracts"]["release_payload"]
+                ):
+                    raise ArtifactError(
+                        "artifact release identity drifted from the source manifest"
+                    )
+                if builder.project_security_contract(
+                    source_manifest,
+                    "public",
+                ) != release["project_security"]:
+                    raise ArtifactError(
+                        "artifact project security drifted from the source manifest"
+                    )
+                release_records = builder.selected_release_records(
+                    source_manifest,
+                    "public",
+                    source["commit"],
+                )
+                collisions = set(expected_records) & set(release_records)
+                if collisions:
+                    raise ArtifactError(
+                        f"source and release records collide: {sorted(collisions)}"
+                    )
+                expected_records.update(release_records)
+            except ArtifactError:
+                raise
+            except Exception as exc:
+                raise ArtifactError(
+                    f"artifact source-manifest binding failed verification: {exc}"
+                ) from exc
+        if delivered_records != expected_records:
+            extra = sorted(set(delivered_records) - set(expected_records))
+            missing = sorted(set(expected_records) - set(delivered_records))
+            changed = sorted(
+                path
+                for path in set(delivered_records) & set(expected_records)
+                if delivered_records[path] != expected_records[path]
+            )
+            raise ArtifactError(
+                "artifact files exceed or drift from the source-bound public set; "
+                f"extra={extra}, missing={missing}, changed={changed}"
+            )
     has_project = "project/index.html" in paths
     if has_project != (release is not None):
         raise ArtifactError("artifact project route disagrees with its public release binding")
     if has_project:
-        builder = _load_release_builder()
+        builder = builder or _load_release_builder()
         try:
             builder.verify_project_links(
                 output,
@@ -636,26 +712,13 @@ def verify_artifact(
             )
         if require_source_manifest:
             try:
-                source_manifest, manifest_sha256 = builder.source_release_manifest(
-                    source_root,
-                    source["commit"],
-                    allow_worktree_fallback=False,
-                )
-                if manifest_sha256 != release["manifest_sha256"]:
-                    raise ArtifactError(
-                        "artifact release manifest drifted from the source commit"
-                    )
-                if builder.project_security_contract(
-                    source_manifest,
-                    "public",
-                ) != release["project_security"]:
-                    raise ArtifactError(
-                        "artifact project security drifted from the source manifest"
-                    )
+                if source_manifest is None:
+                    raise ArtifactError("artifact source manifest was not authenticated")
                 expected_project = builder.project_html(
                     source_manifest,
                     "public",
                     source["commit"],
+                    contract=release["project_security"]["project_contract"],
                 )
                 if hashlib.sha256(expected_project).hexdigest() != release[
                     "project_sha256"

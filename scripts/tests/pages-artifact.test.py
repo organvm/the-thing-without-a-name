@@ -168,6 +168,38 @@ def release_artifact_fixture(base: Path, phase: str) -> tuple[Path, Path]:
     return output, source
 
 
+def authenticated_public_pages_fixture(base: Path) -> tuple[Path, Path, str]:
+    """Build public release + Pages outputs from one exact synthetic Git checkout."""
+    root = RELEASE_SUPPORT.fixture_root(base / "combined-source")
+    manifest = RELEASE_SUPPORT.complete_manifest(root)
+    manifest["status"] = "public-approved"
+    public_fixture(root)
+    contract_bound_runtime = (
+        set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+    ) | {"installation/digital-twin.json"}
+    for relative in contract_bound_runtime:
+        shutil.copyfile(ROOT / relative, root / relative)
+    RELEASE_SUPPORT.write_manifest(root, manifest)
+    commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+    release_artifact = base / "public-release"
+    RELEASE_BUILD.build(
+        root,
+        release_artifact,
+        "public",
+        commit,
+        require_git_source=True,
+    )
+    pages_artifact = base / "public-pages"
+    PAGES.build(
+        root,
+        pages_artifact,
+        commit,
+        release_artifact=release_artifact,
+        require_git_source=True,
+    )
+    return root, pages_artifact, commit
+
+
 class ProductionArtifactTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -780,34 +812,16 @@ class ArtifactBoundaryTest(unittest.TestCase):
             PAGES.verify_artifact(self.output, "b" * 40)
 
     def test_source_manifest_verification_uses_requested_root(self) -> None:
-        release_root = RELEASE_SUPPORT.fixture_root(self.base / "release-source")
-        manifest = RELEASE_SUPPORT.complete_manifest(release_root)
-        manifest["status"] = "public-approved"
-        RELEASE_SUPPORT.write_manifest(release_root, manifest)
-        commit = RELEASE_SUPPORT.initialize_git_fixture(release_root)
-        release_artifact = self.base / "public-release"
-        RELEASE_BUILD.build(
-            release_root,
-            release_artifact,
-            "public",
-            commit,
-            require_git_source=True,
-        )
-
-        PAGES.build(
-            self.root,
-            self.output,
-            commit,
-            release_artifact=release_artifact,
-            release_source_root=release_root,
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "requested-root"
         )
         command = [
             sys.executable,
             str(ROOT / "scripts/build-pages.py"),
             "--root",
-            str(release_root),
+            str(source_root),
             "--verify",
-            str(self.output),
+            str(output),
             "--source-commit",
             commit,
         ]
@@ -819,6 +833,93 @@ class ArtifactBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertIn(f"files from {commit} verified", verified.stdout)
+
+    def test_self_rehashed_pages_manifest_cannot_add_private_file(self) -> None:
+        commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
+        PAGES.build(
+            self.root,
+            self.output,
+            commit,
+            require_git_source=True,
+        )
+        private = self.output / "release/private.txt"
+        write(private, b"private source bytes\n")
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"].append(
+            {
+                "path": "release/private.txt",
+                "bytes": private.stat().st_size,
+                "sha256": PAGES.sha256(private),
+            }
+        )
+        manifest["files"].sort(key=lambda record: record["path"])
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "extra=.*release/private.txt"):
+            PAGES.verify_artifact(
+                self.output,
+                commit,
+                require_source_manifest=True,
+                source_root=self.root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_substitute_runtime_bytes(self) -> None:
+        commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
+        PAGES.build(
+            self.root,
+            self.output,
+            commit,
+            require_git_source=True,
+        )
+        runtime = self.output / "arrival.js"
+        runtime.write_bytes(b"self-receipted replacement runtime\n")
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(item for item in manifest["files"] if item["path"] == "arrival.js")
+        record["bytes"] = runtime.stat().st_size
+        record["sha256"] = PAGES.sha256(runtime)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "changed=.*arrival.js"):
+            PAGES.verify_artifact(
+                self.output,
+                commit,
+                require_source_manifest=True,
+                source_root=self.root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_substitute_public_press_copy(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "press-substitution"
+        )
+        press = output / "press/press-kit.md"
+        press.write_text(
+            "# False approved biography and rights claim\n",
+            encoding="utf-8",
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            item for item in manifest["files"] if item["path"] == "press/press-kit.md"
+        )
+        record["bytes"] = press.stat().st_size
+        record["sha256"] = PAGES.sha256(press)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "changed=.*press/press-kit.md"):
+            PAGES.verify_artifact(
+                output,
+                commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
 
     def test_tampered_pose_vendor_source_fails_closed(self) -> None:
         vendor = self.root / PAGES.VENDOR_BASE / "vision_bundle.mjs"

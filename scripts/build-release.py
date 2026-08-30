@@ -34,6 +34,7 @@ from release_contract import (
     ReleaseError,
     canonical_json,
     load_json,
+    phase_blockers,
     safe_relative,
     sha256,
     source_commit,
@@ -47,6 +48,8 @@ from reportlab.pdfgen import canvas
 
 ARTIFACT_SCHEMA = "danse.release-build.v1"
 ARTIFACT_MANIFEST = "release-build.json"
+PROJECT_PAGE_CONTRACT = "danse.project-page.v1"
+RELEASE_PAYLOAD_CONTRACT = "danse.release-payload.v1"
 REPOSITORY = "organvm/the-thing-without-a-name"
 PDF_NAME = "pitch/danse-installation-pitch.pdf"
 GENERATED_PATHS = (
@@ -293,6 +296,9 @@ def project_security_contract(manifest: dict, phase: str) -> dict:
     if phase not in PHASES:
         raise ReleaseError(f"unknown project security phase: {phase}")
     identity = manifest["identity"]
+    project_contract = manifest["artifact_contracts"]["project_page"]
+    if project_contract != PROJECT_PAGE_CONTRACT:
+        raise ReleaseError(f"unsupported project-page contract: {project_contract}")
     canonical = identity["canonical_url"] + identity["project_path"]
     if identity["canonical_url"] != PROJECT_SITE_URL or canonical != PROJECT_CANONICAL_URL:
         raise ReleaseError("release manifest project URL drifted from the canonical site")
@@ -320,10 +326,14 @@ def project_security_contract(manifest: dict, phase: str) -> dict:
             "bytes": source["bytes"],
             "sha256": source["sha256"],
         }
-    return {"canonical_url": canonical, "social_image": social_image}
+    return {
+        "project_contract": project_contract,
+        "canonical_url": canonical,
+        "social_image": social_image,
+    }
 
 
-def project_html(manifest: dict, phase: str, commit: str) -> bytes:
+def _project_html_v1(manifest: dict, phase: str, commit: str) -> bytes:
     identity = manifest["identity"]
     copy = manifest["copy"]
     installation = manifest["installation"]
@@ -541,6 +551,26 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
 </html>
 """
     return document.encode("utf-8")
+
+
+def project_html(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    *,
+    contract: str | None = None,
+) -> bytes:
+    """Render one explicitly versioned project-page byte contract."""
+    source_contract = manifest["artifact_contracts"]["project_page"]
+    if contract is None:
+        contract = source_contract
+    if contract != source_contract:
+        raise ReleaseError(
+            "project-page contract does not match the source manifest"
+        )
+    if contract == PROJECT_PAGE_CONTRACT:
+        return _project_html_v1(manifest, phase, commit)
+    raise ReleaseError(f"unsupported project-page contract: {contract}")
 
 
 def accessibility_markdown(manifest: dict, phase: str) -> bytes:
@@ -972,6 +1002,163 @@ def pitch_pdf(manifest: dict, phase: str, commit: str) -> bytes:
     return pdf.finish()
 
 
+def manifested_media_records(manifest: dict, phase: str) -> list[dict]:
+    """Derive every copied-media identity directly from the source manifest."""
+    if phase not in PHASES:
+        raise ReleaseError(f"unknown release payload phase: {phase}")
+    records: list[dict] = []
+    paths: set[str] = set()
+    ids: set[str] = set()
+    for medium in manifest["media"]:
+        source = medium["source"]
+        if (
+            phase not in medium["required_for"]
+            or medium["status"] != "ready"
+            or medium["clearance"]["status"] != "cleared"
+            or source is None
+        ):
+            continue
+        destination = safe_relative(
+            source["destination"],
+            f"media {medium['id']} destination",
+        )
+        if medium["id"] in ids or destination in paths:
+            raise ReleaseError("release media identities or destinations are duplicated")
+        ids.add(medium["id"])
+        paths.add(destination)
+        records.append(
+            {
+                "id": medium["id"],
+                "path": destination,
+                "bytes": source["bytes"],
+                "sha256": source["sha256"],
+            }
+        )
+    return records
+
+
+def _generated_release_files_v1(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    copied: list[dict],
+) -> dict[str, bytes]:
+    generated_files = {
+        "project/index.html": project_html(
+            manifest,
+            phase,
+            commit,
+            contract=manifest["artifact_contracts"]["project_page"],
+        ),
+        PDF_NAME: pitch_pdf(manifest, phase, commit),
+        "accessibility/accessibility.md": accessibility_markdown(manifest, phase),
+        "accessibility/captions.en.vtt": captions_vtt(manifest, phase),
+        "accessibility/transcript.txt": transcript_text(manifest, phase),
+        "press/press-kit.md": press_markdown(manifest, phase),
+        "press/credits.txt": credits_text(manifest, phase),
+        "press/posting-calendar.json": canonical_json(
+            {
+                "schema": "danse.release-posting-calendar.v1",
+                "release_id": manifest["release_id"],
+                "phase": phase,
+                "publishes_automatically": False,
+                "items": manifest["press"]["posting_calendar"],
+            }
+        ),
+    }
+    generated_products = []
+    for product in manifest["products"]:
+        relative = product["path"]
+        if (
+            GENERATED_PRODUCT_PATHS.get(product["id"]) != relative
+            or relative not in generated_files
+        ):
+            raise ReleaseError(
+                f"generated product {product['id']} has no canonical builder output"
+            )
+        data = generated_files[relative]
+        generated_products.append(
+            {
+                "id": product["id"],
+                "path": relative,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    generated_files["media/release-media.json"] = media_inventory(
+        manifest,
+        phase,
+        copied,
+        generated_products,
+    )
+    if set(generated_files) != set(GENERATED_PATHS):
+        raise ReleaseError("release builder's generated output contract drifted")
+    return generated_files
+
+
+def generated_release_files(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    copied: list[dict],
+) -> dict[str, bytes]:
+    """Dispatch the source-bound, historically preserved payload renderer."""
+    contract = manifest["artifact_contracts"]["release_payload"]
+    if contract == RELEASE_PAYLOAD_CONTRACT:
+        return _generated_release_files_v1(manifest, phase, commit, copied)
+    raise ReleaseError(f"unsupported release-payload contract: {contract}")
+
+
+def release_payload_records(manifest: dict, phase: str, commit: str) -> dict[str, dict]:
+    """Return the complete source-bound identity of one release artifact."""
+    copied = manifested_media_records(manifest, phase)
+    generated = generated_release_files(manifest, phase, commit, copied)
+    records = {
+        record["path"]: {
+            "path": record["path"],
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
+        for record in copied
+    }
+    for relative, data in generated.items():
+        if relative in records:
+            raise ReleaseError(f"generated output collides with release media: {relative}")
+        records[relative] = {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    return records
+
+
+def selected_release_records(
+    manifest: dict,
+    phase: str,
+    commit: str,
+) -> dict[str, dict]:
+    """Select the exact generated/media records admitted to a composed surface."""
+    payload = release_payload_records(manifest, phase, commit)
+    selected = {
+        record["path"]: payload[record["path"]]
+        for record in manifested_media_records(manifest, phase)
+    }
+    for product in manifest["products"]:
+        if phase not in product["required_for"]:
+            continue
+        if product["status"] != "ready":
+            raise ReleaseError(
+                f"{phase} generated product {product['id']} is not admitted"
+            )
+        relative = product["path"]
+        if relative not in payload or relative in selected:
+            raise ReleaseError(
+                f"{phase} generated product {product['id']} has an invalid identity"
+            )
+        selected[relative] = payload[relative]
+    return selected
+
+
 def write_bytes(output: Path, relative: str, data: bytes) -> Path:
     relative = safe_relative(relative, "artifact output path")
     target = output / PurePosixPath(relative)
@@ -1133,10 +1320,13 @@ def verify_project_security_contract(
 ) -> tuple[str, str | None]:
     """Validate the manifest-derived discovery URLs against receipted bytes."""
     if not isinstance(contract, dict) or set(contract) != {
+        "project_contract",
         "canonical_url",
         "social_image",
     }:
         raise ReleaseError("project security binding has an unknown shape")
+    if contract["project_contract"] != PROJECT_PAGE_CONTRACT:
+        raise ReleaseError("project-page contract is unsupported")
     canonical = contract["canonical_url"]
     if canonical != PROJECT_CANONICAL_URL:
         raise ReleaseError("project canonical URL is not manifest-bound")
@@ -1433,6 +1623,7 @@ def verify_artifact(
     if set(release) != {
         "id",
         "version",
+        "payload_contract",
         "manifest",
         "project_security",
         "installation_reference",
@@ -1461,6 +1652,26 @@ def verify_artifact(
     )
     if release["manifest"]["sha256"] != source_manifest_sha256:
         raise ReleaseError("release artifact manifest digest does not match its source commit")
+    try:
+        blockers = phase_blockers(source_manifest, receipt["phase"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReleaseError(
+            f"source-commit release manifest cannot prove phase eligibility: {exc}"
+        ) from exc
+    if blockers:
+        preview = "; ".join(blockers[:8])
+        suffix = f"; and {len(blockers) - 8} more" if len(blockers) > 8 else ""
+        raise ReleaseError(
+            f"source-commit manifest blocks {receipt['phase']} phase: {preview}{suffix}"
+        )
+    if (
+        release["id"] != source_manifest["release_id"]
+        or release["version"] != source_manifest["version"]
+        or release["payload_contract"]
+        != source_manifest["artifact_contracts"]["release_payload"]
+        or release["payload_contract"] != RELEASE_PAYLOAD_CONTRACT
+    ):
+        raise ReleaseError("release artifact identity drifted from its source manifest")
     expected_project_security = project_security_contract(
         source_manifest,
         receipt["phase"],
@@ -1507,6 +1718,10 @@ def verify_artifact(
             or record["bytes"] < 0
         ):
             raise ReleaseError(f"release artifact installation {key} binding is invalid")
+    if installation_reference != source_manifest["installation"]["reference_contract"]:
+        raise ReleaseError(
+            "release artifact installation binding drifted from its source manifest"
+        )
     if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260829.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity snapshot")
     if release["opportunity_receipt"]["path"] != "opportunities/omega-20260829.receipt.json":
@@ -1568,9 +1783,12 @@ def verify_artifact(
         expected_project_security,
         delivered_records,
     )
-    expected_project = project_html(source_manifest, receipt["phase"], commit).decode(
-        "utf-8"
-    )
+    expected_project = project_html(
+        source_manifest,
+        receipt["phase"],
+        commit,
+        contract=expected_project_security["project_contract"],
+    ).decode("utf-8")
     if project != expected_project:
         raise ReleaseError(
             "project page does not reproduce the source-manifest public claims"
@@ -1595,6 +1813,23 @@ def verify_artifact(
     if not captions.startswith("WEBVTT\n"):
         raise ReleaseError("caption artifact is not WebVTT")
     _verify_pdf(output / PDF_NAME, receipt["phase"], project_title(project))
+    expected_payload = release_payload_records(
+        source_manifest,
+        receipt["phase"],
+        commit,
+    )
+    if delivered_records != expected_payload:
+        extra = sorted(set(delivered_records) - set(expected_payload))
+        missing = sorted(set(expected_payload) - set(delivered_records))
+        changed = sorted(
+            path
+            for path in set(delivered_records) & set(expected_payload)
+            if delivered_records[path] != expected_payload[path]
+        )
+        raise ReleaseError(
+            "release payload does not reproduce its source-manifest contract; "
+            f"extra={extra}, missing={missing}, changed={changed}"
+        )
     return receipt
 
 
@@ -1618,6 +1853,15 @@ def build(
     if require_git_source:
         validate_git_source(root, commit)
     manifest = validate_release(root, phase=phase)
+    source_manifest, source_manifest_sha256 = source_release_manifest(
+        root,
+        commit,
+        allow_worktree_fallback=not require_git_source,
+    )
+    if source_manifest != manifest:
+        raise ReleaseError(
+            "validated release manifest does not match the declared source commit"
+        )
     output = output.absolute()
     if output.is_symlink():
         raise ReleaseError(f"refusing symlinked release output: {output}")
@@ -1657,46 +1901,10 @@ def build(
             }
         )
 
-    generated_files = {
-        "project/index.html": project_html(manifest, phase, commit),
-        PDF_NAME: pitch_pdf(manifest, phase, commit),
-        "accessibility/accessibility.md": accessibility_markdown(manifest, phase),
-        "accessibility/captions.en.vtt": captions_vtt(manifest, phase),
-        "accessibility/transcript.txt": transcript_text(manifest, phase),
-        "press/press-kit.md": press_markdown(manifest, phase),
-        "press/credits.txt": credits_text(manifest, phase),
-        "press/posting-calendar.json": canonical_json(
-            {
-                "schema": "danse.release-posting-calendar.v1",
-                "release_id": manifest["release_id"],
-                "phase": phase,
-                "publishes_automatically": False,
-                "items": manifest["press"]["posting_calendar"],
-            }
-        ),
-    }
-    generated_products = []
-    for product in manifest["products"]:
-        relative = product["path"]
-        if GENERATED_PRODUCT_PATHS.get(product["id"]) != relative or relative not in generated_files:
-            raise ReleaseError(f"generated product {product['id']} has no canonical builder output")
-        data = generated_files[relative]
-        generated_products.append(
-            {
-                "id": product["id"],
-                "path": relative,
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
-        )
-    generated_files["media/release-media.json"] = media_inventory(
-        manifest,
-        phase,
-        copied,
-        generated_products,
-    )
-    if set(generated_files) != set(GENERATED_PATHS):
-        raise ReleaseError("release builder's generated output contract drifted")
+    expected_copied = manifested_media_records(manifest, phase)
+    if copied != expected_copied:
+        raise ReleaseError("copied media drifted from the source-manifest contract")
+    generated_files = generated_release_files(manifest, phase, commit, copied)
     for relative, data in generated_files.items():
         write_bytes(output, relative, data)
 
@@ -1704,7 +1912,6 @@ def build(
     for relative in sorted(artifact_inventory(output)):
         path = output / PurePosixPath(relative)
         files.append({"path": relative, "bytes": path.stat().st_size, "sha256": sha256(path)})
-    manifest_path = source_file(root, MANIFEST.as_posix(), "release manifest")
     installation_reference = manifest["installation"]["reference_contract"]
     receipt = {
         "schema": ARTIFACT_SCHEMA,
@@ -1718,7 +1925,11 @@ def build(
         "release": {
             "id": manifest["release_id"],
             "version": manifest["version"],
-            "manifest": {"path": MANIFEST.as_posix(), "sha256": sha256(manifest_path)},
+            "payload_contract": manifest["artifact_contracts"]["release_payload"],
+            "manifest": {
+                "path": MANIFEST.as_posix(),
+                "sha256": source_manifest_sha256,
+            },
             "project_security": project_security_contract(manifest, phase),
             "installation_reference": {
                 "schema": installation_reference["schema"],
