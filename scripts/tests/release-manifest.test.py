@@ -817,6 +817,120 @@ class ProductionCliSourceTest(unittest.TestCase):
             )
             self.assertNotEqual(CONTRACT.sha256(manifest_path), committed_sha)
 
+    def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base / "source")
+            claimed_commit = initialize_git_fixture(root)
+            alternate = base / "alternate"
+            subprocess.run(
+                ["git", "clone", "-q", str(root), str(alternate)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            alternate_manifest = alternate / "release/manifest.json"
+            manifest = json.loads(alternate_manifest.read_text(encoding="utf-8"))
+            manifest["version"] = "0.1.1-draft"
+            alternate_manifest.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(alternate), "add", "release/manifest.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(alternate),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "alternate release manifest",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            alternate_commit = subprocess.run(
+                ["git", "-C", str(alternate), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            shutil.copy2(alternate_manifest, root / "release/manifest.json")
+            self.assertNotEqual(claimed_commit, alternate_commit)
+
+            redirect = {
+                "GIT_DIR": str(alternate / ".git"),
+                "GIT_WORK_TREE": str(root),
+            }
+            ambient = os.environ.copy()
+            ambient.update(redirect)
+            redirected_identity = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=ambient,
+            ).stdout.strip()
+            redirected_status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=ambient,
+            ).stdout
+            self.assertEqual(redirected_identity, alternate_commit)
+            self.assertEqual(redirected_status, "")
+
+            with mock.patch.dict(os.environ, redirect, clear=False):
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "does not match checkout HEAD",
+                ):
+                    BUILD.build(
+                        root,
+                        base / "redirected-artifact",
+                        "draft",
+                        alternate_commit,
+                        require_git_source=True,
+                    )
+
+    def test_provenance_git_environment_scrubs_all_ambient_git_controls(self) -> None:
+        controls = {
+            "git_dir": "/alternate/repository",
+            "GIT_WORK_TREE": "/alternate/worktree",
+            "GIT_COMMON_DIR": "/alternate/common",
+            "GIT_OBJECT_DIRECTORY": "/alternate/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/alternate/objects-2",
+            "GIT_INDEX_FILE": "/alternate/index",
+            "GIT_NAMESPACE": "alternate",
+            "GIT_SHALLOW_FILE": "/alternate/shallow",
+            "GIT_CONFIG": "/alternate/config",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": "/alternate/worktree",
+        }
+        with mock.patch.dict(os.environ, controls, clear=False):
+            clean = CONTRACT.provenance_git_env()
+        for key in controls:
+            self.assertNotIn(key, clean)
+        self.assertEqual(clean["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(clean["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(clean["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(clean["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(clean["GIT_ATTR_NOSYSTEM"], "1")
+
     def test_source_commit_manifest_rejects_duplicate_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = fixture_root(Path(temporary))

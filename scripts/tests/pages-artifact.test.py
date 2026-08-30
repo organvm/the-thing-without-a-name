@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -550,6 +551,115 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 claimed_commit,
                 require_git_source=True,
             )
+
+    def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
+        root = self.base / "redirected-source"
+        public_fixture(root)
+        claimed_commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        alternate = self.base / "redirected-alternate"
+        subprocess.run(
+            ["git", "clone", "-q", str(root), str(alternate)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        alternate_arrival = alternate / "arrival.js"
+        alternate_arrival.write_bytes(
+            alternate_arrival.read_bytes() + b"// alternate repository payload\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(alternate), "add", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(alternate),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "alternate repository payload",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        alternate_commit = subprocess.run(
+            ["git", "-C", str(alternate), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        shutil.copy2(alternate_arrival, root / "arrival.js")
+        self.assertNotEqual(claimed_commit, alternate_commit)
+
+        redirect = {
+            "GIT_DIR": str(alternate / ".git"),
+            "GIT_WORK_TREE": str(root),
+        }
+        ambient = os.environ.copy()
+        ambient.update(redirect)
+        redirected_identity = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=ambient,
+        ).stdout.strip()
+        redirected_status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=ambient,
+        ).stdout
+        self.assertEqual(redirected_identity, alternate_commit)
+        self.assertEqual(redirected_status, "")
+
+        with mock.patch.dict(os.environ, redirect, clear=False):
+            with self.assertRaisesRegex(
+                PAGES.ArtifactError,
+                "does not match checkout HEAD",
+            ):
+                PAGES.build(
+                    root,
+                    self.base / "redirected-pages",
+                    alternate_commit,
+                    require_git_source=True,
+                )
+
+    def test_provenance_git_environment_scrubs_all_ambient_git_controls(self) -> None:
+        controls = {
+            "git_dir": "/alternate/repository",
+            "GIT_WORK_TREE": "/alternate/worktree",
+            "GIT_COMMON_DIR": "/alternate/common",
+            "GIT_OBJECT_DIRECTORY": "/alternate/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/alternate/objects-2",
+            "GIT_INDEX_FILE": "/alternate/index",
+            "GIT_NAMESPACE": "alternate",
+            "GIT_SHALLOW_FILE": "/alternate/shallow",
+            "GIT_CONFIG": "/alternate/config",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": "/alternate/worktree",
+        }
+        with mock.patch.dict(os.environ, controls, clear=False):
+            clean = PAGES.provenance_git_env()
+        for key in controls:
+            self.assertNotIn(key, clean)
+        self.assertEqual(clean["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(clean["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(clean["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(clean["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(clean["GIT_ATTR_NOSYSTEM"], "1")
 
     def test_legacy_git_grafts_cannot_rewrite_published_provenance(self) -> None:
         root = self.base / "graft-source"

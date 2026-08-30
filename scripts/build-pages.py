@@ -71,9 +71,28 @@ class ArtifactError(RuntimeError):
 
 
 def provenance_git_env() -> dict[str, str]:
-    """Return an environment that reads raw Git objects without replacements."""
-    env = os.environ.copy()
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    """Return an environment pinned to the repository named by ``git -C``.
+
+    Git gives ambient ``GIT_*`` variables precedence over ``-C`` repository
+    discovery.  In particular, ``GIT_DIR``/``GIT_WORK_TREE`` can make a clean
+    alternate checkout answer provenance queries for the requested root.  Drop
+    every inherited Git control variable, then restore only the fail-closed
+    settings needed by these read-only provenance commands.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    env.update(
+        {
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
     return env
 
 
