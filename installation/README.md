@@ -132,6 +132,7 @@ python3 installation/runtime.py --check \
   --evidence /external/evidence.json --release-root /external/release
 python3 installation/runtime.py --run \
   --evidence /external/evidence.json --release-root /external/release \
+  --session-id venue-cycle-20260804-01 \
   --telemetry /external/recovery-session.jsonl
 ```
 
@@ -154,13 +155,24 @@ setup/strike/restore receipt payload, must include the configuration digest
 computed from the exact venue, geometry, release manifest and launcher, hardware,
 calibration, runtime approval/arguments/health contract, river, and output set.
 The telemetry envelope must carry the exact newline-terminated JSONL bytes, not
-only their digest. The validator rehashes those bytes, validates their sequence,
-and requires exactly one leading `runtime-admitted` event whose configuration,
-spec, evidence, release, and launcher bindings match the admitted runtime. All
-other supplied SHA-256 values are recomputed from their canonical payloads. A
-stale telemetry stream or hash placed beside a new configuration therefore fails
-validation. Before any recovery or restore claim exists, the restore binding may
-remain `null`;
+only their digest. The validator rehashes those bytes, requires a unique runtime
+session, strict monotonic sequence/time, one leading `runtime-admitted` event,
+and a final `runtime-ready` event without a terminal failure. Its configuration,
+spec, evidence, release, and launcher bindings must match the admitted runtime.
+All other supplied SHA-256 values are recomputed from their canonical payloads.
+These hashes prove internal consistency only: because a submitter can rewrite
+bytes and recompute every self-authored hash, they do not authenticate a physical
+observation or its provenance.
+
+Accordingly, `--phase complete` intentionally fails closed even for an
+internally consistent v2 candidate. Completion additionally requires a reviewed
+external authority verifier backed by an immutable allowlist. Each of the three
+cycles must be bound by that verifier to a distinct authority receipt identity,
+runtime session, telemetry digest, configuration digest, and observation time.
+The repository does not yet choose or configure a signing key, immutable
+owner-authored record, or other authority rail, so no portable run can certify
+physical completion. Before any recovery or restore claim exists, the restore
+binding may remain `null`;
 `--phase runtime --emit runtime-plan` returns the exact `configuration_sha256`
 used to build the three telemetry/observation envelopes and restore receipts.
 
@@ -170,5 +182,6 @@ The tracked gate ledger intentionally records all eight physical gates as
 blocked. Completion still requires venue approval; exact hardware, cabling,
 power, ventilation, and safety receipts; projector/speaker/AV measurements; the
 human-visible plane/cue test; launcher approval; three distinct human-observed
-wall-plug recoveries; and setup/strike/clean-restore evidence. A green reference
-suite cannot close issue #14.
+wall-plug recoveries; setup/strike/clean-restore evidence; and integration of the
+reviewed immutable authority verifier described above. A green reference suite
+cannot close issue #14.

@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -48,14 +49,20 @@ except ImportError:  # Direct `python3 installation/runtime.py` execution.
 
 TELEMETRY_SCHEMA = "danse.installation.telemetry.v1"
 RUNTIME_PLAN_SCHEMA = "danse.installation.runtime-plan.v2"
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 
 
 def canonical_relative_path(value: Any, label: str) -> PurePosixPath:
-    if not isinstance(value, str) or "\\" in value:
+    if not isinstance(value, str) or "\\" in value or "\0" in value:
         raise ContractError(f"{label} must be a canonical relative path")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"{label} must be a canonical relative path") from exc
     pure = PurePosixPath(value)
     if (
         pure.is_absolute()
+        or not pure.parts
         or pure.as_posix() != value
         or any(part in {"", ".", ".."} for part in pure.parts)
     ):
@@ -98,7 +105,18 @@ def probe_health(url: str, timeout: float) -> bool:
         return False
 
 
-def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
+def validate_session_id(value: Any) -> str:
+    """Validate one venue-owned, non-secret runtime-cycle identifier."""
+    if not isinstance(value, str) or SESSION_ID.fullmatch(value) is None:
+        raise ContractError(
+            "--session-id must be 8-128 safe characters and unique to this runtime cycle"
+        )
+    return value
+
+
+def validate_runtime_plan_contract(
+    plan: Any, *, expected_spec: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Reject obsolete or incomplete plan contracts before field access."""
 
     def exact_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
@@ -118,6 +136,17 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         ):
             raise ContractError(f"installation runtime plan {label} is not SHA-256")
         return result
+
+    def utf8(value: Any, label: str) -> bytes:
+        result = nonempty(value, label)
+        if "\0" in result:
+            raise ContractError(f"installation runtime plan {label} is malformed")
+        try:
+            return result.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ContractError(
+                f"installation runtime plan {label} is malformed"
+            ) from exc
 
     def number(value: Any, label: str, minimum: float = 0) -> float:
         if (
@@ -156,7 +185,7 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         "configuration_sha256",
     ):
         sha256(plan[key], key)
-    nonempty(plan["evidence_id"], "evidence_id")
+    utf8(plan["evidence_id"], "evidence_id")
 
     manifest = exact_object(
         plan["release_manifest"], {"path", "content"}, "release_manifest"
@@ -164,7 +193,7 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
     canonical_relative_path(manifest["path"], "runtime manifest path")
     manifest_content = nonempty(manifest["content"], "release_manifest.content")
     if (
-        hashlib.sha256(manifest_content.encode("utf-8")).hexdigest()
+        hashlib.sha256(utf8(manifest_content, "release_manifest.content")).hexdigest()
         != plan["release_manifest_sha256"]
     ):
         raise ContractError("installation runtime plan manifest digest drifted")
@@ -212,6 +241,8 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         or argv[0] != launcher["path"]
     ):
         raise ContractError("installation runtime plan argv is malformed")
+    for index, argument in enumerate(argv[1:], start=1):
+        validate_snapshot_argument(argument, index)
 
     health_url = plan["health_url"]
     if health_url is not None:
@@ -257,6 +288,8 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         or len(set(outputs)) != len(outputs)
     ):
         raise ContractError("installation runtime plan outputs is malformed")
+    for index, output in enumerate(outputs):
+        utf8(output, f"outputs[{index}]")
 
     policy = exact_object(
         plan["policy"],
@@ -342,6 +375,25 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         )
     for index, value in enumerate(backoff):
         number(value, f"policy.recovery.backoff_seconds[{index}]")
+    if expected_spec is not None:
+        expected_outputs = [
+            output["id"]
+            for output in sorted(
+                expected_spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ]
+        if plan["spec_contract_sha256"] != expected_spec["identity"]["contract_sha256"]:
+            raise ContractError(
+                "installation runtime plan contract drifted from the authenticated digital twin"
+            )
+        if outputs != expected_outputs:
+            raise ContractError(
+                "installation runtime plan outputs drifted from the authenticated digital twin"
+            )
+        if policy != expected_spec["runtime"]:
+            raise ContractError(
+                "installation runtime plan policy drifted from the authenticated digital twin"
+            )
     return plan
 
 
@@ -595,8 +647,9 @@ def supervise(
 ) -> int:
     """Run one admitted launcher and recover only within its declared budget."""
     try:
-        plan = validate_runtime_plan_contract(plan)
-    except ContractError:
+        expected_spec = load_reference_contracts()[0]
+        plan = validate_runtime_plan_contract(plan, expected_spec=expected_spec)
+    except (ContractError, OSError):
         telemetry.emit("runtime-plan-invalid", attempt=0)
         return 78
     policy = plan["policy"]
@@ -682,17 +735,31 @@ def supervise(
 
             started = clock()
             ever_healthy = plan["health_url"] is None
+            readiness_emitted = False
             consecutive_failures = 0
             forced_failure: str | None = None
             try:
                 while process.poll() is None:
-                    if plan["health_url"] is not None:
+                    if plan["health_url"] is None:
+                        if not readiness_emitted:
+                            telemetry.emit(
+                                "runtime-ready",
+                                attempt=attempt,
+                                readiness="process-running",
+                            )
+                            readiness_emitted = True
+                    else:
                         ok = health_probe(
                             plan["health_url"], health["probe_timeout_seconds"]
                         )
                         if ok:
-                            if not ever_healthy:
+                            if not ever_healthy or consecutive_failures > 0:
                                 telemetry.emit("health-ready", attempt=attempt)
+                                telemetry.emit(
+                                    "runtime-ready",
+                                    attempt=attempt,
+                                    readiness="health-probe",
+                                )
                             ever_healthy = True
                             consecutive_failures = 0
                         else:
@@ -775,6 +842,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--telemetry", default="-", help="JSONL receipt path; - writes to stdout"
     )
+    value.add_argument(
+        "--session-id",
+        help="venue-owned unique ID for this --run telemetry cycle",
+    )
     return value
 
 
@@ -798,6 +869,7 @@ def main(argv: list[str] | None = None) -> int:
     stream: TextIO | None = None
     close_stream = False
     try:
+        session_id = validate_session_id(args.session_id) if args.run else None
         spec, _, _ = load_reference_contracts()
         evidence = load_json(args.evidence)
         plan = runtime_plan(evidence, spec, args.release_root)
@@ -808,6 +880,7 @@ def main(argv: list[str] | None = None) -> int:
         telemetry = Telemetry(stream)
         telemetry.emit(
             "runtime-admitted",
+            session_id=session_id,
             spec_contract_sha256=plan["spec_contract_sha256"],
             evidence_id=plan["evidence_id"],
             evidence_sha256=plan["evidence_sha256"],

@@ -100,6 +100,15 @@ def make_release(root: Path, spec: dict) -> None:
     )
 
 
+def refresh_telemetry_receipt(evidence: dict, proof: dict) -> None:
+    receipt = proof["runtime_telemetry_receipt"]
+    receipt["events_sha256"] = hashlib.sha256(
+        receipt["events_jsonl"].encode("utf-8")
+    ).hexdigest()
+    proof["runtime_telemetry_sha256"] = canonical_sha256(receipt)
+    proof["receipt_sha256"] = wall_plug_receipt_sha256(evidence["evidence_id"], proof)
+
+
 def refresh_configuration(evidence: dict, spec: dict, release_root: Path) -> dict:
     configuration_sha256 = physical_configuration_sha256(
         evidence, spec, file_digest(release_root / "bin/danse-launcher")
@@ -107,42 +116,52 @@ def refresh_configuration(evidence: dict, spec: dict, release_root: Path) -> dic
     evidence["restore_rehearsal"]["configuration_sha256"] = configuration_sha256
     for proof in evidence["wall_plug_proofs"]:
         proof["configuration_sha256"] = configuration_sha256
-        events_jsonl = (
-            json.dumps(
-                {
-                    "schema": "danse.installation.telemetry.v1",
-                    "sequence": 0,
-                    "elapsed_seconds": 0.0,
-                    "event": "runtime-admitted",
-                    "spec_contract_sha256": spec["identity"]["contract_sha256"],
-                    "evidence_id": evidence["evidence_id"],
-                    "evidence_sha256": digest(
-                        f"runtime-admission-evidence-{proof['id']}"
-                    ),
-                    "configuration_sha256": configuration_sha256,
-                    "release_manifest_sha256": evidence["release"]["manifest_sha256"],
-                    "launcher_sha256": file_digest(release_root / "bin/danse-launcher"),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
+        session_id = f"session-{proof['id']}"
+        events = [
+            {
+                "schema": "danse.installation.telemetry.v1",
+                "sequence": 0,
+                "elapsed_seconds": 0.0,
+                "event": "runtime-admitted",
+                "session_id": session_id,
+                "spec_contract_sha256": spec["identity"]["contract_sha256"],
+                "evidence_id": evidence["evidence_id"],
+                "evidence_sha256": digest(f"runtime-admission-evidence-{proof['id']}"),
+                "configuration_sha256": configuration_sha256,
+                "release_manifest_sha256": evidence["release"]["manifest_sha256"],
+                "launcher_sha256": file_digest(release_root / "bin/danse-launcher"),
+            },
+            {
+                "schema": "danse.installation.telemetry.v1",
+                "sequence": 1,
+                "elapsed_seconds": 0.001,
+                "event": "launcher-start",
+                "attempt": 1,
+            },
+            {
+                "schema": "danse.installation.telemetry.v1",
+                "sequence": 2,
+                "elapsed_seconds": 0.002,
+                "event": "runtime-ready",
+                "attempt": 1,
+                "readiness": "process-running",
+            },
+        ]
+        events_jsonl = "".join(
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+            for event in events
         )
         proof["runtime_telemetry_receipt"] = {
             "schema": "danse.installation.runtime-telemetry-receipt.v2",
             "evidence_id": evidence["evidence_id"],
             "proof_id": proof["id"],
+            "session_id": session_id,
             "spec_contract_sha256": spec["identity"]["contract_sha256"],
             "configuration_sha256": configuration_sha256,
             "events_sha256": hashlib.sha256(events_jsonl.encode("utf-8")).hexdigest(),
             "events_jsonl": events_jsonl,
         }
-        proof["runtime_telemetry_sha256"] = canonical_sha256(
-            proof["runtime_telemetry_receipt"]
-        )
-        proof["receipt_sha256"] = wall_plug_receipt_sha256(
-            evidence["evidence_id"], proof
-        )
+        refresh_telemetry_receipt(evidence, proof)
     restore = evidence["restore_rehearsal"]
     if all(
         restore[key]
@@ -389,6 +408,10 @@ class InstallationContractTest(unittest.TestCase):
         self.assertIn("runtime_telemetry_receipt", wall_plug["required"])
         self.assertIn(
             "events_jsonl",
+            wall_plug["properties"]["runtime_telemetry_receipt"]["required"],
+        )
+        self.assertIn(
+            "session_id",
             wall_plug["properties"]["runtime_telemetry_receipt"]["required"],
         )
         self.assertEqual(
@@ -823,12 +846,12 @@ class InstallationContractTest(unittest.TestCase):
             release = Path(temporary)
             make_release(release, self.spec)
             evidence = evidence_for(self.spec, release, complete=True)
-            self.assertEqual(
+            with self.assertRaisesRegex(
+                ContractError, "immutable allowlisted authority attestation"
+            ):
                 validate_evidence(
                     evidence, self.spec, phase="complete", release_root=release
-                ),
-                evidence,
-            )
+                )
 
             missing = copy.deepcopy(evidence)
             missing["wall_plug_proofs"].pop()
@@ -926,6 +949,136 @@ class InstallationContractTest(unittest.TestCase):
                     release_root=release,
                 )
 
+            terminal_failure = copy.deepcopy(evidence)
+            terminal_proof = terminal_failure["wall_plug_proofs"][0]
+            terminal_records = [
+                json.loads(line)
+                for line in terminal_proof["runtime_telemetry_receipt"][
+                    "events_jsonl"
+                ].splitlines()
+            ]
+            terminal_records[-1] = {
+                "schema": "danse.installation.telemetry.v1",
+                "sequence": 2,
+                "elapsed_seconds": 0.002,
+                "event": "release-integrity-failed",
+                "attempt": 1,
+            }
+            terminal_proof["runtime_telemetry_receipt"]["events_jsonl"] = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in terminal_records
+            )
+            refresh_telemetry_receipt(terminal_failure, terminal_proof)
+            with self.assertRaisesRegex(ContractError, "failure state"):
+                validate_evidence(
+                    terminal_failure,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            unhealthy = copy.deepcopy(evidence)
+            unhealthy_proof = unhealthy["wall_plug_proofs"][0]
+            unhealthy_records = [
+                json.loads(line)
+                for line in unhealthy_proof["runtime_telemetry_receipt"][
+                    "events_jsonl"
+                ].splitlines()
+            ]
+            unhealthy_records[-1] = {
+                "schema": "danse.installation.telemetry.v1",
+                "sequence": 2,
+                "elapsed_seconds": 0.002,
+                "event": "launcher-unhealthy",
+                "attempt": 1,
+                "reason": "runtime-health",
+                "returncode": -15,
+            }
+            unhealthy_proof["runtime_telemetry_receipt"]["events_jsonl"] = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in unhealthy_records
+            )
+            refresh_telemetry_receipt(unhealthy, unhealthy_proof)
+            with self.assertRaisesRegex(ContractError, "does not end ready"):
+                validate_evidence(
+                    unhealthy,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            duplicate_events = copy.deepcopy(evidence)
+            first = duplicate_events["wall_plug_proofs"][0]
+            second = duplicate_events["wall_plug_proofs"][1]
+            second["runtime_telemetry_receipt"] = copy.deepcopy(
+                first["runtime_telemetry_receipt"]
+            )
+            second["runtime_telemetry_receipt"]["proof_id"] = second["id"]
+            refresh_telemetry_receipt(duplicate_events, second)
+            with self.assertRaisesRegex(ContractError, "distinct underlying telemetry"):
+                validate_evidence(
+                    duplicate_events,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            non_integer_sequence = copy.deepcopy(evidence)
+            sequence_proof = non_integer_sequence["wall_plug_proofs"][0]
+            sequence_records = [
+                json.loads(line)
+                for line in sequence_proof["runtime_telemetry_receipt"][
+                    "events_jsonl"
+                ].splitlines()
+            ]
+            sequence_records[0]["sequence"] = False
+            sequence_proof["runtime_telemetry_receipt"]["events_jsonl"] = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in sequence_records
+            )
+            refresh_telemetry_receipt(non_integer_sequence, sequence_proof)
+            with self.assertRaisesRegex(ContractError, "event sequence is malformed"):
+                validate_evidence(
+                    non_integer_sequence,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            backwards_elapsed = copy.deepcopy(evidence)
+            elapsed_proof = backwards_elapsed["wall_plug_proofs"][0]
+            elapsed_records = [
+                json.loads(line)
+                for line in elapsed_proof["runtime_telemetry_receipt"][
+                    "events_jsonl"
+                ].splitlines()
+            ]
+            elapsed_records[-1]["elapsed_seconds"] = 0.0005
+            elapsed_proof["runtime_telemetry_receipt"]["events_jsonl"] = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in elapsed_records
+            )
+            refresh_telemetry_receipt(backwards_elapsed, elapsed_proof)
+            with self.assertRaisesRegex(ContractError, "elapsed time moved backwards"):
+                validate_evidence(
+                    backwards_elapsed,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            surrogate = copy.deepcopy(evidence)
+            surrogate["wall_plug_proofs"][0]["runtime_telemetry_receipt"][
+                "events_jsonl"
+            ] = "\ud800\n"
+            with self.assertRaisesRegex(ContractError, "not valid UTF-8 text"):
+                validate_evidence(
+                    surrogate,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
             relabeled_receipts = copy.deepcopy(evidence)
             relabeled_receipts["venue"]["id"] = "another-approved-venue"
             relabeled_configuration = physical_configuration_sha256(
@@ -960,6 +1113,28 @@ class InstallationContractTest(unittest.TestCase):
             ):
                 validate_evidence(
                     relabeled_receipts,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
+            coherent_relabel = copy.deepcopy(relabeled_receipts)
+            for proof in coherent_relabel["wall_plug_proofs"]:
+                receipt = proof["runtime_telemetry_receipt"]
+                records = [
+                    json.loads(line) for line in receipt["events_jsonl"].splitlines()
+                ]
+                records[0]["configuration_sha256"] = relabeled_configuration
+                receipt["events_jsonl"] = "".join(
+                    json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                    for record in records
+                )
+                refresh_telemetry_receipt(coherent_relabel, proof)
+            with self.assertRaisesRegex(
+                ContractError, "immutable allowlisted authority attestation"
+            ):
+                validate_evidence(
+                    coherent_relabel,
                     self.spec,
                     phase="complete",
                     release_root=release,
@@ -1034,6 +1209,36 @@ class InstallationContractTest(unittest.TestCase):
                 "empty-manifest": lambda plan: plan.__setitem__("release_manifest", {}),
                 "empty-release-file": lambda plan: plan.__setitem__(
                     "release_files", [{}]
+                ),
+                "drifted-policy": lambda plan: plan["policy"]["recovery"].update(
+                    {
+                        "max_restarts": 20,
+                        "backoff_seconds": [1.0] * 20,
+                    }
+                ),
+                "unbounded-policy-time": lambda plan: plan["policy"]["health"].update(
+                    {"probe_interval_seconds": 1e308}
+                ),
+                "drifted-spec": lambda plan: plan.__setitem__(
+                    "spec_contract_sha256", digest("untrusted-runtime-spec")
+                ),
+                "drifted-outputs": lambda plan: plan.__setitem__(
+                    "outputs", ["projection-counterfeit"]
+                ),
+                "nul-argument": lambda plan: plan["argv"].append("bad\0argument"),
+                "surrogate-argument": lambda plan: plan["argv"].append("\ud800"),
+                "surrogate-manifest": lambda plan: plan["release_manifest"].__setitem__(
+                    "content", "\ud800"
+                ),
+                "empty-path": lambda plan: (
+                    plan["release_files"][0].__setitem__("path", "."),
+                    plan["launcher"].__setitem__("path", "."),
+                    plan["argv"].__setitem__(0, "."),
+                ),
+                "nul-path": lambda plan: (
+                    plan["release_files"][0].__setitem__("path", "a\0b"),
+                    plan["launcher"].__setitem__("path", "a\0b"),
+                    plan["argv"].__setitem__(0, "a\0b"),
                 ),
             }
             for name, mutate in cases.items():

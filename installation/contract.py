@@ -29,6 +29,7 @@ EVIDENCE_SCHEMA = HERE / "evidence.schema.json"
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+RUNTIME_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 UINT32_MAX = 0xFFFFFFFF
 REQUIRED_SOURCE_CONTRACTS = {
     "projector-camera",
@@ -309,6 +310,10 @@ def validate_snapshot_argument(value: Any, index: int) -> str:
     """Require every trailing file argument to resolve inside the snapshot."""
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ContractError(f"runtime argv[{index}] is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"runtime argv[{index}] is invalid") from exc
     candidate = (
         value.split("=", 1)[1] if value.startswith("-") and "=" in value else value
     )
@@ -1928,6 +1933,8 @@ def validate_evidence(
         by_proof = _unique(proofs, "id", "wall_plug_proofs")
         observed_times: set[str] = set()
         telemetry: set[str] = set()
+        telemetry_events: set[str] = set()
+        telemetry_sessions: set[str] = set()
         proof_receipts: set[str] = set()
         for proof_id, proof in by_proof.items():
             _exact_keys(
@@ -2003,6 +2010,7 @@ def validate_evidence(
                     "schema",
                     "evidence_id",
                     "proof_id",
+                    "session_id",
                     "spec_contract_sha256",
                     "configuration_sha256",
                     "events_sha256",
@@ -2031,6 +2039,14 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} telemetry belongs to another admitted physical configuration"
                 )
+            session_id = telemetry_receipt["session_id"]
+            if (
+                not isinstance(session_id, str)
+                or RUNTIME_SESSION_ID.fullmatch(session_id) is None
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry session_id is malformed"
+                )
             _sha256(
                 telemetry_receipt["events_sha256"],
                 f"wall-plug proof {proof_id} telemetry events digest",
@@ -2040,7 +2056,12 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} telemetry must be newline-terminated JSONL"
                 )
-            events_bytes = events_jsonl.encode("utf-8")
+            try:
+                events_bytes = events_jsonl.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry is not valid UTF-8 text"
+                ) from exc
             if len(events_bytes) > 1_048_576:
                 raise ContractError(
                     f"wall-plug proof {proof_id} telemetry exceeds the receipt size limit"
@@ -2052,7 +2073,18 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} telemetry events digest does not match supplied bytes"
                 )
+            if telemetry_receipt["events_sha256"] in telemetry_events:
+                raise ContractError(
+                    "wall-plug proofs must preserve distinct underlying telemetry bytes"
+                )
+            telemetry_events.add(telemetry_receipt["events_sha256"])
+            if session_id in telemetry_sessions:
+                raise ContractError(
+                    "wall-plug proofs must preserve distinct runtime session ids"
+                )
+            telemetry_sessions.add(session_id)
             event_records: list[dict[str, Any]] = []
+            previous_elapsed = -math.inf
             for index, line in enumerate(events_jsonl.splitlines()):
                 if not line:
                     raise ContractError(
@@ -2064,6 +2096,8 @@ def validate_evidence(
                 )
                 if (
                     record.get("schema") != "danse.installation.telemetry.v1"
+                    or isinstance(record.get("sequence"), bool)
+                    or not isinstance(record.get("sequence"), int)
                     or record.get("sequence") != index
                     or isinstance(record.get("elapsed_seconds"), bool)
                     or not isinstance(record.get("elapsed_seconds"), (int, float))
@@ -2075,6 +2109,12 @@ def validate_evidence(
                     raise ContractError(
                         f"wall-plug proof {proof_id} telemetry event sequence is malformed"
                     )
+                elapsed = float(record["elapsed_seconds"])
+                if elapsed < previous_elapsed:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry elapsed time moved backwards"
+                    )
+                previous_elapsed = elapsed
                 event_records.append(record)
             admitted = [
                 record
@@ -2092,6 +2132,7 @@ def validate_evidence(
                     "sequence",
                     "elapsed_seconds",
                     "event",
+                    "session_id",
                     "spec_contract_sha256",
                     "evidence_id",
                     "evidence_sha256",
@@ -2103,6 +2144,7 @@ def validate_evidence(
             )
             if (
                 admission["sequence"] != 0
+                or admission["session_id"] != session_id
                 or admission["spec_contract_sha256"]
                 != spec["identity"]["contract_sha256"]
                 or admission["evidence_id"] != value["evidence_id"]
@@ -2118,6 +2160,90 @@ def validate_evidence(
                 admission["evidence_sha256"],
                 f"wall-plug proof {proof_id} admitted evidence digest",
             )
+            terminal_events = {
+                "runtime-plan-invalid",
+                "release-integrity-failed",
+                "recovery-budget-exhausted",
+                "operator-stop",
+            }
+            if any(record["event"] in terminal_events for record in event_records):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry terminates in a failure state"
+                )
+            if any(
+                record["event"] == "launcher-exit" and record.get("returncode") == 0
+                for record in event_records
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry shows the admitted runtime exited"
+                )
+            if event_records[-1]["event"] != "runtime-ready":
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry does not end ready"
+                )
+            ready = _exact_keys(
+                event_records[-1],
+                {
+                    "schema",
+                    "sequence",
+                    "elapsed_seconds",
+                    "event",
+                    "attempt",
+                    "readiness",
+                },
+                f"wall-plug proof {proof_id} runtime-ready event",
+            )
+            ready_attempt = ready["attempt"]
+            if (
+                isinstance(ready_attempt, bool)
+                or not isinstance(ready_attempt, int)
+                or ready_attempt < 1
+                or ready["readiness"] not in {"process-running", "health-probe"}
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} runtime-ready event is malformed"
+                )
+            launcher_started = any(
+                record["event"] == "launcher-start"
+                and record.get("attempt") == ready_attempt
+                for record in event_records[:-1]
+            )
+            if not launcher_started:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} became ready without a launcher start"
+                )
+            if value["runtime"]["health_url"] is None:
+                if ready["readiness"] != "process-running":
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} has the wrong readiness contract"
+                    )
+            else:
+                health_ready = any(
+                    record["event"] == "health-ready"
+                    and record.get("attempt") == ready_attempt
+                    for record in event_records[:-1]
+                )
+                if ready["readiness"] != "health-probe" or not health_ready:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} lacks a successful health receipt"
+                    )
+            recoverable_failures = {
+                "launcher-error",
+                "launcher-unhealthy",
+                "launcher-exit",
+            }
+            if any(
+                record["event"] in recoverable_failures
+                and (
+                    isinstance(record.get("attempt"), bool)
+                    or not isinstance(record.get("attempt"), int)
+                    or record["attempt"] >= ready_attempt
+                )
+                for record in event_records[:-1]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry has an unrecovered launcher failure"
+                )
             telemetry_sha = _receipt_sha(
                 proof["runtime_telemetry_sha256"],
                 f"wall-plug proof {proof_id} telemetry",
@@ -2162,6 +2288,11 @@ def validate_evidence(
             receipt_values.append(receipt_sha)
         if len(set(receipt_values)) != len(receipt_values):
             raise ContractError("setup, strike, and restore receipts must be distinct")
+    if phase == "complete":
+        raise ContractError(
+            "BLOCKED: physical completion requires an immutable allowlisted authority "
+            "attestation; no trusted external authority anchor is configured"
+        )
     return value
 
 
