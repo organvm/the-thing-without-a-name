@@ -391,6 +391,100 @@ def write_fake_reel_concat(render_out: Path, payload: bytes = b"rendered reel") 
     return picture
 
 
+def retained_score_package(
+    out: Path,
+    package: Path,
+    *,
+    repository_head: str = "b" * 40,
+) -> SimpleNamespace:
+    """Create a passage package whose restart receipts live below capture_root."""
+    program = json.loads((ROOT / "render/program.json").read_text())
+    package.mkdir(parents=True)
+    score = package / DELIVER.SCORE_SOURCE_ITEM
+    score.parent.mkdir(parents=True)
+    score.write_bytes(b"retained passage score")
+    score_sha = DELIVER.digest(score)
+    score_item = {
+        "name": DELIVER.SCORE_SOURCE_ITEM,
+        "bytes": score.stat().st_size,
+        "sha256": score_sha,
+    }
+    passage = {
+        "seed": DELIVER.hexseed(program["seed"]),
+        "passage_seed": DELIVER.hexseed(SPAN["seed"]),
+        "passage": SPAN["passage"],
+        "start": 0.0,
+        "t0": SPAN["t0"],
+        "t1": SPAN["t1"],
+        "duration": SPAN["duration"],
+        "corpus_tier": "film",
+    }
+    render_root = DELIVER.capture_root(out, SPAN, SPAN["t0"])
+    render_root.mkdir(parents=True)
+    score_receipt = render_root / "passage-score.json"
+    score_receipt.write_text(
+        json.dumps(
+            {
+                "schema": "danse.score.receipt.v2",
+                "sha256": score_sha,
+                "t0": SPAN["t0"],
+                "t1": SPAN["t1"],
+                "duration": SPAN["duration"],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    receipt_sha = DELIVER.digest(score_receipt)
+    producer_id = f"score-{receipt_sha[:20]}"
+    packaged_receipt = package / DELIVER.PRODUCER_RECEIPTS / f"{producer_id}.json"
+    packaged_receipt.parent.mkdir(parents=True)
+    shutil.copy2(score_receipt, packaged_receipt)
+    source_tree = "5" * 64
+    production = {
+        "schema": "danse.delivery.production.v1",
+        "repository_head": repository_head,
+        "source_tree_sha256": source_tree,
+        "passage": passage,
+        "sound": None,
+        "producers": [
+            {
+                "id": producer_id,
+                "kind": "score",
+                "receipt": {
+                    "path": packaged_receipt.relative_to(package).as_posix(),
+                    "sha256": receipt_sha,
+                },
+                "output_sha256": score_sha,
+                "components": [],
+            }
+        ],
+        "outputs": [{**score_item, "producers": [producer_id]}],
+    }
+    production_path = package / DELIVER.PRODUCTION_RECEIPT
+    production_path.write_text(json.dumps(production, indent=2) + "\n")
+    manifest = {
+        "schema": "danse.delivery.manifest.v1",
+        "title": program["title"],
+        "repository_head": repository_head,
+        **passage,
+        "source_tree_sha256": source_tree,
+        "items": [score_item],
+        "production": {
+            "path": DELIVER.PRODUCTION_RECEIPT,
+            "sha256": DELIVER.digest(production_path),
+        },
+    }
+    (package / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return SimpleNamespace(
+        manifest=manifest,
+        render_root=render_root,
+        score_receipt=score_receipt,
+        packaged_receipt=packaged_receipt,
+        production_path=production_path,
+    )
+
+
 class DeliveryContractTest(unittest.TestCase):
     def test_production_delivery_rejects_nonzero_score_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2437,6 +2531,722 @@ class DeliveryContractTest(unittest.TestCase):
             self.assertEqual(manifest["sound"], old_sound)
             self.assertEqual(manifest["score_motion_evidence"], evidence_reference)
 
+    def test_text_only_rebuild_uses_the_retained_passage_capture_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            expected_receipt = fixture.score_receipt.read_bytes()
+            retained_manifest = dict(fixture.manifest)
+
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "deliver.py",
+                        "--only",
+                        "text",
+                        "--out",
+                        str(out),
+                        "--package",
+                        str(package),
+                    ],
+                ),
+                mock.patch.object(
+                    DELIVER,
+                    "query_capture_span",
+                    side_effect=AssertionError("text-only update resolved a new passage"),
+                ),
+                mock.patch.object(
+                    DELIVER,
+                    "require_clean_repository",
+                    return_value={
+                        "head": SUBMISSION_REPOSITORY_HEAD,
+                        "clean": True,
+                        "changes": [],
+                    },
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(DELIVER.main(), 0)
+
+            manifest = json.loads((package / "manifest.json").read_text())
+            production_path = package / manifest["production"]["path"]
+            production = json.loads(production_path.read_text())
+            self.assertEqual(manifest["repository_head"], SUBMISSION_REPOSITORY_HEAD)
+            self.assertEqual(production["repository_head"], SUBMISSION_REPOSITORY_HEAD)
+            expected_passage = {
+                key: retained_manifest[key]
+                for key in (
+                    "seed",
+                    "passage_seed",
+                    "passage",
+                    "start",
+                    "t0",
+                    "t1",
+                    "duration",
+                    "corpus_tier",
+                )
+            }
+            self.assertEqual(production["passage"], expected_passage)
+            copied = package / production["producers"][0]["receipt"]["path"]
+            self.assertEqual(copied.read_bytes(), expected_receipt)
+
+    def test_failed_producer_rebuild_preserves_the_prior_package_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            previous = dict(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            receipt_root = package / DELIVER.PRODUCER_RECEIPTS
+            before_receipts = {
+                path.name: path.read_bytes()
+                for path in receipt_root.iterdir()
+            }
+            before_production = fixture.production_path.read_bytes()
+            fixture.score_receipt.unlink()
+
+            with self.assertRaisesRegex(SystemExit, "producer receipt is missing"):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                )
+
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in receipt_root.iterdir()},
+                before_receipts,
+            )
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+            self.assertEqual(
+                sorted(
+                    path.name
+                    for path in fixture.production_path.parent.iterdir()
+                    if path.name.startswith(".production-receipts-")
+                ),
+                [],
+            )
+
+    def test_interrupted_producer_publish_rolls_back_the_prior_package_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            previous = dict(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            receipt_root = package / DELIVER.PRODUCER_RECEIPTS
+            before_receipts = {
+                path.name: path.read_bytes()
+                for path in receipt_root.iterdir()
+            }
+            before_production = fixture.production_path.read_bytes()
+            rename = DELIVER.atomic_rename_noreplace
+
+            def interrupt_new_production(source, destination, **kwargs):
+                if Path(source).name == "production.new.json":
+                    raise OSError("injected production-receipt publication failure")
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=interrupt_new_production,
+                ),
+                self.assertRaisesRegex(SystemExit, "replacement failed"),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                )
+
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in receipt_root.iterdir()},
+                before_receipts,
+            )
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+
+            def interrupt_with_keyboard(source, destination, **kwargs):
+                if Path(source).name == "production.new.json":
+                    raise KeyboardInterrupt
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=interrupt_with_keyboard,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                )
+
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in receipt_root.iterdir()},
+                before_receipts,
+            )
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+
+    def test_manifest_publication_failure_rolls_back_the_entire_receipt_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            receipt_root = package / DELIVER.PRODUCER_RECEIPTS
+            before_manifest = manifest_path.read_bytes()
+            before_production = fixture.production_path.read_bytes()
+            before_receipts = {
+                path.name: path.read_bytes() for path in receipt_root.iterdir()
+            }
+            rename = DELIVER.atomic_rename_noreplace
+
+            def interrupt_manifest(source, destination, **kwargs):
+                if Path(source).name == "manifest.new.json":
+                    raise OSError("injected manifest publication failure")
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=interrupt_manifest,
+                ),
+                self.assertRaisesRegex(SystemExit, "replacement failed"),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertEqual(manifest_path.read_bytes(), before_manifest)
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in receipt_root.iterdir()},
+                before_receipts,
+            )
+            self.assertEqual(
+                list(root.glob(".danse-package-transaction-*")),
+                [],
+            )
+
+    def test_manifest_commit_rejects_a_stale_prior_manifest_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            expected_manifest_sha = DELIVER.digest(manifest_path)
+            before_production = fixture.production_path.read_bytes()
+            manifest_path.write_text(manifest_path.read_text() + "\n")
+            changed_manifest = manifest_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                SystemExit,
+                "manifest changed after it was read",
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=expected_manifest_sha,
+                )
+
+            self.assertEqual(manifest_path.read_bytes(), changed_manifest)
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+            self.assertEqual(
+                list(root.glob(".danse-package-transaction-*")),
+                [],
+            )
+
+    def test_reused_production_is_revalidated_at_the_manifest_commit_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            before_manifest = manifest_path.read_bytes()
+            before_production = fixture.production_path.read_bytes()
+            rename = DELIVER.atomic_rename_noreplace
+            published_manifest = False
+
+            def mutate_after_manifest_publication(source, destination, **kwargs):
+                nonlocal published_manifest
+                result = rename(source, destination, **kwargs)
+                if Path(source).name == "manifest.new.json":
+                    published_manifest = True
+                    fixture.production_path.write_bytes(b"concurrent mutation")
+                return result
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=mutate_after_manifest_publication,
+                ),
+                self.assertRaisesRegex(SystemExit, "replacement failed"),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertTrue(published_manifest)
+            self.assertEqual(manifest_path.read_bytes(), before_manifest)
+            self.assertEqual(fixture.production_path.read_bytes(), before_production)
+            self.assertEqual(
+                list(root.glob(".danse-package-transaction-*")),
+                [],
+            )
+
+    def test_rebuilt_graph_is_validated_before_manifest_publication(self) -> None:
+        for mutation in ("production", "producer-receipt"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                out = root / "render"
+                package = root / "package"
+                fixture = retained_score_package(out, package)
+                manifest_path = package / "manifest.json"
+                previous = copy.deepcopy(fixture.manifest)
+                current = copy.deepcopy(previous)
+                current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+                before_manifest = manifest_path.read_bytes()
+                before_production = fixture.production_path.read_bytes()
+                before_receipts = {
+                    path.name: path.read_bytes()
+                    for path in (package / DELIVER.PRODUCER_RECEIPTS).iterdir()
+                }
+                rename = DELIVER.atomic_rename_noreplace
+                mutated = False
+                manifest_published = False
+
+                def mutate_after_graph_moves(source, destination, **kwargs):
+                    nonlocal mutated, manifest_published
+                    result = rename(source, destination, **kwargs)
+                    if Path(source).name == "production.new.json":
+                        mutated = True
+                        if mutation == "production":
+                            fixture.production_path.write_bytes(b"concurrent production mutation")
+                        else:
+                            receipt = next(
+                                (package / DELIVER.PRODUCER_RECEIPTS).iterdir()
+                            )
+                            receipt.write_bytes(b"concurrent producer mutation")
+                    elif Path(source).name == "manifest.new.json":
+                        manifest_published = True
+                    return result
+
+                with (
+                    mock.patch.object(
+                        DELIVER,
+                        "atomic_rename_noreplace",
+                        side_effect=mutate_after_graph_moves,
+                    ),
+                    self.assertRaisesRegex(SystemExit, "replacement failed"),
+                ):
+                    DELIVER.write_production_receipt(
+                        package,
+                        fixture.render_root,
+                        current,
+                        previous,
+                        publish_manifest=True,
+                        previous_manifest_sha256=DELIVER.digest(manifest_path),
+                    )
+
+                self.assertTrue(mutated)
+                self.assertFalse(manifest_published)
+                self.assertEqual(manifest_path.read_bytes(), before_manifest)
+                self.assertEqual(fixture.production_path.read_bytes(), before_production)
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in (package / DELIVER.PRODUCER_RECEIPTS).iterdir()
+                    },
+                    before_receipts,
+                )
+                self.assertEqual(list(root.glob(".danse-package-transaction-*")), [])
+
+    def test_concurrent_publication_destination_is_preserved_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            old_production = fixture.production_path.read_bytes()
+            concurrent = b'{"schema":"concurrent-production-winner"}\n'
+            rename = DELIVER.atomic_rename_noreplace
+
+            def install_winner_before_new_production(source, destination, **kwargs):
+                if Path(source).name == "production.new.json":
+                    fixture.production_path.write_bytes(concurrent)
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=install_winner_before_new_production,
+                ),
+                self.assertRaisesRegex(SystemExit, "recovery preserved at") as caught,
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertEqual(fixture.production_path.read_bytes(), concurrent)
+            match = re.search(r"recovery preserved at (.+)$", str(caught.exception))
+            self.assertIsNotNone(match)
+            recovery = Path(match.group(1))
+            self.assertEqual((recovery / "production.old.json").read_bytes(), old_production)
+
+    def test_concurrent_rollback_destination_is_preserved_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            old_production = fixture.production_path.read_bytes()
+            concurrent = b'{"schema":"concurrent-rollback-winner"}\n'
+            rename = DELIVER.atomic_rename_noreplace
+
+            def fail_manifest_then_install_rollback_winner(source, destination, **kwargs):
+                source_name = Path(source).name
+                destination_name = Path(destination).name
+                if source_name == "manifest.new.json":
+                    raise OSError("injected manifest publication failure")
+                result = rename(source, destination, **kwargs)
+                if source_name == "production.json" and destination_name == "production.failed.json":
+                    fixture.production_path.write_bytes(concurrent)
+                return result
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=fail_manifest_then_install_rollback_winner,
+                ),
+                self.assertRaisesRegex(SystemExit, "recovery preserved at") as caught,
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertEqual(fixture.production_path.read_bytes(), concurrent)
+            match = re.search(r"recovery preserved at (.+)$", str(caught.exception))
+            self.assertIsNotNone(match)
+            recovery = Path(match.group(1))
+            self.assertEqual((recovery / "production.old.json").read_bytes(), old_production)
+
+    def test_displaced_stage_edge_preserves_recovery_and_same_name_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            old_manifest = manifest_path.read_bytes()
+            old_production = fixture.production_path.read_bytes()
+            write_staged = DELIVER.write_new_regular_bytes_at
+            displaced = root / "displaced-original-stage"
+            replacement = None
+
+            def displace_before_first_staging_write(directory_fd, name, payload, **kwargs):
+                nonlocal replacement
+                if replacement is None:
+                    stages = list(root.glob(".danse-package-transaction-*"))
+                    self.assertEqual(len(stages), 1)
+                    replacement = stages[0]
+                    DELIVER.os.replace(replacement, displaced)
+                    replacement.mkdir()
+                    (replacement / "unrelated.txt").write_text("do not remove\n")
+                return write_staged(directory_fd, name, payload, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "write_new_regular_bytes_at",
+                    side_effect=displace_before_first_staging_write,
+                ),
+                self.assertRaisesRegex(SystemExit, "displaced originally opened"),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertIsNotNone(replacement)
+            self.assertEqual((replacement / "unrelated.txt").read_text(), "do not remove\n")
+            self.assertEqual((displaced / "manifest.old.json").read_bytes(), old_manifest)
+            self.assertEqual((displaced / "production.old.json").read_bytes(), old_production)
+            self.assertEqual(
+                json.loads(manifest_path.read_text())["repository_head"],
+                SUBMISSION_REPOSITORY_HEAD,
+            )
+
+    def test_post_rename_interrupts_restore_the_prior_package_commit(self) -> None:
+        rename_sources = (
+            "manifest.json",
+            "production.json",
+            "producer-receipts",
+            "producer-receipts.new",
+            "production.new.json",
+            "manifest.new.json",
+        )
+        for rename_source in rename_sources:
+            with self.subTest(rename_source=rename_source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                out = root / "render"
+                package = root / "package"
+                fixture = retained_score_package(out, package)
+                manifest_path = package / "manifest.json"
+                previous = copy.deepcopy(fixture.manifest)
+                current = copy.deepcopy(previous)
+                current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+                receipt_root = package / DELIVER.PRODUCER_RECEIPTS
+                before_manifest = manifest_path.read_bytes()
+                before_production = fixture.production_path.read_bytes()
+                before_receipts = {
+                    path.name: path.read_bytes() for path in receipt_root.iterdir()
+                }
+                rename = DELIVER.atomic_rename_noreplace
+                interrupted = False
+
+                def interrupt_after_rename(source, destination, **kwargs):
+                    nonlocal interrupted
+                    result = rename(source, destination, **kwargs)
+                    if not interrupted and Path(source).name == rename_source:
+                        interrupted = True
+                        raise KeyboardInterrupt
+                    return result
+
+                with (
+                    mock.patch.object(
+                        DELIVER,
+                        "atomic_rename_noreplace",
+                        side_effect=interrupt_after_rename,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    DELIVER.write_production_receipt(
+                        package,
+                        fixture.render_root,
+                        current,
+                        previous,
+                        publish_manifest=True,
+                        previous_manifest_sha256=DELIVER.digest(manifest_path),
+                    )
+
+                self.assertTrue(interrupted)
+                self.assertEqual(manifest_path.read_bytes(), before_manifest)
+                self.assertEqual(fixture.production_path.read_bytes(), before_production)
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in receipt_root.iterdir()},
+                    before_receipts,
+                )
+                self.assertEqual(
+                    list(root.glob(".danse-package-transaction-*")),
+                    [],
+                )
+
+    def test_provenance_ancestor_swap_cannot_redirect_receipt_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            before_manifest = manifest_path.read_bytes()
+            before_production = fixture.production_path.read_bytes()
+            before_receipts = {
+                path.name: path.read_bytes()
+                for path in (package / DELIVER.PRODUCER_RECEIPTS).iterdir()
+            }
+
+            external = root / "external-provenance"
+            shutil.copytree(package / "provenance", external)
+            external_before = {
+                path.relative_to(external).as_posix(): path.read_bytes()
+                for path in external.rglob("*")
+                if path.is_file()
+            }
+            displaced = root / "displaced-provenance"
+            replace = DELIVER.os.replace
+            rename = DELIVER.atomic_rename_noreplace
+            swapped = False
+
+            def swap_ancestor_before_first_rename(source, destination, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    replace(package / "provenance", displaced)
+                    (package / "provenance").symlink_to(
+                        external,
+                        target_is_directory=True,
+                    )
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=swap_ancestor_before_first_rename,
+                ),
+                self.assertRaisesRegex(SystemExit, "replacement failed"),
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            self.assertTrue(swapped)
+            self.assertTrue((package / "provenance").is_symlink())
+            self.assertEqual(manifest_path.read_bytes(), before_manifest)
+            self.assertEqual(
+                {
+                    path.relative_to(external).as_posix(): path.read_bytes()
+                    for path in external.rglob("*")
+                    if path.is_file()
+                },
+                external_before,
+            )
+            self.assertEqual(
+                (displaced / "production.json").read_bytes(),
+                before_production,
+            )
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in (displaced / "producer-receipts").iterdir()
+                },
+                before_receipts,
+            )
+            self.assertEqual(
+                list(root.glob(".danse-package-transaction-*")),
+                [],
+            )
+
+    def test_failed_rollback_preserves_an_external_recovery_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            manifest_path = package / "manifest.json"
+            previous = copy.deepcopy(fixture.manifest)
+            current = copy.deepcopy(previous)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            old_receipts = {
+                path.name: path.read_bytes()
+                for path in (package / DELIVER.PRODUCER_RECEIPTS).iterdir()
+            }
+            rename = DELIVER.atomic_rename_noreplace
+
+            def fail_manifest_and_receipt_restore(source, destination, **kwargs):
+                if Path(source).name == "manifest.new.json":
+                    raise OSError("injected manifest publication failure")
+                if Path(source).name == "producer-receipts.old":
+                    raise OSError("injected prior-receipt rollback failure")
+                return rename(source, destination, **kwargs)
+
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=fail_manifest_and_receipt_restore,
+                ),
+                self.assertRaisesRegex(SystemExit, "recovery preserved at") as caught,
+            ):
+                DELIVER.write_production_receipt(
+                    package,
+                    fixture.render_root,
+                    current,
+                    previous,
+                    publish_manifest=True,
+                    previous_manifest_sha256=DELIVER.digest(manifest_path),
+                )
+
+            match = re.search(r"recovery preserved at (.+)$", str(caught.exception))
+            self.assertIsNotNone(match)
+            recovery = Path(match.group(1))
+            try:
+                recovered_receipts = recovery / "producer-receipts.old"
+                self.assertTrue(recovered_receipts.is_dir())
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in recovered_receipts.iterdir()},
+                    old_receipts,
+                )
+                self.assertFalse(recovery.is_relative_to(package))
+            finally:
+                shutil.rmtree(recovery)
+
     def test_prior_score_motion_reference_rejects_symlinked_ancestors(self) -> None:
         for ancestor in ("provenance", "provenance/score-to-motion"):
             with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory() as tmp:
@@ -2592,6 +3402,149 @@ class DeliveryContractTest(unittest.TestCase):
                 )
             self.assertEqual(outside.read_bytes(), b"must remain unchanged")
             self.assertFalse((package / DELIVER.PRODUCER_RECEIPTS).exists())
+
+    def test_package_manifest_and_producer_receipt_reads_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            producer = root / "segment.receipt.json"
+            with producer.open("wb") as handle:
+                handle.truncate(DELIVER.PRODUCER_RECEIPT_MAX_BYTES + 1)
+            with self.assertRaisesRegex(SystemExit, "safe byte limit"):
+                DELIVER._read_producer_receipt(producer, "danse.render.segment.v1")
+
+            manifest = root / "manifest.json"
+            with manifest.open("wb") as handle:
+                handle.truncate(DELIVER.PACKAGE_MANIFEST_MAX_BYTES + 1)
+            with self.assertRaisesRegex(SystemExit, "safe byte limit"):
+                DELIVER.bounded_regular_bytes(
+                    manifest,
+                    max_bytes=DELIVER.PACKAGE_MANIFEST_MAX_BYTES,
+                    description="package manifest",
+                )
+
+    def test_producer_receipt_graph_has_count_duplicate_and_aggregate_bounds(self) -> None:
+        def graph_fixture(root: Path, segments: list[dict]) -> tuple[SimpleNamespace, dict, Path]:
+            out = root / "render"
+            package = root / "package"
+            fixture = retained_score_package(out, package)
+            fixture.package = package
+            current = copy.deepcopy(fixture.manifest)
+            current["repository_head"] = SUBMISSION_REPOSITORY_HEAD
+            current["items"].append(
+                {
+                    "name": "master.mov",
+                    "bytes": 17,
+                    "sha256": "a" * 64,
+                }
+            )
+            concat = fixture.render_root / "passage-default.mov.receipt.json"
+            concat.write_text(
+                json.dumps(
+                    {
+                        "schema": "danse.render.concat.v1",
+                        "codec": "prores",
+                        "segments": segments,
+                        "file_sha256": "b" * 64,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            return fixture, current, concat
+
+        with self.subTest("segment count"), tempfile.TemporaryDirectory() as tmp:
+            segments = [
+                {"name": f"passage-default-seg-{index:03d}.mov", "receipt_sha256": "c" * 64}
+                for index in range(DELIVER.PRODUCER_CONCAT_SEGMENT_MAX_COUNT + 1)
+            ]
+            fixture, current, _concat = graph_fixture(Path(tmp), segments)
+            with (
+                mock.patch.object(DELIVER, "renderer_source_sha256", return_value="source"),
+                self.assertRaisesRegex(SystemExit, "segment-count limit"),
+            ):
+                DELIVER.write_production_receipt(
+                    fixture.package,
+                    fixture.render_root,
+                    current,
+                    fixture.manifest,
+                )
+
+        with self.subTest("duplicate names"), tempfile.TemporaryDirectory() as tmp:
+            name = "passage-default-seg-000.mov"
+            segments = [
+                {"name": name, "receipt_sha256": "c" * 64},
+                {"name": name, "receipt_sha256": "c" * 64},
+            ]
+            fixture, current, concat = graph_fixture(Path(tmp), segments)
+            reader = DELIVER._read_producer_receipt
+            with (
+                mock.patch.object(DELIVER, "renderer_source_sha256", return_value="source"),
+                mock.patch.object(
+                    DELIVER,
+                    "_read_producer_receipt",
+                    wraps=reader,
+                ) as read_probe,
+                self.assertRaisesRegex(SystemExit, "repeats a segment"),
+            ):
+                DELIVER.write_production_receipt(
+                    fixture.package,
+                    fixture.render_root,
+                    current,
+                    fixture.manifest,
+                )
+            self.assertEqual(
+                [Path(call.args[0]).name for call in read_probe.call_args_list],
+                [fixture.score_receipt.name, concat.name],
+            )
+
+        with self.subTest("aggregate bytes"), tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name = "passage-default-seg-000.mov"
+            fixture, current, concat = graph_fixture(
+                root,
+                [{"name": name, "receipt_sha256": "placeholder"}],
+            )
+            segment_receipt = fixture.render_root / f"{name}.receipt.json"
+            segment_receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "danse.render.segment.v1",
+                        "segment": 0,
+                        "frames": 1,
+                        "inputs": {
+                            "source_tree_sha256": "source",
+                            "tier": "film",
+                        },
+                        "file_sha256": "d" * 64,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            concat_value = json.loads(concat.read_text())
+            concat_value["segments"][0]["receipt_sha256"] = DELIVER.digest(segment_receipt)
+            concat.write_text(json.dumps(concat_value, indent=2) + "\n")
+            aggregate_limit = (
+                fixture.score_receipt.stat().st_size
+                + concat.stat().st_size
+                + segment_receipt.stat().st_size
+                - 1
+            )
+            with (
+                mock.patch.object(DELIVER, "renderer_source_sha256", return_value="source"),
+                mock.patch.object(
+                    DELIVER,
+                    "PRODUCER_RECEIPT_TOTAL_MAX_BYTES",
+                    aggregate_limit,
+                ),
+                self.assertRaisesRegex(SystemExit, "aggregate byte limit"),
+            ):
+                DELIVER.write_production_receipt(
+                    fixture.package,
+                    fixture.render_root,
+                    current,
+                    fixture.manifest,
+                )
 
     def test_package_identity_requires_a_clean_exact_git_head(self) -> None:
         head = subprocess.CompletedProcess([], 0, stdout=SUBMISSION_REPOSITORY_HEAD + "\n", stderr="")

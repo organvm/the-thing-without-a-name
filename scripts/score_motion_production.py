@@ -21,11 +21,13 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
@@ -83,6 +85,11 @@ PRODUCER_SEGMENT_MAX_COUNT = 256
 PRODUCER_SEGMENT_FRAME_MAX = 600
 PRODUCTION_FRAME_MAX = PRODUCER_SEGMENT_MAX_COUNT * PRODUCER_SEGMENT_FRAME_MAX
 PRODUCER_MEDIA_MAX_BYTES_PER_FRAME = 8 << 20
+CANONICAL_REPLAY_TIMEOUT_SECONDS = 15 * 60
+CANONICAL_REPLAY_CLEANUP_SECONDS = 10
+CANONICAL_REPLAY_SOURCE_FILE_MAX_BYTES = 128 << 20
+CANONICAL_REPLAY_SOURCE_TOTAL_MAX_BYTES = 4 << 30
+CANONICAL_REPLAY_SOURCE_DIRECTORY_MAX_ENTRIES = 4096
 FRAME_IMAGE_MAX_BYTES = 64 << 20
 PRODUCTION_RECEIPT_MAX_BYTES = 4 << 20
 SAMPLE_RECEIPT_MAX_BYTES = 16 << 20
@@ -1872,6 +1879,30 @@ def _producer_media_identity_errors(
     return errors, decoded
 
 
+def _encoded_media_revalidation_errors(
+    path: Path,
+    receipt: dict[str, Any],
+    *,
+    expected_frames: int,
+    label: str,
+) -> list[str]:
+    """Re-pin encoded bytes after a long replay so path swaps cannot bridge it."""
+
+    try:
+        with _pinned_regular_file(path, label) as (file_fd, info):
+            maximum = expected_frames * PRODUCER_MEDIA_MAX_BYTES_PER_FRAME
+            if info.st_size > maximum:
+                raise EvidenceError(f"{label} exceeds its {maximum}-byte media limit")
+            if (
+                receipt.get("file_bytes") != info.st_size
+                or receipt.get("file_sha256") != _fd_sha256(file_fd, label)
+            ):
+                raise EvidenceError(f"{label} changed during authentication")
+    except EvidenceError as exc:
+        return [str(exc)]
+    return []
+
+
 def _producer_segment_media_identity_errors(
     paths: list[Path],
     receipts: list[dict[str, Any]],
@@ -1939,6 +1970,784 @@ def _producer_segment_media_identity_errors(
     return errors, chain_decoded
 
 
+class _CanonicalReplaySourceSnapshot:
+    """Descriptor-pinned repository closure consumed by one canonical replay."""
+
+    def __init__(self, root: Path, *, mode: str, original_inputs: dict[str, Any]):
+        self.root = root.absolute()
+        self.mode = mode
+        self.original_inputs = original_inputs
+        self.source_tree_sha256 = ""
+        self._directories: list[dict[str, Any]] = []
+        self._repository_directories: dict[tuple[str, ...], dict[str, Any]] = {}
+        self._files: dict[str, dict[str, Any]] = {}
+        self._listings: list[tuple[dict[str, Any], str, tuple[str, ...], str]] = []
+        self._closed = False
+
+    @staticmethod
+    def _directory_flags() -> int:
+        required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+        if any(not hasattr(os, name) for name in required) or not hasattr(os, "pread"):
+            raise EvidenceError(
+                "canonical replay sources cannot be descriptor-pinned on this platform"
+            )
+        return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    @staticmethod
+    def _file_flags() -> int:
+        return os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+    def _record_directory(
+        self,
+        fd: int,
+        *,
+        parent_fd: int | None,
+        name: str | None,
+        label: str,
+    ) -> dict[str, Any]:
+        try:
+            info = os.fstat(fd)
+            named = (
+                os.stat(os.sep, follow_symlinks=False)
+                if parent_fd is None
+                else os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+        except OSError as exc:
+            raise EvidenceError(f"{label} changed during authentication") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or _stat_identity(info) != _stat_identity(named)
+        ):
+            raise EvidenceError(f"{label} is missing, unsafe, or not a directory")
+        record = {
+            "fd": fd,
+            "parent_fd": parent_fd,
+            "name": name,
+            "identity": _stat_identity(info),
+            "label": label,
+        }
+        self._directories.append(record)
+        return record
+
+    def _open_directory_edge(
+        self,
+        parent: dict[str, Any],
+        name: str,
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        if not name or name in {".", ".."} or os.sep in name:
+            raise EvidenceError(f"{label} has an unsafe named directory edge")
+        try:
+            fd = os.open(name, self._directory_flags(), dir_fd=parent["fd"])
+        except OSError as exc:
+            raise EvidenceError(f"{label} is missing, unsafe, or cannot be pinned") from exc
+        try:
+            return self._record_directory(
+                fd,
+                parent_fd=parent["fd"],
+                name=name,
+                label=label,
+            )
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _open_repository_root(self) -> None:
+        try:
+            root_fd = os.open(os.sep, self._directory_flags())
+        except OSError as exc:
+            raise EvidenceError("canonical replay filesystem root cannot be pinned") from exc
+        try:
+            current = self._record_directory(
+                root_fd,
+                parent_fd=None,
+                name=None,
+                label="canonical replay filesystem root",
+            )
+        except BaseException:
+            os.close(root_fd)
+            raise
+        current_path = Path(os.sep)
+        for part in self.root.parts[1:]:
+            current_path /= part
+            current = self._open_directory_edge(
+                current,
+                part,
+                label=f"canonical replay source ancestor {current_path}",
+            )
+        self._repository_directories[()] = current
+
+    def _repository_directory(self, parts: tuple[str, ...]) -> dict[str, Any]:
+        current = self._repository_directories[()]
+        traversed: list[str] = []
+        for part in parts:
+            if not part or part in {".", ".."} or os.sep in part:
+                raise EvidenceError("canonical replay source has an unsafe directory edge")
+            traversed.append(part)
+            key = tuple(traversed)
+            existing = self._repository_directories.get(key)
+            if existing is None:
+                existing = self._open_directory_edge(
+                    current,
+                    part,
+                    label=(
+                        "canonical replay source directory "
+                        + PurePosixPath(*traversed).as_posix()
+                    ),
+                )
+                self._repository_directories[key] = existing
+            current = existing
+        return current
+
+    def _named_regular_file_exists(self, relative: str, label: str) -> bool:
+        pure = _safe_relative(relative, label)
+        parent = self._repository_directory(tuple(pure.parts[:-1]))
+        try:
+            info = os.stat(pure.name, dir_fd=parent["fd"], follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise EvidenceError(f"{label} cannot be inspected safely") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise EvidenceError(f"{label} exists but is not a no-follow regular file")
+        return True
+
+    def _open_file(self, relative: str, label: str) -> dict[str, Any]:
+        pure = _safe_relative(relative, label)
+        canonical = pure.as_posix()
+        existing = self._files.get(canonical)
+        if existing is not None:
+            return existing
+        parent = self._repository_directory(tuple(pure.parts[:-1]))
+        try:
+            fd = os.open(pure.name, self._file_flags(), dir_fd=parent["fd"])
+        except OSError as exc:
+            raise EvidenceError(f"{label} is missing, unsafe, or cannot be pinned") from exc
+        try:
+            info = os.fstat(fd)
+            named = os.stat(pure.name, dir_fd=parent["fd"], follow_symlinks=False)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not stat.S_ISREG(named.st_mode)
+                or _stat_identity(info) != _stat_identity(named)
+            ):
+                raise EvidenceError(f"{label} is not a no-follow regular file")
+            if info.st_size > CANONICAL_REPLAY_SOURCE_FILE_MAX_BYTES:
+                raise EvidenceError(f"{label} exceeds the canonical source-file limit")
+            digest = _fd_sha256(fd, label)
+            current = os.fstat(fd)
+            renamed = os.stat(
+                pure.name,
+                dir_fd=parent["fd"],
+                follow_symlinks=False,
+            )
+            if (
+                _stat_identity(current) != _stat_identity(info)
+                or _stat_identity(renamed) != _stat_identity(info)
+            ):
+                raise EvidenceError(f"{label} changed during authentication")
+        finally:
+            os.close(fd)
+        record = {
+            "parent_fd": parent["fd"],
+            "name": pure.name,
+            "identity": _stat_identity(info),
+            "digest": digest,
+            "bytes": info.st_size,
+            "label": label,
+            "relative": canonical,
+        }
+        self._files[canonical] = record
+        return record
+
+    def _revalidate_directories(self) -> None:
+        for record in self._directories:
+            current = os.fstat(record["fd"])
+            named = (
+                os.stat(os.sep, follow_symlinks=False)
+                if record["parent_fd"] is None
+                else os.stat(
+                    record["name"],
+                    dir_fd=record["parent_fd"],
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or _stat_identity(current) != record["identity"]
+                or _stat_identity(named) != record["identity"]
+            ):
+                raise EvidenceError(f"{record['label']} changed during authentication")
+
+    def _revalidate_file(self, record: dict[str, Any]) -> None:
+        try:
+            fd = os.open(
+                record["name"],
+                self._file_flags(),
+                dir_fd=record["parent_fd"],
+            )
+        except OSError as exc:
+            raise EvidenceError(
+                f"{record['label']} changed during authentication"
+            ) from exc
+        try:
+            before = os.fstat(fd)
+            named_before = os.stat(
+                record["name"],
+                dir_fd=record["parent_fd"],
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(named_before.st_mode)
+                or _stat_identity(before) != record["identity"]
+                or _stat_identity(named_before) != record["identity"]
+                or before.st_size > CANONICAL_REPLAY_SOURCE_FILE_MAX_BYTES
+            ):
+                raise EvidenceError(
+                    f"{record['label']} changed during authentication"
+                )
+            digest = _fd_sha256(fd, record["label"])
+            after = os.fstat(fd)
+            named_after = os.stat(
+                record["name"],
+                dir_fd=record["parent_fd"],
+                follow_symlinks=False,
+            )
+            if (
+                _stat_identity(after) != record["identity"]
+                or _stat_identity(named_after) != record["identity"]
+                or digest != record["digest"]
+            ):
+                raise EvidenceError(
+                    f"{record['label']} changed during authentication"
+                )
+        finally:
+            os.close(fd)
+
+    def _matching_names(
+        self,
+        directory: dict[str, Any],
+        suffix: str,
+        label: str,
+    ) -> tuple[str, ...]:
+        selected = []
+        try:
+            with os.scandir(directory["fd"]) as entries:
+                for count, entry in enumerate(entries, start=1):
+                    if count > CANONICAL_REPLAY_SOURCE_DIRECTORY_MAX_ENTRIES:
+                        raise EvidenceError(
+                            f"{label} exceeds the canonical source-directory entry limit"
+                        )
+                    if entry.name.endswith(suffix):
+                        selected.append(entry.name)
+        except EvidenceError:
+            raise
+        except (OSError, TypeError) as exc:
+            raise EvidenceError(f"{label} cannot be enumerated safely") from exc
+        return tuple(sorted(selected))
+
+    def _matching_files(
+        self,
+        directory: str,
+        suffix: str,
+        label: str,
+    ) -> list[str]:
+        pure = _safe_relative(directory, label)
+        record = self._repository_directory(tuple(pure.parts))
+        selected = self._matching_names(record, suffix, label)
+        for name in selected:
+            if not name or name in {".", ".."} or os.sep in name:
+                raise EvidenceError(f"{label} contains an unsafe named edge")
+            try:
+                info = os.stat(name, dir_fd=record["fd"], follow_symlinks=False)
+            except OSError as exc:
+                raise EvidenceError(f"{label} changed during enumeration") from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise EvidenceError(f"{label} contains a non-regular {suffix} entry")
+        self._listings.append((record, suffix, selected, label))
+        return [(pure / name).as_posix() for name in selected]
+
+    def capture(self) -> None:
+        self._open_repository_root()
+        fixed = [
+            "film.html",
+            "render/program.json",
+            "render/render.py",
+            "render/browser.py",
+            "render/media_identity.py",
+            "pipeline/corpus_contract.py",
+            "corpus/manifest.json",
+            "corpus/room.webp",
+            "corpus/score-2017.json",
+            f"corpus/tier-receipts/{PRODUCTION_TIER}.json",
+        ]
+        identity_paths = list(fixed)
+        if self._named_regular_file_exists(
+            "corpus/manifest.local.json",
+            "canonical replay local corpus manifest",
+        ):
+            identity_paths.append("corpus/manifest.local.json")
+        identity_paths.extend(
+            self._matching_files("engine", ".js", "canonical replay engine sources")
+        )
+
+        if self.mode == "with_score":
+            score = self.original_inputs.get("music_score")
+            choreography = self.original_inputs.get("choreography")
+            if not isinstance(score, dict) or not isinstance(choreography, dict):
+                raise EvidenceError("canonical replay has no exact score source closure")
+            identity_paths.append(
+                _safe_relative(
+                    score.get("path"),
+                    "canonical replay music score",
+                ).as_posix()
+            )
+            identity_paths.append(
+                _safe_relative(
+                    choreography.get("path"),
+                    "canonical replay choreography",
+                ).as_posix()
+            )
+        elif self.mode == "control":
+            timing = self.original_inputs.get("timing_score")
+            if not isinstance(timing, dict):
+                raise EvidenceError("canonical replay has no exact timing-score source closure")
+            identity_paths.append(
+                _safe_relative(
+                    timing.get("path"),
+                    "canonical replay timing score",
+                ).as_posix()
+            )
+        else:
+            raise EvidenceError("canonical replay has an invalid A/B source mode")
+
+        for kind in ("plates", "mattes"):
+            relative = f"corpus/{kind}/{PRODUCTION_TIER}"
+            identity_paths.extend(
+                self._matching_files(
+                    relative,
+                    ".webp",
+                    f"canonical replay film {kind}",
+                )
+            )
+
+        identity_records = [
+            self._open_file(path, f"canonical replay source {path}")
+            for path in identity_paths
+        ]
+        for path in ("sound/choreography.py", "sound/music_score.py"):
+            self._open_file(path, f"canonical replay validator {path}")
+        if (
+            sum(record["bytes"] for record in self._files.values())
+            > CANONICAL_REPLAY_SOURCE_TOTAL_MAX_BYTES
+        ):
+            raise EvidenceError("canonical replay source graph exceeds its aggregate byte limit")
+
+        digest = hashlib.sha256()
+        for record in identity_records:
+            digest.update(record["relative"].encode())
+            digest.update(bytes.fromhex(record["digest"]))
+        self.source_tree_sha256 = digest.hexdigest()
+
+    def revalidate(self) -> None:
+        if self._closed:
+            raise EvidenceError("canonical replay source snapshot is already closed")
+        try:
+            self._revalidate_directories()
+            for record in self._files.values():
+                self._revalidate_file(record)
+            for directory, suffix, expected, label in self._listings:
+                current = self._matching_names(directory, suffix, label)
+                if current != expected:
+                    raise EvidenceError(f"{label} changed during authentication")
+            # A rename while file bytes were being re-read changes one of these
+            # pinned parent/ancestor ctime tokens even if every name was restored.
+            self._revalidate_directories()
+        except EvidenceError:
+            raise
+        except OSError as exc:
+            raise EvidenceError("canonical replay sources changed during authentication") from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for record in reversed(self._directories):
+            try:
+                os.close(record["fd"])
+            except OSError:
+                pass
+
+
+@contextmanager
+def _pinned_canonical_replay_source_snapshot(
+    root: Path,
+    *,
+    mode: str,
+    original_inputs: dict[str, Any],
+):
+    """Hold the complete no-follow source graph stable for one replay process."""
+
+    snapshot = _CanonicalReplaySourceSnapshot(
+        root,
+        mode=mode,
+        original_inputs=original_inputs,
+    )
+    try:
+        snapshot.capture()
+        snapshot.revalidate()
+        yield snapshot
+    except BaseException:
+        raise
+    else:
+        snapshot.revalidate()
+    finally:
+        snapshot.close()
+
+
+def _canonical_segment_replay(
+    *,
+    mode: str,
+    ordinal: int,
+    frames: int,
+    segment_frames: int,
+    expected: dict[str, Any],
+    original_inputs: dict[str, Any],
+    root: Path,
+) -> tuple[dict[str, Any], dict[str, object]]:
+    """Replay one segment and bind its GPU capture to independently decoded pixels.
+
+    A producer receipt can describe an Apple-Metal capture without proving that
+    the described raw GPU frames made the referenced, lossy ProRes segment.  The
+    production predicate therefore runs the canonical renderer again from the
+    validated context, then requires both its raw capture identity and its full
+    decoded RGB identity to agree with the retained producer graph.
+    """
+
+    if sys.platform != "darwin":
+        raise EvidenceError(
+            "canonical producer replay requires the authorized macOS Apple-Metal host"
+        )
+    if mode not in {"with_score", "control"}:
+        raise EvidenceError("canonical producer replay has an invalid A/B mode")
+    if (
+        type(ordinal) is not int
+        or ordinal < 0
+        or type(frames) is not int
+        or frames < 1
+        or type(segment_frames) is not int
+        or not 1 <= segment_frames <= PRODUCER_SEGMENT_FRAME_MAX
+        or frames > segment_frames
+        or not isinstance(original_inputs, dict)
+    ):
+        raise EvidenceError("canonical producer replay has no exact bounded segment plan")
+
+    span = expected.get("span") if isinstance(expected.get("span"), dict) else {}
+    seed = span.get("river_seed")
+    stream = span.get("stream")
+    if (
+        type(seed) is not int
+        or not 0 <= seed <= 0xFFFFFFFF
+        or type(stream) is not int
+        or stream < 0
+    ):
+        raise EvidenceError("canonical producer replay has no exact river identity")
+    total_frames = production_frame_count(
+        span.get("duration_seconds"),
+        "canonical producer replay duration",
+    )
+    remaining = total_frames - ordinal * segment_frames
+    if remaining < 1 or frames != min(segment_frames, remaining):
+        raise EvidenceError("canonical producer replay segment does not own its exact frame range")
+    if (
+        (expected.get("score") or {}).get("path") != "music/score.json"
+        or (expected.get("choreography") or {}).get("path")
+        != "render/choreography.json"
+    ):
+        raise EvidenceError("canonical producer replay has non-canonical score inputs")
+
+    require_production_tier(root)
+    render_tool = repository_file(root, "render/render.py", "canonical renderer")
+    stream_suffix = f"-stream-{stream}" if stream else ""
+    control_suffix = "-control" if mode == "control" else ""
+    stem = f"passage-{seed}{stream_suffix}{control_suffix}"
+    media_name = f"{stem}-seg-{ordinal:03d}.mov"
+
+    with (
+        tempfile.TemporaryDirectory(prefix="danse-canonical-replay-") as temporary,
+        _pinned_canonical_replay_source_snapshot(
+            root,
+            mode=mode,
+            original_inputs=original_inputs,
+        ) as source_snapshot,
+    ):
+        if source_snapshot.source_tree_sha256 != original_inputs.get(
+            "source_tree_sha256"
+        ):
+            raise EvidenceError(
+                f"canonical {mode} segment {ordinal} replay source tree differs "
+                "from its producer inputs"
+            )
+        replay_root = Path(temporary)
+        command = [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            f"pycache_prefix={os.devnull}",
+            str(render_tool),
+            "--capture",
+            "passage",
+            "--start",
+            "0",
+            "--tier",
+            PRODUCTION_TIER,
+            "--seed",
+            str(seed),
+            "--stream",
+            str(stream),
+            "--codec",
+            "prores",
+            "--width",
+            str(PRODUCTION_WIDTH),
+            "--height",
+            str(PRODUCTION_HEIGHT),
+            "--fps",
+            str(PRODUCTION_FPS),
+            "--segment",
+            str(ordinal),
+            "--segment-frames",
+            str(segment_frames),
+            "--out",
+            str(replay_root),
+            "--quiet",
+        ]
+        if mode == "with_score":
+            command.extend(
+                [
+                    "--score",
+                    "music/score.json",
+                    "--choreography",
+                    "render/choreography.json",
+                ]
+            )
+        else:
+            command.extend(["--timing-score", "music/score.json"])
+
+        environment = os.environ.copy()
+        # The flags above are authoritative even if a same-UID actor controls
+        # inherited Python environment variables.  Keep these as belt-and-
+        # suspenders for runtimes that also expose the settings to child tools.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONPYCACHEPREFIX"] = os.devnull
+        waitid_requirements = (
+            "waitid",
+            "P_PID",
+            "WEXITED",
+            "WNOWAIT",
+            "WNOHANG",
+            "CLD_EXITED",
+            "CLD_KILLED",
+            "CLD_DUMPED",
+        )
+        if any(not hasattr(os, name) for name in waitid_requirements):
+            raise EvidenceError(
+                "canonical replay cannot hold its process identity through exit on this host"
+            )
+        waitid_flags = os.WEXITED | os.WNOWAIT | os.WNOHANG
+        process: subprocess.Popen[bytes] | None = None
+
+        def observed_replay_returncode(result: object) -> int:
+            code = getattr(result, "si_code", None)
+            status = getattr(result, "si_status", None)
+            if type(status) is not int:
+                raise EvidenceError("canonical replay returned an invalid wait identity")
+            if code == os.CLD_EXITED:
+                return status
+            if code in {os.CLD_KILLED, os.CLD_DUMPED}:
+                return -status
+            raise EvidenceError("canonical replay returned an unexpected wait state")
+
+        def observe_replay_exit() -> int | None:
+            assert process is not None
+            deadline = time.monotonic() + CANONICAL_REPLAY_TIMEOUT_SECONDS
+            while True:
+                try:
+                    result = os.waitid(os.P_PID, process.pid, waitid_flags)
+                except InterruptedError:
+                    continue
+                except (ChildProcessError, OSError) as exc:
+                    raise EvidenceError(
+                        f"cannot observe canonical {mode} segment {ordinal} replay exit: {exc}"
+                    ) from exc
+                if result is not None and getattr(result, "si_pid", 0) == process.pid:
+                    return observed_replay_returncode(result)
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.05)
+
+        def terminate_replay_group() -> int:
+            if process is None:
+                raise EvidenceError("canonical replay process was not launched")
+            group_gone = False
+            kill_failure: EvidenceError | None = None
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                group_gone = True
+            except OSError as exc:
+                kill_failure = EvidenceError(
+                    f"cannot terminate canonical {mode} segment {ordinal} replay workers: {exc}"
+                )
+            try:
+                returncode = process.wait(timeout=CANONICAL_REPLAY_CLEANUP_SECONDS)
+            except subprocess.TimeoutExpired as exc:
+                raise EvidenceError(
+                    f"canonical {mode} segment {ordinal} replay workers did not terminate"
+                ) from exc
+            if type(returncode) is not int:
+                raise EvidenceError("canonical replay returned no exact process status")
+            if kill_failure is not None:
+                raise kill_failure
+            if group_gone:
+                return returncode
+            deadline = time.monotonic() + CANONICAL_REPLAY_CLEANUP_SECONDS
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                except OSError as exc:
+                    raise EvidenceError(
+                        f"cannot verify canonical {mode} segment {ordinal} replay "
+                        f"worker termination: {exc}"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise EvidenceError(
+                        f"canonical {mode} segment {ordinal} replay process group "
+                        "did not terminate"
+                    )
+                time.sleep(0.05)
+            return returncode
+
+        with open(os.devnull, "wb") as diagnostic:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=root,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=diagnostic,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise EvidenceError(
+                    f"cannot launch canonical {mode} segment {ordinal} replay: {exc}"
+                ) from exc
+            try:
+                try:
+                    observed_returncode = observe_replay_exit()
+                except BaseException:
+                    # waitid leaves the leader unreaped, so its PID/PGID cannot
+                    # be reused while this cleanup signal is sent.
+                    terminate_replay_group()
+                    raise
+                if observed_returncode is None:
+                    terminate_replay_group()
+                    raise EvidenceError(
+                        f"canonical {mode} segment {ordinal} replay timed out"
+                    )
+                # waitid+WNOWAIT keeps the exited leader as a zombie and reserves
+                # its PID/PGID.  Kill possible descendants first, then reap it.
+                returncode = terminate_replay_group()
+                if returncode != observed_returncode:
+                    raise EvidenceError(
+                        f"canonical {mode} segment {ordinal} replay exit identity changed"
+                    )
+            finally:
+                if process is not None:
+                    # The renderer has exited (or was killed) before any receipt
+                    # can be trusted.  Recheck every held source descriptor and
+                    # named edge now so swap-and-restore cannot bridge Popen.
+                    source_snapshot.revalidate()
+            if returncode:
+                raise EvidenceError(
+                    f"canonical {mode} segment {ordinal} replay failed"
+                )
+
+        replay_media = _bounded_file(
+            replay_root,
+            media_name,
+            f"canonical {mode} segment {ordinal} replay media",
+        )
+        replay_receipt_path = _bounded_file(
+            replay_root,
+            f"{media_name}.receipt.json",
+            f"canonical {mode} segment {ordinal} replay receipt",
+        )
+        replay_receipt, _payload = _bounded_json_snapshot(
+            replay_receipt_path,
+            f"canonical {mode} segment {ordinal} replay receipt",
+            max_bytes=PRODUCER_SEGMENT_RECEIPT_MAX_BYTES,
+        )
+        if (
+            replay_receipt.get("schema") != "danse.render.segment.v1"
+            or replay_receipt.get("segment") != ordinal
+            or replay_receipt.get("frames") != frames
+            or replay_receipt.get("inputs") != original_inputs
+        ):
+            raise EvidenceError(
+                f"canonical {mode} segment {ordinal} replay did not reproduce its exact inputs"
+            )
+        capture = replay_receipt.get("capture")
+        if not isinstance(capture, dict) or set(capture) != {
+            "renderer",
+            "raw_rgba_sha256",
+            "missing",
+            "signature",
+            "passage",
+        }:
+            raise EvidenceError(
+                f"canonical {mode} segment {ordinal} replay has no exact GPU capture"
+            )
+        renderer = str(capture.get("renderer", "")).lower()
+        if (
+            "apple" not in renderer
+            or "metal" not in renderer
+            or type(capture.get("missing")) is not int
+            or capture.get("missing") != 0
+            or not isinstance(capture.get("raw_rgba_sha256"), str)
+            or not HEX64.fullmatch(capture["raw_rgba_sha256"])
+            or not isinstance(capture.get("signature"), str)
+            or not capture["signature"]
+            or not isinstance(capture.get("passage"), dict)
+        ):
+            raise EvidenceError(
+                f"canonical {mode} segment {ordinal} replay is not an exact Apple-Metal capture"
+            )
+        replay_errors, replay_decoded = _producer_media_identity_errors(
+            replay_media,
+            replay_receipt,
+            expected_frames=frames,
+            include_fps=False,
+            label=f"canonical {mode} segment {ordinal} replay",
+        )
+        if replay_errors or replay_decoded is None:
+            detail = "; ".join(replay_errors) or "decoded identity is absent"
+            raise EvidenceError(
+                f"canonical {mode} segment {ordinal} replay cannot be authenticated: {detail}"
+            )
+        # Receipt/media inspection is also attacker-controlled work.  Keep the
+        # same source closure pinned until immediately before acceptance.
+        source_snapshot.revalidate()
+        return dict(capture), replay_decoded
+
+
 def _producer_receipt_errors(
     receipt_path: Path,
     reference: object,
@@ -1999,6 +2808,7 @@ def _producer_receipt_errors(
         errors.append(str(exc))
         return errors, concat_path
 
+    concat_media = None
     try:
         concat_media = _producer_media_for_receipt(
             concat_path,
@@ -2180,6 +2990,67 @@ def _producer_receipt_errors(
                 errors.append(
                     f"{mode} render segment decoded chain differs from its actual concat"
                 )
+    if not errors and segment_frames is not None:
+        for ordinal, segment in enumerate(segment_receipt_plan):
+            inputs = segment["inputs"]
+            capture = segment["capture"]
+            decoded = segment["decoded_video"]
+            try:
+                replay_capture, replay_decoded = _canonical_segment_replay(
+                    mode=mode,
+                    ordinal=ordinal,
+                    frames=segment_frame_plan[ordinal],
+                    segment_frames=segment_frames,
+                    expected=expected,
+                    original_inputs=inputs,
+                    root=root,
+                )
+            except EvidenceError as exc:
+                errors.append(str(exc))
+                break
+            if capture.get("raw_rgba_sha256") != replay_capture.get(
+                "raw_rgba_sha256"
+            ):
+                errors.append(
+                    f"{mode} render segment {ordinal} GPU-frame sequence digest "
+                    "differs from canonical replay"
+                )
+            for field in ("renderer", "missing", "signature", "passage"):
+                if capture.get(field) != replay_capture.get(field):
+                    errors.append(
+                        f"{mode} render segment {ordinal} capture {field} "
+                        "differs from canonical replay"
+                    )
+            if decoded != replay_decoded:
+                errors.append(
+                    f"{mode} render segment {ordinal} decoded pixels differ from "
+                    "canonical Apple-Metal replay"
+                )
+    if concat_media is not None:
+        errors.extend(
+            _encoded_media_revalidation_errors(
+                concat_media,
+                concat,
+                expected_frames=expected_frames,
+                label=f"{mode} render concat",
+            )
+        )
+    for ordinal, (segment_media, segment, frames) in enumerate(
+        zip(
+            segment_media_plan,
+            segment_receipt_plan,
+            segment_frame_plan,
+            strict=True,
+        )
+    ):
+        errors.extend(
+            _encoded_media_revalidation_errors(
+                segment_media,
+                segment,
+                expected_frames=frames,
+                label=f"{mode} render segment {ordinal}",
+            )
+        )
     try:
         _revalidate_json_snapshot_token(
             concat_path,
@@ -2316,6 +3187,17 @@ def _media_errors(
             root=root,
         )
         errors.extend(producer_errors)
+        errors.extend(
+            _encoded_media_revalidation_errors(
+                path,
+                {
+                    "file_bytes": reference.get("bytes"),
+                    "file_sha256": reference.get("sha256"),
+                },
+                expected_frames=expected_video_frames,
+                label=f"{name} review media",
+            )
+        )
         identities[name] = (probed, path)
     if set(identities) == {"with_score", "control"}:
         with_probe, with_path = identities["with_score"]

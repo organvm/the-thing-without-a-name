@@ -13,6 +13,7 @@ import unittest
 import wave
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from PIL import Image
@@ -41,6 +42,65 @@ def reference(path: Path, base: Path) -> dict:
         "sha256": digest(path),
         "bytes": path.stat().st_size,
     }
+
+
+def canonical_replay_source_closure(root: Path, *, mode: str = "with_score") -> str:
+    """Create a tiny complete source graph with render.py's exact digest order."""
+
+    identity_paths = [
+        "film.html",
+        "render/program.json",
+        "render/render.py",
+        "render/browser.py",
+        "render/media_identity.py",
+        "pipeline/corpus_contract.py",
+        "corpus/manifest.json",
+        "corpus/room.webp",
+        "corpus/score-2017.json",
+        f"corpus/tier-receipts/{AB.PRODUCTION_TIER}.json",
+        "corpus/manifest.local.json",
+        "engine/a.js",
+        "engine/z.js",
+    ]
+    if mode == "with_score":
+        identity_paths.extend(["music/score.json", "render/choreography.json"])
+    else:
+        identity_paths.append("music/score.json")
+    identity_paths.extend(
+        [
+            f"corpus/plates/{AB.PRODUCTION_TIER}/plate-a.webp",
+            f"corpus/plates/{AB.PRODUCTION_TIER}/plate-z.webp",
+            f"corpus/mattes/{AB.PRODUCTION_TIER}/matte-a.webp",
+            f"corpus/mattes/{AB.PRODUCTION_TIER}/matte-z.webp",
+        ]
+    )
+    all_paths = [*identity_paths, "sound/choreography.py", "sound/music_score.py"]
+    for index, relative in enumerate(all_paths):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"canonical replay fixture {index}: {relative}\n".encode())
+
+    value = hashlib.sha256()
+    for relative in identity_paths:
+        value.update(relative.encode())
+        value.update(bytes.fromhex(digest(root / relative)))
+    return value.hexdigest()
+
+
+def disappearing_process_group(_pid: int, sig: int) -> None:
+    if sig == AB.signal.SIGKILL:
+        return
+    if sig == 0:
+        raise ProcessLookupError
+    raise AssertionError(f"unexpected process-group signal {sig}")
+
+
+def exited_waitid(pid: int, status: int = 0):
+    return SimpleNamespace(
+        si_pid=pid,
+        si_code=AB.os.CLD_EXITED,
+        si_status=status,
+    )
 
 
 def write_wav(path: Path, frames: int = 48000) -> None:
@@ -259,6 +319,8 @@ class EvidenceFixture:
         self.producer_paths = {}
         self.producer_media_paths = {}
         self.producer_decoded_by_payload = {}
+        self.replay_by_mode = {}
+        self.replay_calls = []
         control_source_tree = AB.renderer_source_tree(
             AB.PRODUCTION_TIER,
             ROOT,
@@ -317,7 +379,10 @@ class EvidenceFixture:
                         "inputs": inputs,
                         "capture": {
                             "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
-                            "raw_rgba_sha256": "5" * 64,
+                            "raw_rgba_sha256": (
+                                "5" if mode == "with_score" else "6"
+                            )
+                            * 64,
                             "missing": 0,
                             "signature": f"fixture-{mode}",
                             "passage": {
@@ -340,6 +405,11 @@ class EvidenceFixture:
                     indent=2,
                 )
                 + "\n"
+            )
+            segment_document = json.loads(segment_receipt.read_text())
+            self.replay_by_mode[mode] = (
+                copy.deepcopy(segment_document["capture"]),
+                copy.deepcopy(segment_document["decoded_video"]),
             )
             concat_media = producer_root / f"{mode}.mov"
             concat_payload = f"{mode} canonical concat media".encode()
@@ -468,12 +538,21 @@ class EvidenceFixture:
             aggregate_digest.update(self.producer_rgb_by_payload[payload])
         return identity
 
+    def replay_probe(self, **kwargs):
+        mode = kwargs["mode"]
+        self.replay_calls.append(copy.deepcopy(kwargs))
+        return copy.deepcopy(self.replay_by_mode[mode])
+
     @contextmanager
     def producer_patch(self):
         with mock.patch.object(
             AB,
             "_producer_decoded_video_identity",
             side_effect=self.producer_probe,
+        ), mock.patch.object(
+            AB,
+            "_canonical_segment_replay",
+            side_effect=self.replay_probe,
         ):
             yield
 
@@ -701,6 +780,11 @@ class ProductionScoreMotionTest(unittest.TestCase):
                     "_producer_decoded_video_identity",
                     side_effect=fixture.producer_probe,
                 ) as producer_probe,
+                mock.patch.object(
+                    AB,
+                    "_canonical_segment_replay",
+                    side_effect=fixture.replay_probe,
+                ) as replay_probe,
                 mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
             ):
                 document = AB.write_receipt(
@@ -718,6 +802,11 @@ class ProductionScoreMotionTest(unittest.TestCase):
             self.assertEqual(review_probe.call_count, 2)
             self.assertEqual(anchor_probe.call_count, 2)
             self.assertEqual(producer_probe.call_count, 4)
+            self.assertEqual(replay_probe.call_count, 2)
+            self.assertEqual(
+                [(call.kwargs["mode"], call.kwargs["ordinal"]) for call in replay_probe.call_args_list],
+                [("with_score", 0), ("control", 0)],
+            )
             for probe_call, anchor_call in zip(
                 review_probe.call_args_list,
                 anchor_probe.call_args_list,
@@ -763,6 +852,705 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 "with_score review media full decoded video differs from its canonical producer",
                 errors,
             )
+
+    def test_gpu_capture_and_decoded_pixels_require_canonical_replay(self) -> None:
+        with self.subTest("forged raw GPU digest"), tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            concat_path = fixture.producer_paths["with_score"]
+            concat = json.loads(concat_path.read_text())
+            segment_path = concat_path.parent / f"{concat['segments'][0]['name']}.receipt.json"
+            segment = json.loads(segment_path.read_text())
+            segment["capture"]["raw_rgba_sha256"] = "f" * 64
+            segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+            concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+            concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+            fixture.write_receipt()
+
+            errors = fixture.production_errors()
+            self.assertIn(
+                "with_score render segment 0 GPU-frame sequence digest differs from canonical replay",
+                errors,
+            )
+
+        with self.subTest("forged full decoded stream"), tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            mode = "with_score"
+            concat_path = fixture.producer_paths[mode]
+            concat_media = fixture.producer_media_paths[mode]["concat"]
+            segment_media = fixture.producer_media_paths[mode]["segments"][0]
+            concat = json.loads(concat_path.read_text())
+            segment_path = segment_media.with_name(segment_media.name + ".receipt.json")
+            segment = json.loads(segment_path.read_text())
+
+            forged_rgb = b"forged full decoded producer stream"
+            forged = {
+                "algorithm": "rgb24-stream-sha256-v1",
+                "sha256": hashlib.sha256(forged_rgb).hexdigest(),
+                "frames": 30,
+                "width": AB.PRODUCTION_WIDTH,
+                "height": AB.PRODUCTION_HEIGHT,
+            }
+            segment_payload = segment_media.read_bytes()
+            concat_payload = concat_media.read_bytes()
+            fixture.producer_decoded_by_payload[segment_payload] = copy.deepcopy(forged)
+            fixture.producer_decoded_by_payload[concat_payload] = copy.deepcopy(forged)
+            fixture.producer_rgb_by_payload[segment_payload] = forged_rgb
+            fixture.media[fixture.with_movie]["video_framehash_sha256"] = forged["sha256"]
+            fixture.media[fixture.with_movie]["decoded_rgb_sha256"] = forged["sha256"]
+            segment["decoded_video"] = copy.deepcopy(forged)
+            segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+            concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+            concat["decoded_video"] = {**forged, "fps": AB.PRODUCTION_FPS}
+            concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+            fixture.write_receipt()
+
+            errors = fixture.production_errors()
+            self.assertIn(
+                "with_score render segment 0 decoded pixels differ from canonical Apple-Metal replay",
+                errors,
+            )
+
+    def test_canonical_replay_has_no_portable_acceptance_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            segment_media = fixture.producer_media_paths["with_score"]["segments"][0]
+            segment = json.loads(
+                segment_media.with_name(segment_media.name + ".receipt.json").read_text()
+            )
+            with mock.patch.object(AB.sys, "platform", "linux"), self.assertRaisesRegex(
+                AB.EvidenceError,
+                "authorized macOS Apple-Metal host",
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+
+    def test_canonical_replay_source_snapshot_rejects_restored_mutations(self) -> None:
+        def replay_inputs(fixture, source_root):
+            segment_media = fixture.producer_media_paths["with_score"]["segments"][0]
+            segment = json.loads(
+                segment_media.with_name(segment_media.name + ".receipt.json").read_text()
+            )
+            inputs = copy.deepcopy(segment["inputs"])
+            inputs["source_tree_sha256"] = canonical_replay_source_closure(source_root)
+            return inputs
+
+        with (
+            self.subTest("source bytes overwritten then restored"),
+            tempfile.TemporaryDirectory() as evidence_temporary,
+            tempfile.TemporaryDirectory(dir=ROOT.parent) as source_temporary,
+        ):
+            fixture = EvidenceFixture(Path(evidence_temporary))
+            source_root = Path(source_temporary)
+            inputs = replay_inputs(fixture, source_root)
+            target = source_root / "engine/a.js"
+            original = target.read_bytes()
+            original_mode = target.stat().st_mode & 0o777
+
+            class MutatingReplay:
+                pid = 4545
+
+                @staticmethod
+                def wait(timeout=None):
+                    return 0
+
+                @staticmethod
+                def poll():
+                    return 0
+
+            def launch_mutating(*_args, **_kwargs):
+                # Exercise the gap inside Popen itself: the source is restored
+                # before the caller receives a process handle.
+                target.write_bytes(b"substituted renderer source\n")
+                target.write_bytes(original)
+                # Make the ctime transition explicit even on a coarse test FS.
+                target.chmod(0o600)
+                target.chmod(original_mode)
+                return MutatingReplay()
+
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(AB.subprocess, "Popen", side_effect=launch_mutating),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=disappearing_process_group,
+                ) as kill_group,
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    r"canonical replay source engine/a\.js changed during authentication",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=inputs,
+                    root=source_root,
+                )
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(MutatingReplay.pid, AB.signal.SIGKILL),
+                    mock.call(MutatingReplay.pid, 0),
+                ],
+            )
+            self.assertEqual(target.read_bytes(), original)
+
+        with (
+            self.subTest("ancestor directory swapped then restored"),
+            tempfile.TemporaryDirectory() as evidence_temporary,
+            tempfile.TemporaryDirectory(dir=ROOT.parent) as source_temporary,
+        ):
+            fixture = EvidenceFixture(Path(evidence_temporary))
+            source_root = Path(source_temporary)
+            inputs = replay_inputs(fixture, source_root)
+            alternate = source_root / "render-alternate"
+            alternate.mkdir()
+            for path in (source_root / "render").iterdir():
+                if path.is_file():
+                    (alternate / path.name).write_bytes(path.read_bytes())
+
+            class SwappingReplay:
+                pid = 4646
+
+                @staticmethod
+                def wait(timeout=None):
+                    original = source_root / "render"
+                    parked = source_root / "render-authenticated-original"
+                    original.rename(parked)
+                    alternate.rename(original)
+                    original.rename(alternate)
+                    parked.rename(original)
+                    return 0
+
+                @staticmethod
+                def poll():
+                    return 0
+
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(AB.subprocess, "Popen", return_value=SwappingReplay()),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=disappearing_process_group,
+                ) as kill_group,
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    r"canonical replay source ancestor .* changed during authentication",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=inputs,
+                    root=source_root,
+                )
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(SwappingReplay.pid, AB.signal.SIGKILL),
+                    mock.call(SwappingReplay.pid, 0),
+                ],
+            )
+            self.assertTrue((source_root / "render/render.py").is_file())
+
+    def test_canonical_replay_source_snapshot_normal_lifecycle(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as evidence_temporary,
+            # Source and replay output deliberately share the platform temp
+            # ancestor; replay-temp creation must precede its ctime snapshot.
+            tempfile.TemporaryDirectory() as source_temporary,
+        ):
+            fixture = EvidenceFixture(Path(evidence_temporary))
+            source_root = Path(source_temporary)
+            source_digest = canonical_replay_source_closure(source_root)
+            segment_media = fixture.producer_media_paths["with_score"]["segments"][0]
+            segment = json.loads(
+                segment_media.with_name(segment_media.name + ".receipt.json").read_text()
+            )
+            inputs = copy.deepcopy(segment["inputs"])
+            inputs["source_tree_sha256"] = source_digest
+            capture, decoded = copy.deepcopy(fixture.replay_by_mode["with_score"])
+            snapshots = []
+            lifecycle = []
+            real_snapshot = AB._pinned_canonical_replay_source_snapshot
+
+            @contextmanager
+            def observing_snapshot(*args, **kwargs):
+                with real_snapshot(*args, **kwargs) as snapshot:
+                    snapshots.append(snapshot)
+                    yield snapshot
+
+            class SuccessfulReplay:
+                pid = 4747
+
+                @staticmethod
+                def wait(timeout=None):
+                    lifecycle.append("wait")
+                    self.assertEqual(len(snapshots), 1)
+                    for record in snapshots[0]._directories:
+                        self.assertTrue(AB.stat.S_ISDIR(AB.os.fstat(record["fd"]).st_mode))
+                    return 0
+
+                @staticmethod
+                def poll():
+                    return 0
+
+            def launch(command, **kwargs):
+                output_root = Path(command[command.index("--out") + 1])
+                self.assertEqual(
+                    command[:6],
+                    [
+                        AB.sys.executable,
+                        "-I",
+                        "-B",
+                        "-X",
+                        f"pycache_prefix={AB.os.devnull}",
+                        str(source_root / "render/render.py"),
+                    ],
+                )
+                self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+                self.assertEqual(kwargs["env"]["PYTHONPYCACHEPREFIX"], AB.os.devnull)
+                self.assertEqual(kwargs["stdout"].name, AB.os.devnull)
+                self.assertEqual(kwargs["stderr"], AB.subprocess.STDOUT)
+                self.assertEqual(kwargs["stdout"].write(b"noisy renderer\n" * 1024), 15 * 1024)
+                self.assertFalse((output_root / ".pycache").exists())
+                media = output_root / "passage-20170620-seg-000.mov"
+                media.write_bytes(b"canonical replay media")
+                media.with_name(media.name + ".receipt.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": "danse.render.segment.v1",
+                            "segment": 0,
+                            "frames": 30,
+                            "inputs": inputs,
+                            "capture": capture,
+                            "decoded_video": decoded,
+                            "file_sha256": digest(media),
+                            "file_bytes": media.stat().st_size,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                return SuccessfulReplay()
+
+            def observe_waitid(kind, pid, flags):
+                lifecycle.append("waitid")
+                self.assertEqual(kind, AB.os.P_PID)
+                self.assertEqual(flags, AB.os.WEXITED | AB.os.WNOWAIT | AB.os.WNOHANG)
+                return exited_waitid(pid)
+
+            def kill_group(pid, sig):
+                lifecycle.append(f"killpg:{sig}")
+                return disappearing_process_group(pid, sig)
+
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=observing_snapshot,
+                ),
+                mock.patch.object(AB.subprocess, "Popen", side_effect=launch),
+                mock.patch.object(AB.os, "waitid", side_effect=observe_waitid),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=kill_group,
+                ) as kill_group,
+                mock.patch.object(
+                    AB,
+                    "_producer_media_identity_errors",
+                    return_value=([], decoded),
+                ),
+            ):
+                replay_capture, replay_decoded = AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=inputs,
+                    root=source_root,
+                )
+            self.assertEqual(replay_capture, capture)
+            self.assertEqual(replay_decoded, decoded)
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(SuccessfulReplay.pid, AB.signal.SIGKILL),
+                    mock.call(SuccessfulReplay.pid, 0),
+                ],
+            )
+            self.assertEqual(
+                lifecycle,
+                ["waitid", f"killpg:{AB.signal.SIGKILL}", "wait", "killpg:0"],
+            )
+            self.assertTrue(snapshots[0]._closed)
+            for record in snapshots[0]._directories:
+                with self.assertRaises(OSError):
+                    AB.os.fstat(record["fd"])
+
+            stale_inputs = copy.deepcopy(inputs)
+            stale_inputs["source_tree_sha256"] = "0" * 64
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(AB.subprocess, "Popen") as popen,
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    "source tree differs from its producer inputs",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=stale_inputs,
+                    root=source_root,
+                )
+            popen.assert_not_called()
+
+    def test_failed_canonical_replay_terminates_its_worker_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            segment_media = fixture.producer_media_paths["with_score"]["segments"][0]
+            segment = json.loads(
+                segment_media.with_name(segment_media.name + ".receipt.json").read_text()
+            )
+
+            class StableSourceSnapshot:
+                def __init__(self, source_tree_sha256):
+                    self.source_tree_sha256 = source_tree_sha256
+
+                @staticmethod
+                def revalidate():
+                    return None
+
+            @contextmanager
+            def stable_source_snapshot(_root, *, original_inputs, **_kwargs):
+                yield StableSourceSnapshot(original_inputs["source_tree_sha256"])
+
+            class FailedReplay:
+                pid = 4242
+
+                @staticmethod
+                def wait(timeout=None):
+                    return 1
+
+                @staticmethod
+                def poll():
+                    return 1
+
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "repository_file",
+                    return_value=ROOT / "render/render.py",
+                ),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=stable_source_snapshot,
+                ),
+                mock.patch.object(AB.subprocess, "Popen", return_value=FailedReplay()),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid, 1),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=disappearing_process_group,
+                ) as kill_group,
+                self.assertRaisesRegex(AB.EvidenceError, "canonical with_score segment 0 replay failed"),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(FailedReplay.pid, AB.signal.SIGKILL),
+                    mock.call(FailedReplay.pid, 0),
+                ],
+            )
+
+            class KillErrorReplay:
+                pid = 4262
+
+                def __init__(self):
+                    self.wait_timeouts = []
+
+                def wait(self, timeout=None):
+                    self.wait_timeouts.append(timeout)
+                    return 0
+
+            kill_error = KillErrorReplay()
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "repository_file",
+                    return_value=ROOT / "render/render.py",
+                ),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=stable_source_snapshot,
+                ),
+                mock.patch.object(AB.subprocess, "Popen", return_value=kill_error),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=PermissionError("process-group signal denied"),
+                ),
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    "cannot terminate canonical with_score segment 0 replay workers",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+            self.assertEqual(
+                kill_error.wait_timeouts,
+                [AB.CANONICAL_REPLAY_CLEANUP_SECONDS],
+            )
+
+            class TimedOutReplay:
+                pid = 4272
+
+                def __init__(self):
+                    self.wait_timeouts = []
+
+                def wait(self, timeout=None):
+                    self.wait_timeouts.append(timeout)
+                    return -AB.signal.SIGKILL
+
+            timed_out = TimedOutReplay()
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "repository_file",
+                    return_value=ROOT / "render/render.py",
+                ),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=stable_source_snapshot,
+                ),
+                mock.patch.object(AB.subprocess, "Popen", return_value=timed_out),
+                mock.patch.object(AB.os, "waitid", return_value=None),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=disappearing_process_group,
+                ) as kill_group,
+                mock.patch.object(
+                    AB.time,
+                    "monotonic",
+                    side_effect=[0.0, 901.0, 902.0],
+                ),
+                mock.patch.object(AB.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    "canonical with_score segment 0 replay timed out",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(TimedOutReplay.pid, AB.signal.SIGKILL),
+                    mock.call(TimedOutReplay.pid, 0),
+                ],
+            )
+            self.assertEqual(
+                timed_out.wait_timeouts,
+                [AB.CANONICAL_REPLAY_CLEANUP_SECONDS],
+            )
+            sleep.assert_not_called()
+
+            class LingeringGroupReplay:
+                pid = 4292
+
+                @staticmethod
+                def wait(timeout=None):
+                    return 0
+
+                @staticmethod
+                def poll():
+                    return 0
+
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "repository_file",
+                    return_value=ROOT / "render/render.py",
+                ),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=stable_source_snapshot,
+                ),
+                mock.patch.object(
+                    AB.subprocess,
+                    "Popen",
+                    return_value=LingeringGroupReplay(),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid),
+                ),
+                mock.patch.object(AB.os, "killpg", return_value=None) as kill_group,
+                mock.patch.object(
+                    AB.time,
+                    "monotonic",
+                    side_effect=[0.0, 100.0, 111.0],
+                ),
+                mock.patch.object(AB.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    AB.EvidenceError,
+                    "replay process group did not terminate",
+                ),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+            self.assertEqual(
+                kill_group.call_args_list,
+                [
+                    mock.call(LingeringGroupReplay.pid, AB.signal.SIGKILL),
+                    mock.call(LingeringGroupReplay.pid, 0),
+                ],
+            )
+            sleep.assert_not_called()
+
+            class StuckReplay:
+                pid = 4343
+
+                def __init__(self):
+                    self.wait_timeouts = []
+
+                def wait(self, timeout=None):
+                    self.wait_timeouts.append(timeout)
+                    raise AB.subprocess.TimeoutExpired("canonical replay", timeout)
+
+                @staticmethod
+                def poll():
+                    return None
+
+            stuck = StuckReplay()
+            with (
+                mock.patch.object(AB.sys, "platform", "darwin"),
+                mock.patch.object(AB, "require_production_tier", return_value=None),
+                mock.patch.object(
+                    AB,
+                    "repository_file",
+                    return_value=ROOT / "render/render.py",
+                ),
+                mock.patch.object(
+                    AB,
+                    "_pinned_canonical_replay_source_snapshot",
+                    side_effect=stable_source_snapshot,
+                ),
+                mock.patch.object(AB.subprocess, "Popen", return_value=stuck),
+                mock.patch.object(
+                    AB.os,
+                    "waitid",
+                    side_effect=lambda _kind, pid, _flags: exited_waitid(pid),
+                ),
+                mock.patch.object(
+                    AB.os,
+                    "killpg",
+                    side_effect=disappearing_process_group,
+                ) as kill_group,
+                self.assertRaisesRegex(AB.EvidenceError, "workers did not terminate"),
+            ):
+                AB._canonical_segment_replay(
+                    mode="with_score",
+                    ordinal=0,
+                    frames=30,
+                    segment_frames=30,
+                    expected=fixture.context,
+                    original_inputs=segment["inputs"],
+                    root=ROOT,
+                )
+            self.assertEqual(
+                stuck.wait_timeouts,
+                [AB.CANONICAL_REPLAY_CLEANUP_SECONDS],
+            )
+            kill_group.assert_called_once_with(StuckReplay.pid, AB.signal.SIGKILL)
 
     def test_producer_modes_and_segment_chain_fail_closed(self) -> None:
         cases = (
@@ -1187,6 +1975,44 @@ class ProductionScoreMotionTest(unittest.TestCase):
             self.assertTrue(any("aggregate byte limit" in error for error in errors), errors)
 
     def test_pinned_media_and_receipt_snapshots_reject_path_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            target = fixture.producer_media_paths["with_score"]["segments"][0]
+            swapped = False
+
+            def swapping_replay(**kwargs):
+                nonlocal swapped
+                identity = fixture.replay_probe(**kwargs)
+                if not swapped and kwargs["mode"] == "with_score":
+                    swapped = True
+                    target.rename(target.with_name(target.name + ".authenticated-original"))
+                    target.write_bytes(b"replaced after decode during canonical replay")
+                return identity
+
+            with (
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                mock.patch.object(
+                    AB,
+                    "_producer_decoded_video_identity",
+                    side_effect=fixture.producer_probe,
+                ),
+                mock.patch.object(
+                    AB,
+                    "_canonical_segment_replay",
+                    side_effect=swapping_replay,
+                ),
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertIn(
+                "with_score render segment 0 changed during authentication",
+                errors,
+            )
+
         with tempfile.TemporaryDirectory() as temporary:
             fixture = EvidenceFixture(Path(temporary))
             target = fixture.producer_media_paths["with_score"]["concat"]
