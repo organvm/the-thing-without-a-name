@@ -26,7 +26,7 @@
     "music": {
       "source": {
         "path": "music/repertoire.yaml",
-        "sha256": "38424f2b553d28b57abd4fd19c048009b7a1f1a02aef6c73466681d20b381fe0",
+        "sha256": "5fb4cb1faf283b50464d6e095b2918cb49d03e8227c8070d17e2e0eea69c9e10",
         "summary": "Selected Delibes suite with separately evidenced composition, edition, arrangement/MIDI, performance, recording, and sample layers."
       },
       "schema": "danse.music.repertoire.v1",
@@ -595,7 +595,7 @@
       "public_credit": {"state": "pending", "label": "Music by Léo Delibes. Source arrangements by Paul De Bra, adapted and re-orchestrated for Danse under CC BY 4.0. Changes include instrumentation, sequencing, cue markers, and mix.", "note": "Exact required wording is recorded, but source/license review, artist approval, and package binding remain pending."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "music/repertoire.yaml", "sha256": "38424f2b553d28b57abd4fd19c048009b7a1f1a02aef6c73466681d20b381fe0", "summary": "Selected Delibes repertoire register with component rights kept separate and durable package binding still pending."},
+        {"path": "music/repertoire.yaml", "sha256": "5fb4cb1faf283b50464d6e095b2918cb49d03e8227c8070d17e2e0eea69c9e10", "summary": "Selected Delibes repertoire register with component rights kept separate and durable package binding still pending."},
         {"path": "rights/evidence/delibes-source-license-custody.json", "sha256": "92f5df76904b11cc543055c12d1f2e426e78130c5ff9006a06b6ff1f947ed545", "summary": "Exact public-safe custody for the selected source arrangements, composition evidence, licenses, soundfont notice, and required credit."},
         {"path": "sound/audio-uses.json", "sha256": "d312487481ca456c4f26357b18fef7f0f58b5d8ae4a3dc5e687895d9c98f53e4", "summary": "Usage manifest makes competition-classical the only package-eligible profile and excludes private grains, DAW instruments, and unverified downloads."}
       ],

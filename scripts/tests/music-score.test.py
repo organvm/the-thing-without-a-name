@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,9 +40,12 @@ from compile_score import (  # noqa: E402
 from music_score import events_between, load_score, score_at, validate as validate_score  # noqa: E402
 from record_recording_custody import (  # noqa: E402
     CANONICAL_STEMS,
+    _atomic_write_many,
+    _canonical_repository_output,
     authenticate_production_outputs,
     build_receipt,
     hydrated_receipt_errors,
+    transition_recording_custody,
     validate_production_input_graph,
 )
 from validate_repertoire import (  # noqa: E402
@@ -244,7 +248,10 @@ def current_recording_custody_receipt(master_digest: str = "a" * 64) -> dict:
         "clearance": {
             "gate": "music-cleared",
             "state": "pending",
-            "note": "Custody only; no rights, final-cut, upload, or submission claim.",
+            "note": (
+                "This receipt binds deterministic recording custody only; it does not approve "
+                "music rights, credit, final cut, upload, or submission."
+            ),
         },
     }
 
@@ -444,6 +451,13 @@ class MusicScoreContractTest(unittest.TestCase):
                     "receipt": {"path": relative_receipt, "sha256": sha256(receipt_path)},
                 },
             }
+            recording["evidence"].append(
+                {
+                    "kind": "recording-custody-receipt",
+                    "citation": "Downstream receipt evidence must not feed back into its source score.",
+                    "source": {"path": relative_receipt, "sha256": sha256(receipt_path)},
+                }
+            )
             with mock.patch("validate_repertoire.subprocess.run", return_value=listed):
                 self.assertEqual(validate_document(candidate, check_derived=False), [])
                 hydrated_errors = validate_document(
@@ -493,6 +507,9 @@ class MusicScoreContractTest(unittest.TestCase):
                 variant = copy.deepcopy(candidate)
                 variant_recording = variant["works"][0]["recording"]
                 variant_recording["status"] = status
+                if isinstance(document.get("master"), dict):
+                    variant_recording["source"]["path"] = document["master"].get("path")
+                    variant_recording["source"]["sha256"] = document["master"].get("sha256")
                 variant_recording["source"]["receipt"]["sha256"] = sha256(receipt_path)
                 if status == "pending-render":
                     variant_recording["render_contract"] = copy.deepcopy(
@@ -532,6 +549,43 @@ class MusicScoreContractTest(unittest.TestCase):
             self.assertTrue(any("one exact PCM shape" in error for error in errors), errors)
             self.assertTrue(any("current score duration" in error for error in errors), errors)
 
+            wrong_duration = copy.deepcopy(receipt)
+            wrong_duration["stems"][0]["duration_seconds"] = 1.0
+            errors = validate_variant(wrong_duration)
+            self.assertTrue(any("duration_seconds" in error and "frames / sample_rate" in error for error in errors), errors)
+
+            for alias in (".work//music/competition/delibes-master.wav", ".work/./music/competition/delibes-master.wav"):
+                with self.subTest(alias=alias):
+                    noncanonical = copy.deepcopy(receipt)
+                    noncanonical["master"]["path"] = alias
+                    errors = validate_variant(noncanonical)
+                    self.assertTrue(any("canonical POSIX" in error for error in errors), errors)
+
+            newline_digest = copy.deepcopy(receipt)
+            newline_digest["stems"][0]["sha256"] += "\n"
+            newline_digest["verification"]["seek_probes"][0]["sha256"] += "\n"
+            newline_digest["verification"]["seek_probes"][0]["repeat_sha256"] += "\n"
+            errors = validate_variant(newline_digest)
+            self.assertTrue(any("exactly one lowercase SHA-256" in error for error in errors), errors)
+
+            out_of_range_probe = copy.deepcopy(receipt)
+            out_of_range_probe["verification"]["seek_probes"][0] |= {
+                "start_frame": out_of_range_probe["master"]["frames"] - 1,
+                "frames": 2,
+            }
+            errors = validate_variant(out_of_range_probe)
+            self.assertTrue(any("range must be" in error and "final master" in error for error in errors), errors)
+
+            impossible_polyphony = copy.deepcopy(receipt)
+            impossible_polyphony["master"]["polyphonic_frames"] = impossible_polyphony["master"]["frames"] + 1
+            errors = validate_variant(impossible_polyphony)
+            self.assertTrue(any("polyphonic_frames" in error and "no greater" in error for error in errors), errors)
+
+            mismatched_polyphony = copy.deepcopy(receipt)
+            mismatched_polyphony["pre_normalized_master"]["polyphonic_frames"] -= 1
+            errors = validate_variant(mismatched_polyphony)
+            self.assertTrue(any("same polyphonic frame count" in error for error in errors), errors)
+
             wrong_order = copy.deepcopy(receipt)
             wrong_order["stems"][0]["id"], wrong_order["stems"][1]["id"] = (
                 wrong_order["stems"][1]["id"],
@@ -557,6 +611,25 @@ class MusicScoreContractTest(unittest.TestCase):
             stale_probe["verification"]["seek_probes"][0]["repeat_sha256"] = "f" * 64
             errors = validate_variant(stale_probe)
             self.assertTrue(any("repeat digest must equal" in error for error in errors), errors)
+
+            wrong_normalization = copy.deepcopy(receipt)
+            wrong_normalization["normalization"]["targets"]["integrated_lufs"] = -18.0
+            errors = validate_variant(wrong_normalization)
+            self.assertTrue(any("normalization.targets" in error and "current mix" in error for error in errors), errors)
+
+            impossible_output = copy.deepcopy(receipt)
+            impossible_output["normalization"]["output"]["integrated_lufs"] = -50.0
+            impossible_output["normalization"]["output"]["true_peak_dbtp"] = 0.0
+            errors = validate_variant(impossible_output)
+            self.assertTrue(any("integrated_lufs" in error and "mix tolerance" in error for error in errors), errors)
+            self.assertTrue(any("true_peak_dbtp" in error and "mix ceiling" in error for error in errors), errors)
+
+            false_clearance = copy.deepcopy(receipt)
+            false_clearance["clearance"]["note"] = (
+                "Music rights approved; final cut approved; uploaded and submitted."
+            )
+            errors = validate_variant(false_clearance)
+            self.assertTrue(any("clearance.note" in error and "must equal" in error for error in errors), errors)
 
             errors = validate_variant(receipt, status="pending-render")
             self.assertTrue(any("hydrated-derived custody is valid only" in error for error in errors), errors)
@@ -784,6 +857,79 @@ class MusicScoreContractTest(unittest.TestCase):
                     recorded_on="2026-08-30",
                 )
 
+    def test_custody_transition_rebinds_both_rights_identities_and_is_portable(self) -> None:
+        receipt = current_recording_custody_receipt("a" * 64)
+        with tempfile.TemporaryDirectory(dir=ROOT / "music") as temporary:
+            receipt_path = Path(temporary) / "recording-custody.json"
+            receipt_payload = json.dumps(receipt, indent=2) + "\n"
+            receipt_path.write_text(receipt_payload)
+            relative_receipt = receipt_path.relative_to(ROOT).as_posix()
+            transitioned, repertoire_payload, rights = transition_recording_custody(
+                copy.deepcopy(self.production_register),
+                json.loads((ROOT / "rights/register.json").read_text()),
+                receipt,
+                receipt_path=relative_receipt,
+                receipt_sha256=sha256(receipt_path),
+            )
+            repertoire_digest = hashlib.sha256(repertoire_payload).hexdigest()
+            references: list[dict] = []
+
+            def collect(value: object) -> None:
+                if isinstance(value, dict):
+                    if value.get("path") == "music/repertoire.yaml":
+                        references.append(value)
+                    for child in value.values():
+                        collect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        collect(child)
+
+            collect(rights)
+            self.assertEqual(len(references), 2)
+            self.assertTrue(all(row.get("sha256") == repertoire_digest for row in references))
+
+            tracked = subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files", "-z"],
+                capture_output=True,
+                check=True,
+            ).stdout + relative_receipt.encode() + b"\0"
+            listed = subprocess.CompletedProcess([], 0, stdout=tracked, stderr=b"")
+            with mock.patch("validate_repertoire.subprocess.run", return_value=listed):
+                self.assertEqual(validate_document(transitioned, check_derived=False), [])
+                transitioned_score = compile_contract(
+                    transitioned,
+                    self.program,
+                    "delibes-screendance-suite",
+                )
+            self.assertEqual(output_bytes(transitioned_score), (ROOT / "music/score.json").read_bytes())
+
+    def test_custody_transition_rejects_symlink_outputs_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT / "music") as temporary:
+            directory = Path(temporary)
+            target = directory / "target.json"
+            target.write_text("target")
+            alias = directory / "receipt.json"
+            alias.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                _canonical_repository_output(alias, "custody receipt output")
+
+            first = directory / "first.json"
+            second = directory / "second.json"
+            first.write_bytes(b"first-old")
+            second.write_bytes(b"second-old")
+            real_replace = os.replace
+
+            def fail_second(source: object, destination: object) -> None:
+                if Path(destination) == second:
+                    raise OSError("simulated second replacement failure")
+                real_replace(source, destination)
+
+            with mock.patch("record_recording_custody.os.replace", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "simulated"):
+                    _atomic_write_many([(first, b"first-new"), (second, b"second-new")])
+            self.assertEqual(first.read_bytes(), b"first-old")
+            self.assertEqual(second.read_bytes(), b"second-old")
+
     def test_recording_custody_rehashes_every_current_render_input(self) -> None:
         score_path = ROOT / "music/score.json"
         choreography_path = ROOT / "render/choreography.json"
@@ -796,6 +942,14 @@ class MusicScoreContractTest(unittest.TestCase):
         score = json.loads(score_path.read_text())
         choreography = json.loads(choreography_path.read_text())
         mix = json.loads(mix_path.read_text())
+        env_name = shutil.which("env")
+        true_name = shutil.which("true")
+        self.assertIsNotNone(env_name, "portable test fixture requires an env executable")
+        self.assertIsNotNone(true_name, "portable test fixture requires a true executable")
+        env_executable = Path(str(env_name)).resolve(strict=True)
+        true_executable = Path(str(true_name)).resolve(strict=True)
+        self.assertTrue(env_executable.is_file() and not env_executable.is_symlink())
+        self.assertTrue(true_executable.is_file() and not true_executable.is_symlink())
         inputs = {
             "score": {
                 "path": score_path.relative_to(ROOT).as_posix(),
@@ -824,13 +978,13 @@ class MusicScoreContractTest(unittest.TestCase):
                 "sha256": sha256(soundfont_path),
             },
             "fluidsynth_executable": {
-                "path": "/usr/bin/env",
-                "sha256": sha256(Path("/usr/bin/env")),
+                "path": str(env_executable),
+                "sha256": sha256(env_executable),
                 "version": "2.6.0",
             },
             "ffmpeg_executable": {
-                "path": "/usr/bin/true",
-                "sha256": sha256(Path("/usr/bin/true")),
+                "path": str(true_executable),
+                "sha256": sha256(true_executable),
                 "version": "9.0.1",
             },
         }

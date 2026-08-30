@@ -486,6 +486,27 @@ def retained_score_package(
 
 
 class DeliveryContractTest(unittest.TestCase):
+    def test_normalization_targets_are_owned_by_the_mix_contract(self) -> None:
+        settings = {
+            "target_lufs": -18.0,
+            "tolerance_lu": 0.75,
+            "target_true_peak_dbtp": -2.1,
+            "max_true_peak_dbtp": -2.0,
+            "target_lra_lu": 9.0,
+        }
+        self.assertEqual(
+            DELIVER.normalization_targets_from_mix(settings),
+            {
+                "integrated_lufs": -18.0,
+                "tolerance_lu": 0.75,
+                "target_true_peak_dbtp": -2.1,
+                "max_true_peak_dbtp": -2.0,
+                "lra_lu": 9.0,
+            },
+        )
+        with self.assertRaisesRegex(SystemExit, "internally inconsistent"):
+            DELIVER.normalization_targets_from_mix({**settings, "tolerance_lu": 0})
+
     def test_production_delivery_rejects_nonzero_score_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with (

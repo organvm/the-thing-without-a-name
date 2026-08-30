@@ -605,12 +605,29 @@ def score_bound_recording(recording: dict[str, Any]) -> dict[str, Any]:
     repertoire validation still authenticates the final recording separately.
     """
     source = recording.get("source")
-    if (
+    derived = (
         recording.get("status") == "project-authored"
         and isinstance(source, dict)
         and source.get("custody") == "hydrated-derived"
-    ):
-        return {**recording, "status": "pending-render", "source": None}
+    )
+    if recording.get("status") == "pending-render" or derived:
+        # Only the render contract and its pre-render evidence are upstream of
+        # the score. Final master identities, custody citations, and any other
+        # receipt-derived fields belong to repertoire/package validation and
+        # must never feed back into the score that produced them.
+        stable_evidence = [
+            row
+            for row in recording.get("evidence", [])
+            if isinstance(row, dict) and row.get("kind") == "deterministic-render-contract"
+        ]
+        return {
+            "owner": recording.get("owner"),
+            "status": "pending-render",
+            "license": recording.get("license"),
+            "source": None,
+            "render_contract": recording.get("render_contract"),
+            "evidence": stable_evidence,
+        }
     return recording
 
 

@@ -91,7 +91,7 @@ violate the repository custody boundary. After the exact production render is
 green, emit the public-safe tracked bridge with an explicit custody date:
 
 ```bash
-python3 music/record_recording_custody.py --recorded-on YYYY-MM-DD
+python3 music/record_recording_custody.py --recorded-on YYYY-MM-DD --apply-registers
 ```
 
 The resulting `rights/evidence/delibes-recording-custody.json` is accepted only
@@ -102,9 +102,21 @@ both reproductions equal the declared hashes and normalization, every artifact
 is uncompressed 48 kHz stereo s16 PCM with recomputed metrics and seek probes,
 and the result satisfies `recording-custody.schema.json`. The bridge records the
 exact ordered seven-stem mix, normalization evidence, generator, and schema.
-Review and commit that redacted receipt, then change the repertoire recording
-from `pending-render` to `project-authored` with a `hydrated-derived` master
-source and the tracked receipt identity. Retain the canonical `render_contract`:
+With `--apply-registers`, the command writes the redacted receipt, changes the
+repertoire recording from `pending-render` to `project-authored` with a
+`hydrated-derived` master source, retains the canonical `render_contract`, and
+rebinds both `music/repertoire.yaml` identities in `rights/register.json` to the
+new exact bytes. Review and stage all three tracked files together, then verify
+the complete portable graph before committing:
+
+```bash
+git add rights/evidence/delibes-recording-custody.json music/repertoire.yaml rights/register.json
+python3 music/validate_repertoire.py
+python3 music/compile_score.py --check
+python3 scripts/rights_contract.py --phase draft
+```
+
+The transition is deliberately explicit and fail-closed:
 score compilation normalizes only this derived-recording transition back to its
 pre-render declaration, which keeps the score -> render -> custody graph acyclic
 without weakening final recording validation. `validate_repertoire.py

@@ -93,11 +93,11 @@
           "additionalProperties": false,
           "required": ["integrated_lufs", "tolerance_lu", "target_true_peak_dbtp", "max_true_peak_dbtp", "lra_lu"],
           "properties": {
-            "integrated_lufs": {"const": -16.0},
-            "tolerance_lu": {"const": 0.5},
-            "target_true_peak_dbtp": {"const": -1.1},
-            "max_true_peak_dbtp": {"const": -1.0},
-            "lra_lu": {"const": 11.0}
+            "integrated_lufs": {"type": "number", "minimum": -100, "maximum": 0},
+            "tolerance_lu": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
+            "target_true_peak_dbtp": {"type": "number", "minimum": -100, "maximum": 0},
+            "max_true_peak_dbtp": {"type": "number", "minimum": -100, "maximum": 0},
+            "lra_lu": {"type": "number", "minimum": 0, "maximum": 100}
           }
         },
         "output": {"$ref": "#/$defs/loudnessOutput"}
@@ -144,19 +144,21 @@
       "properties": {
         "gate": {"const": "music-cleared"},
         "state": {"const": "pending"},
-        "note": {"type": "string", "minLength": 1}
+        "note": {
+          "const": "This receipt binds deterministic recording custody only; it does not approve music rights, credit, final cut, upload, or submission."
+        }
       }
     }
   },
   "$defs": {
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256": {"type": "string", "pattern": "^(?![\\s\\S]*[\\r\\n])[0-9a-f]{64}$"},
     "workPath": {
       "type": "string",
-      "pattern": "^\\.work/(?!\\.\\.(?:/|$))(?!.*?/\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
+      "pattern": "^\\.work/(?!\\.\\.?/)(?!.*//)(?!.*?/\\.\\.?(?:/|$))[A-Za-z0-9._/-]+$"
     },
     "repoPath": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"
+      "pattern": "^(?!/)(?!\\.\\.?/)(?!.*//)(?!.*?/\\.\\.?(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"
     },
     "derivedArtifact": {
       "type": "object",
@@ -245,8 +247,8 @@
       "additionalProperties": false,
       "required": ["integrated_lufs", "true_peak_dbtp", "lra_lu", "threshold_lufs"],
       "properties": {
-        "integrated_lufs": {"type": "number", "minimum": -16.5, "maximum": -15.5},
-        "true_peak_dbtp": {"type": "number", "maximum": -1.0},
+        "integrated_lufs": {"type": "number"},
+        "true_peak_dbtp": {"type": "number"},
         "lra_lu": {"type": "number", "minimum": 0},
         "threshold_lufs": {"type": "number"}
       }

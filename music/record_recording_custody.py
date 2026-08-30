@@ -10,6 +10,7 @@ music clearance, final-cut approval, upload, or submission.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -22,10 +23,15 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_AUDIO_RECEIPT = ROOT / ".work/music/competition/audio-render.json"
 DEFAULT_OUTPUT = ROOT / "rights/evidence/delibes-recording-custody.json"
 AUDIO_RENDER_SCHEMA = ROOT / "music/audio-render.schema.json"
+DEFAULT_REPERTOIRE = ROOT / "music/repertoire.yaml"
+DEFAULT_RIGHTS_REGISTER = ROOT / "rights/register.json"
+REPERTOIRE_PATH = "music/repertoire.yaml"
 CANONICAL_STEMS = (
     "violin-i",
     "violin-ii",
@@ -139,8 +145,8 @@ def checked_output(root: Path, row: Any, label: str, *, stem: bool = False) -> d
         result[key] = measured[key]
     if "polyphonic_frames" in row:
         polyphonic = row.get("polyphonic_frames")
-        if type(polyphonic) is not int or polyphonic <= 0:
-            raise ValueError(f"{label}.polyphonic_frames must be a positive integer")
+        if type(polyphonic) is not int or not 0 < polyphonic <= result["frames"]:
+            raise ValueError(f"{label}.polyphonic_frames must be positive and no greater than frames")
         result["polyphonic_frames"] = polyphonic
     if stem:
         stem_id = row.get("id")
@@ -419,6 +425,8 @@ def build_receipt(
     audio_shapes = {(row["frames"], row["sample_rate"], row["channels"]) for row in outputs_by_path}
     if len(audio_shapes) != 1:
         raise ValueError("audio render receipt outputs do not share one exact audio shape")
+    if pre_normalized_master.get("polyphonic_frames") != master.get("polyphonic_frames"):
+        raise ValueError("audio render receipt masters must share one polyphonic frame count")
     repeat_master = verification.get("repeat_master_sha256")
     if repeat_master != master["sha256"]:
         raise ValueError("audio render receipt repeat master does not equal the final master")
@@ -426,6 +434,14 @@ def build_receipt(
 
     master_path = root / master["path"]
     for index, probe in enumerate(verification["seek_probes"]):
+        if (
+            type(probe.get("start_frame")) is not int
+            or type(probe.get("frames")) is not int
+            or probe["start_frame"] < 0
+            or probe["frames"] <= 0
+            or probe["start_frame"] + probe["frames"] > master["frames"]
+        ):
+            raise ValueError(f"audio render receipt seek probe {index} is outside the final master")
         actual_probe = pcm_slice_hash(master_path, probe["start_frame"], probe["frames"])
         if probe["sha256"] != actual_probe or probe["repeat_sha256"] != actual_probe:
             raise ValueError(f"audio render receipt seek probe {index} does not match the final master")
@@ -518,12 +534,190 @@ def hydrated_receipt_errors(
     return errors
 
 
+def _rights_repertoire_sources(document: dict[str, Any]) -> list[dict[str, Any]]:
+    bindings = document.get("bindings")
+    music = bindings.get("music") if isinstance(bindings, dict) else None
+    binding_source = music.get("source") if isinstance(music, dict) else None
+    assets = document.get("assets")
+    selected = [row for row in assets or [] if isinstance(row, dict) and row.get("id") == "selected-music"]
+    provenance = selected[0].get("provenance") if len(selected) == 1 else None
+    inventory_sources = [
+        row
+        for row in provenance or []
+        if isinstance(row, dict) and row.get("path") == REPERTOIRE_PATH
+    ]
+    sources = [binding_source, *inventory_sources]
+    if (
+        len(selected) != 1
+        or len(inventory_sources) != 1
+        or len(sources) != 2
+        or any(not isinstance(row, dict) or row.get("path") != REPERTOIRE_PATH for row in sources)
+    ):
+        raise ValueError("rights register must contain exactly the binding and selected-music repertoire identities")
+    return [row for row in sources if isinstance(row, dict)]
+
+
+def transition_recording_custody(
+    repertoire: dict[str, Any],
+    rights: dict[str, Any],
+    receipt: dict[str, Any],
+    *,
+    receipt_path: str,
+    receipt_sha256: str,
+) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
+    """Build the tracked, non-affirming custody transition and all hash rebindings."""
+    if (
+        not isinstance(receipt_path, str)
+        or PurePosixPath(receipt_path).is_absolute()
+        or PurePosixPath(receipt_path).as_posix() != receipt_path
+        or any(part in {"", ".", ".."} for part in PurePosixPath(receipt_path).parts)
+    ):
+        raise ValueError("custody receipt path must be canonical and repository-relative")
+    if not isinstance(receipt_sha256, str) or SHA256.fullmatch(receipt_sha256) is None:
+        raise ValueError("custody receipt identity must be an exact SHA-256 digest")
+    from validate_repertoire import validate_recording_custody_schema
+
+    schema_errors = validate_recording_custody_schema(receipt)
+    if schema_errors:
+        raise ValueError("custody transition receipt is invalid: " + "; ".join(schema_errors))
+    if receipt.get("schema") != "danse.music.recording-custody.v1" or receipt.get("status") != "custody-only":
+        raise ValueError("custody transition requires a validated public-safe receipt")
+    master = receipt.get("master")
+    if not isinstance(master, dict) or not isinstance(master.get("path"), str) or not isinstance(master.get("sha256"), str):
+        raise ValueError("custody receipt has no exact master identity")
+
+    transitioned = copy.deepcopy(repertoire)
+    works = transitioned.get("works")
+    matching = [row for row in works or [] if isinstance(row, dict) and row.get("id") == receipt.get("work_id")]
+    if len(matching) != 1:
+        raise ValueError("custody receipt must identify exactly one repertoire work")
+    recording = matching[0].get("recording")
+    if not isinstance(recording, dict) or recording.get("status") not in {"pending-render", "project-authored"}:
+        raise ValueError("custody transition requires the pending-render recording layer")
+    if not isinstance(recording.get("render_contract"), dict):
+        raise ValueError("custody transition must retain the deterministic render contract")
+    receipt_identity = {"path": receipt_path, "sha256": receipt_sha256}
+    expected_source = {
+        "path": master["path"],
+        "sha256": master["sha256"],
+        "custody": "hydrated-derived",
+        "receipt": receipt_identity,
+    }
+    if recording.get("status") == "project-authored" and recording.get("source") != expected_source:
+        raise ValueError("custody transition cannot replace a different project-authored recording")
+    recording["status"] = "project-authored"
+    recording["source"] = expected_source
+    evidence = recording.get("evidence")
+    if not isinstance(evidence, list):
+        raise ValueError("recording layer must retain its render-contract evidence")
+    custody_rows = [row for row in evidence if isinstance(row, dict) and row.get("kind") == "recording-custody-receipt"]
+    custody_evidence = {
+        "kind": "recording-custody-receipt",
+        "citation": (
+            "Deterministic recording custody only; this does not approve music rights, "
+            "credit, final cut, upload, or submission."
+        ),
+        "source": receipt_identity,
+    }
+    if custody_rows:
+        if len(custody_rows) != 1:
+            raise ValueError("recording layer has duplicate custody evidence")
+        custody_rows[0].clear()
+        custody_rows[0].update(custody_evidence)
+    else:
+        evidence.append(custody_evidence)
+
+    repertoire_payload = yaml.safe_dump(
+        transitioned,
+        sort_keys=False,
+        allow_unicode=True,
+        width=120,
+    ).encode("utf-8")
+    repertoire_digest = hashlib.sha256(repertoire_payload).hexdigest()
+    rebound_rights = copy.deepcopy(rights)
+    for source in _rights_repertoire_sources(rebound_rights):
+        source["sha256"] = repertoire_digest
+    rebound = _rights_repertoire_sources(rebound_rights)
+    if any(source.get("sha256") != repertoire_digest for source in rebound):
+        raise ValueError("rights register repertoire identities did not rebind atomically")
+    return transitioned, repertoire_payload, rebound_rights
+
+
+def _canonical_repository_output(path: Path, label: str) -> tuple[Path, str]:
+    if "\\" in str(path) or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{label} must use one canonical repository-relative spelling")
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    try:
+        relative = absolute.relative_to(ROOT).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain inside the repository") from exc
+    current = ROOT
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} must not traverse or replace a symlink")
+    return absolute, relative
+
+
+def _atomic_write_many(writes: list[tuple[Path, bytes]]) -> None:
+    """Stage every payload first and roll back if any replacement fails."""
+    if len({path for path, _ in writes}) != len(writes):
+        raise ValueError("custody transition output paths must be distinct")
+    snapshots = {
+        path: (path.exists(), path.read_bytes() if path.exists() else b"")
+        for path, _ in writes
+    }
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for path, payload in writes:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as pending:
+                pending.write(payload)
+                staged.append((path, Path(pending.name)))
+        replaced: list[Path] = []
+        try:
+            for path, pending_path in staged:
+                os.replace(pending_path, path)
+                replaced.append(path)
+        except OSError:
+            for path in reversed(replaced):
+                existed, previous = snapshots[path]
+                if existed:
+                    with tempfile.NamedTemporaryFile(
+                        "wb",
+                        dir=path.parent,
+                        prefix=f".{path.name}.rollback.",
+                        delete=False,
+                    ) as rollback:
+                        rollback.write(previous)
+                        rollback_path = Path(rollback.name)
+                    os.replace(rollback_path, path)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
+    finally:
+        for _, pending_path in staged:
+            pending_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio-receipt", type=Path, default=DEFAULT_AUDIO_RECEIPT)
     parser.add_argument("--work-id", default="delibes-screendance-suite")
     parser.add_argument("--recorded-on", required=True, help="explicit YYYY-MM-DD custody date")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--apply-registers",
+        action="store_true",
+        help="transition repertoire custody and rebind both rights-register identities",
+    )
+    parser.add_argument("--repertoire", type=Path, default=DEFAULT_REPERTOIRE)
+    parser.add_argument("--rights-register", type=Path, default=DEFAULT_RIGHTS_REGISTER)
     args = parser.parse_args()
     try:
         document = build_receipt(
@@ -536,21 +730,49 @@ def main() -> int:
         schema_errors = validate_recording_custody_schema(document)
         if schema_errors:
             raise ValueError("; ".join(schema_errors))
-        args.out.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(document, indent=2) + "\n"
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=args.out.parent,
-            prefix=f".{args.out.name}.",
-            delete=False,
-        ) as pending:
-            pending.write(payload)
-            pending_path = Path(pending.name)
-        os.replace(pending_path, args.out)
+        receipt_digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        output_path = args.out if args.out.is_absolute() else Path.cwd() / args.out
+        if output_path.is_symlink():
+            raise ValueError("custody receipt output must not be a symlink")
+        transitioned: tuple[bytes, bytes] | None = None
+        if args.apply_registers:
+            output_path, relative_receipt = _canonical_repository_output(args.out, "custody receipt output")
+            repertoire_path, relative_repertoire = _canonical_repository_output(
+                args.repertoire,
+                "repertoire register",
+            )
+            rights_path, relative_rights = _canonical_repository_output(
+                args.rights_register,
+                "rights register",
+            )
+            if relative_repertoire != REPERTOIRE_PATH or relative_rights != "rights/register.json":
+                raise ValueError("applied custody transition must update the canonical repertoire and rights registers")
+            repertoire = yaml.safe_load(args.repertoire.read_text())
+            rights = json.loads(args.rights_register.read_text())
+            if not isinstance(repertoire, dict) or not isinstance(rights, dict):
+                raise ValueError("repertoire and rights registers must be mappings")
+            _, repertoire_payload, rebound_rights = transition_recording_custody(
+                repertoire,
+                rights,
+                document,
+                receipt_path=relative_receipt,
+                receipt_sha256=receipt_digest,
+            )
+            transitioned = (
+                repertoire_payload,
+                (json.dumps(rebound_rights, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+        writes = [(output_path, payload.encode("utf-8"))]
+        if transitioned is not None:
+            writes.extend([(repertoire_path, transitioned[0]), (rights_path, transitioned[1])])
+        _atomic_write_many(writes)
     except (OSError, ValueError, TypeError) as exc:
         print(f"FAIL: {exc}")
         return 1
     print(f"ok: {args.out} ({sha256(args.out)})")
+    if args.apply_registers:
+        print("ok: repertoire transitioned and both rights-register identities rebound")
     return 0
 
 

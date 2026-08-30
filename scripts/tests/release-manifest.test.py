@@ -315,7 +315,7 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertEqual(binding["status"], "reference-only")
         self.assertEqual(
             binding["spec_contract_sha256"],
-            "35cebf541a80788bce08586ada4299cbef77fffe1ebdbb4633f357214ecc9c66",
+            "d069282efd9a7fc62caccffdcd0dc74ae716863a78fce955f9e8d8cc3d83f27f",
         )
         self.assertFalse(binding["physical_predicates_satisfied"])
         self.assertFalse(binding["issue_14_can_close"])
