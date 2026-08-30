@@ -518,6 +518,12 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 "</head>",
                 '<link rel="dns-prefetch" href="//attacker.example"></head>',
             ),
+            "unmanifested-image": lambda value: value.replace(
+                "</main>",
+                '<img alt="unmanifested" '
+                'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">'
+                "</main>",
+            ),
         }
         for label, attack in attacks.items():
             with self.subTest(attack=label):

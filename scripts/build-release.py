@@ -61,8 +61,8 @@ GENERATED_PATHS = (
     "media/release-media.json",
 )
 PROJECT_CSP = (
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
-    "media-src 'self'; connect-src 'none'; font-src 'none'; object-src 'none'; "
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; "
+    "media-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; "
     "script-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
     "base-uri 'none'; form-action 'none'"
 )
@@ -136,16 +136,22 @@ class _ProjectMarkup(HTMLParser):
         if tag == "link":
             self.link_elements.append(values)
         if tag in {
+            "audio",
             "base",
             "embed",
             "form",
             "iframe",
+            "img",
             "math",
             "noscript",
             "object",
+            "picture",
             "script",
+            "source",
             "svg",
             "template",
+            "track",
+            "video",
         }:
             self.active_elements.add(tag)
         self.event_handlers.update(

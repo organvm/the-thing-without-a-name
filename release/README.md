@@ -73,12 +73,13 @@ Git worktree named by the exact source commit. It sets deterministic file timest
 and reproduces the same PDF and other bytes for the same manifest, phase, dependency
 version, and source commit. The generated project page is passive by contract: an exact
 fail-closed Content Security Policy blocks scripts, connections, frames, objects, forms,
-workers, and remote media, while a no-referrer policy prevents outbound link
+workers, and all image or media loads, while a no-referrer policy prevents outbound link
 navigation from disclosing the project path. Artifact verification rejects a weakened
 policy, active elements, redirect metadata, duplicate attributes, or inline event
 handlers even if a modified artifact is self-rehashed. Inert security metadata,
 element-level referrer overrides, and background network resource hints also fail
-closed. Generated outputs are not committed from the draft phase. The Pages verifier
+closed. Image or media elements remain prohibited until a future integration binds
+every displayed source to the release-media receipt. Generated outputs are not committed from the draft phase. The Pages verifier
 reapplies the same policy after composing the artwork and public release, so rehashing
 the outer Pages manifest cannot admit weakened project markup.
 

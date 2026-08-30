@@ -991,12 +991,12 @@ class AdversarialArtifactTest(unittest.TestCase):
         project.write_text(
             project.read_text(encoding="utf-8").replace(
                 "</main>",
-                '<img src="data:," onerror="document.body.dataset.changed = true"/></main>',
+                '<br onmouseover="document.body.dataset.changed = true"/></main>',
             ),
             encoding="utf-8",
         )
         self.rehash_project()
-        with self.assertRaisesRegex(CONTRACT.ReleaseError, "inline event handlers: onerror"):
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "inline event handlers: onmouseover"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_meta_refresh_fails(self) -> None:
@@ -1065,6 +1065,34 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_reenter_head_after_paragraph(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"<p></p>{csp}{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_unmanifested_image_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<img alt="unmanifested" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: img"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_referrer_policy_override_fails(self) -> None:
