@@ -22,7 +22,11 @@ from typing import Any
 
 import yaml
 
-from record_recording_custody import CANONICAL_STEMS, hydrated_receipt_errors
+from record_recording_custody import (
+    CANONICAL_REPOSITORY_INPUTS,
+    CANONICAL_STEMS,
+    hydrated_receipt_errors,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTER = ROOT / "music" / "repertoire.yaml"
@@ -533,6 +537,16 @@ def validate_document(
                             )
                         contracts = receipt_document.get("contracts")
                         if isinstance(contracts, dict):
+                            for contract_name, expected_path in CANONICAL_REPOSITORY_INPUTS.items():
+                                contract_row = contracts.get(contract_name)
+                                declared_path = (
+                                    contract_row.get("path") if isinstance(contract_row, dict) else None
+                                )
+                                if declared_path != expected_path:
+                                    error(
+                                        f"{receipt_location}.contracts.{contract_name}.path",
+                                        f"must equal the canonical current artifact {expected_path}",
+                                    )
                             contract_identities: dict[str, tuple[str, str] | None] = {}
                             for contract_name, contract_row in contracts.items():
                                 if contract_name == "soundfont":
@@ -723,11 +737,26 @@ def validate_document(
                             require_hydrated=require_hydrated,
                         ):
                             error(f"{location}.recording.source.receipt", receipt_error)
-        source(
+        derived_recording = (
+            isinstance(recording_source_row, dict)
+            and recording_source_row.get("custody") == "hydrated-derived"
+        )
+        render_contract_identity = source(
             recording.get("render_contract"),
             f"{location}.recording.render_contract",
-            required=recording.get("status") == "pending-render",
+            required=recording.get("status") == "pending-render" or derived_recording,
         )
+        if render_contract_identity is not None:
+            canonical_render_contract = "music/audio-render.schema.json"
+            expected_render_contract = (
+                canonical_render_contract,
+                sha256(root / canonical_render_contract),
+            )
+            if render_contract_identity != expected_render_contract:
+                error(
+                    f"{location}.recording.render_contract",
+                    "must equal the canonical deterministic audio-render contract",
+                )
 
         samples = layer_rows["samples"]
         items = samples.get("items")

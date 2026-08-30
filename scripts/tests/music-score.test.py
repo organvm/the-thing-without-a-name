@@ -39,6 +39,7 @@ from compile_score import (  # noqa: E402
 from music_score import events_between, load_score, score_at, validate as validate_score  # noqa: E402
 from record_recording_custody import (  # noqa: E402
     CANONICAL_STEMS,
+    authenticate_production_outputs,
     build_receipt,
     hydrated_receipt_errors,
     validate_production_input_graph,
@@ -443,7 +444,6 @@ class MusicScoreContractTest(unittest.TestCase):
                     "receipt": {"path": relative_receipt, "sha256": sha256(receipt_path)},
                 },
             }
-            recording.pop("render_contract", None)
             with mock.patch("validate_repertoire.subprocess.run", return_value=listed):
                 self.assertEqual(validate_document(candidate, check_derived=False), [])
                 hydrated_errors = validate_document(
@@ -451,8 +451,24 @@ class MusicScoreContractTest(unittest.TestCase):
                     check_derived=False,
                     require_hydrated=True,
                 )
+                transitioned_score = compile_contract(
+                    candidate,
+                    self.program,
+                    "delibes-screendance-suite",
+                )
+            self.assertEqual(
+                output_bytes(transitioned_score),
+                (ROOT / "music/score.json").read_bytes(),
+                "adding downstream recording custody must not change its upstream score",
+            )
             self.assertTrue(any("required hydrated bytes are absent" in error for error in hydrated_errors))
             self.assertTrue(any("requires hydrated audio render bytes" in error for error in hydrated_errors))
+
+            missing_render_contract = copy.deepcopy(candidate)
+            missing_render_contract["works"][0]["recording"].pop("render_contract")
+            with mock.patch("validate_repertoire.subprocess.run", return_value=listed):
+                errors = validate_document(missing_render_contract, check_derived=False)
+            self.assertTrue(any("recording.render_contract: is required" in error for error in errors), errors)
 
             wrong_master = copy.deepcopy(candidate)
             wrong_master["works"][0]["recording"]["source"]["sha256"] = "c" * 64
@@ -490,6 +506,18 @@ class MusicScoreContractTest(unittest.TestCase):
             errors = validate_variant(traversal)
             self.assertTrue(
                 any("contracts.adaptation" in error and "does not match" in error for error in errors),
+                errors,
+            )
+
+            alternate_score = copy.deepcopy(receipt)
+            alternate_score_path = ROOT / "music/fixtures/score-affine.json"
+            alternate_score["contracts"]["score"] |= {
+                "path": alternate_score_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(alternate_score_path),
+            }
+            errors = validate_variant(alternate_score)
+            self.assertTrue(
+                any("contracts.score.path" in error and "canonical current artifact" in error for error in errors),
                 errors,
             )
 
@@ -812,8 +840,11 @@ class MusicScoreContractTest(unittest.TestCase):
             "choreography": choreography,
             "mix": mix,
         }
-        with mock.patch("render_music.validate_inputs", return_value=validated):
+        with mock.patch("render_music.validate_inputs", return_value=validated), mock.patch(
+            "record_recording_custody.authenticate_production_outputs"
+        ) as output_authentication:
             self.assertEqual(validate_production_input_graph(audio), CANONICAL_STEMS)
+        output_authentication.assert_called_once()
 
         stale = copy.deepcopy(audio)
         stale["inputs"]["midi"]["sha256"] = "f" * 64
@@ -821,6 +852,74 @@ class MusicScoreContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "midi.sha256 declares"):
                 validate_production_input_graph(stale)
         production_validation.assert_not_called()
+
+        alternate = copy.deepcopy(audio)
+        alternate_score = ROOT / "music/fixtures/score-affine.json"
+        alternate["inputs"]["score"] |= {
+            "path": alternate_score.relative_to(ROOT).as_posix(),
+            "sha256": sha256(alternate_score),
+        }
+        with mock.patch("render_music.validate_inputs", return_value=validated) as production_validation:
+            with self.assertRaisesRegex(ValueError, "score.path must equal the canonical current artifact"):
+                validate_production_input_graph(alternate)
+        production_validation.assert_not_called()
+
+    def test_recording_custody_authenticates_outputs_against_two_reproductions(self) -> None:
+        def row(digest: str, *, stem_id: str | None = None, polyphonic: bool = False) -> dict:
+            value = {
+                "sha256": digest,
+                "frames": 2,
+                "sample_rate": 48_000,
+                "channels": 2,
+                "duration_seconds": round(2 / 48_000, 9),
+                "peak_sample": 100,
+                "rms_sample": 50.0,
+                "non_silent": True,
+            }
+            if polyphonic:
+                value["polyphonic_frames"] = 1
+            if stem_id is not None:
+                value = {"id": stem_id, **value}
+            return value
+
+        rendered = {
+            "pre_normalized_master": row("a" * 64, polyphonic=True),
+            "master": row("b" * 64, polyphonic=True),
+            "stems": [
+                row(hashlib.sha256(stem_id.encode()).hexdigest(), stem_id=stem_id)
+                for stem_id in CANONICAL_STEMS
+            ],
+            "normalization": {"schema": "test-normalization"},
+        }
+        audio = {
+            "outputs": copy.deepcopy(
+                {
+                    "pre_normalized_master": rendered["pre_normalized_master"],
+                    "master": rendered["master"],
+                    "stems": rendered["stems"],
+                }
+            ),
+            "normalization": copy.deepcopy(rendered["normalization"]),
+        }
+        contracts = {
+            "score": {"time": {"duration_seconds": 2 / 48_000}},
+            "mix": {"sample_rate": 48_000},
+        }
+        with mock.patch(
+            "render_music.render_once",
+            side_effect=[copy.deepcopy(rendered), copy.deepcopy(rendered)],
+        ) as reproduce:
+            authenticate_production_outputs(audio, args=SimpleNamespace(), contracts=contracts)
+        self.assertEqual(reproduce.call_count, 2)
+
+        forged = copy.deepcopy(audio)
+        forged["outputs"]["master"]["sha256"] = "f" * 64
+        with mock.patch(
+            "render_music.render_once",
+            side_effect=[copy.deepcopy(rendered), copy.deepcopy(rendered)],
+        ):
+            with self.assertRaisesRegex(ValueError, "reproduction 1 master"):
+                authenticate_production_outputs(forged, args=SimpleNamespace(), contracts=contracts)
 
     def test_compiler_boundaries_global_dynamics_and_authored_note_order(self) -> None:
         division = 480

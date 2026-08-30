@@ -595,10 +595,35 @@ def lookup_rows(
     return {"quantum_seconds": 1, "buckets": buckets, "maxima": maxima}
 
 
+def score_bound_recording(recording: dict[str, Any]) -> dict[str, Any]:
+    """Remove the output-custody edge from the upstream score identity.
+
+    A project-authored recording is derived from this score. Once its tracked
+    custody receipt is added to the repertoire register, hashing that receipt
+    back into the score would create an impossible score -> render -> receipt ->
+    score cycle. Preserve the pre-render declaration for score compilation;
+    repertoire validation still authenticates the final recording separately.
+    """
+    source = recording.get("source")
+    if (
+        recording.get("status") == "project-authored"
+        and isinstance(source, dict)
+        and source.get("custody") == "hydrated-derived"
+    ):
+        return {**recording, "status": "pending-render", "source": None}
+    return recording
+
+
+def score_bound_work(work: dict[str, Any]) -> dict[str, Any]:
+    entry = {key: value for key, value in work.items() if key != "derived_artifacts"}
+    entry["recording"] = score_bound_recording(work["recording"])
+    return entry
+
+
 def provenance_layers(work: dict[str, Any]) -> dict[str, Any]:
     layers = {}
     for name in ("composition", "edition", "arrangement_midi", "performance", "recording"):
-        row = work[name]
+        row = score_bound_recording(work[name]) if name == "recording" else work[name]
         layers[name] = {"status": row["status"], "source": row.get("source")}
     layers["sample"] = {
         "status": work["samples"]["status"],
@@ -664,7 +689,7 @@ def compile_contract(register: dict[str, Any], program: dict[str, Any], work_id:
                     f"does not match program share {expected_start}..{expected_end}"
                 )
 
-    entry_for_identity = {key: value for key, value in work.items() if key != "derived_artifacts"}
+    entry_for_identity = score_bound_work(work)
     release_status = "fixture-only" if work["role"] == "fixture" else (
         "production-selected"
         if register["artistic_gate"]["status"] == "accepted" and work["selection"]["status"] == "selected"

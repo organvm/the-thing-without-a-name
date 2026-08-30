@@ -18,6 +18,7 @@ import re
 import sys
 import tempfile
 import wave
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -34,6 +35,15 @@ CANONICAL_STEMS = (
     "triangle",
     "timpani",
 )
+CANONICAL_REPOSITORY_INPUTS = {
+    "score": "music/score.json",
+    "choreography": "render/choreography.json",
+    "midi": "music/delibes-screendance-suite.mid",
+    "adaptation": "music/adaptation.json",
+    "toolchain": "music/audio-toolchain.json",
+    "mix": "music/delibes-mix.json",
+    "audio_uses": "sound/audio-uses.json",
+}
 REQUIRED_INPUTS = (
     "score",
     "choreography",
@@ -192,11 +202,117 @@ def _input_path(root: Path, row: dict[str, Any], label: str, *, absolute: bool =
     return candidate
 
 
+def _render_row_identity(row: Any, label: str, *, stem: bool = False) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise ValueError(f"{label} reproduction must be a mapping")
+    keys = (
+        "sha256",
+        "frames",
+        "sample_rate",
+        "channels",
+        "duration_seconds",
+        "peak_sample",
+        "rms_sample",
+        "non_silent",
+    )
+    identity = {key: row.get(key) for key in keys}
+    if stem:
+        identity = {"id": row.get("id"), **identity}
+    else:
+        identity["polyphonic_frames"] = row.get("polyphonic_frames")
+    return identity
+
+
+def _assert_reproduced_outputs(audio: dict[str, Any], rendered: dict[str, Any], label: str) -> None:
+    declared = audio.get("outputs")
+    if not isinstance(declared, dict):
+        raise ValueError("audio render receipt outputs must be a mapping")
+    for name in ("pre_normalized_master", "master"):
+        expected = _render_row_identity(declared.get(name), f"audio receipt {name}")
+        actual = _render_row_identity(rendered.get(name), f"{label} {name}")
+        if actual != expected:
+            raise ValueError(f"{label} {name} does not equal the source audio receipt")
+    declared_stems = declared.get("stems")
+    rendered_stems = rendered.get("stems")
+    if not isinstance(declared_stems, list) or not isinstance(rendered_stems, list):
+        raise ValueError(f"{label} stems must be a list")
+    expected_stems = [
+        _render_row_identity(row, f"audio receipt stems[{index}]", stem=True)
+        for index, row in enumerate(declared_stems)
+    ]
+    actual_stems = [
+        _render_row_identity(row, f"{label} stems[{index}]", stem=True)
+        for index, row in enumerate(rendered_stems)
+    ]
+    if actual_stems != expected_stems:
+        raise ValueError(f"{label} stems do not equal the source audio receipt")
+    if rendered.get("normalization") != audio.get("normalization"):
+        raise ValueError(f"{label} normalization does not equal the source audio receipt")
+
+
+def authenticate_production_outputs(
+    audio: dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    contracts: dict[str, Any],
+) -> None:
+    """Reproduce the complete render twice and bind its outputs to the source receipt."""
+    from render_music import render_once
+
+    sample_rate = int(contracts["mix"]["sample_rate"])
+    duration = Decimal(str(contracts["score"]["time"]["duration_seconds"]))
+    frames = int((duration * sample_rate).to_integral_value(rounding=ROUND_HALF_UP))
+
+    reproductions: list[dict[str, Any]] = []
+    for index in range(2):
+        # Keep only one full stem set on disk at a time; a production render is
+        # hundreds of megabytes even though the returned identities are small.
+        with tempfile.TemporaryDirectory(prefix=f"danse-custody-reproduction-{index + 1}-") as temporary:
+            reproduced = render_once(
+                Path(temporary),
+                args=args,
+                contracts=contracts,
+                frames=frames,
+                sample_rate=sample_rate,
+            )
+            _assert_reproduced_outputs(audio, reproduced, f"reproduction {index + 1}")
+            reproductions.append(reproduced)
+
+    # Each reproduction was compared with the source receipt. This explicit
+    # comparison also makes the deterministic requirement legible in errors if
+    # the renderer ever changes between consecutive runs.
+    first = {
+        "pre_normalized_master": _render_row_identity(reproductions[0]["pre_normalized_master"], "first"),
+        "master": _render_row_identity(reproductions[0]["master"], "first"),
+        "stems": [
+            _render_row_identity(row, "first stem", stem=True)
+            for row in reproductions[0]["stems"]
+        ],
+        "normalization": reproductions[0]["normalization"],
+    }
+    second = {
+        "pre_normalized_master": _render_row_identity(reproductions[1]["pre_normalized_master"], "second"),
+        "master": _render_row_identity(reproductions[1]["master"], "second"),
+        "stems": [
+            _render_row_identity(row, "second stem", stem=True)
+            for row in reproductions[1]["stems"]
+        ],
+        "normalization": reproductions[1]["normalization"],
+    }
+    if first != second:
+        raise ValueError("consecutive custody reproductions are not byte-deterministic")
+
+
 def validate_production_input_graph(audio: dict[str, Any], *, root: Path = ROOT) -> tuple[str, ...]:
     """Re-run the authoritative render preflight against every receipt input."""
     if root.resolve() != ROOT.resolve():
         raise ValueError("production input validation requires the canonical repository root")
     inputs = audio["inputs"]
+    for name, expected_path in CANONICAL_REPOSITORY_INPUTS.items():
+        if inputs[name].get("path") != expected_path:
+            raise ValueError(
+                f"audio receipt input {name}.path must equal the canonical current artifact {expected_path}"
+            )
     paths = {
         name: _input_path(root, inputs[name], name)
         for name in REQUIRED_INPUTS
@@ -219,21 +335,20 @@ def validate_production_input_graph(audio: dict[str, Any], *, root: Path = ROOT)
         sys.path.insert(0, sound)
     from render_music import contract_identity, validate_inputs
 
-    contracts = validate_inputs(
-        argparse.Namespace(
-            score=paths["score"],
-            choreography=paths["choreography"],
-            midi=paths["midi"],
-            adaptation=paths["adaptation"],
-            toolchain=paths["toolchain"],
-            mix=paths["mix"],
-            audio_uses=paths["audio_uses"],
-            profile=audio["profile"],
-            fluidsynth=paths["fluidsynth_executable"],
-            ffmpeg=paths["ffmpeg_executable"],
-            soundfont=paths["soundfont"],
-        )
+    args = argparse.Namespace(
+        score=paths["score"],
+        choreography=paths["choreography"],
+        midi=paths["midi"],
+        adaptation=paths["adaptation"],
+        toolchain=paths["toolchain"],
+        mix=paths["mix"],
+        audio_uses=paths["audio_uses"],
+        profile=audio["profile"],
+        fluidsynth=paths["fluidsynth_executable"],
+        ffmpeg=paths["ffmpeg_executable"],
+        soundfont=paths["soundfont"],
     )
+    contracts = validate_inputs(args)
     if inputs["score"]["contract_sha256"] != contract_identity(contracts["score"], "score"):
         raise ValueError("audio receipt score contract identity is stale")
     if inputs["choreography"]["contract_sha256"] != contract_identity(
@@ -246,6 +361,7 @@ def validate_production_input_graph(audio: dict[str, Any], *, root: Path = ROOT)
     expected_stems = tuple(row["id"] for row in contracts["mix"]["stems"])
     if expected_stems != CANONICAL_STEMS:
         raise ValueError("authoritative competition mix has an unexpected stem contract")
+    authenticate_production_outputs(audio, args=args, contracts=contracts)
     return expected_stems
 
 
