@@ -29,7 +29,7 @@ the film that contains it.
     render/deliver.py --only stills
     render/deliver.py --force reel    # re-make one that already exists
     render/deliver.py --out <scratch-render-root> --package <package-root>
-    render/deliver.py --preflight      # same dependency plan, no writes or rendering
+    render/deliver.py --preflight      # same plan, no persistent output or rendering
 """
 
 from __future__ import annotations
@@ -201,22 +201,24 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def bounded_regular_bytes(
-    path: Path,
+def _bounded_regular_bytes(
+    target: str | os.PathLike[str],
     *,
     max_bytes: int,
     description: str,
+    dir_fd: int | None = None,
 ) -> tuple[bytes, str]:
-    """Read one stable regular-file snapshot without following its final link."""
+    """Read one stable regular-file snapshot from a path or pinned directory."""
+    label = Path(target).name
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(target, flags, dir_fd=dir_fd)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise OSError("not a regular file")
         if before.st_size > max_bytes:
-            raise SystemExit(f"{description} exceeds its safe byte limit: {path.name}")
+            raise SystemExit(f"{description} exceeds its safe byte limit: {label}")
         chunks = []
         copied = 0
         while copied <= max_bytes:
@@ -226,13 +228,13 @@ def bounded_regular_bytes(
             chunks.append(block)
             copied += len(block)
         if copied > max_bytes:
-            raise SystemExit(f"{description} exceeds its safe byte limit: {path.name}")
+            raise SystemExit(f"{description} exceeds its safe byte limit: {label}")
         after = os.fstat(descriptor)
-        named = os.stat(path, follow_symlinks=False)
+        named = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
     except SystemExit:
         raise
     except OSError as exc:
-        raise SystemExit(f"{description} is missing or unsafe: {path.name}") from exc
+        raise SystemExit(f"{description} is missing or unsafe: {label}") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -243,11 +245,21 @@ def bounded_regular_bytes(
         after.st_mode,
         after.st_size,
     ) != (named.st_dev, named.st_ino, named.st_mode, named.st_size):
-        raise SystemExit(f"{description} changed while being read: {path.name}")
+        raise SystemExit(f"{description} changed while being read: {label}")
     payload = b"".join(chunks)
     if len(payload) != after.st_size:
-        raise SystemExit(f"{description} changed while being read: {path.name}")
+        raise SystemExit(f"{description} changed while being read: {label}")
     return payload, hashlib.sha256(payload).hexdigest()
+
+
+def bounded_regular_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    description: str,
+) -> tuple[bytes, str]:
+    """Read one stable regular-file snapshot without following its final link."""
+    return _bounded_regular_bytes(path, max_bytes=max_bytes, description=description)
 
 
 def bounded_regular_bytes_at(
@@ -260,46 +272,66 @@ def bounded_regular_bytes_at(
     """Read one stable regular-file snapshot relative to a pinned directory."""
     if not isinstance(name, str) or not name or Path(name).name != name:
         raise SystemExit(f"{description} has an unsafe descriptor-relative name")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = None
-    try:
-        descriptor = os.open(name, flags, dir_fd=directory_fd)
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise OSError("not a regular file")
-        if before.st_size > max_bytes:
-            raise SystemExit(f"{description} exceeds its safe byte limit: {name}")
-        chunks = []
-        copied = 0
-        while copied <= max_bytes:
-            block = os.read(descriptor, min(1 << 20, max_bytes + 1 - copied))
-            if not block:
-                break
-            chunks.append(block)
-            copied += len(block)
-        if copied > max_bytes:
-            raise SystemExit(f"{description} exceeds its safe byte limit: {name}")
-        after = os.fstat(descriptor)
-        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except SystemExit:
-        raise
-    except OSError as exc:
-        raise SystemExit(f"{description} is missing or unsafe: {name}") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if any(getattr(before, field) != getattr(after, field) for field in stable_fields) or (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-    ) != (named.st_dev, named.st_ino, named.st_mode, named.st_size):
-        raise SystemExit(f"{description} changed while being read: {name}")
-    payload = b"".join(chunks)
-    if len(payload) != after.st_size:
-        raise SystemExit(f"{description} changed while being read: {name}")
-    return payload, hashlib.sha256(payload).hexdigest()
+    return _bounded_regular_bytes(
+        name,
+        max_bytes=max_bytes,
+        description=description,
+        dir_fd=directory_fd,
+    )
+
+
+def require_atomic_rename_host():
+    """Return the supported no-replace rename primitive or fail before publication."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+        requirement = "Linux kernel 3.15+ with glibc 2.28+ exporting renameat2"
+    elif sys.platform == "darwin":  # pragma: no cover - exercised on capture hosts
+        rename = getattr(libc, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+        requirement = "macOS 10.12.3+ exporting renameatx_np"
+    else:  # pragma: no cover - fail closed on unsupported POSIX variants
+        rename = None
+        flag = 0
+        requirement = "Linux or macOS with a kernel atomic no-replace rename"
+    if rename is None:
+        raise OSError(
+            errno.ENOTSUP,
+            f"package publication requires {requirement}",
+        )
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    # Resolve the libc entry point *and* prove that the running kernel accepts
+    # the primitive.  An exported glibc ``renameat2`` wrapper can outlive the
+    # kernel support it needs (or be blocked by the host), so symbol discovery
+    # alone can make ``--preflight`` report a false READY.  Relative names with
+    # deliberately invalid directory descriptors cannot mutate the filesystem;
+    # EBADF proves the request reached a kernel implementation that parsed the
+    # no-replace operation.  Every other result fails closed before staging.
+    ctypes.set_errno(0)
+    probe_result = rename(
+        -1,
+        b".danse-atomic-rename-probe-source",
+        -1,
+        b".danse-atomic-rename-probe-destination",
+        flag,
+    )
+    probe_errno = ctypes.get_errno()
+    if probe_result == 0 or probe_errno != errno.EBADF:
+        code = probe_errno or errno.ENOTSUP
+        raise OSError(
+            code,
+            f"package publication requires {requirement}; "
+            f"atomic no-replace capability probe failed: {os.strerror(code)}",
+        )
+    return rename, flag, requirement
 
 
 def atomic_rename_noreplace(
@@ -318,32 +350,12 @@ def atomic_rename_noreplace(
     """
     source_bytes = os.fsencode(source)
     destination_bytes = os.fsencode(destination)
-    source_directory = -100 if src_dir_fd is None else src_dir_fd
-    destination_directory = -100 if dst_dir_fd is None else dst_dir_fd
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform.startswith("linux"):
-        rename = getattr(libc, "renameat2", None)
-        flag = 1  # RENAME_NOREPLACE
-    elif sys.platform == "darwin":  # pragma: no cover - exercised on capture hosts
-        rename = getattr(libc, "renameatx_np", None)
-        flag = 0x00000004  # RENAME_EXCL
-    else:  # pragma: no cover - fail closed on unsupported POSIX variants
-        rename = None
-        flag = 0
-    if rename is None:
-        raise OSError(
-            errno.ENOTSUP,
-            "atomic no-replace rename is unavailable on this host",
-            os.fspath(destination),
-        )
-    rename.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    rename.restype = ctypes.c_int
+    # POSIX leaves AT_FDCWD implementation-defined: Linux uses -100 while
+    # Darwin uses -2.  Python does not expose it on every supported version.
+    current_directory = -2 if sys.platform == "darwin" else -100
+    source_directory = current_directory if src_dir_fd is None else src_dir_fd
+    destination_directory = current_directory if dst_dir_fd is None else dst_dir_fd
+    rename, flag, _ = require_atomic_rename_host()
     if rename(
         source_directory,
         source_bytes,
@@ -394,6 +406,242 @@ def write_new_regular_bytes_at(
     finally:
         os.close(descriptor)
     return hashlib.sha256(payload).hexdigest()
+
+
+def create_atomic_probe_entry_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+) -> tuple[int, tuple[int, int, int]]:
+    """Create and pin one private probe entry until its rename is verified."""
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise OSError(errno.EINVAL, "unsafe atomic probe name", name)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written < 1:
+                raise OSError(errno.EIO, "short write while creating atomic probe")
+            offset += written
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_mode)
+        named_identity = (named.st_dev, named.st_ino, named.st_mode)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != len(payload)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or named_identity != opened_identity
+        ):
+            raise OSError(errno.ESTALE, "atomic probe entry changed after creation")
+        return descriptor, opened_identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def require_atomic_rename_filesystem(target: Path) -> str:
+    """Prove no-replace publication semantics on the target filesystem.
+
+    Kernel support does not imply that the filesystem mounted at the package
+    boundary implements the rename flag.  Exercise both the absent-destination
+    success path and the existing-destination refusal before rendering.  Probe
+    Entries are descriptor-relative, independently unpredictable, and tracked
+    from their still-open O_EXCL descriptors.  Cleanup removes only an exact
+    recorded inode; an unowned winner is preserved and reported.
+    """
+    _, _, requirement = require_atomic_rename_host()
+    probe_root = target if target.exists() else target.parent
+    while not probe_root.exists() and probe_root.parent != probe_root:
+        probe_root = probe_root.parent
+    if probe_root.is_symlink() or not probe_root.is_dir():
+        raise OSError(
+            errno.ENOTDIR,
+            f"package filesystem probe has no safe existing directory: {probe_root}",
+        )
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(probe_root, directory_flags)
+    source = f".danse-atomic-source-{os.getpid()}-{secrets.token_hex(16)}"
+    destination = f".danse-atomic-destination-{os.getpid()}-{secrets.token_hex(16)}"
+    contender = f".danse-atomic-contender-{os.getpid()}-{secrets.token_hex(16)}"
+    names = (source, destination, contender)
+    root_identity: tuple[int, int, int] | None = None
+    owned_entries: dict[str, tuple[int, int, int]] = {}
+    probe_descriptors: list[int] = []
+    primary_error: BaseException | None = None
+    cleanup_errors: list[str] = []
+
+    def identity(value: os.stat_result) -> tuple[int, int, int]:
+        return value.st_dev, value.st_ino, value.st_mode
+
+    def named_entry(name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def create_owned(name: str, payload: bytes) -> tuple[int, int, int]:
+        descriptor, created_identity = create_atomic_probe_entry_at(
+            directory_fd,
+            name,
+            payload,
+        )
+        probe_descriptors.append(descriptor)
+        owned_entries[name] = created_identity
+        return created_identity
+
+    try:
+        opened_root = os.fstat(directory_fd)
+        named_root = os.stat(probe_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or identity(opened_root) != identity(named_root)
+        ):
+            raise OSError(errno.ESTALE, "package filesystem probe root changed")
+        root_identity = identity(opened_root)
+
+        source_identity = create_owned(source, b"probe")
+        atomic_rename_noreplace(
+            source,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        source_info = named_entry(source)
+        destination_info = named_entry(destination)
+        if (
+            source_info is not None
+            or destination_info is None
+            or identity(destination_info) != source_identity
+            or destination_info.st_size != 5
+        ):
+            raise OSError(errno.EIO, "atomic package filesystem probe lost its source")
+        owned_entries.pop(source, None)
+        owned_entries[destination] = source_identity
+
+        contender_identity = create_owned(contender, b"other")
+        try:
+            atomic_rename_noreplace(
+                contender,
+                destination,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+            destination_info = named_entry(destination)
+            contender_info = named_entry(contender)
+            if (
+                destination_info is None
+                or identity(destination_info) != source_identity
+                or contender_info is None
+                or identity(contender_info) != contender_identity
+            ):
+                raise OSError(
+                    errno.EIO,
+                    "atomic package filesystem probe changed an entry on collision",
+                )
+        else:
+            destination_info = named_entry(destination)
+            contender_info = named_entry(contender)
+            if (
+                destination_info is not None
+                and identity(destination_info) == contender_identity
+                and contender_info is None
+            ):
+                owned_entries[destination] = contender_identity
+                owned_entries.pop(contender, None)
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic package filesystem probe replaced an existing destination",
+            )
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        for name, owned_identity in tuple(owned_entries.items()):
+            try:
+                current = named_entry(name)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot inspect {name}: {exc}")
+                continue
+            if current is None:
+                continue
+            if identity(current) != owned_identity:
+                cleanup_errors.append(f"{name} is no longer probe-owned")
+                continue
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+
+        for name in names:
+            try:
+                current = named_entry(name)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot census {name}: {exc}")
+                continue
+            if current is not None:
+                cleanup_errors.append(f"unowned probe entry retained: {name}")
+
+        for descriptor in probe_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot close probe entry: {exc}")
+
+        if root_identity is not None:
+            try:
+                current_root = os.stat(probe_root, follow_symlinks=False)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot revalidate package filesystem root: {exc}")
+            else:
+                if identity(current_root) != root_identity:
+                    cleanup_errors.append("package filesystem root changed during probe")
+        try:
+            os.close(directory_fd)
+        except OSError as exc:
+            cleanup_errors.append(f"cannot close package filesystem root: {exc}")
+
+    if cleanup_errors:
+        detail = "; ".join(cleanup_errors)
+        if primary_error is not None:
+            raise OSError(
+                errno.EIO,
+                f"atomic package filesystem probe failed ({primary_error}) and cleanup "
+                f"did not complete safely: {detail}",
+            ) from primary_error
+        raise OSError(
+            errno.EIO,
+            f"atomic package filesystem probe cleanup did not complete safely: {detail}",
+        )
+    if primary_error is not None:
+        if isinstance(primary_error, OSError):
+            code = primary_error.errno or errno.ENOTSUP
+            raise OSError(
+                code,
+                f"package publication requires atomic no-replace support on the "
+                f"filesystem at {probe_root}: {primary_error}",
+            ) from primary_error
+        raise primary_error
+    return f"{requirement}; verified on {probe_root}"
 
 
 def repository_state() -> dict:
@@ -2620,7 +2868,7 @@ def preflight(
     span_error: str | None = None,
     passage_requested: bool = True,
 ) -> int:
-    """Validate a delivery invocation without creating a directory or rendering."""
+    """Validate a delivery invocation without persistent output or rendering."""
     rows: list[tuple[bool, str, str]] = []
 
     def add(ok: bool, name: str, detail: str) -> None:
@@ -2644,6 +2892,12 @@ def preflight(
         "exact repository head",
         repository_detail,
     )
+    try:
+        rename_requirement = require_atomic_rename_filesystem(package)
+    except OSError as exc:
+        add(False, "atomic package publication", str(exc))
+    else:
+        add(True, "atomic package publication", rename_requirement)
     add(program.get("schema") == "danse.program.v2", "program", str(program.get("schema")))
     add(
         not passage_requested or program.get("seed") == 20170620,
@@ -3267,7 +3521,11 @@ def main() -> int:
     ap.add_argument("--force", action="append", choices=FORCE_ITEMS, default=[], help="re-make an existing item")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="root for restartable render intermediates")
     ap.add_argument("--package", type=Path, help="staged package root (default: <out>/package)")
-    ap.add_argument("--preflight", action="store_true", help="validate this invocation without rendering or writing")
+    ap.add_argument(
+        "--preflight",
+        action="store_true",
+        help="validate without rendering or retaining output",
+    )
     args = ap.parse_args()
     if args.start < 0:
         ap.error("--start must be non-negative")
@@ -3318,6 +3576,10 @@ def main() -> int:
         repository["head"],
     ):
         raise SystemExit(f"{package}/manifest.json belongs to a different passage; choose a fresh --package root")
+    try:
+        require_atomic_rename_filesystem(package)
+    except OSError as exc:
+        raise SystemExit(str(exc)) from exc
 
     work = pending(program, only, force, package)
     selected_fixed_windows = {

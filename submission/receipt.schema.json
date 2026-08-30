@@ -119,7 +119,7 @@
         }
       }
     },
-    "packagePriorReceipt": {
+    "packageReceiptRow": {
       "type": "object",
       "additionalProperties": false,
       "required": ["phase", "path", "sha256", "receipt_id"],
@@ -130,7 +130,7 @@
         "receipt_id": { "$ref": "#/$defs/typedId" }
       }
     },
-    "uploadedPriorReceipt": {
+    "uploadedReceiptRow": {
       "type": "object",
       "additionalProperties": false,
       "required": ["phase", "path", "sha256", "receipt_id"],
@@ -223,7 +223,7 @@
         "deadline": { "$ref": "#/$defs/deadlineBinding" },
         "attestation": { "$ref": "#/$defs/attestationBinding" },
         "assertions": { "$ref": "#/$defs/assertionBinding" },
-        "prior_receipt": { "$ref": "#/$defs/packagePriorReceipt" },
+        "prior_receipt": { "$ref": "#/$defs/packageReceiptRow" },
         "upload": { "$ref": "#/$defs/upload" }
       }
     },
@@ -253,30 +253,8 @@
         "deadline": { "$ref": "#/$defs/deadlineBinding" },
         "attestation": { "$ref": "#/$defs/attestationBinding" },
         "assertions": { "$ref": "#/$defs/assertionBinding" },
-        "prior_receipt": { "$ref": "#/$defs/uploadedPriorReceipt" },
+        "prior_receipt": { "$ref": "#/$defs/uploadedReceiptRow" },
         "submission": { "$ref": "#/$defs/submission" }
-      }
-    },
-    "packageReceiptRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["phase", "path", "sha256", "receipt_id"],
-      "properties": {
-        "phase": { "const": "package" },
-        "path": { "const": "receipts/package.json" },
-        "sha256": { "$ref": "#/$defs/digest" },
-        "receipt_id": { "$ref": "#/$defs/typedId" }
-      }
-    },
-    "uploadedReceiptRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["phase", "path", "sha256", "receipt_id"],
-      "properties": {
-        "phase": { "const": "uploaded" },
-        "path": { "const": "receipts/uploaded.json" },
-        "sha256": { "$ref": "#/$defs/digest" },
-        "receipt_id": { "$ref": "#/$defs/typedId" }
       }
     },
     "submittedReceiptRow": {

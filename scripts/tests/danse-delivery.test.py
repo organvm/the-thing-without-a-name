@@ -2045,6 +2045,203 @@ class DeliveryContractTest(unittest.TestCase):
                 self.assertEqual(DELIVER.main(), 0)
             self.assertFalse(out.exists())
 
+    def test_atomic_package_publication_host_requirement_fails_closed(self) -> None:
+        with (
+            mock.patch.object(DELIVER.sys, "platform", "linux"),
+            mock.patch.object(DELIVER.ctypes, "CDLL", return_value=SimpleNamespace()),
+            self.assertRaisesRegex(OSError, "glibc 2.28.*renameat2"),
+        ):
+            DELIVER.require_atomic_rename_host()
+
+    def test_atomic_package_publication_probes_the_running_kernel(self) -> None:
+        def unsupported_kernel(*_args) -> int:
+            DELIVER.ctypes.set_errno(DELIVER.errno.ENOSYS)
+            return -1
+
+        with (
+            mock.patch.object(DELIVER.sys, "platform", "linux"),
+            mock.patch.object(
+                DELIVER.ctypes,
+                "CDLL",
+                return_value=SimpleNamespace(renameat2=unsupported_kernel),
+            ),
+            self.assertRaisesRegex(OSError, "capability probe failed.*not implemented"),
+        ):
+            DELIVER.require_atomic_rename_host()
+
+    def test_atomic_package_publication_uses_darwin_at_fdcwd(self) -> None:
+        calls = []
+
+        def rename(*args) -> int:
+            calls.append(args)
+            return 0
+
+        with (
+            mock.patch.object(DELIVER.sys, "platform", "darwin"),
+            mock.patch.object(
+                DELIVER,
+                "require_atomic_rename_host",
+                return_value=(rename, 4, "macOS renameatx_np"),
+            ),
+        ):
+            DELIVER.atomic_rename_noreplace("source", "destination")
+        self.assertEqual(calls, [(-2, b"source", -2, b"destination", 4)])
+
+    def test_atomic_package_publication_checks_target_filesystem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "require_atomic_rename_host",
+                    return_value=(object(), 1, "Linux renameat2"),
+                ),
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=OSError(DELIVER.errno.EOPNOTSUPP, "unsupported"),
+                ),
+                self.assertRaisesRegex(OSError, "filesystem at .*unsupported"),
+            ):
+                DELIVER.require_atomic_rename_filesystem(root / "package")
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_atomic_package_probe_never_deletes_a_concurrent_winner(self) -> None:
+        def inject_winner(
+            _source,
+            destination,
+            *,
+            src_dir_fd,
+            dst_dir_fd,
+        ) -> None:
+            self.assertEqual(src_dir_fd, dst_dir_fd)
+            DELIVER.write_new_regular_bytes_at(
+                dst_dir_fd,
+                destination,
+                b"winner",
+                mode=0o600,
+            )
+            raise OSError(DELIVER.errno.EEXIST, "concurrent winner")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "require_atomic_rename_host",
+                    return_value=(object(), 1, "Linux renameat2"),
+                ),
+                mock.patch.object(
+                    DELIVER,
+                    "atomic_rename_noreplace",
+                    side_effect=inject_winner,
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "cleanup did not complete safely.*unowned probe entry retained",
+                ),
+            ):
+                DELIVER.require_atomic_rename_filesystem(root / "package")
+            winners = list(root.iterdir())
+            self.assertEqual(len(winners), 1)
+            winner = winners[0]
+            self.assertEqual(winner.read_bytes(), b"winner")
+            winner.unlink()
+
+    def test_atomic_package_probe_never_removes_an_exclusive_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / f".danse-atomic-source-{os.getpid()}-fixed"
+            marker.write_bytes(b"keep")
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "require_atomic_rename_host",
+                    return_value=(object(), 1, "Linux renameat2"),
+                ),
+                mock.patch.object(DELIVER.secrets, "token_hex", return_value="fixed"),
+                self.assertRaisesRegex(
+                    OSError,
+                    "cleanup did not complete safely.*unowned probe entry retained",
+                ),
+            ):
+                DELIVER.require_atomic_rename_filesystem(root / "package")
+            self.assertEqual(marker.read_bytes(), b"keep")
+
+    def test_atomic_package_probe_never_adopts_a_replaced_source(self) -> None:
+        original = DELIVER.create_atomic_probe_entry_at
+        replaced = False
+
+        def replace_after_create(directory_fd, name, payload):
+            nonlocal replaced
+            descriptor, owned_identity = original(directory_fd, name, payload)
+            if not replaced and name.startswith(".danse-atomic-source-"):
+                replaced = True
+                os.unlink(name, dir_fd=directory_fd)
+                foreign_descriptor, _ = original(directory_fd, name, b"foreign")
+                os.close(foreign_descriptor)
+            return descriptor, owned_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch.object(
+                    DELIVER,
+                    "require_atomic_rename_host",
+                    wraps=DELIVER.require_atomic_rename_host,
+                ),
+                mock.patch.object(
+                    DELIVER,
+                    "create_atomic_probe_entry_at",
+                    side_effect=replace_after_create,
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "cleanup did not complete safely.*unowned probe entry retained",
+                ),
+            ):
+                DELIVER.require_atomic_rename_filesystem(root / "package")
+            foreign = list(root.iterdir())
+            self.assertEqual(len(foreign), 1)
+            self.assertEqual(foreign[0].read_bytes(), b"foreign")
+            foreign[0].unlink()
+
+    def test_bounded_path_and_descriptor_reads_share_one_stable_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "receipt.json"
+            target.write_bytes(b'{"ok":true}\n')
+            directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                by_path = DELIVER.bounded_regular_bytes(
+                    target,
+                    max_bytes=64,
+                    description="receipt",
+                )
+                by_descriptor = DELIVER.bounded_regular_bytes_at(
+                    directory_fd,
+                    target.name,
+                    max_bytes=64,
+                    description="receipt",
+                )
+            finally:
+                os.close(directory_fd)
+            self.assertEqual(by_path, by_descriptor)
+
+    def test_phase_predecessors_reuse_the_receipt_row_schemas(self) -> None:
+        schema = json.loads((ROOT / "submission/receipt.schema.json").read_text())
+        definitions = schema["$defs"]
+        self.assertNotIn("packagePriorReceipt", definitions)
+        self.assertNotIn("uploadedPriorReceipt", definitions)
+        self.assertEqual(
+            definitions["uploadedReceipt"]["properties"]["prior_receipt"]["$ref"],
+            "#/$defs/packageReceiptRow",
+        )
+        self.assertEqual(
+            definitions["submittedReceipt"]["properties"]["prior_receipt"]["$ref"],
+            "#/$defs/uploadedReceiptRow",
+        )
+
     def test_preflight_reports_failed_capture_query_without_aborting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "absent"
