@@ -53,6 +53,11 @@ INTERFACE_FILES = (
     "interface/map.v1.json",
 )
 PROJECT_MAP = "interface/map.v1.json"
+PROJECT_MAP_IDENTITY = {
+    "schema": "danse.map.v1",
+    "title": "Danse project map",
+    "version": 1,
+}
 LIVE_PROJECT_NODE = {
     "id": "live",
     "label": "Live artwork",
@@ -63,6 +68,59 @@ LIVE_PROJECT_NODE = {
     "status": "admitted",
     "availability": "available",
 }
+PROJECT_MAP_SOURCE_NODES = (
+    LIVE_PROJECT_NODE,
+    {
+        "id": "study",
+        "label": "Study",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": None,
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "cubism",
+        "label": "Cubism",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "cubism",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "glitch",
+        "label": "Glitch?",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "glitch",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "ballet-score",
+        "label": "Ballet / Score",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "ballet-score",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "evidence",
+        "label": "Evidence",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "evidence",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+)
 VENDOR_BASE = "interaction/vendor/mediapipe"
 VENDOR_MANIFEST = f"{VENDOR_BASE}/manifest.json"
 RUNTIME_FILES = (
@@ -114,46 +172,41 @@ def project_map(root: Path, *, admit_study: bool = False, allow_resolved: bool =
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read project map: {exc}") from exc
-    if set(value) != {"schema", "title", "version", "nodes"} or value.get("schema") != "danse.map.v1":
-        raise ArtifactError("project map has an unknown shape or schema")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {*PROJECT_MAP_IDENTITY, "nodes"}
+        or any(value.get(key) != expected for key, expected in PROJECT_MAP_IDENTITY.items())
+    ):
+        raise ArtifactError("project map metadata or schema is not canonical")
     nodes = value.get("nodes")
-    if not isinstance(nodes, list) or not nodes:
-        raise ArtifactError("project map has no nodes")
-    expected_keys = {"id", "label", "product_id", "route", "fragment", "href", "status", "availability"}
-    ids: list[str] = []
-    for node in nodes:
-        if not isinstance(node, dict) or set(node) != expected_keys:
+    if not isinstance(nodes, list) or len(nodes) != len(PROJECT_MAP_SOURCE_NODES):
+        raise ArtifactError("project map source-node inventory drifted")
+    resolution_keys = {"status", "availability", "href"}
+    for node, expected in zip(nodes, PROJECT_MAP_SOURCE_NODES, strict=True):
+        if not isinstance(node, dict) or set(node) != set(expected):
             raise ArtifactError("project map contains a malformed node")
-        if (
-            any(
-                not isinstance(node[key], str) or not node[key]
-                for key in ("id", "label", "route", "status", "availability")
-            )
-            or not (node["product_id"] is None or isinstance(node["product_id"], str))
-            or not (node["fragment"] is None or isinstance(node["fragment"], str))
-            or not (node["href"] is None or isinstance(node["href"], str))
-        ):
-            raise ArtifactError("project map contains a malformed node field")
-        ids.append(node["id"])
-        if node["id"] == "live":
-            if node != LIVE_PROJECT_NODE:
+        if expected["id"] == "live":
+            if node != expected:
                 raise ArtifactError(
                     "live project-map node must remain the canonical local artwork route"
                 )
             continue
-        if node["product_id"] is None:
-            raise ArtifactError("only the canonical live project-map node may be unbound")
-        if node["product_id"] != "project-page-copy":
-            raise ArtifactError("study map nodes name an unknown product")
-        if node["route"] != "./project/":
-            raise ArtifactError("study map nodes use a noncanonical route")
-        canonical = node["route"] + (f"#{node['fragment']}" if node["fragment"] else "")
-        source_gated = node["status"] == "gated" and node["href"] is None
-        resolved = allow_resolved and node["status"] == "admitted" and node["href"] == canonical
-        if not (source_gated or resolved):
-            raise ArtifactError("study map nodes are neither gated nor canonically admitted")
-    if ids != ["live", "study", "cubism", "glitch", "ballet-score", "evidence"] or len(ids) != len(set(ids)):
-        raise ArtifactError("project map identity or order drifted")
+        if any(node[key] != expected[key] for key in set(expected) - resolution_keys):
+            raise ArtifactError("project map source-node identity drifted")
+        source_resolution = {key: expected[key] for key in resolution_keys}
+        canonical_href = expected["route"] + (
+            f"#{expected['fragment']}" if expected["fragment"] else ""
+        )
+        admitted_resolution = {
+            "status": "admitted",
+            "availability": "available",
+            "href": canonical_href,
+        }
+        actual_resolution = {key: node[key] for key in resolution_keys}
+        if actual_resolution != source_resolution and not (
+            allow_resolved and actual_resolution == admitted_resolution
+        ):
+            raise ArtifactError("project map node resolution is not canonical")
     if admit_study:
         for node in nodes:
             if node["product_id"] == "project-page-copy":

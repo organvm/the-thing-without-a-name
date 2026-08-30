@@ -665,6 +665,29 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.wait_for_function("() => danse.controlState.playback === 'running'")
     shot("reduced-motion-opt-in")
 
+    # The unavailable-score visit above proves fail-readable controls. A second
+    # phase must load the shipped score and choreography and exercise Web Audio;
+    # otherwise missing production files or a broken audio integration could
+    # still produce a green progressive-controls receipt.
+    page.goto(f"{base}/index.html", wait_until="load")
+    page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    page.wait_for_function("() => document.getElementById('veil').hidden", timeout=180_000)
+    want(page.evaluate("() => danse.controlState.music") == "stopped", "shipped score did not initialize Music")
+    want(not page.locator("#music-tray").is_disabled(), "shipped score left Music unavailable")
+    page.click('[data-category="score"]')
+    page.click("#music-tray")
+    page.wait_for_function("() => danse.controlState.music === 'playing'")
+    want("follows" in page.locator("#music-status").inner_text().lower(), "shipped score did not start Web Audio")
+    page.click('[data-category="hold"]')
+    page.wait_for_function("() => danse.controlState.music === 'suspended-by-hold'")
+    want("suspended" in page.locator("#music-status").inner_text().lower(), "Hold did not suspend shipped score audio")
+    page.click('[data-category="hold"]')
+    page.wait_for_function("() => danse.controlState.music === 'playing'")
+    page.click("#music-tray")
+    page.wait_for_function("() => danse.controlState.music === 'stopped'")
+    want("stopped" in page.locator("#music-status").inner_text().lower(), "shipped score audio did not stop")
+    shot("shipped-score-audio")
+
     page.add_init_script("""(() => {
       const getContext = HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext = function(kind, ...args) {
@@ -685,18 +708,48 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.wait_for_function("() => document.getElementById('river').textContent !== '—'")
     want(page.locator("#planes").inner_text() == "unavailable", "renderer fallback reported a fake plane count")
     want(page.locator("#cut").inner_text() != "—", "renderer fallback left the deterministic cut unknown")
-    page.evaluate("() => { danse.seed = 0x12345678; danse.t = 60; }")
-    page.wait_for_function("() => danse.controlState.movement === 2")
-    want(
-        page.locator('[data-movement="2"]').get_attribute("aria-pressed") == "true",
-        "no-WebGL movement 2 did not update its pressed Score control",
+    # Arrival supplies a random passage stream even when the displayed seed is
+    # pinned. Derive the expected control index from the movement actually
+    # rendered for that complete river identity instead of asserting a flaky
+    # seed-only movement number.
+    fallback_movement_variants = (
+        (0x12345678, 60),
+        (0x12345678, 90),
+        (0x87654321, 60),
+        (0x87654321, 90),
     )
-    page.evaluate("() => { danse.t = 90; }")
-    page.wait_for_function("() => danse.controlState.movement === 3")
-    want(
-        page.locator('[data-movement="3"]').get_attribute("aria-pressed") == "true",
-        "no-WebGL movement 3 did not update its pressed Score control",
-    )
+    for fallback_seed, fallback_time in fallback_movement_variants:
+        movement = page.evaluate(
+            """async ({ seed, time }) => {
+              danse.seed = seed;
+              danse.t = time;
+              await new Promise((resolve) => requestAnimationFrame(
+                () => requestAnimationFrame(resolve)
+              ));
+              const movementId = document.getElementById('cut').textContent.split(' · ')[0];
+              const expected = danse.program.movements.findIndex(
+                (candidate) => candidate.id === movementId
+              ) + 1;
+              const selected = [...document.querySelectorAll('[data-movement]')]
+                .filter((button) => button.getAttribute('aria-pressed') === 'true')
+                .map((button) => Number(button.dataset.movement));
+              return {
+                movementId,
+                expected,
+                control: danse.controlState.movement,
+                selected,
+              };
+            }""",
+            {"seed": fallback_seed, "time": fallback_time},
+        )
+        want(
+            movement["expected"] > 0
+            and movement["control"] == movement["expected"]
+            and movement["selected"] == [movement["expected"]],
+            "no-WebGL movement did not synchronize its live Details state and "
+            f"pressed Score control at seed {fallback_seed:#010x}, t={fallback_time}: "
+            f"{movement}",
+        )
     page.click("#fallback-start")
     page.wait_for_function("() => document.getElementById('interaction-summary').textContent === 'fallback'")
     want(page.locator("#interaction-summary").inner_text() == "fallback", "renderer fallback left Details interaction stale")

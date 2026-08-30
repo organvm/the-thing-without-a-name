@@ -330,7 +330,7 @@ def complete_manifest(root: Path) -> dict:
     progressive_gate["evidence"] = {
         "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
         "sha256": CONTRACT.sha256(progressive_path),
-        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+        "summary": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
     }
     write_manifest(root, manifest)
     return manifest
@@ -387,7 +387,7 @@ def rebind_progressive_receipt(root: Path, manifest: dict) -> None:
     gate["evidence"] = {
         "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
         "sha256": CONTRACT.sha256(receipt_path),
-        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+        "summary": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
     }
     write_manifest(root, manifest)
 
@@ -972,6 +972,24 @@ class AdversarialManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "names the wrong evidence receipt"):
                 CONTRACT.validate_release(root)
 
+    def test_progressive_controls_gate_rejects_a_claiming_evidence_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["summary"] = (
+                "All final-cut, rights, package, upload, and submission gates are approved."
+            )
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "manifest gate evidence is not canonical"
+            ):
+                CONTRACT.validate_release(root)
+
     def test_rehashed_progressive_controls_receipt_with_missing_check_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = fixture_root(Path(temporary))
@@ -1062,6 +1080,145 @@ class AdversarialManifestTest(unittest.TestCase):
                 gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
                 write_manifest(root, manifest)
                 with self.assertRaisesRegex(CONTRACT.ReleaseError, message):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_ignores_local_git_replacements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            exact_head = receipt["source"]["exact_head"]
+            exact_tree = receipt["source"]["tree"]
+
+            # Build an alternate commit without touching the fixture checkout,
+            # then install it as a local replacement for the reviewed head.
+            # With replacement refs enabled, rev-parse/show/diff can all see
+            # this alternate object graph while HEAD still names exact_head.
+            alternate_index = root / ".git/pr43-replacement-index"
+            replacement_environment = os.environ.copy()
+            replacement_environment["GIT_INDEX_FILE"] = str(alternate_index)
+            subprocess.run(
+                ["git", "-C", str(root), "read-tree", exact_head],
+                check=True,
+                capture_output=True,
+                env=replacement_environment,
+            )
+            replacement_blob = subprocess.run(
+                ["git", "-C", str(root), "hash-object", "-w", "--stdin"],
+                input=b"# replacement-only reviewed source\n",
+                check=True,
+                capture_output=True,
+            ).stdout.decode("ascii").strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{replacement_blob},.gitignore",
+                ],
+                check=True,
+                capture_output=True,
+                env=replacement_environment,
+            )
+            replacement_tree = subprocess.run(
+                ["git", "-C", str(root), "write-tree"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=replacement_environment,
+            ).stdout.strip()
+            replacement_commit = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "commit-tree",
+                    replacement_tree,
+                    "-p",
+                    exact_head,
+                ],
+                input="replacement-only source\n",
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            alternate_index.unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "replace", exact_head, replacement_commit],
+                check=True,
+                capture_output=True,
+            )
+
+            ambient_tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"{exact_head}^{{tree}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            no_replace_environment = os.environ.copy()
+            no_replace_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+            stored_tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"{exact_head}^{{tree}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=no_replace_environment,
+            ).stdout.strip()
+            self.assertEqual(ambient_tree, replacement_tree)
+            self.assertEqual(stored_tree, exact_tree)
+
+            receipt["source"]["tree"] = replacement_tree
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "tree does not belong to its exact head"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_git_environment_redirects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            complete_manifest(root)
+            decoy = base / "clean-decoy"
+            shutil.copytree(root, decoy)
+            (root / ".gitignore").write_text(
+                "# dirty source hidden by a decoy Git worktree\n", encoding="utf-8"
+            )
+            redirect = {
+                "GIT_DIR": str(decoy / ".git"),
+                "GIT_WORK_TREE": str(decoy),
+            }
+            redirected_environment = os.environ.copy()
+            redirected_environment.update(redirect)
+            redirected_root = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=redirected_environment,
+            ).stdout.strip()
+            self.assertEqual(Path(redirected_root), decoy)
+
+            with mock.patch.dict(os.environ, redirect, clear=False):
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "reviewed source includes non-receipt changes: .gitignore",
+                ):
                     CONTRACT.validate_release(root)
 
     def test_progressive_controls_receipt_rejects_a_different_source_tree(self) -> None:
@@ -1246,6 +1403,78 @@ class AdversarialManifestTest(unittest.TestCase):
                     "reviewed source includes non-receipt changes",
                 ):
                     CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_renamed_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            reviewed_copy = root / "reviewed-progressive-controls-replay.json"
+            reviewed_copy.write_bytes(receipt_path.read_bytes())
+            rebind_progressive_receipt(root, manifest)
+
+            receipt = receipt_path.read_bytes()
+            receipt_path.unlink()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "mv",
+                    reviewed_copy.name,
+                    CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            receipt_path.write_bytes(receipt)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-A"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "rename reviewed source into completion envelope",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            exact_head = json.loads(receipt.decode("utf-8"))["source"]["exact_head"]
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "diff",
+                    "--name-status",
+                    "--find-renames",
+                    exact_head,
+                    "HEAD",
+                    "--",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertRegex(status, r"(?m)^R\d+\s+reviewed-progressive-controls-replay\.json")
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "reviewed source includes non-receipt changes: "
+                "reviewed-progressive-controls-replay.json",
+            ):
+                CONTRACT.validate_release(root)
 
     def test_progressive_controls_manifest_cannot_self_authorize_post_review_drift(self) -> None:
         def change_copy(root: Path, manifest: dict) -> None:

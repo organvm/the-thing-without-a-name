@@ -364,6 +364,67 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 ):
                     PAGES.project_map(self.root)
 
+    def test_project_map_metadata_and_source_node_identities_are_canonical(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+
+        def swap_fragments(project_map: dict) -> None:
+            project_map["nodes"][2]["fragment"], project_map["nodes"][3]["fragment"] = (
+                project_map["nodes"][3]["fragment"],
+                project_map["nodes"][2]["fragment"],
+            )
+
+        mutations = (
+            ("title", lambda project_map: project_map.update(title="Rights cleared")),
+            ("version", lambda project_map: project_map.update(version=999)),
+            (
+                "study label",
+                lambda project_map: project_map["nodes"][1].update(label="Rights cleared"),
+            ),
+            ("fragment swap", swap_fragments),
+            (
+                "evidence label",
+                lambda project_map: project_map["nodes"][5].update(label="Publication evidence"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                project_map = copy.deepcopy(original)
+                mutate(project_map)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "metadata or schema is not canonical|source-node identity drifted",
+                ):
+                    PAGES.project_map(self.root)
+
+    def test_project_map_accepts_only_the_declared_admission_projection(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        source = original["nodes"][1]
+        canonical_href = source["route"]
+        mutations = (
+            {"status": "admitted", "availability": "available", "href": None},
+            {"status": "admitted", "availability": "available", "href": "javascript:alert(1)"},
+            {"status": "admitted", "availability": "available now", "href": canonical_href},
+            {"status": "gated", "availability": "available", "href": canonical_href},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][1].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError, "node resolution is not canonical"
+                ):
+                    PAGES.project_map(self.root, allow_resolved=True)
+
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
         commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
@@ -948,6 +1009,28 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("def touch_targets(scope: str, label: str)", browser)
         self.assertIn('touch_targets("#project-map", "Map")', browser)
         self.assertIn('touch_targets("#hud", "no-WebGL Details")', browser)
+        fallback = browser.split("fallback_movement_variants =", 1)[1].split(
+            'page.click("#fallback-start")', 1
+        )[0]
+        self.assertIn("danse.program.movements.findIndex", fallback)
+        self.assertIn("movement[\"control\"] == movement[\"expected\"]", fallback)
+        self.assertIn("movement[\"selected\"] == [movement[\"expected\"]]", fallback)
+        self.assertGreaterEqual(fallback.count("0x12345678"), 2)
+        self.assertGreaterEqual(fallback.count("0x87654321"), 2)
+        self.assertNotIn("danse.controlState.movement === 2", fallback)
+        self.assertNotIn("danse.controlState.movement === 3", fallback)
+
+    def test_controls_replay_exercises_the_shipped_score_audio_lifecycle(self) -> None:
+        browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        shipped = browser.split(
+            "# The unavailable-score visit above proves fail-readable controls.", 1
+        )[1].split("page.add_init_script", 1)[0]
+        self.assertIn('page.goto(f"{base}/index.html", wait_until="load")', shipped)
+        self.assertIn("danse.controlState.music === 'playing'", shipped)
+        self.assertIn("danse.controlState.music === 'suspended-by-hold'", shipped)
+        self.assertIn("danse.controlState.music === 'stopped'", shipped)
+        self.assertGreaterEqual(shipped.count("#music-tray"), 3)
+        self.assertEqual(shipped.count("[data-category=\"hold\"]"), 2)
 
     def test_share_feedback_has_its_own_polite_live_region(self) -> None:
         tag, toast = self.markup.by_id["toast"]

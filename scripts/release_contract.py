@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterable, Iterator
@@ -28,6 +29,10 @@ LIVE_INTERACTION_COMMENT_BODY_SHA256 = "4cc41f9ed353c92c27b172907800b123c7b4e85e
 LIVE_INTERACTION_DEPLOYED_COMMIT = "f19244afbce94015e78b7f746b07d267ed9e67ae"
 PROGRESSIVE_CONTROLS_EVIDENCE_PATH = "release/evidence/progressive-controls-replay.json"
 PROGRESSIVE_CONTROLS_SCHEMA_PATH = "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY = (
+    "Exact-head progressive-controls replay only; does not establish final-cut, "
+    "rights, package, upload, or filing readiness."
+)
 PROGRESSIVE_CONTROLS_CHECKS = (
     "exact-head",
     "desktop-layout",
@@ -80,6 +85,25 @@ PUBLIC_MARKERS = re.compile(
 
 class ReleaseError(ValueError):
     """The release manifest or artifact violates its declared contract."""
+
+
+def _git_environment() -> dict[str, str]:
+    """Run provenance Git without ambient repository/object/config redirects."""
+    environment = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "LC_ALL": "C",
+    }
+    # Git for Windows needs SYSTEMROOT; temporary-path variables are harmless
+    # process prerequisites. Deliberately do not inherit any other ambient key,
+    # especially GIT_DIR, GIT_WORK_TREE, index/object redirects, namespaces, or
+    # GIT_CONFIG_COUNT/KEY/VALUE injection.
+    for key in ("SYSTEMROOT", "TMPDIR", "TMP", "TEMP"):
+        if value := os.environ.get(key):
+            environment[key] = value
+    return environment
 
 
 def sha256(path: Path) -> str:
@@ -508,6 +532,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=_git_environment(),
     )
     if resolved_head.returncode != 0 or resolved_head.stdout.strip() != exact_head:
         raise ReleaseError("progressive controls replay exact head is not a repository commit")
@@ -516,6 +541,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=_git_environment(),
     )
     if resolved_tree.returncode != 0 or resolved_tree.stdout.strip() != source["tree"]:
         raise ReleaseError("progressive controls replay tree does not belong to its exact head")
@@ -523,6 +549,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
         ["git", "-C", str(root), "merge-base", "--is-ancestor", exact_head, "HEAD"],
         capture_output=True,
         check=False,
+        env=_git_environment(),
     )
     if is_ancestor.returncode != 0:
         raise ReleaseError("progressive controls replay exact head is not an ancestor of the checkout")
@@ -533,6 +560,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
         ["git", "-C", str(root), "show", f"{exact_head}:{MANIFEST.as_posix()}"],
         capture_output=True,
         check=False,
+        env=_git_environment(),
     )
     if exact_manifest_result.returncode != 0:
         raise ReleaseError("progressive controls exact head has no release manifest")
@@ -571,11 +599,12 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
     ):
         raise ReleaseError("progressive controls manifest gate transition is not canonical")
     gate_evidence = current_gate.get("evidence")
-    if (
-        not isinstance(gate_evidence, dict)
-        or gate_evidence.get("path") != PROGRESSIVE_CONTROLS_EVIDENCE_PATH
-        or gate_evidence.get("sha256") != sha256(path)
-    ):
+    expected_gate_evidence = {
+        "path": PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": sha256(path),
+        "summary": PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
+    }
+    if gate_evidence != expected_gate_evidence:
         raise ReleaseError("progressive controls manifest gate evidence is not canonical")
     projected_manifest = json.loads(canonical_json(manifest))
     projected_manifest["gates"][current_gate_index] = exact_gate
@@ -589,6 +618,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
             ["git", "-C", str(root), *arguments],
             capture_output=True,
             check=False,
+            env=_git_environment(),
         )
         if result.returncode != 0:
             raise ReleaseError(f"cannot inspect progressive controls {label}")
@@ -599,7 +629,10 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
                 f"progressive controls {label} contains a non-UTF-8 path"
             ) from exc
 
-    diff_arguments = ["--name-only", "--diff-filter=ACDMRTUXB", "-z"]
+    # Disable rename detection so both the deleted reviewed source and the added
+    # destination enter the path set. Otherwise a rename into an allowlisted
+    # completion path can report only its destination and hide source removal.
+    diff_arguments = ["--name-only", "--no-renames", "--diff-filter=ACDMRTUXB", "-z"]
     changed_paths = git_paths(
         ["diff", *diff_arguments, exact_head, "HEAD", "--"],
         "reviewed source diff",
@@ -864,6 +897,7 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
             capture_output=True,
             text=True,
             check=False,
+            env=_git_environment(),
         )
         if done.returncode != 0:
             raise ReleaseError(f"cannot resolve source commit: {done.stderr.strip()}")
