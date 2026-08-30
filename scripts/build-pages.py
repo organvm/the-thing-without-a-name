@@ -593,6 +593,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             )
         except Exception as exc:
             raise ArtifactError(f"artifact project links failed verification: {exc}") from exc
+        try:
+            project = (output / "project/index.html").read_text(encoding="utf-8")
+            builder.verify_project_security(project)
+        except Exception as exc:
+            raise ArtifactError(f"artifact project security failed verification: {exc}") from exc
     return manifest
 
 

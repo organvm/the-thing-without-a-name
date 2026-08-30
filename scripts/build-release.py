@@ -85,9 +85,15 @@ class _ProjectMarkup(HTMLParser):
         self.active_elements: set[str] = set()
         self.event_handlers: set[str] = set()
         self.duplicate_attributes: set[str] = set()
+        self.in_head = False
+        self.head_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "head":
+            self.in_head = True
+        elif self.in_head:
+            self.head_elements.append((tag, values))
         element_id = values.get("id")
         if element_id:
             self.ids.add(element_id)
@@ -110,6 +116,10 @@ class _ProjectMarkup(HTMLParser):
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
         self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "head":
+            self.in_head = False
 
 
 def _h(value: object) -> str:
@@ -955,6 +965,44 @@ def verify_project_security(project: str) -> None:
     ]
     if referrers != ["no-referrer"]:
         raise ReleaseError("project page lacks the exact no-referrer policy")
+    csp_head_positions = [
+        index
+        for index, (tag, meta) in enumerate(parser.head_elements)
+        if tag == "meta"
+        and (meta.get("http-equiv") or "").lower() == "content-security-policy"
+        and meta.get("content") == PROJECT_CSP
+    ]
+    referrer_head_positions = [
+        index
+        for index, (tag, meta) in enumerate(parser.head_elements)
+        if tag == "meta"
+        and (meta.get("name") or "").lower() == "referrer"
+        and meta.get("content") == "no-referrer"
+    ]
+    if len(csp_head_positions) != 1 or len(referrer_head_positions) != 1:
+        raise ReleaseError("project security metadata must occur exactly once inside head")
+    loading_positions = [
+        index
+        for index, (tag, _attrs) in enumerate(parser.head_elements)
+        if tag
+        in {
+            "audio",
+            "base",
+            "embed",
+            "form",
+            "iframe",
+            "img",
+            "link",
+            "object",
+            "script",
+            "source",
+            "style",
+            "track",
+            "video",
+        }
+    ]
+    if loading_positions and csp_head_positions[0] > min(loading_positions):
+        raise ReleaseError("project content security policy must precede load-bearing markup")
     unexpected_http_equiv = sorted(
         {
             value

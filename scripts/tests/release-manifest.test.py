@@ -1009,6 +1009,33 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTP-equivalent metadata: refresh"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_self_rehashed_project_with_security_metadata_outside_head_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</body>", f"{csp}{referrer}</body>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "exactly once inside head"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_late_csp_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        project.write_text(
+            original.replace(csp, "").replace("</head>", f"{csp}</head>"),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede load-bearing markup"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_symlinked_project_file_fails(self) -> None:
         outside = self.base / "outside.html"

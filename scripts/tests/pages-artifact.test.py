@@ -319,6 +319,20 @@ class ArtifactBoundaryTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._temporary.cleanup()
 
+    def rehash_project_manifest(self) -> None:
+        project = self.output / "project/index.html"
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in manifest["files"] if record["path"] == "project/index.html"
+        )
+        record["bytes"] = project.stat().st_size
+        record["sha256"] = PAGES.sha256(project)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def test_unlisted_files_are_not_copied(self) -> None:
         PAGES.build(self.root, self.output, TEST_COMMIT)
         inventory = PAGES.artifact_inventory(self.output)
@@ -458,18 +472,28 @@ class ArtifactBoundaryTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        record = next(
-            record for record in manifest["files"] if record["path"] == "project/index.html"
+        self.rehash_project_manifest()
+        with self.assertRaisesRegex(PAGES.ArtifactError, "project links failed verification"):
+            PAGES.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_rehashed_pages_manifest_cannot_admit_weakened_project_security(self) -> None:
+        release = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
         )
-        record["bytes"] = project.stat().st_size
-        record["sha256"] = PAGES.sha256(project)
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                RELEASE_BUILD.PROJECT_CSP,
+                "default-src * 'unsafe-inline' 'unsafe-eval'",
+            ),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(PAGES.ArtifactError, "project links failed verification"):
+        self.rehash_project_manifest()
+        with self.assertRaisesRegex(PAGES.ArtifactError, "project security failed verification"):
             PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_missing_or_draft_release_artifact_fails_before_pages_bytes(self) -> None:
