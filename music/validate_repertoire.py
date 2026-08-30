@@ -16,12 +16,13 @@ import json
 import math
 import re
 import subprocess
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from record_recording_custody import hydrated_receipt_errors
+from record_recording_custody import CANONICAL_STEMS, hydrated_receipt_errors
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTER = ROOT / "music" / "repertoire.yaml"
@@ -165,13 +166,17 @@ def validate_schema_instance(
     register: Any,
     path: Path = DEFAULT_SCHEMA,
 ) -> list[str]:
+    return validate_json_instance(register, path, "register")
+
+
+def validate_json_instance(value: Any, path: Path, label: str) -> list[str]:
     try:
         schema = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         return [f"schema document: {exc}"]
     if not isinstance(schema, dict):
         return ["schema document: root must be an object"]
-    return _schema_errors(register, schema, schema, "register")
+    return _schema_errors(value, schema, schema, label)
 
 
 def validate_recording_custody_schema(
@@ -201,16 +206,37 @@ def validate_recording_custody_schema(
                 "recording custody receipt.verification.repeat_master_sha256: "
                 "must equal the final master digest"
             )
+        probes = verification.get("seek_probes")
+        if isinstance(probes, list):
+            for index, probe in enumerate(probes):
+                if isinstance(probe, dict) and probe.get("sha256") != probe.get("repeat_sha256"):
+                    errors.append(
+                        f"recording custody receipt.verification.seek_probes[{index}]: "
+                        "repeat digest must equal the first digest"
+                    )
     stems = receipt.get("stems")
     artifacts = [receipt.get("pre_normalized_master"), master]
     if isinstance(stems, list):
         artifacts.extend(stems)
-        stem_ids = [row.get("id") for row in stems if isinstance(row, dict)]
+        stem_ids = [row.get("id") for row in stems if isinstance(row, dict) and isinstance(row.get("id"), str)]
         if len(stem_ids) != len(set(stem_ids)):
             errors.append("recording custody receipt.stems: ids must be unique")
-    paths = [row.get("path") for row in artifacts if isinstance(row, dict)]
+        if len(stem_ids) == len(stems) and tuple(stem_ids) != CANONICAL_STEMS:
+            errors.append("recording custody receipt.stems: ids must equal the canonical competition mix order")
+    paths = [row.get("path") for row in artifacts if isinstance(row, dict) and isinstance(row.get("path"), str)]
     if len(paths) != len(set(paths)):
         errors.append("recording custody receipt: audio output paths must be unique")
+    shapes = [
+        (row.get("frames"), row.get("sample_rate"), row.get("channels"), row.get("sample_format"))
+        for row in artifacts
+        if isinstance(row, dict)
+        and type(row.get("frames")) is int
+        and type(row.get("sample_rate")) is int
+        and type(row.get("channels")) is int
+        and isinstance(row.get("sample_format"), str)
+    ]
+    if len(shapes) == len(artifacts) and len(set(shapes)) != 1:
+        errors.append("recording custody receipt: all audio outputs must share one exact PCM shape")
     return errors
 
 
@@ -466,6 +492,11 @@ def validate_document(
         )
         recording_source_row = recording.get("source")
         if isinstance(recording_source_row, dict) and recording_source_row.get("custody") == "hydrated-derived":
+            if recording.get("status") != "project-authored":
+                error(
+                    f"{location}.recording.status",
+                    "hydrated-derived custody is valid only for a project-authored recording",
+                )
             receipt_reference = recording_source_row.get("receipt")
             if isinstance(receipt_reference, dict) and isinstance(receipt_reference.get("path"), str):
                 receipt_path = root / receipt_reference["path"]
@@ -493,6 +524,199 @@ def validate_document(
                                 f"{location}.recording.source",
                                 "must equal the master identity in its tracked custody receipt",
                             )
+                        receipt_location = f"{location}.recording.source.receipt"
+                        for metadata_name in ("generator", "source_schema"):
+                            source(
+                                receipt_document.get(metadata_name),
+                                f"{receipt_location}.{metadata_name}",
+                                required=True,
+                            )
+                        contracts = receipt_document.get("contracts")
+                        if isinstance(contracts, dict):
+                            contract_identities: dict[str, tuple[str, str] | None] = {}
+                            for contract_name, contract_row in contracts.items():
+                                if contract_name == "soundfont":
+                                    continue
+                                contract_identities[contract_name] = source(
+                                    contract_row,
+                                    f"{receipt_location}.contracts.{contract_name}",
+                                    required=True,
+                                )
+
+                            derived_rows = work.get("derived_artifacts")
+                            derived_by_kind: dict[str, tuple[str, str]] = {}
+                            if isinstance(derived_rows, list):
+                                for derived_row in derived_rows:
+                                    if (
+                                        isinstance(derived_row, dict)
+                                        and isinstance(derived_row.get("kind"), str)
+                                        and isinstance(derived_row.get("path"), str)
+                                        and isinstance(derived_row.get("sha256"), str)
+                                    ):
+                                        derived_by_kind[derived_row["kind"]] = (
+                                            derived_row["path"],
+                                            derived_row["sha256"],
+                                        )
+                            expected_contracts = {
+                                "midi": arrangement_source,
+                                "adaptation": derived_by_kind.get("adaptation-contract"),
+                                "toolchain": derived_by_kind.get("audio-toolchain-contract"),
+                                "audio_uses": derived_by_kind.get("audio-use-manifest"),
+                            }
+                            for contract_name, expected_identity in expected_contracts.items():
+                                if contract_identities.get(contract_name) != expected_identity:
+                                    error(
+                                        f"{receipt_location}.contracts.{contract_name}",
+                                        "must equal the current repertoire/toolchain source identity",
+                                    )
+
+                            parsed_contracts: dict[str, dict[str, Any]] = {}
+                            for contract_name in ("score", "choreography", "toolchain", "mix"):
+                                identity = contract_identities.get(contract_name)
+                                if identity is None:
+                                    continue
+                                try:
+                                    parsed = json.loads((root / identity[0]).read_text())
+                                except (OSError, json.JSONDecodeError) as exc:
+                                    error(
+                                        f"{receipt_location}.contracts.{contract_name}",
+                                        f"cannot read current contract: {exc}",
+                                    )
+                                else:
+                                    if isinstance(parsed, dict):
+                                        parsed_contracts[contract_name] = parsed
+
+                            toolchain = parsed_contracts.get("toolchain", {})
+                            for contract_name in ("mix", "soundfont"):
+                                expected_row = toolchain.get(contract_name)
+                                receipt_row = contracts.get(contract_name)
+                                expected_identity = (
+                                    (expected_row.get("path"), expected_row.get("sha256"))
+                                    if isinstance(expected_row, dict)
+                                    else None
+                                )
+                                receipt_identity = (
+                                    (receipt_row.get("path"), receipt_row.get("sha256"))
+                                    if isinstance(receipt_row, dict)
+                                    else None
+                                )
+                                if receipt_identity != expected_identity:
+                                    error(
+                                        f"{receipt_location}.contracts.{contract_name}",
+                                        "must equal the current audio-toolchain source identity",
+                                    )
+
+                            score_document = parsed_contracts.get("score", {})
+                            score_identity = score_document.get("identity")
+                            score_row = contracts.get("score")
+                            midi_row = contracts.get("midi")
+                            if isinstance(score_identity, dict) and isinstance(score_row, dict):
+                                if score_identity.get("work_id") != work_id:
+                                    error(f"{receipt_location}.contracts.score", "must identify the repertoire work")
+                                midi_digest = midi_row.get("sha256") if isinstance(midi_row, dict) else None
+                                if score_identity.get("midi_sha256") != midi_digest:
+                                    error(
+                                        f"{receipt_location}.contracts.score",
+                                        "must bind the current repertoire MIDI",
+                                    )
+                                if score_identity.get("contract_sha256") != score_row.get("contract_sha256"):
+                                    error(f"{receipt_location}.contracts.score", "contract identity is stale")
+
+                            choreography_document = parsed_contracts.get("choreography", {})
+                            choreography_identity = choreography_document.get("identity")
+                            choreography_row = contracts.get("choreography")
+                            if isinstance(choreography_identity, dict) and isinstance(choreography_row, dict):
+                                if choreography_identity.get("contract_sha256") != choreography_row.get(
+                                    "contract_sha256"
+                                ):
+                                    error(f"{receipt_location}.contracts.choreography", "contract identity is stale")
+                                if choreography_identity.get("score_contract_sha256") != (
+                                    score_row.get("contract_sha256") if isinstance(score_row, dict) else None
+                                ):
+                                    error(
+                                        f"{receipt_location}.contracts.choreography",
+                                        "must bind the custody receipt score contract",
+                                    )
+
+                            executables = receipt_document.get("executables")
+                            if isinstance(executables, dict):
+                                for executable_name in ("fluidsynth", "ffmpeg"):
+                                    expected = toolchain.get(executable_name)
+                                    declared = executables.get(executable_name)
+                                    expected_identity = (
+                                        (expected.get("executable_sha256"), expected.get("version"))
+                                        if isinstance(expected, dict)
+                                        else None
+                                    )
+                                    declared_identity = (
+                                        (declared.get("sha256"), declared.get("version"))
+                                        if isinstance(declared, dict)
+                                        else None
+                                    )
+                                    if declared_identity != expected_identity:
+                                        error(
+                                            f"{receipt_location}.executables.{executable_name}",
+                                            "must equal the current pinned executable identity",
+                                        )
+
+                            mix_document = parsed_contracts.get("mix", {})
+                            mix_master = mix_document.get("master")
+                            mix_normalization = (
+                                mix_master.get("normalization") if isinstance(mix_master, dict) else None
+                            )
+                            custody_normalization = receipt_document.get("normalization")
+                            if isinstance(mix_normalization, dict) and isinstance(custody_normalization, dict):
+                                expected_targets = {
+                                    "integrated_lufs": mix_normalization.get("target_lufs"),
+                                    "tolerance_lu": mix_normalization.get("tolerance_lu"),
+                                    "target_true_peak_dbtp": mix_normalization.get("target_true_peak_dbtp"),
+                                    "max_true_peak_dbtp": mix_normalization.get("max_true_peak_dbtp"),
+                                    "lra_lu": mix_normalization.get("target_lra_lu"),
+                                }
+                                if custody_normalization.get("method") != mix_normalization.get("method"):
+                                    error(f"{receipt_location}.normalization.method", "must equal the current mix")
+                                if custody_normalization.get("targets") != expected_targets:
+                                    error(f"{receipt_location}.normalization.targets", "must equal the current mix")
+
+                            score_time = score_document.get("time")
+                            duration = score_time.get("duration_seconds") if isinstance(score_time, dict) else None
+                            if type(duration) in (int, float):
+                                expected_frames = int(
+                                    (Decimal(str(duration)) * 48_000).to_integral_value(rounding=ROUND_HALF_UP)
+                                )
+                                audio_rows = [receipt_document.get("pre_normalized_master"), master]
+                                stems = receipt_document.get("stems")
+                                if isinstance(stems, list):
+                                    audio_rows.extend(stems)
+                                for audio_index, audio_row in enumerate(audio_rows):
+                                    if isinstance(audio_row, dict) and audio_row.get("frames") != expected_frames:
+                                        error(
+                                            f"{receipt_location}.audio[{audio_index}].frames",
+                                            f"must equal the current score duration ({expected_frames} frames)",
+                                        )
+                            sample_items = layer_rows["samples"].get("items")
+                            sample_identities: set[tuple[Any, Any]] = set()
+                            if isinstance(sample_items, list):
+                                for sample_item in sample_items:
+                                    sample_source = (
+                                        sample_item.get("source") if isinstance(sample_item, dict) else None
+                                    )
+                                    if isinstance(sample_source, dict):
+                                        sample_path = sample_source.get("path")
+                                        sample_digest = sample_source.get("sha256")
+                                        if isinstance(sample_path, str) and isinstance(sample_digest, str):
+                                            sample_identities.add((sample_path, sample_digest))
+                            soundfont_row = contracts.get("soundfont")
+                            soundfont_identity = (
+                                (soundfont_row.get("path"), soundfont_row.get("sha256"))
+                                if isinstance(soundfont_row, dict)
+                                else None
+                            )
+                            if soundfont_identity not in sample_identities:
+                                error(
+                                    f"{receipt_location}.contracts.soundfont",
+                                    "must identify a current repertoire sample source",
+                                )
                         for receipt_error in hydrated_receipt_errors(
                             receipt_document,
                             root=root,

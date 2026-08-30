@@ -37,7 +37,12 @@ from compile_score import (  # noqa: E402
     parse_track,
 )
 from music_score import events_between, load_score, score_at, validate as validate_score  # noqa: E402
-from record_recording_custody import build_receipt, hydrated_receipt_errors  # noqa: E402
+from record_recording_custody import (  # noqa: E402
+    CANONICAL_STEMS,
+    build_receipt,
+    hydrated_receipt_errors,
+    validate_production_input_graph,
+)
 from validate_repertoire import (  # noqa: E402
     load_register,
     sha256,
@@ -93,6 +98,154 @@ def compact_events(events: list[dict]) -> list[dict]:
         }
         for event in events
     ]
+
+
+def current_recording_custody_receipt(master_digest: str = "a" * 64) -> dict:
+    score_path = ROOT / "music/score.json"
+    choreography_path = ROOT / "render/choreography.json"
+    midi_path = ROOT / "music/delibes-screendance-suite.mid"
+    adaptation_path = ROOT / "music/adaptation.json"
+    toolchain_path = ROOT / "music/audio-toolchain.json"
+    mix_path = ROOT / "music/delibes-mix.json"
+    uses_path = ROOT / "sound/audio-uses.json"
+    score = json.loads(score_path.read_text())
+    choreography = json.loads(choreography_path.read_text())
+    toolchain = json.loads(toolchain_path.read_text())
+
+    def artifact(path: str, digest: str, *, polyphonic: bool = False) -> dict:
+        row = {
+            "path": path,
+            "sha256": digest,
+            "bytes": 67_372_140,
+            "frames": 16_843_024,
+            "sample_rate": 48_000,
+            "channels": 2,
+            "sample_format": "signed-16-bit-little-endian-pcm",
+            "duration_seconds": 350.896333333,
+            "peak_sample": 20_000,
+            "rms_sample": 2_000.0,
+            "non_silent": True,
+        }
+        if polyphonic:
+            row["polyphonic_frames"] = 1_000_000
+        return row
+
+    return {
+        "schema": "danse.music.recording-custody.v1",
+        "status": "custody-only",
+        "profile": "competition-classical",
+        "work_id": "delibes-screendance-suite",
+        "recorded_on": "2026-08-30",
+        "audio_render": {
+            "path": ".work/music/competition/audio-render.json",
+            "sha256": "b" * 64,
+            "bytes": 4096,
+        },
+        "generator": {
+            "path": "music/record_recording_custody.py",
+            "sha256": sha256(ROOT / "music/record_recording_custody.py"),
+        },
+        "source_schema": {
+            "path": "music/audio-render.schema.json",
+            "sha256": sha256(ROOT / "music/audio-render.schema.json"),
+        },
+        "pre_normalized_master": artifact(
+            ".work/music/competition/delibes-pre-normalized.wav",
+            "d" * 64,
+            polyphonic=True,
+        ),
+        "master": artifact(
+            ".work/music/competition/delibes-master.wav",
+            master_digest,
+            polyphonic=True,
+        ),
+        "stems": [
+            {
+                "id": stem_id,
+                **artifact(
+                    f".work/music/competition/stems/{stem_id}.wav",
+                    hashlib.sha256(stem_id.encode()).hexdigest(),
+                ),
+            }
+            for stem_id in CANONICAL_STEMS
+        ],
+        "contracts": {
+            "score": {
+                "path": score_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(score_path),
+                "contract_sha256": score["identity"]["contract_sha256"],
+            },
+            "choreography": {
+                "path": choreography_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(choreography_path),
+                "contract_sha256": choreography["identity"]["contract_sha256"],
+            },
+            "midi": {"path": midi_path.relative_to(ROOT).as_posix(), "sha256": sha256(midi_path)},
+            "adaptation": {
+                "path": adaptation_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(adaptation_path),
+            },
+            "toolchain": {
+                "path": toolchain_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(toolchain_path),
+            },
+            "mix": {"path": mix_path.relative_to(ROOT).as_posix(), "sha256": sha256(mix_path)},
+            "audio_uses": {"path": uses_path.relative_to(ROOT).as_posix(), "sha256": sha256(uses_path)},
+            "soundfont": {
+                "path": toolchain["soundfont"]["path"],
+                "sha256": toolchain["soundfont"]["sha256"],
+            },
+        },
+        "executables": {
+            name: {
+                "sha256": toolchain[name]["executable_sha256"],
+                "version": toolchain[name]["version"],
+            }
+            for name in ("fluidsynth", "ffmpeg")
+        },
+        "normalization": {
+            "method": "ffmpeg-loudnorm-two-pass",
+            "targets": {
+                "integrated_lufs": -16.0,
+                "tolerance_lu": 0.5,
+                "target_true_peak_dbtp": -1.1,
+                "max_true_peak_dbtp": -1.0,
+                "lra_lu": 11.0,
+            },
+            "output": {
+                "integrated_lufs": -16.0,
+                "true_peak_dbtp": -1.1,
+                "lra_lu": 8.0,
+                "threshold_lufs": -26.0,
+            },
+        },
+        "verification": {
+            "repeat_master_sha256": master_digest,
+            "deterministic": True,
+            "non_silent": True,
+            "stems_non_silent": True,
+            "polyphonic": True,
+            "normalization_deterministic": True,
+            "loudness_in_target": True,
+            "true_peak_in_target": True,
+            "duration_matches_score": True,
+            "seek_safe": True,
+            "seek_probes": [
+                {
+                    "start_frame": 0,
+                    "frames": 12_000,
+                    "sha256": "e" * 64,
+                    "repeat_sha256": "e" * 64,
+                    "equal": True,
+                }
+            ],
+        },
+        "clearance": {
+            "gate": "music-cleared",
+            "state": "pending",
+            "note": "Custody only; no rights, final-cut, upload, or submission claim.",
+        },
+    }
 
 
 class MusicScoreContractTest(unittest.TestCase):
@@ -266,81 +419,11 @@ class MusicScoreContractTest(unittest.TestCase):
 
     def test_rendered_recording_uses_ignored_bytes_and_a_tracked_custody_receipt(self) -> None:
         digest = "a" * 64
-        stem_ids = ("violin-i", "violin-ii", "viola", "cello", "contrabass", "triangle", "timpani")
         with tempfile.TemporaryDirectory(dir=ROOT / "music") as temporary:
             directory = Path(temporary)
             receipt_path = directory / "recording-custody.json"
             relative_receipt = receipt_path.relative_to(ROOT).as_posix()
-            receipt = {
-                "schema": "danse.music.recording-custody.v1",
-                "status": "custody-only",
-                "profile": "competition-classical",
-                "work_id": "delibes-screendance-suite",
-                "recorded_on": "2026-08-30",
-                "audio_render": {
-                    "path": ".work/music/competition/audio-render.json",
-                    "sha256": "b" * 64,
-                    "bytes": 4096,
-                },
-                "master": {
-                    "path": ".work/music/competition/delibes-master.wav",
-                    "sha256": digest,
-                    "bytes": 67_372_140,
-                    "frames": 16_843_024,
-                    "sample_rate": 48_000,
-                    "channels": 2,
-                },
-                "pre_normalized_master": {
-                    "path": ".work/music/competition/delibes-pre-normalized.wav",
-                    "sha256": "d" * 64,
-                    "bytes": 67_372_140,
-                    "frames": 16_843_024,
-                    "sample_rate": 48_000,
-                    "channels": 2,
-                },
-                "stems": [
-                    {
-                        "id": stem_id,
-                        "path": f".work/music/competition/stems/{stem_id}.wav",
-                        "sha256": hashlib.sha256(stem_id.encode()).hexdigest(),
-                        "bytes": 67_372_140,
-                        "frames": 16_843_024,
-                        "sample_rate": 48_000,
-                        "channels": 2,
-                    }
-                    for stem_id in stem_ids
-                ],
-                "contracts": {
-                    name: {"path": f"music/{name}.json", "sha256": hashlib.sha256(name.encode()).hexdigest()}
-                    for name in (
-                        "score",
-                        "choreography",
-                        "midi",
-                        "adaptation",
-                        "toolchain",
-                        "mix",
-                        "audio_uses",
-                        "soundfont",
-                    )
-                },
-                "verification": {
-                    "repeat_master_sha256": digest,
-                    "deterministic": True,
-                    "non_silent": True,
-                    "stems_non_silent": True,
-                    "polyphonic": True,
-                    "normalization_deterministic": True,
-                    "loudness_in_target": True,
-                    "true_peak_in_target": True,
-                    "duration_matches_score": True,
-                    "seek_safe": True,
-                },
-                "clearance": {
-                    "gate": "music-cleared",
-                    "state": "pending",
-                    "note": "Custody only; no rights, final-cut, upload, or submission claim.",
-                },
-            }
+            receipt = current_recording_custody_receipt(digest)
             receipt_path.write_text(json.dumps(receipt))
             tracked = subprocess.run(
                 ["git", "-C", str(ROOT), "ls-files", "-z"],
@@ -383,6 +466,73 @@ class MusicScoreContractTest(unittest.TestCase):
                 errors = validate_document(wrong_layer, check_derived=False)
             self.assertTrue(any("hydrated-derived is allowed only" in error for error in errors), errors)
 
+            malformed = copy.deepcopy(receipt)
+            malformed["stems"][0]["id"] = []
+            malformed["master"]["path"] = []
+            malformed_errors = validate_recording_custody_schema(malformed)
+            self.assertTrue(any("must have JSON type string" in error for error in malformed_errors))
+
+            def validate_variant(document: dict, *, status: str = "project-authored") -> list[str]:
+                receipt_path.write_text(json.dumps(document))
+                variant = copy.deepcopy(candidate)
+                variant_recording = variant["works"][0]["recording"]
+                variant_recording["status"] = status
+                variant_recording["source"]["receipt"]["sha256"] = sha256(receipt_path)
+                if status == "pending-render":
+                    variant_recording["render_contract"] = copy.deepcopy(
+                        self.production_register["works"][0]["recording"]["render_contract"]
+                    )
+                with mock.patch("validate_repertoire.subprocess.run", return_value=listed):
+                    return validate_document(variant, check_derived=False)
+
+            traversal = copy.deepcopy(receipt)
+            traversal["contracts"]["adaptation"]["path"] = "../foreign/adaptation.json"
+            errors = validate_variant(traversal)
+            self.assertTrue(
+                any("contracts.adaptation" in error and "does not match" in error for error in errors),
+                errors,
+            )
+
+            stale = copy.deepcopy(receipt)
+            stale["contracts"]["adaptation"]["sha256"] = "f" * 64
+            errors = validate_variant(stale)
+            self.assertTrue(any("contracts.adaptation" in error and "actual" in error for error in errors), errors)
+
+            wrong_shape = copy.deepcopy(receipt)
+            wrong_shape["stems"][0]["frames"] -= 1
+            errors = validate_variant(wrong_shape)
+            self.assertTrue(any("one exact PCM shape" in error for error in errors), errors)
+            self.assertTrue(any("current score duration" in error for error in errors), errors)
+
+            wrong_order = copy.deepcopy(receipt)
+            wrong_order["stems"][0]["id"], wrong_order["stems"][1]["id"] = (
+                wrong_order["stems"][1]["id"],
+                wrong_order["stems"][0]["id"],
+            )
+            errors = validate_variant(wrong_order)
+            self.assertTrue(any("canonical competition mix order" in error for error in errors), errors)
+
+            wrong_pcm = copy.deepcopy(receipt)
+            wrong_pcm["master"]["sample_format"] = "unsigned-8-bit-pcm"
+            errors = validate_variant(wrong_pcm)
+            self.assertTrue(any("sample_format" in error and "must equal" in error for error in errors), errors)
+
+            stale_executable = copy.deepcopy(receipt)
+            stale_executable["executables"]["ffmpeg"]["sha256"] = "f" * 64
+            errors = validate_variant(stale_executable)
+            self.assertTrue(
+                any("executables.ffmpeg" in error and "current pinned" in error for error in errors),
+                errors,
+            )
+
+            stale_probe = copy.deepcopy(receipt)
+            stale_probe["verification"]["seek_probes"][0]["repeat_sha256"] = "f" * 64
+            errors = validate_variant(stale_probe)
+            self.assertTrue(any("repeat digest must equal" in error for error in errors), errors)
+
+            errors = validate_variant(receipt, status="pending-render")
+            self.assertTrue(any("hydrated-derived custody is valid only" in error for error in errors), errors)
+
     def test_recording_custody_emitter_is_exact_redacted_and_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(dir=FIXTURE_TMP_ROOT) as temporary:
             directory = Path(temporary)
@@ -407,14 +557,12 @@ class MusicScoreContractTest(unittest.TestCase):
                     writer.setframerate(48_000)
                     writer.writeframes(b"".join(int(value).to_bytes(2, "little", signed=True) for value in samples))
 
+            from render_music import inspect_wav, pcm_slice_hash
+
             def output(path: Path, *, stem_id: str | None = None) -> dict:
-                row = {
-                    "path": path.relative_to(ROOT).as_posix(),
-                    "sha256": sha256(path),
-                    "frames": 2,
-                    "sample_rate": 48_000,
-                    "channels": 2,
-                }
+                row = inspect_wav(path, sample_rate=48_000, frames=2)
+                if stem_id is None:
+                    row["polyphonic_frames"] = 1
                 return {"id": stem_id, **row} if stem_id else row
 
             audio_path = directory / "audio-render.json"
@@ -431,6 +579,24 @@ class MusicScoreContractTest(unittest.TestCase):
                     "soundfont",
                 )
             }
+            contracts["score"] |= {"contract_sha256": "1" * 64, "duration_seconds": 2 / 48_000}
+            contracts["choreography"]["contract_sha256"] = "2" * 64
+            contracts["fluidsynth_executable"] = {
+                "path": "/opt/homebrew/bin/fluidsynth",
+                "sha256": "3" * 64,
+                "version": "2.6.0",
+            }
+            contracts["ffmpeg_executable"] = {
+                "path": "/opt/homebrew/bin/ffmpeg",
+                "sha256": "4" * 64,
+                "version": "9.0.1",
+            }
+            loudness = {
+                "integrated_lufs": -16.0,
+                "true_peak_dbtp": -1.1,
+                "lra_lu": 8.0,
+                "threshold_lufs": -26.0,
+            }
             audio = {
                 "schema": "danse.audio.render.v1",
                 "profile": "competition-classical",
@@ -443,6 +609,23 @@ class MusicScoreContractTest(unittest.TestCase):
                         for stem_id, path in zip(stem_ids, stem_paths, strict=True)
                     ],
                 },
+                "normalization": {
+                    "schema": "danse.audio.normalization.v1",
+                    "method": "ffmpeg-loudnorm-two-pass",
+                    "limiter": "ffmpeg-loudnorm-dynamic-true-peak",
+                    "ffmpeg": {"version": "9.0.1", "executable_sha256": "4" * 64},
+                    "targets": {
+                        "integrated_lufs": -16.0,
+                        "tolerance_lu": 0.5,
+                        "target_true_peak_dbtp": -1.1,
+                        "max_true_peak_dbtp": -1.0,
+                        "lra_lu": 11.0,
+                    },
+                    "first_pass": loudness,
+                    "application_filter": "loudnorm=I=-16:LRA=11:TP=-1.1",
+                    "normalization_type": "dynamic",
+                    "output": loudness,
+                },
                 "verification": {
                     "repeat_master_sha256": sha256(master),
                     "deterministic": True,
@@ -454,34 +637,190 @@ class MusicScoreContractTest(unittest.TestCase):
                     "true_peak_in_target": True,
                     "duration_matches_score": True,
                     "seek_safe": True,
+                    "seek_probes": [
+                        {
+                            "start_frame": 0,
+                            "frames": 2,
+                            "sha256": pcm_slice_hash(master, 0, 2),
+                            "repeat_sha256": pcm_slice_hash(master, 0, 2),
+                            "equal": True,
+                        }
+                    ],
                 },
+                "runtime": {"python": "3.13.7", "platform": "test"},
             }
             audio_path.write_text(json.dumps(audio))
-            receipt = build_receipt(
-                audio_path,
-                work_id="delibes-screendance-suite",
-                recorded_on="2026-08-30",
-            )
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ) as production_validation:
+                receipt = build_receipt(
+                    audio_path.relative_to(ROOT),
+                    work_id="delibes-screendance-suite",
+                    recorded_on="2026-08-30",
+                )
+            production_validation.assert_called_once()
             self.assertEqual(receipt["status"], "custody-only")
             self.assertEqual(receipt["clearance"]["state"], "pending")
             self.assertEqual(receipt["pre_normalized_master"]["sha256"], sha256(pre_normalized))
             self.assertEqual(receipt["master"]["sha256"], sha256(master))
             self.assertNotIn(str(ROOT), json.dumps(receipt))
             self.assertEqual(validate_recording_custody_schema(receipt), [])
-            self.assertEqual(hydrated_receipt_errors(receipt, require_hydrated=True), [])
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ):
+                self.assertEqual(hydrated_receipt_errors(receipt, require_hydrated=True), [])
+
+            missing_schema_fields = copy.deepcopy(audio)
+            missing_schema_fields.pop("normalization")
+            audio_path.write_text(json.dumps(missing_schema_fields))
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ) as production_validation:
+                with self.assertRaisesRegex(ValueError, "audio render receipt schema"):
+                    build_receipt(
+                        audio_path,
+                        work_id="delibes-screendance-suite",
+                        recorded_on="2026-08-30",
+                    )
+            production_validation.assert_not_called()
+
+            wrong_stems = copy.deepcopy(audio)
+            for index, row in enumerate(wrong_stems["outputs"]["stems"]):
+                row["id"] = f"arbitrary-{index}"
+            audio_path.write_text(json.dumps(wrong_stems))
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ):
+                with self.assertRaisesRegex(ValueError, "canonical competition mix"):
+                    build_receipt(
+                        audio_path,
+                        work_id="delibes-screendance-suite",
+                        recorded_on="2026-08-30",
+                    )
+
+            audio_path.write_text(json.dumps(audio))
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                side_effect=ValueError("current production graph is stale"),
+            ):
+                with self.assertRaisesRegex(ValueError, "current production graph is stale"):
+                    build_receipt(
+                        audio_path,
+                        work_id="delibes-screendance-suite",
+                        recorded_on="2026-08-30",
+                    )
+
+            pcm8 = directory / "pcm8.wav"
+            with wave.open(str(pcm8), "wb") as writer:
+                writer.setnchannels(2)
+                writer.setsampwidth(1)
+                writer.setframerate(48_000)
+                writer.writeframes(b"\x80\x80\x81\x7f")
+            wrong_pcm = copy.deepcopy(audio)
+            wrong_pcm["outputs"]["stems"][0] |= {
+                "path": pcm8.relative_to(ROOT).as_posix(),
+                "sha256": sha256(pcm8),
+                "frames": 2,
+            }
+            audio_path.write_text(json.dumps(wrong_pcm))
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ):
+                with self.assertRaisesRegex(ValueError, "signed 16-bit PCM"):
+                    build_receipt(
+                        audio_path,
+                        work_id="delibes-screendance-suite",
+                        recorded_on="2026-08-30",
+                    )
 
             master.write_bytes(master.read_bytes() + b"replacement")
-            errors = hydrated_receipt_errors(receipt, require_hydrated=True)
+            audio_path.write_text(json.dumps(audio))
+            with mock.patch(
+                "record_recording_custody.validate_production_input_graph",
+                return_value=CANONICAL_STEMS,
+            ):
+                errors = hydrated_receipt_errors(receipt, require_hydrated=True)
             self.assertTrue(any("declares" in error and "actual" in error for error in errors), errors)
 
             audio["verification"]["loudness_in_target"] = False
             audio_path.write_text(json.dumps(audio))
-            with self.assertRaisesRegex(ValueError, "incomplete or false verification gate"):
+            with self.assertRaisesRegex(ValueError, "audio render receipt schema"):
                 build_receipt(
                     audio_path,
                     work_id="delibes-screendance-suite",
                     recorded_on="2026-08-30",
                 )
+
+    def test_recording_custody_rehashes_every_current_render_input(self) -> None:
+        score_path = ROOT / "music/score.json"
+        choreography_path = ROOT / "render/choreography.json"
+        midi_path = ROOT / "music/delibes-screendance-suite.mid"
+        adaptation_path = ROOT / "music/adaptation.json"
+        toolchain_path = ROOT / "music/audio-toolchain.json"
+        mix_path = ROOT / "music/delibes-mix.json"
+        uses_path = ROOT / "sound/audio-uses.json"
+        soundfont_path = ROOT / "music/licenses/MuseScore_General_License.md"
+        score = json.loads(score_path.read_text())
+        choreography = json.loads(choreography_path.read_text())
+        mix = json.loads(mix_path.read_text())
+        inputs = {
+            "score": {
+                "path": score_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(score_path),
+                "contract_sha256": score["identity"]["contract_sha256"],
+                "duration_seconds": score["time"]["duration_seconds"],
+            },
+            "choreography": {
+                "path": choreography_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(choreography_path),
+                "contract_sha256": choreography["identity"]["contract_sha256"],
+            },
+            "midi": {"path": midi_path.relative_to(ROOT).as_posix(), "sha256": sha256(midi_path)},
+            "adaptation": {
+                "path": adaptation_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(adaptation_path),
+            },
+            "toolchain": {
+                "path": toolchain_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(toolchain_path),
+            },
+            "mix": {"path": mix_path.relative_to(ROOT).as_posix(), "sha256": sha256(mix_path)},
+            "audio_uses": {"path": uses_path.relative_to(ROOT).as_posix(), "sha256": sha256(uses_path)},
+            "soundfont": {
+                "path": soundfont_path.relative_to(ROOT).as_posix(),
+                "sha256": sha256(soundfont_path),
+            },
+            "fluidsynth_executable": {
+                "path": "/usr/bin/env",
+                "sha256": sha256(Path("/usr/bin/env")),
+                "version": "2.6.0",
+            },
+            "ffmpeg_executable": {
+                "path": "/usr/bin/true",
+                "sha256": sha256(Path("/usr/bin/true")),
+                "version": "9.0.1",
+            },
+        }
+        audio = {"profile": "competition-classical", "inputs": inputs}
+        validated = {
+            "score": score,
+            "choreography": choreography,
+            "mix": mix,
+        }
+        with mock.patch("render_music.validate_inputs", return_value=validated):
+            self.assertEqual(validate_production_input_graph(audio), CANONICAL_STEMS)
+
+        stale = copy.deepcopy(audio)
+        stale["inputs"]["midi"]["sha256"] = "f" * 64
+        with mock.patch("render_music.validate_inputs", return_value=validated) as production_validation:
+            with self.assertRaisesRegex(ValueError, "midi.sha256 declares"):
+                validate_production_input_graph(stale)
+        production_validation.assert_not_called()
 
     def test_compiler_boundaries_global_dynamics_and_authored_note_order(self) -> None:
         division = 480

@@ -95,8 +95,11 @@ python3 music/record_recording_custody.py --recorded-on YYYY-MM-DD
 ```
 
 The resulting `rights/evidence/delibes-recording-custody.json` is accepted only
-when it satisfies `recording-custody.schema.json`, repeats every required green
-audio verification, and equals the hydrated audio-render graph byte for byte.
+when the source receipt satisfies `audio-render.schema.json`, the authoritative
+render preflight rehashes every current input and pinned executable, each output
+is uncompressed 48 kHz stereo s16 PCM with recomputed metrics and seek probes,
+and the result satisfies `recording-custody.schema.json`. The bridge records the
+exact ordered seven-stem mix, normalization evidence, generator, and schema.
 Review and commit that redacted receipt, then change the repertoire recording
 from `pending-render` to `project-authored` with a `hydrated-derived` master
 source and the tracked receipt identity. `validate_repertoire.py

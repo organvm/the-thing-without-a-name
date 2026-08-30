@@ -11,10 +11,14 @@
     "work_id",
     "recorded_on",
     "audio_render",
+    "generator",
+    "source_schema",
     "pre_normalized_master",
     "master",
     "stems",
     "contracts",
+    "executables",
+    "normalization",
     "verification",
     "clearance"
   ],
@@ -25,6 +29,18 @@
     "work_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
     "recorded_on": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
     "audio_render": {"$ref": "#/$defs/derivedArtifact"},
+    "generator": {
+      "allOf": [
+        {"$ref": "#/$defs/repositorySource"},
+        {"properties": {"path": {"const": "music/record_recording_custody.py"}}}
+      ]
+    },
+    "source_schema": {
+      "allOf": [
+        {"$ref": "#/$defs/repositorySource"},
+        {"properties": {"path": {"const": "music/audio-render.schema.json"}}}
+      ]
+    },
     "pre_normalized_master": {"$ref": "#/$defs/audioArtifact"},
     "master": {"$ref": "#/$defs/audioArtifact"},
     "stems": {
@@ -47,14 +63,44 @@
         "soundfont"
       ],
       "properties": {
-        "score": {"$ref": "#/$defs/contract"},
-        "choreography": {"$ref": "#/$defs/contract"},
-        "midi": {"$ref": "#/$defs/contract"},
-        "adaptation": {"$ref": "#/$defs/contract"},
-        "toolchain": {"$ref": "#/$defs/contract"},
-        "mix": {"$ref": "#/$defs/contract"},
-        "audio_uses": {"$ref": "#/$defs/contract"},
-        "soundfont": {"$ref": "#/$defs/contract"}
+        "score": {"$ref": "#/$defs/contractSource"},
+        "choreography": {"$ref": "#/$defs/contractSource"},
+        "midi": {"$ref": "#/$defs/repositorySource"},
+        "adaptation": {"$ref": "#/$defs/repositorySource"},
+        "toolchain": {"$ref": "#/$defs/repositorySource"},
+        "mix": {"$ref": "#/$defs/repositorySource"},
+        "audio_uses": {"$ref": "#/$defs/repositorySource"},
+        "soundfont": {"$ref": "#/$defs/repositorySource"}
+      }
+    },
+    "executables": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fluidsynth", "ffmpeg"],
+      "properties": {
+        "fluidsynth": {"$ref": "#/$defs/executable"},
+        "ffmpeg": {"$ref": "#/$defs/executable"}
+      }
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "targets", "output"],
+      "properties": {
+        "method": {"const": "ffmpeg-loudnorm-two-pass"},
+        "targets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["integrated_lufs", "tolerance_lu", "target_true_peak_dbtp", "max_true_peak_dbtp", "lra_lu"],
+          "properties": {
+            "integrated_lufs": {"const": -16.0},
+            "tolerance_lu": {"const": 0.5},
+            "target_true_peak_dbtp": {"const": -1.1},
+            "max_true_peak_dbtp": {"const": -1.0},
+            "lra_lu": {"const": 11.0}
+          }
+        },
+        "output": {"$ref": "#/$defs/loudnessOutput"}
       }
     },
     "verification": {
@@ -70,7 +116,8 @@
         "loudness_in_target",
         "true_peak_in_target",
         "duration_matches_score",
-        "seek_safe"
+        "seek_safe",
+        "seek_probes"
       ],
       "properties": {
         "repeat_master_sha256": {"$ref": "#/$defs/sha256"},
@@ -82,7 +129,12 @@
         "loudness_in_target": {"const": true},
         "true_peak_in_target": {"const": true},
         "duration_matches_score": {"const": true},
-        "seek_safe": {"const": true}
+        "seek_safe": {"const": true},
+        "seek_probes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/seekProbe"}
+        }
       }
     },
     "clearance": {
@@ -98,8 +150,14 @@
   },
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "workPath": {"type": "string", "pattern": "^\\.work/[A-Za-z0-9._/-]+$"},
-    "repoPath": {"type": "string", "pattern": "^[A-Za-z0-9._/-]+$"},
+    "workPath": {
+      "type": "string",
+      "pattern": "^\\.work/(?!\\.\\.(?:/|$))(?!.*?/\\.\\.(?:/|$))[A-Za-z0-9._/-]+$"
+    },
+    "repoPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"
+    },
     "derivedArtifact": {
       "type": "object",
       "additionalProperties": false,
@@ -113,38 +171,96 @@
     "audioArtifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "bytes", "frames", "sample_rate", "channels"],
+      "required": [
+        "path", "sha256", "bytes", "frames", "sample_rate", "channels", "sample_format",
+        "duration_seconds", "peak_sample", "rms_sample", "non_silent", "polyphonic_frames"
+      ],
       "properties": {
         "path": {"$ref": "#/$defs/workPath"},
         "sha256": {"$ref": "#/$defs/sha256"},
         "bytes": {"type": "integer", "minimum": 1},
         "frames": {"type": "integer", "minimum": 1},
-        "sample_rate": {"type": "integer", "minimum": 1},
-        "channels": {"type": "integer", "minimum": 1}
+        "sample_rate": {"const": 48000},
+        "channels": {"const": 2},
+        "sample_format": {"const": "signed-16-bit-little-endian-pcm"},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "peak_sample": {"type": "integer", "minimum": 32, "maximum": 32767},
+        "rms_sample": {"type": "number", "minimum": 1},
+        "non_silent": {"const": true},
+        "polyphonic_frames": {"type": "integer", "minimum": 1}
       }
     },
     "stemArtifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "path", "sha256", "bytes", "frames", "sample_rate", "channels"],
+      "required": [
+        "id", "path", "sha256", "bytes", "frames", "sample_rate", "channels", "sample_format",
+        "duration_seconds", "peak_sample", "rms_sample", "non_silent"
+      ],
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
         "path": {"$ref": "#/$defs/workPath"},
         "sha256": {"$ref": "#/$defs/sha256"},
         "bytes": {"type": "integer", "minimum": 1},
         "frames": {"type": "integer", "minimum": 1},
-        "sample_rate": {"type": "integer", "minimum": 1},
-        "channels": {"type": "integer", "minimum": 1}
+        "sample_rate": {"const": 48000},
+        "channels": {"const": 2},
+        "sample_format": {"const": "signed-16-bit-little-endian-pcm"},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "peak_sample": {"type": "integer", "minimum": 32, "maximum": 32767},
+        "rms_sample": {"type": "number", "minimum": 1},
+        "non_silent": {"const": true}
       }
     },
-    "contract": {
+    "repositorySource": {
       "type": "object",
       "additionalProperties": false,
       "required": ["path", "sha256"],
       "properties": {
         "path": {"$ref": "#/$defs/repoPath"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "contractSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "contract_sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/repoPath"},
         "sha256": {"$ref": "#/$defs/sha256"},
         "contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "executable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "version"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "loudnessOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrated_lufs", "true_peak_dbtp", "lra_lu", "threshold_lufs"],
+      "properties": {
+        "integrated_lufs": {"type": "number", "minimum": -16.5, "maximum": -15.5},
+        "true_peak_dbtp": {"type": "number", "maximum": -1.0},
+        "lra_lu": {"type": "number", "minimum": 0},
+        "threshold_lufs": {"type": "number"}
+      }
+    },
+    "seekProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_frame", "frames", "sha256", "repeat_sha256", "equal"],
+      "properties": {
+        "start_frame": {"type": "integer", "minimum": 0},
+        "frames": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "repeat_sha256": {"$ref": "#/$defs/sha256"},
+        "equal": {"const": true}
       }
     }
   }
