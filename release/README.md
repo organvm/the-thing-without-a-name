@@ -71,7 +71,12 @@ The builder accepts only an absent or empty output outside the repository, rejec
 symlinks and path traversal, and checks that CLI builds start and finish on the clean
 Git worktree named by the exact source commit. It sets deterministic file timestamps
 and reproduces the same PDF and other bytes for the same manifest, phase, dependency
-version, and source commit. Generated outputs are not committed from the draft phase.
+version, and source commit. The generated project page is passive by contract: an exact
+fail-closed Content Security Policy blocks scripts, connections, frames, objects, forms,
+workers, and remote media, while a no-referrer policy prevents outbound link
+navigation from disclosing the project path. Artifact verification rejects a weakened
+policy, active elements, or inline event handlers even if a modified artifact is
+self-rehashed. Generated outputs are not committed from the draft phase.
 
 ## Closing a gate
 

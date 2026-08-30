@@ -60,6 +60,12 @@ GENERATED_PATHS = (
     "press/posting-calendar.json",
     "media/release-media.json",
 )
+PROJECT_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; "
+    "media-src 'self'; connect-src 'none'; font-src 'none'; object-src 'none'; "
+    "script-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
+    "base-uri 'none'; form-action 'none'"
+)
 PROJECT_RESOURCES = (
     ("pitch-pdf-copy", "Installation pitch (PDF)"),
     ("accessibility-copy", "Accessibility statement"),
@@ -75,6 +81,9 @@ class _ProjectMarkup(HTMLParser):
         super().__init__()
         self.ids: set[str] = set()
         self.hrefs: list[str] = []
+        self.metas: list[dict[str, str | None]] = []
+        self.active_elements: set[str] = set()
+        self.event_handlers: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
@@ -84,6 +93,13 @@ class _ProjectMarkup(HTMLParser):
         href = values.get("href")
         if tag == "a" and href:
             self.hrefs.append(href)
+        if tag == "meta":
+            self.metas.append(values)
+        if tag in {"base", "embed", "form", "iframe", "object", "script"}:
+            self.active_elements.add(tag)
+        self.event_handlers.update(
+            name for name, _value in attrs if name.lower().startswith("on")
+        )
 
 
 def _h(value: object) -> str:
@@ -239,6 +255,8 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="{PROJECT_CSP}">
+  <meta name="referrer" content="no-referrer">
   {robots}
   <title>{_h(identity['public_title'])} | Project</title>
   <meta name="description" content="{_h(copy['logline'])}">
@@ -909,6 +927,36 @@ def verify_project_links(
             raise ReleaseError(f"project page names a missing fragment: #{parsed.fragment}")
 
 
+def verify_project_security(project: str) -> None:
+    """Require the generated project page to remain passive and network-closed."""
+    parser = _ProjectMarkup()
+    parser.feed(project)
+    policies = [
+        meta.get("content")
+        for meta in parser.metas
+        if (meta.get("http-equiv") or "").lower() == "content-security-policy"
+    ]
+    if policies != [PROJECT_CSP]:
+        raise ReleaseError("project page lacks the exact fail-closed content security policy")
+    referrers = [
+        meta.get("content")
+        for meta in parser.metas
+        if (meta.get("name") or "").lower() == "referrer"
+    ]
+    if referrers != ["no-referrer"]:
+        raise ReleaseError("project page lacks the exact no-referrer policy")
+    if parser.active_elements:
+        raise ReleaseError(
+            "project page contains prohibited active elements: "
+            + ", ".join(sorted(parser.active_elements))
+        )
+    if parser.event_handlers:
+        raise ReleaseError(
+            "project page contains prohibited inline event handlers: "
+            + ", ".join(sorted(parser.event_handlers))
+        )
+
+
 def _verify_pdf(path: Path, phase: str, title: str) -> None:
     try:
         reader = PdfReader(str(path))
@@ -1070,6 +1118,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
 
     project = _read_utf8_artifact(output, "project/index.html", "project page")
     verify_project_links(output, set(paths))
+    verify_project_security(project)
     draft = receipt["phase"] == "draft"
     if ('name="robots" content="noindex,nofollow"' in project) != draft:
         raise ReleaseError("project-page robot policy does not match artifact phase")

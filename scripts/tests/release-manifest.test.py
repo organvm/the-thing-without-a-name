@@ -406,6 +406,11 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertIn("Draft - not for publication", project)
         self.assertIn("@media (prefers-reduced-motion:reduce)", project)
         self.assertIn("viewport-fit=cover", project)
+        self.assertIn(
+            f'http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}"',
+            project,
+        )
+        self.assertIn('name="referrer" content="no-referrer"', project)
         self.assertNotIn("<script", project)
         self.assertNotIn("sound is not scored to the image", project.lower())
         reference = self.manifest["installation"]["reference_contract"]
@@ -426,6 +431,14 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertIn("#evidence", hrefs)
         robots = [meta for meta in markup.metas if meta.get("name") == "robots"]
         self.assertEqual(robots[0]["content"], "noindex,nofollow")
+        policies = [
+            meta
+            for meta in markup.metas
+            if meta.get("http-equiv") == "Content-Security-Policy"
+        ]
+        self.assertEqual([meta.get("content") for meta in policies], [BUILD.PROJECT_CSP])
+        referrers = [meta for meta in markup.metas if meta.get("name") == "referrer"]
+        self.assertEqual([meta.get("content") for meta in referrers], ["no-referrer"])
 
     def test_project_resources_are_accessible_receipted_artifact_links(self) -> None:
         markup = Markup()
@@ -872,6 +885,17 @@ class AdversarialArtifactTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def rehash_project(self) -> None:
+        project = self.output / "project/index.html"
+        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in receipt["files"] if record["path"] == "project/index.html"
+        )
+        record["bytes"] = project.stat().st_size
+        record["sha256"] = CONTRACT.sha256(project)
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
     def test_tampered_pdf_digest_fails(self) -> None:
         with (self.output / BUILD.PDF_NAME).open("ab") as handle:
             handle.write(b"tamper")
@@ -929,15 +953,34 @@ class AdversarialArtifactTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        record = next(
-            record for record in receipt["files"] if record["path"] == "project/index.html"
-        )
-        record["bytes"] = project.stat().st_size
-        record["sha256"] = CONTRACT.sha256(project)
-        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing internal target"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_weakened_csp_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                BUILD.PROJECT_CSP,
+                "default-src * 'unsafe-inline' 'unsafe-eval'",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "content security policy"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_active_content_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                "<script>document.body.dataset.changed = 'true'</script></main>",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: script"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
