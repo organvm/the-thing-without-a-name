@@ -50,9 +50,11 @@ insurance, and public-operation decisions.
    `--emit runtime-plan`. Use its exact `configuration_sha256` in each v2
    wall-plug telemetry envelope, canonical observation receipt payload, and the
    three canonical setup/strike/restore receipt payloads. A sibling digest is not
-   sufficient: the validator recomputes every supplied receipt hash from the
-   payload. The restore binding may be `null` only while no restore result or
-   receipt is claimed.
+   sufficient: retain the exact newline-terminated JSONL telemetry bytes, and the
+   validator rehashes them and verifies their embedded `runtime-admitted`
+   configuration before recomputing every receipt hash from its payload. The
+   restore binding may be `null` only while no restore result or receipt is
+   claimed.
 
 Before transport or venue work, the portable control-plane preflight may be run:
 

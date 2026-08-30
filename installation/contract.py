@@ -2006,6 +2006,7 @@ def validate_evidence(
                     "spec_contract_sha256",
                     "configuration_sha256",
                     "events_sha256",
+                    "events_jsonl",
                 },
                 f"wall-plug proof {proof_id} runtime telemetry receipt",
             )
@@ -2033,6 +2034,89 @@ def validate_evidence(
             _sha256(
                 telemetry_receipt["events_sha256"],
                 f"wall-plug proof {proof_id} telemetry events digest",
+            )
+            events_jsonl = telemetry_receipt["events_jsonl"]
+            if not isinstance(events_jsonl, str) or not events_jsonl.endswith("\n"):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry must be newline-terminated JSONL"
+                )
+            events_bytes = events_jsonl.encode("utf-8")
+            if len(events_bytes) > 1_048_576:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry exceeds the receipt size limit"
+                )
+            if (
+                hashlib.sha256(events_bytes).hexdigest()
+                != telemetry_receipt["events_sha256"]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry events digest does not match supplied bytes"
+                )
+            event_records: list[dict[str, Any]] = []
+            for index, line in enumerate(events_jsonl.splitlines()):
+                if not line:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry contains a blank event"
+                    )
+                record = load_json_bytes(
+                    line.encode("utf-8"),
+                    f"wall-plug proof {proof_id} telemetry event {index}",
+                )
+                if (
+                    record.get("schema") != "danse.installation.telemetry.v1"
+                    or record.get("sequence") != index
+                    or isinstance(record.get("elapsed_seconds"), bool)
+                    or not isinstance(record.get("elapsed_seconds"), (int, float))
+                    or not math.isfinite(float(record["elapsed_seconds"]))
+                    or float(record["elapsed_seconds"]) < 0
+                    or not isinstance(record.get("event"), str)
+                    or not record["event"]
+                ):
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry event sequence is malformed"
+                    )
+                event_records.append(record)
+            admitted = [
+                record
+                for record in event_records
+                if record["event"] == "runtime-admitted"
+            ]
+            if len(admitted) != 1:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry must contain one runtime-admitted event"
+                )
+            admission = _exact_keys(
+                admitted[0],
+                {
+                    "schema",
+                    "sequence",
+                    "elapsed_seconds",
+                    "event",
+                    "spec_contract_sha256",
+                    "evidence_id",
+                    "evidence_sha256",
+                    "configuration_sha256",
+                    "release_manifest_sha256",
+                    "launcher_sha256",
+                },
+                f"wall-plug proof {proof_id} runtime-admitted event",
+            )
+            if (
+                admission["sequence"] != 0
+                or admission["spec_contract_sha256"]
+                != spec["identity"]["contract_sha256"]
+                or admission["evidence_id"] != value["evidence_id"]
+                or admission["configuration_sha256"] != configuration_sha256
+                or admission["release_manifest_sha256"]
+                != value["release"]["manifest_sha256"]
+                or admission["launcher_sha256"] != launcher["sha256"]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry bytes belong to another admitted physical configuration"
+                )
+            _sha256(
+                admission["evidence_sha256"],
+                f"wall-plug proof {proof_id} admitted evidence digest",
             )
             telemetry_sha = _receipt_sha(
                 proof["runtime_telemetry_sha256"],

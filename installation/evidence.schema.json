@@ -328,7 +328,8 @@
             "proof_id",
             "spec_contract_sha256",
             "configuration_sha256",
-            "events_sha256"
+            "events_sha256",
+            "events_jsonl"
           ],
           "properties": {
             "schema": {"const": "danse.installation.runtime-telemetry-receipt.v2"},
@@ -336,7 +337,8 @@
             "proof_id": {"type": "string", "minLength": 1},
             "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
             "configuration_sha256": {"$ref": "#/$defs/sha256"},
-            "events_sha256": {"$ref": "#/$defs/sha256"}
+            "events_sha256": {"$ref": "#/$defs/sha256"},
+            "events_jsonl": {"type": "string", "minLength": 1, "maxLength": 1048576}
           }
         },
         "runtime_telemetry_sha256": {"$ref": "#/$defs/sha256"},

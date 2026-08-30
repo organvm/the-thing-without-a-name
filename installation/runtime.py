@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import signal
 import stat
@@ -24,6 +25,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 try:
     from .contract import (
@@ -98,6 +100,35 @@ def probe_health(url: str, timeout: float) -> bool:
 
 def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
     """Reject obsolete or incomplete plan contracts before field access."""
+
+    def exact_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ContractError(f"installation runtime plan {label} is malformed")
+        return value
+
+    def nonempty(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ContractError(f"installation runtime plan {label} is empty")
+        return value
+
+    def sha256(value: Any, label: str) -> str:
+        result = nonempty(value, label)
+        if len(result) != 64 or any(
+            character not in "0123456789abcdef" for character in result
+        ):
+            raise ContractError(f"installation runtime plan {label} is not SHA-256")
+        return result
+
+    def number(value: Any, label: str, minimum: float = 0) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < minimum
+        ):
+            raise ContractError(f"installation runtime plan {label} is not numeric")
+        return float(value)
+
     if not isinstance(plan, dict) or plan.get("schema") != RUNTIME_PLAN_SCHEMA:
         raise ContractError("unknown installation runtime plan schema")
     required = {
@@ -124,13 +155,193 @@ def validate_runtime_plan_contract(plan: Any) -> dict[str, Any]:
         "release_manifest_sha256",
         "configuration_sha256",
     ):
-        value = plan[key]
+        sha256(plan[key], key)
+    nonempty(plan["evidence_id"], "evidence_id")
+
+    manifest = exact_object(
+        plan["release_manifest"], {"path", "content"}, "release_manifest"
+    )
+    canonical_relative_path(manifest["path"], "runtime manifest path")
+    manifest_content = nonempty(manifest["content"], "release_manifest.content")
+    if (
+        hashlib.sha256(manifest_content.encode("utf-8")).hexdigest()
+        != plan["release_manifest_sha256"]
+    ):
+        raise ContractError("installation runtime plan manifest digest drifted")
+
+    def release_record(value: Any, label: str) -> dict[str, Any]:
+        record = exact_object(value, {"path", "bytes", "sha256", "executable"}, label)
+        canonical_relative_path(record["path"], f"runtime {label} path")
         if (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
+            isinstance(record["bytes"], bool)
+            or not isinstance(record["bytes"], int)
+            or record["bytes"] < 0
         ):
-            raise ContractError(f"installation runtime plan {key} is not SHA-256")
+            raise ContractError(f"installation runtime plan {label} bytes is invalid")
+        sha256(record["sha256"], f"{label}.sha256")
+        if not isinstance(record["executable"], bool):
+            raise ContractError(
+                f"installation runtime plan {label} executable is invalid"
+            )
+        return record
+
+    files = plan["release_files"]
+    if not isinstance(files, list) or not files:
+        raise ContractError("installation runtime plan release_files is malformed")
+    records = [
+        release_record(record, f"release_files[{index}]")
+        for index, record in enumerate(files)
+    ]
+    paths = [record["path"] for record in records]
+    if len(set(paths)) != len(paths):
+        raise ContractError("installation runtime plan release paths are duplicated")
+    launcher = release_record(plan["launcher"], "launcher")
+    matching_launcher = [
+        record for record in records if record["path"] == launcher["path"]
+    ]
+    if len(matching_launcher) != 1 or matching_launcher[0] != launcher:
+        raise ContractError(
+            "installation runtime plan launcher is not in release_files"
+        )
+
+    argv = plan["argv"]
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(argument, str) and argument for argument in argv)
+        or argv[0] != launcher["path"]
+    ):
+        raise ContractError("installation runtime plan argv is malformed")
+
+    health_url = plan["health_url"]
+    if health_url is not None:
+        if not isinstance(health_url, str):
+            raise ContractError("installation runtime plan health_url is malformed")
+        try:
+            parsed = urlsplit(health_url)
+            port = parsed.port
+        except ValueError as exc:
+            raise ContractError(
+                "installation runtime plan health_url is malformed"
+            ) from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is None
+            or not 1 <= port <= 65535
+            or parsed.fragment
+        ):
+            raise ContractError("installation runtime plan health_url is unsafe")
+
+    river = exact_object(plan["river"], {"seed", "stream", "epoch_ms"}, "river")
+    for key, maximum in (
+        ("seed", 0xFFFFFFFF),
+        ("stream", 0xFFFFFFFF),
+        ("epoch_ms", 9_007_199_254_740_991),
+    ):
+        value = river[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= maximum
+        ):
+            raise ContractError(f"installation runtime plan river.{key} is invalid")
+
+    outputs = plan["outputs"]
+    if (
+        not isinstance(outputs, list)
+        or not outputs
+        or not all(isinstance(output, str) and output for output in outputs)
+        or len(set(outputs)) != len(outputs)
+    ):
+        raise ContractError("installation runtime plan outputs is malformed")
+
+    policy = exact_object(
+        plan["policy"],
+        {
+            "mode",
+            "persistent_host_service",
+            "single_approved_launcher",
+            "forbidden_host_mutations",
+            "health",
+            "recovery",
+        },
+        "policy",
+    )
+    if (
+        policy["mode"] != "foreground-supervisor"
+        or policy["persistent_host_service"] is not False
+        or policy["single_approved_launcher"] is not True
+        or not isinstance(policy["forbidden_host_mutations"], list)
+        or not all(
+            isinstance(item, str) and item
+            for item in policy["forbidden_host_mutations"]
+        )
+    ):
+        raise ContractError("installation runtime plan policy boundary is malformed")
+    health = exact_object(
+        policy["health"],
+        {
+            "probe_interval_seconds",
+            "startup_timeout_seconds",
+            "probe_timeout_seconds",
+            "max_consecutive_failures",
+        },
+        "policy.health",
+    )
+    for key in (
+        "probe_interval_seconds",
+        "startup_timeout_seconds",
+        "probe_timeout_seconds",
+    ):
+        number(health[key], f"policy.health.{key}", 0.001)
+    if (
+        isinstance(health["max_consecutive_failures"], bool)
+        or not isinstance(health["max_consecutive_failures"], int)
+        or health["max_consecutive_failures"] < 1
+    ):
+        raise ContractError(
+            "installation runtime plan policy.health.max_consecutive_failures is invalid"
+        )
+    recovery = exact_object(
+        policy["recovery"],
+        {
+            "max_restarts",
+            "window_seconds",
+            "stable_seconds",
+            "backoff_seconds",
+            "wall_plug_return_timeout_seconds",
+            "wall_plug_proofs_required",
+        },
+        "policy.recovery",
+    )
+    for key in (
+        "max_restarts",
+        "wall_plug_proofs_required",
+    ):
+        if (
+            isinstance(recovery[key], bool)
+            or not isinstance(recovery[key], int)
+            or recovery[key] < 0
+        ):
+            raise ContractError(
+                f"installation runtime plan policy.recovery.{key} is invalid"
+            )
+    for key in (
+        "window_seconds",
+        "stable_seconds",
+        "wall_plug_return_timeout_seconds",
+    ):
+        number(recovery[key], f"policy.recovery.{key}", 0.001)
+    backoff = recovery["backoff_seconds"]
+    if not isinstance(backoff, list) or len(backoff) < recovery["max_restarts"]:
+        raise ContractError(
+            "installation runtime plan policy.recovery.backoff_seconds is malformed"
+        )
+    for index, value in enumerate(backoff):
+        number(value, f"policy.recovery.backoff_seconds[{index}]")
     return plan
 
 

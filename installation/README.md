@@ -153,9 +153,14 @@ Every external wall-plug telemetry envelope and observation receipt, plus each
 setup/strike/restore receipt payload, must include the configuration digest
 computed from the exact venue, geometry, release manifest and launcher, hardware,
 calibration, runtime approval/arguments/health contract, river, and output set.
-Their supplied SHA-256 values are recomputed from those canonical payloads. A
-stale hash placed beside a new configuration therefore fails validation. Before
-any recovery or restore claim exists, the restore binding may remain `null`;
+The telemetry envelope must carry the exact newline-terminated JSONL bytes, not
+only their digest. The validator rehashes those bytes, validates their sequence,
+and requires exactly one leading `runtime-admitted` event whose configuration,
+spec, evidence, release, and launcher bindings match the admitted runtime. All
+other supplied SHA-256 values are recomputed from their canonical payloads. A
+stale telemetry stream or hash placed beside a new configuration therefore fails
+validation. Before any recovery or restore claim exists, the restore binding may
+remain `null`;
 `--phase runtime --emit runtime-plan` returns the exact `configuration_sha256`
 used to build the three telemetry/observation envelopes and restore receipts.
 

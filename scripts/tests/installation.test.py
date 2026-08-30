@@ -107,13 +107,35 @@ def refresh_configuration(evidence: dict, spec: dict, release_root: Path) -> dic
     evidence["restore_rehearsal"]["configuration_sha256"] = configuration_sha256
     for proof in evidence["wall_plug_proofs"]:
         proof["configuration_sha256"] = configuration_sha256
+        events_jsonl = (
+            json.dumps(
+                {
+                    "schema": "danse.installation.telemetry.v1",
+                    "sequence": 0,
+                    "elapsed_seconds": 0.0,
+                    "event": "runtime-admitted",
+                    "spec_contract_sha256": spec["identity"]["contract_sha256"],
+                    "evidence_id": evidence["evidence_id"],
+                    "evidence_sha256": digest(
+                        f"runtime-admission-evidence-{proof['id']}"
+                    ),
+                    "configuration_sha256": configuration_sha256,
+                    "release_manifest_sha256": evidence["release"]["manifest_sha256"],
+                    "launcher_sha256": file_digest(release_root / "bin/danse-launcher"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
         proof["runtime_telemetry_receipt"] = {
             "schema": "danse.installation.runtime-telemetry-receipt.v2",
             "evidence_id": evidence["evidence_id"],
             "proof_id": proof["id"],
             "spec_contract_sha256": spec["identity"]["contract_sha256"],
             "configuration_sha256": configuration_sha256,
-            "events_sha256": digest(f"events-{proof['id']}"),
+            "events_sha256": hashlib.sha256(events_jsonl.encode("utf-8")).hexdigest(),
+            "events_jsonl": events_jsonl,
         }
         proof["runtime_telemetry_sha256"] = canonical_sha256(
             proof["runtime_telemetry_receipt"]
@@ -365,6 +387,10 @@ class InstallationContractTest(unittest.TestCase):
         wall_plug = evidence_schema["$defs"]["wall_plug_proof"]
         self.assertIn("configuration_sha256", wall_plug["required"])
         self.assertIn("runtime_telemetry_receipt", wall_plug["required"])
+        self.assertIn(
+            "events_jsonl",
+            wall_plug["properties"]["runtime_telemetry_receipt"]["required"],
+        )
         self.assertEqual(
             wall_plug["properties"]["configuration_sha256"]["$ref"],
             "#/$defs/sha256",
@@ -884,6 +910,22 @@ class InstallationContractTest(unittest.TestCase):
                     release_root=release,
                 )
 
+            altered_telemetry_bytes = copy.deepcopy(evidence)
+            altered_telemetry_bytes["wall_plug_proofs"][0]["runtime_telemetry_receipt"][
+                "events_jsonl"
+            ] = altered_telemetry_bytes["wall_plug_proofs"][0][
+                "runtime_telemetry_receipt"
+            ]["events_jsonl"].replace("runtime-admitted", "runtime-diverted")
+            with self.assertRaisesRegex(
+                ContractError, "events digest does not match supplied bytes"
+            ):
+                validate_evidence(
+                    altered_telemetry_bytes,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
             relabeled_receipts = copy.deepcopy(evidence)
             relabeled_receipts["venue"]["id"] = "another-approved-venue"
             relabeled_configuration = physical_configuration_sha256(
@@ -893,11 +935,28 @@ class InstallationContractTest(unittest.TestCase):
             )
             for proof in relabeled_receipts["wall_plug_proofs"]:
                 proof["configuration_sha256"] = relabeled_configuration
+                proof["runtime_telemetry_receipt"]["configuration_sha256"] = (
+                    relabeled_configuration
+                )
+                proof["runtime_telemetry_sha256"] = canonical_sha256(
+                    proof["runtime_telemetry_receipt"]
+                )
+                proof["receipt_sha256"] = wall_plug_receipt_sha256(
+                    relabeled_receipts["evidence_id"], proof
+                )
             relabeled_receipts["restore_rehearsal"]["configuration_sha256"] = (
                 relabeled_configuration
             )
+            for phase in ("setup", "strike", "restore"):
+                relabeled_receipts["restore_rehearsal"][f"{phase}_receipt_sha256"] = (
+                    restore_phase_receipt_sha256(
+                        relabeled_receipts["evidence_id"],
+                        relabeled_receipts["restore_rehearsal"],
+                        phase,
+                    )
+                )
             with self.assertRaisesRegex(
-                ContractError, "telemetry belongs to another admitted"
+                ContractError, "telemetry bytes belong to another admitted"
             ):
                 validate_evidence(
                     relabeled_receipts,
@@ -958,13 +1017,35 @@ class InstallationContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             release = Path(temporary)
             make_release(release, self.spec)
-            plan = runtime_plan(evidence_for(self.spec, release), self.spec, release)
-            plan["schema"] = "danse.installation.runtime-plan.v1"
-            plan.pop("configuration_sha256")
-            output = io.StringIO()
-            self.assertEqual(supervise(plan, release, Telemetry(output)), 78)
-            records = [json.loads(line) for line in output.getvalue().splitlines()]
-            self.assertEqual(records[-1]["event"], "runtime-plan-invalid")
+            valid = runtime_plan(evidence_for(self.spec, release), self.spec, release)
+            cases = {
+                "obsolete": lambda plan: (
+                    plan.__setitem__("schema", "danse.installation.runtime-plan.v1"),
+                    plan.pop("configuration_sha256"),
+                ),
+                "empty-policy": lambda plan: plan.__setitem__("policy", {}),
+                "empty-health": lambda plan: plan["policy"].__setitem__("health", {}),
+                "empty-recovery": lambda plan: plan["policy"].__setitem__(
+                    "recovery", {}
+                ),
+                "empty-launcher": lambda plan: plan.__setitem__("launcher", {}),
+                "empty-river": lambda plan: plan.__setitem__("river", {}),
+                "invalid-outputs": lambda plan: plan.__setitem__("outputs", [None]),
+                "empty-manifest": lambda plan: plan.__setitem__("release_manifest", {}),
+                "empty-release-file": lambda plan: plan.__setitem__(
+                    "release_files", [{}]
+                ),
+            }
+            for name, mutate in cases.items():
+                with self.subTest(name=name):
+                    plan = copy.deepcopy(valid)
+                    mutate(plan)
+                    output = io.StringIO()
+                    self.assertEqual(supervise(plan, release, Telemetry(output)), 78)
+                    records = [
+                        json.loads(line) for line in output.getvalue().splitlines()
+                    ]
+                    self.assertEqual(records[-1]["event"], "runtime-plan-invalid")
 
     def test_foreground_supervisor_exhausts_a_bounded_restart_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
