@@ -1402,7 +1402,7 @@ def verify_artifact(
     expected_commit: str | None = None,
     *,
     source_root: Path = ROOT,
-    allow_worktree_manifest: bool = True,
+    allow_worktree_manifest: bool = False,
 ) -> dict:
     output = output.absolute()
     if output.is_symlink() or not output.is_dir():
@@ -1751,7 +1751,7 @@ def build(
         output,
         commit,
         source_root=root,
-        allow_worktree_manifest=True,
+        allow_worktree_manifest=not require_git_source,
     )
 
 

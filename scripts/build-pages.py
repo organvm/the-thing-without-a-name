@@ -262,6 +262,7 @@ def public_release_files(
     expected_commit: str,
     *,
     source_root: Path = ROOT,
+    allow_worktree_manifest: bool = False,
 ) -> tuple[dict[str, tuple[Path, dict]], dict]:
     """Verify one public release artifact and select only declared public outputs."""
     release_artifact = release_artifact.absolute()
@@ -274,7 +275,7 @@ def public_release_files(
             release_artifact,
             expected_commit,
             source_root=source_root,
-            allow_worktree_manifest=True,
+            allow_worktree_manifest=allow_worktree_manifest,
         )
     except Exception as exc:
         raise ArtifactError(f"public release artifact failed verification: {exc}") from exc
@@ -703,6 +704,7 @@ def build(
             release_artifact,
             commit,
             source_root=release_source_root or root,
+            allow_worktree_manifest=not require_git_source,
         )
     collisions = set(files) & set(release_files)
     if collisions:

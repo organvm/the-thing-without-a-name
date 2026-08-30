@@ -65,6 +65,16 @@ def load_release_builder():
 BUILD = load_release_builder()
 
 
+def verify_fixture_artifact(
+    output: Path,
+    expected_commit: str | None = TEST_COMMIT,
+    **kwargs,
+) -> dict:
+    """Verify a synthetic non-Git fixture through the explicit fallback rail."""
+    kwargs.setdefault("allow_worktree_manifest", True)
+    return BUILD.verify_artifact(output, expected_commit, **kwargs)
+
+
 def load_pages_builder():
     path = ROOT / "scripts/build-pages.py"
     spec = importlib.util.spec_from_file_location("danse_release_pages_boundary", path)
@@ -903,12 +913,12 @@ class AdversarialArtifactTest(unittest.TestCase):
         with (self.output / BUILD.PDF_NAME).open("ab") as handle:
             handle.write(b"tamper")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "digest mismatch"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_unrecorded_file_fails(self) -> None:
         (self.output / "private.txt").write_text("not allowlisted\n")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "inventory mismatch"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_receipt_omitting_required_output_fails_before_post_inventory_reads(self) -> None:
         for relative in (
@@ -927,7 +937,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                 ]
                 receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
                 with self.assertRaisesRegex(CONTRACT.ReleaseError, "omits required outputs"):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_self_rehashed_invalid_utf8_output_fails_as_release_error(self) -> None:
         for relative in ("project/index.html", "accessibility/captions.en.vtt"):
@@ -945,7 +955,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                 record["sha256"] = CONTRACT.sha256(path)
                 receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
                 with self.assertRaisesRegex(CONTRACT.ReleaseError, "not readable UTF-8"):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_receipted_project_link_to_source_manifest_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -958,7 +968,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing internal target"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_weakened_csp_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -971,7 +981,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "content security policy"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_active_content_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -984,7 +994,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: script"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_self_closing_event_handler_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -997,7 +1007,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "inline event handlers: onmouseover"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_meta_refresh_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1010,7 +1020,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTP-equivalent metadata: refresh"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_inert_security_metadata_fails(self) -> None:
         for container in ("template", "noscript"):
@@ -1036,7 +1046,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                     CONTRACT.ReleaseError,
                     f"prohibited active elements: {container}",
                 ):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_self_rehashed_project_with_nested_security_metadata_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1051,7 +1061,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_cannot_reenter_head_after_body(self) -> None:
         project = self.output / "project/index.html"
@@ -1065,7 +1075,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_cannot_reenter_head_after_paragraph(self) -> None:
         project = self.output / "project/index.html"
@@ -1080,7 +1090,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_cannot_reenter_head_after_text(self) -> None:
         project = self.output / "project/index.html"
@@ -1095,7 +1105,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-whitespace head text"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_cannot_place_head_after_body(self) -> None:
         project = self.output / "project/index.html"
@@ -1107,7 +1117,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "misordered head start"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_image_input_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1121,7 +1131,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: input"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_unmanifested_image_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1134,7 +1144,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: img"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_referrer_policy_override_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1147,7 +1157,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "referrer-policy overrides"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_resource_hint_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1160,7 +1170,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_external_open_graph_image_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1177,7 +1187,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             CONTRACT.ReleaseError,
             "prohibited property metadata: og:image",
         ):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_external_canonical_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1190,7 +1200,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_pre_csp_html_style_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1204,7 +1214,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "opening document attributes"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_cannot_change_public_claims(self) -> None:
         attacks = {
@@ -1240,7 +1250,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                     CONTRACT.ReleaseError,
                     "does not reproduce the source-manifest public claims",
                 ):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_coherently_rehashed_social_claim_still_fails_source_binding(self) -> None:
         root = fixture_root(self.base / "social-source")
@@ -1292,7 +1302,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             CONTRACT.ReleaseError,
             "project security binding drifted from its source manifest",
         ):
-            BUILD.verify_artifact(
+            verify_fixture_artifact(
                 output,
                 TEST_COMMIT,
                 source_root=root,
@@ -1312,7 +1322,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_late_csp_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -1324,7 +1334,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_symlinked_project_file_fails(self) -> None:
@@ -1334,11 +1344,18 @@ class AdversarialArtifactTest(unittest.TestCase):
         project.unlink()
         project.symlink_to(outside)
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing or non-regular"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_wrong_source_commit_fails(self) -> None:
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "does not match expected"):
-            BUILD.verify_artifact(self.output, "b" * 40)
+            verify_fixture_artifact(self.output, "b" * 40)
+
+    def test_nonexistent_source_commit_never_uses_worktree_manifest_by_default(self) -> None:
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "cannot resolve release manifest at source commit",
+        ):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_noncanonical_manifest_binding_fails(self) -> None:
         receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
@@ -1346,7 +1363,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         receipt["release"]["manifest"]["path"] = "release/other-manifest.json"
         receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-canonical release manifest"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_manifest_digest_cannot_leave_source_commit(self) -> None:
         receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
@@ -1357,7 +1374,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             CONTRACT.ReleaseError,
             "manifest digest does not match its source commit",
         ):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_duplicate_receipt_key_fails(self) -> None:
         receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
@@ -1366,7 +1383,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "duplicate key 'schema'"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
 
 if __name__ == "__main__":

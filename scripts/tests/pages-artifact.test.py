@@ -400,6 +400,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
             release,
             TEST_COMMIT,
             source_root=release_source,
+            allow_worktree_manifest=True,
         )
         root_index = (self.root / "index.html").read_bytes()
         manifest = PAGES.build(
