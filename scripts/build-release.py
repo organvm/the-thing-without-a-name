@@ -104,20 +104,57 @@ class _ProjectMarkup(HTMLParser):
         self.duplicate_attributes: set[str] = set()
         self.referrer_policy_overrides: set[str] = set()
         self.link_elements: list[dict[str, str | None]] = []
+        self.doctypes = 0
+        self.html_starts = 0
+        self.html_ends = 0
         self.in_head = False
         self.head_starts = 0
         self.head_ends = 0
         self.head_stack: list[str] = []
+        self.in_body = False
+        self.body_starts = 0
+        self.body_ends = 0
         self.structure_errors: set[str] = set()
         self.head_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
-        if tag == "head":
+        if tag == "html":
+            self.html_starts += 1
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts
+                or self.body_starts
+            ):
+                self.structure_errors.add("misordered html start")
+        elif tag == "head":
             self.head_starts += 1
-            if self.in_head:
-                self.structure_errors.add("nested head")
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts != 1
+                or self.head_ends
+                or self.body_starts
+                or self.in_body
+                or self.in_head
+            ):
+                self.structure_errors.add("misordered head start")
             self.in_head = True
+        elif tag == "body":
+            self.body_starts += 1
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts != 1
+                or self.head_ends != 1
+                or self.in_head
+                or self.body_starts != 1
+                or self.body_ends
+                or self.in_body
+            ):
+                self.structure_errors.add("misordered body start")
+            self.in_body = True
         elif self.in_head:
             if not self.head_stack:
                 self.head_elements.append((tag, values))
@@ -125,6 +162,8 @@ class _ProjectMarkup(HTMLParser):
                     self.structure_errors.add(f"prohibited head child {tag}")
             if tag not in HTML_VOID_ELEMENTS:
                 self.head_stack.append(tag)
+        elif not self.in_body:
+            self.structure_errors.add(f"element outside head or body: {tag}")
         element_id = values.get("id")
         if element_id:
             self.ids.add(element_id)
@@ -142,6 +181,7 @@ class _ProjectMarkup(HTMLParser):
             "form",
             "iframe",
             "img",
+            "input",
             "math",
             "noscript",
             "object",
@@ -177,7 +217,18 @@ class _ProjectMarkup(HTMLParser):
             self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "head":
+        if tag == "html":
+            self.html_ends += 1
+            if (
+                self.html_starts != 1
+                or self.html_ends != 1
+                or self.in_head
+                or self.in_body
+                or self.head_ends != 1
+                or self.body_ends != 1
+            ):
+                self.structure_errors.add("misordered html end")
+        elif tag == "head":
             self.head_ends += 1
             if not self.in_head:
                 self.structure_errors.add("unmatched head end")
@@ -185,15 +236,38 @@ class _ProjectMarkup(HTMLParser):
                 self.structure_errors.add("unclosed head descendant")
                 self.head_stack.clear()
             self.in_head = False
+        elif tag == "body":
+            self.body_ends += 1
+            if not self.in_body or self.body_ends != 1:
+                self.structure_errors.add("misordered body end")
+            self.in_body = False
         elif self.in_head and tag not in HTML_VOID_ELEMENTS:
             if not self.head_stack or self.head_stack[-1] != tag:
                 self.structure_errors.add(f"mismatched head descendant {tag}")
             else:
                 self.head_stack.pop()
+        elif not self.in_body:
+            self.structure_errors.add(f"element end outside head or body: {tag}")
 
     def handle_data(self, data: str) -> None:
         if self.in_head and not self.head_stack and data.strip():
             self.structure_errors.add("non-whitespace head text")
+        elif not self.in_head and not self.in_body and data.strip():
+            self.structure_errors.add("text outside head or body")
+
+    def handle_decl(self, decl: str) -> None:
+        self.doctypes += 1
+        if (
+            decl.lower() != "doctype html"
+            or self.doctypes != 1
+            or self.html_starts
+            or self.head_starts
+            or self.body_starts
+        ):
+            self.structure_errors.add("invalid or misordered doctype")
+
+    def handle_pi(self, data: str) -> None:
+        self.structure_errors.add("processing instruction")
 
 
 def _h(value: object) -> str:
@@ -1045,9 +1119,15 @@ def verify_project_security(project: str) -> None:
             + ", ".join(sorted(parser.active_elements))
         )
     if (
-        parser.head_starts != 1
+        parser.doctypes != 1
+        or parser.html_starts != 1
+        or parser.html_ends != 1
+        or parser.head_starts != 1
         or parser.head_ends != 1
         or parser.in_head
+        or parser.body_starts != 1
+        or parser.body_ends != 1
+        or parser.in_body
         or parser.structure_errors
     ):
         details = ", ".join(sorted(parser.structure_errors)) or "head count"

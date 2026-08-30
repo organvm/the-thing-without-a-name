@@ -524,6 +524,14 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">'
                 "</main>",
             ),
+            "head-after-body": lambda value: value.replace(
+                "<head>", "<body></body><head>", 1
+            ),
+            "image-input": lambda value: value.replace(
+                "</main>",
+                '<input type="image" alt="unmanifested" '
+                'src="https://attacker.example/pixel.png"></main>',
+            ),
         }
         for label, attack in attacks.items():
             with self.subTest(attack=label):

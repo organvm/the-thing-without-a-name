@@ -1097,6 +1097,32 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-whitespace head text"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_self_rehashed_project_cannot_place_head_after_body(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "<head>", "<body></body>\n<head>", 1
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "misordered head start"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_image_input_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<input type="image" alt="unmanifested" '
+                'src="https://attacker.example/pixel.png"></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: input"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
     def test_self_rehashed_project_with_unmanifested_image_fails(self) -> None:
         project = self.output / "project/index.html"
         project.write_text(
