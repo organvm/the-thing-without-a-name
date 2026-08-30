@@ -1317,7 +1317,12 @@ def _validate_audio_use_profiles(
         ]
 
     package_rules = {rule["id"]: rule for rule in document.get("package_rules", [])}
-    for rule_id in ("moving-image", "score-source", "audio-render-receipt"):
+    for rule_id in (
+        "moving-image",
+        "score-source",
+        "audio-render-receipt",
+        "score-motion-evidence",
+    ):
         rule = package_rules.get(rule_id)
         if rule is not None and audio_requirements(rule) != list(COMPETITION_AUDIO_REQUIREMENTS):
             errors.append(f"package rule {rule_id} does not require the exact competition audio rights layers")
@@ -1583,6 +1588,7 @@ def validate_document(
         "origin-still",
         "score-source",
         "audio-render-receipt",
+        "score-motion-evidence",
     ):
         if required_rule not in package_rule_ids:
             errors.append(f"required package rule is missing: {required_rule}")
@@ -2675,6 +2681,7 @@ def validate_package(
         "origin-still",
         "score-source",
         "audio-render-receipt",
+        "score-motion-evidence",
     ):
         if required_rule not in rule_ids:
             blockers.append(f"rights register is missing required package rule {required_rule}")

@@ -44,6 +44,24 @@
         }
       }
     },
+    "packageSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "package-approver" } } }
+      ]
+    },
+    "uploadedSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "upload-account-owner" } } }
+      ]
+    },
+    "submittedSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "submission-account-owner" } } }
+      ]
+    },
     "packageBinding": {
       "type": "object",
       "additionalProperties": false,
@@ -101,15 +119,24 @@
         }
       }
     },
-    "priorReceipt": {
+    "packagePriorReceipt": {
       "type": "object",
       "additionalProperties": false,
       "required": ["phase", "path", "sha256", "receipt_id"],
       "properties": {
-        "phase": { "enum": ["package", "uploaded"] },
-        "path": {
-          "enum": ["receipts/package.json", "receipts/uploaded.json"]
-        },
+        "phase": { "const": "package" },
+        "path": { "const": "receipts/package.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "uploadedPriorReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "uploaded" },
+        "path": { "const": "receipts/uploaded.json" },
         "sha256": { "$ref": "#/$defs/digest" },
         "receipt_id": { "$ref": "#/$defs/typedId" }
       }
@@ -162,7 +189,7 @@
         "schema": { "const": "danse.submission.package.v1" },
         "receipt_id": { "$ref": "#/$defs/typedId" },
         "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
-        "signer": { "$ref": "#/$defs/signer" },
+        "signer": { "$ref": "#/$defs/packageSigner" },
         "package": { "$ref": "#/$defs/packageBinding" },
         "opportunity": { "$ref": "#/$defs/opportunityBinding" },
         "deadline": { "$ref": "#/$defs/deadlineBinding" },
@@ -190,13 +217,13 @@
         "schema": { "const": "danse.submission.uploaded.v1" },
         "receipt_id": { "$ref": "#/$defs/typedId" },
         "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
-        "signer": { "$ref": "#/$defs/signer" },
+        "signer": { "$ref": "#/$defs/uploadedSigner" },
         "package": { "$ref": "#/$defs/packageBinding" },
         "opportunity": { "$ref": "#/$defs/opportunityBinding" },
         "deadline": { "$ref": "#/$defs/deadlineBinding" },
         "attestation": { "$ref": "#/$defs/attestationBinding" },
         "assertions": { "$ref": "#/$defs/assertionBinding" },
-        "prior_receipt": { "$ref": "#/$defs/priorReceipt" },
+        "prior_receipt": { "$ref": "#/$defs/packagePriorReceipt" },
         "upload": { "$ref": "#/$defs/upload" }
       }
     },
@@ -220,32 +247,55 @@
         "schema": { "const": "danse.submission.submitted.v1" },
         "receipt_id": { "$ref": "#/$defs/typedId" },
         "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
-        "signer": { "$ref": "#/$defs/signer" },
+        "signer": { "$ref": "#/$defs/submittedSigner" },
         "package": { "$ref": "#/$defs/packageBinding" },
         "opportunity": { "$ref": "#/$defs/opportunityBinding" },
         "deadline": { "$ref": "#/$defs/deadlineBinding" },
         "attestation": { "$ref": "#/$defs/attestationBinding" },
         "assertions": { "$ref": "#/$defs/assertionBinding" },
-        "prior_receipt": { "$ref": "#/$defs/priorReceipt" },
+        "prior_receipt": { "$ref": "#/$defs/uploadedPriorReceipt" },
         "submission": { "$ref": "#/$defs/submission" }
       }
     },
-    "phaseReceiptRow": {
+    "packageReceiptRow": {
       "type": "object",
       "additionalProperties": false,
       "required": ["phase", "path", "sha256", "receipt_id"],
       "properties": {
-        "phase": { "enum": ["package", "uploaded", "submitted"] },
-        "path": {
-          "enum": [
-            "receipts/package.json",
-            "receipts/uploaded.json",
-            "receipts/submitted.json"
-          ]
-        },
+        "phase": { "const": "package" },
+        "path": { "const": "receipts/package.json" },
         "sha256": { "$ref": "#/$defs/digest" },
         "receipt_id": { "$ref": "#/$defs/typedId" }
       }
+    },
+    "uploadedReceiptRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "uploaded" },
+        "path": { "const": "receipts/uploaded.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "submittedReceiptRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "submitted" },
+        "path": { "const": "receipts/submitted.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "phaseReceiptRow": {
+      "oneOf": [
+        { "$ref": "#/$defs/packageReceiptRow" },
+        { "$ref": "#/$defs/uploadedReceiptRow" },
+        { "$ref": "#/$defs/submittedReceiptRow" }
+      ]
     },
     "validationReceipt": {
       "type": "object",
@@ -279,7 +329,55 @@
           "maxItems": 1,
           "items": { "type": "string", "minLength": 1 }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "phase": { "const": "package" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [{ "$ref": "#/$defs/packageReceiptRow" }],
+                "items": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "uploaded" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  { "$ref": "#/$defs/packageReceiptRow" },
+                  { "$ref": "#/$defs/uploadedReceiptRow" }
+                ],
+                "items": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "submitted" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 3,
+                "maxItems": 3,
+                "prefixItems": [
+                  { "$ref": "#/$defs/packageReceiptRow" },
+                  { "$ref": "#/$defs/uploadedReceiptRow" },
+                  { "$ref": "#/$defs/submittedReceiptRow" }
+                ],
+                "items": false
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

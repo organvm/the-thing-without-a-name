@@ -2385,6 +2385,13 @@ class DeliveryContractTest(unittest.TestCase):
             package = out / "package"
             package.mkdir(parents=True)
             old_sound = {"bank_fingerprint": "old-bank", "sources": ["IMG_0226.MOV", "IMG_0227.MOV"]}
+            evidence = package / DELIVER.SCORE_MOTION_EVIDENCE_ITEM
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text('{"schema":"danse.evidence.score-to-motion.production.v1"}\n')
+            evidence_reference = {
+                "path": DELIVER.SCORE_MOTION_EVIDENCE_ITEM,
+                "sha256": DELIVER.digest(evidence),
+            }
             (package / "manifest.json").write_text(
                 json.dumps(
                     {
@@ -2394,7 +2401,14 @@ class DeliveryContractTest(unittest.TestCase):
                         "t1": SPAN["t1"],
                         "duration": SPAN["duration"],
                         "sound": old_sound,
-                        "items": [],
+                        "score_motion_evidence": evidence_reference,
+                        "items": [
+                            {
+                                "name": DELIVER.SCORE_MOTION_EVIDENCE_ITEM,
+                                "bytes": evidence.stat().st_size,
+                                "sha256": evidence_reference["sha256"],
+                            }
+                        ],
                     }
                 )
             )
@@ -2421,6 +2435,38 @@ class DeliveryContractTest(unittest.TestCase):
                 self.assertEqual(DELIVER.main(), 0)
             manifest = json.loads((package / "manifest.json").read_text())
             self.assertEqual(manifest["sound"], old_sound)
+            self.assertEqual(manifest["score_motion_evidence"], evidence_reference)
+
+    def test_prior_score_motion_reference_rejects_symlinked_ancestors(self) -> None:
+        for ancestor in ("provenance", "provenance/score-to-motion"):
+            with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                package = root / "package"
+                package.mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                receipt = outside / "score-to-motion-production.json"
+                receipt.write_text('{"schema":"danse.evidence.score-to-motion.production.v1"}\n')
+                digest = DELIVER.digest(receipt)
+                linked = package / ancestor
+                linked.parent.mkdir(parents=True, exist_ok=True)
+                linked.symlink_to(outside, target_is_directory=True)
+                previous = {
+                    "score_motion_evidence": {
+                        "path": DELIVER.SCORE_MOTION_EVIDENCE_ITEM,
+                        "sha256": digest,
+                    }
+                }
+                items = {
+                    DELIVER.SCORE_MOTION_EVIDENCE_ITEM: {
+                        "name": DELIVER.SCORE_MOTION_EVIDENCE_ITEM,
+                        "bytes": receipt.stat().st_size,
+                        "sha256": digest,
+                    }
+                }
+                self.assertIsNone(
+                    DELIVER.prior_score_motion_evidence(package, previous, items)
+                )
 
     def test_reused_media_without_producer_receipt_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3829,11 +3875,72 @@ class DeliveryContractTest(unittest.TestCase):
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp)
-            build_submission_receipt_chain(package, reg, through="package")
+            build_submission_receipt_chain(package, reg, through="submitted")
             receipt = json.loads((package / CHECK.PHASE_RECEIPTS["package"]).read_text())
             self.assertEqual(CHECK.receipt_schema_errors(receipt, "package receipt"), [])
             receipt["unexpected"] = True
             self.assertTrue(CHECK.receipt_schema_errors(receipt, "package receipt"))
+
+            uploaded = json.loads((package / CHECK.PHASE_RECEIPTS["uploaded"]).read_text())
+            self.assertEqual(CHECK.receipt_schema_errors(uploaded, "uploaded receipt"), [])
+            uploaded["signer"]["role"] = CHECK.PHASE_SIGNER_ROLES["submitted"]
+            self.assertTrue(CHECK.receipt_schema_errors(uploaded, "uploaded receipt"))
+            uploaded["signer"]["role"] = CHECK.PHASE_SIGNER_ROLES["uploaded"]
+            uploaded["prior_receipt"]["phase"] = "uploaded"
+            uploaded["prior_receipt"]["path"] = CHECK.PHASE_RECEIPTS["uploaded"]
+            self.assertTrue(CHECK.receipt_schema_errors(uploaded, "uploaded receipt"))
+
+            submitted = json.loads((package / CHECK.PHASE_RECEIPTS["submitted"]).read_text())
+            self.assertEqual(CHECK.receipt_schema_errors(submitted, "submitted receipt"), [])
+            submitted["prior_receipt"]["phase"] = "package"
+            submitted["prior_receipt"]["path"] = CHECK.PHASE_RECEIPTS["package"]
+            self.assertTrue(CHECK.receipt_schema_errors(submitted, "submitted receipt"))
+
+            schema = json.loads((ROOT / "submission/receipt.schema.json").read_text())
+            row_validator = CHECK.jsonschema.Draft202012Validator(
+                {"$ref": "#/$defs/phaseReceiptRow", "$defs": schema["$defs"]}
+            )
+            mismatched_row = {
+                "phase": "package",
+                "path": CHECK.PHASE_RECEIPTS["uploaded"],
+                "sha256": "0" * 64,
+                "receipt_id": "package-receipt-001",
+            }
+            self.assertTrue(list(row_validator.iter_errors(mismatched_row)))
+
+            rows = [
+                {
+                    "phase": phase,
+                    "path": CHECK.PHASE_RECEIPTS[phase],
+                    "sha256": str(index) * 64,
+                    "receipt_id": f"{phase}-receipt-001",
+                }
+                for index, phase in enumerate(CHECK.PHASES, start=1)
+            ]
+            validation_receipt = {
+                "schema": CHECK.DONE_RECEIPT_SCHEMA,
+                "scope": CHECK.DONE_RECEIPT_SCOPE,
+                "phase": "submitted",
+                "validated_at": "2026-08-30T05:00:00Z",
+                "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                "package": {
+                    "manifest": "manifest.json",
+                    "manifest_sha256": "4" * 64,
+                    "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                },
+                "phase_receipts": rows,
+                "predicates": ["python3 submission/check.py --package package --phase submitted"],
+            }
+            validation_validator = CHECK.jsonschema.Draft202012Validator(
+                {"$ref": "#/$defs/validationReceipt", "$defs": schema["$defs"]}
+            )
+            self.assertEqual(list(validation_validator.iter_errors(validation_receipt)), [])
+            short_chain = copy.deepcopy(validation_receipt)
+            short_chain["phase_receipts"].pop()
+            self.assertTrue(list(validation_validator.iter_errors(short_chain)))
+            reversed_chain = copy.deepcopy(validation_receipt)
+            reversed_chain["phase_receipts"].reverse()
+            self.assertTrue(list(validation_validator.iter_errors(reversed_chain)))
 
             schema_path = package / "invalid-receipt.schema.json"
             schema_path.write_text('{"$schema":"https://json-schema.org/draft/2020-12/schema","type":5}\n')
@@ -5737,7 +5844,7 @@ class DeliveryContractTest(unittest.TestCase):
                             "passage": SPAN["passage"],
                             "t0": SPAN["t0"],
                             "t1": SPAN["t1"],
-                            "duration_seconds": SPAN["duration"],
+                            "duration_seconds": SPAN["duration"] + 0.0000005,
                         },
                     }
                 )
@@ -5777,6 +5884,20 @@ class DeliveryContractTest(unittest.TestCase):
             self.assertEqual(outside.read_text(), "must remain unchanged\n")
             self.assertEqual(outside.stat().st_ino, shared_inode)
             self.assertNotEqual(linked_sample.stat().st_ino, shared_inode)
+
+            stale = json.loads(receipt.read_text())
+            stale["span"]["duration_seconds"] = SPAN["duration"] + 0.000002
+            receipt.write_text(json.dumps(stale) + "\n")
+            with (
+                mock.patch.object(DELIVER, "SCORE_MOTION_EVIDENCE", receipt),
+                mock.patch.object(DELIVER, "score_motion_contract", return_value=contract),
+                self.assertRaisesRegex(SystemExit, "different package span"),
+            ):
+                DELIVER.stage_score_motion_evidence(
+                    package,
+                    SPAN,
+                    SUBMISSION_REPOSITORY_HEAD,
+                )
 
     def test_score_motion_staging_rejects_every_symlink_ancestor(self) -> None:
         for attack in ("provenance", "nested"):

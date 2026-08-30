@@ -104,7 +104,7 @@ NODE_SETUP = r"""
   import { validate as validateChoreography, poseAt } from './engine/choreography.js';
   import { state } from './engine/clock.js';
   import { step } from './engine/engine.js';
-  import { captureSpan, fixedPassageTiming, validate as validateProgram } from './engine/program.js';
+  import { captureSpan, fixedPassageTiming, passageAt, validate as validateProgram } from './engine/program.js';
   import { validate as validateScore } from './engine/score.js';
 
   const scoreBytes = fs.readFileSync('music/score.json');
@@ -609,7 +609,8 @@ class ChoreographyContractTest(unittest.TestCase):
             NODE_SETUP
             + """
           const timing = fixedPassageTiming(score.time.duration_seconds);
-          const naturalEdge = 312.54005199847745;
+          const firstNaturalPassage = passageAt(program, seed, 0);
+          const naturalEdge = firstNaturalPassage.t0 + firstNaturalPassage.seconds;
           const moments = [naturalEdge + 1 / 30, score.time.duration_seconds - 1 / 30];
           const states = moments.map((at) => step(corpus, seed, at, program, {timing}).state);
           const boundary = step(corpus, seed, score.time.duration_seconds, program, {timing}).state;

@@ -39,6 +39,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -121,6 +122,7 @@ PRODUCTION_RECEIPT = "provenance/production.json"
 PRODUCER_RECEIPTS = "provenance/producer-receipts"
 SCORE_MOTION_EVIDENCE_DIR = "provenance/score-to-motion"
 SCORE_MOTION_EVIDENCE_ITEM = f"{SCORE_MOTION_EVIDENCE_DIR}/score-to-motion-production.json"
+SCORE_MOTION_RECEIPT_MAX_BYTES = 4 << 20
 PASSAGE_SELECTORS = {"master", "derived", "reel", "stills"}
 FIXED_WINDOW_ITEMS = {"midnight-moment.mov", "trailer.mp4", REEL_ITEM}
 
@@ -1067,6 +1069,113 @@ def safe_score_motion_directory(package: Path, directory: Path) -> Path:
     return current
 
 
+def prior_score_motion_evidence(
+    package: Path,
+    previous: dict,
+    items: dict[str, dict],
+) -> dict | None:
+    """Retain one prior evidence reference only from stable in-package bytes."""
+    reference = previous.get("score_motion_evidence")
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"path", "sha256"}
+        or reference.get("path") != SCORE_MOTION_EVIDENCE_ITEM
+        or not isinstance(reference.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])
+    ):
+        return None
+    item = items.get(SCORE_MOTION_EVIDENCE_ITEM)
+    if not isinstance(item, dict):
+        return None
+
+    common_flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+    descriptors: list[int] = []
+    directory_edges: list[tuple[int, str, os.stat_result]] = []
+    try:
+        root_fd = os.open(package, directory_flags)
+        descriptors.append(root_fd)
+        root_info = os.fstat(root_fd)
+        named_root = os.stat(package, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or (root_info.st_dev, root_info.st_ino) != (named_root.st_dev, named_root.st_ino)
+        ):
+            return None
+
+        parent_fd = root_fd
+        parts = PurePosixPath(SCORE_MOTION_EVIDENCE_ITEM).parts
+        for part in parts[:-1]:
+            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            descriptors.append(child_fd)
+            child_info = os.fstat(child_fd)
+            if not stat.S_ISDIR(child_info.st_mode):
+                return None
+            directory_edges.append((parent_fd, part, child_info))
+            parent_fd = child_fd
+
+        receipt_fd = os.open(parts[-1], os.O_RDONLY | common_flags, dir_fd=parent_fd)
+        descriptors.append(receipt_fd)
+        before = os.fstat(receipt_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > SCORE_MOTION_RECEIPT_MAX_BYTES
+        ):
+            return None
+        receipt_digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(
+                receipt_fd,
+                min(1 << 20, SCORE_MOTION_RECEIPT_MAX_BYTES + 1 - copied),
+            )
+            if not block:
+                break
+            receipt_digest.update(block)
+            copied += len(block)
+            if copied > SCORE_MOTION_RECEIPT_MAX_BYTES:
+                return None
+        after = os.fstat(receipt_fd)
+
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+        if identity(before) != identity(after) or copied != after.st_size:
+            return None
+        named_receipt = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if identity(after) != identity(named_receipt):
+            return None
+        for ancestor_fd, name, opened in directory_edges:
+            named = os.stat(name, dir_fd=ancestor_fd, follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino, opened.st_mode) != (
+                named.st_dev,
+                named.st_ino,
+                named.st_mode,
+            ):
+                return None
+        digest_value = receipt_digest.hexdigest()
+        if (
+            digest_value != reference["sha256"]
+            or item.get("sha256") != digest_value
+            or item.get("bytes") != copied
+        ):
+            return None
+        return dict(reference)
+    except OSError:
+        return None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def prune_score_motion_evidence(destination_root: Path, expected: set[str]) -> None:
     """Make the owned evidence subtree equal the current graph, never a union."""
     expected_directories = {
@@ -1286,7 +1395,23 @@ def stage_score_motion_evidence(
         "t1": span["t1"],
         "duration_seconds": span["duration"],
     }
-    if receipt.get("repository_head") != repository_head or receipt.get("span") != expected_span:
+    receipt_span = receipt.get("span")
+    comparable_span = isinstance(receipt_span, dict) and set(receipt_span) == set(expected_span)
+    if comparable_span:
+        comparable_span = all(
+            receipt_span[key] == expected_span[key]
+            for key in expected_span
+            if key != "duration_seconds"
+        )
+    receipt_duration = receipt_span.get("duration_seconds") if isinstance(receipt_span, dict) else None
+    if (
+        not isinstance(receipt_duration, (int, float))
+        or isinstance(receipt_duration, bool)
+        or not math.isfinite(receipt_duration)
+        or abs(receipt_duration - expected_span["duration_seconds"]) > 1e-6
+    ):
+        comparable_span = False
+    if receipt.get("repository_head") != repository_head or not comparable_span:
         raise SystemExit("production score-to-motion evidence belongs to a different package span or Git HEAD")
     source_root = SCORE_MOTION_EVIDENCE.parent.resolve(strict=True)
     sources = contract.evidence_artifact_paths(SCORE_MOTION_EVIDENCE)
@@ -1301,6 +1426,12 @@ def stage_score_motion_evidence(
     prune_score_motion_evidence(destination_root, expected)
     require_score_motion_evidence_census(destination_root, expected)
     receipt_copy = package / SCORE_MOTION_EVIDENCE_ITEM
+    staged_errors = contract.production_receipt_errors(receipt_copy)
+    if staged_errors:
+        raise SystemExit(
+            "staged production score-to-motion evidence is inconsistent: "
+            + "; ".join(staged_errors[:6])
+        )
     return {"path": SCORE_MOTION_EVIDENCE_ITEM, "sha256": digest(receipt_copy)}, staged
 
 
@@ -2323,6 +2454,12 @@ def main() -> int:
     production = write_production_receipt(PACKAGE, OUT, manifest, previous)
     if production is not None:
         manifest["production"] = production
+    if span is None:
+        score_motion_evidence = prior_score_motion_evidence(
+            PACKAGE,
+            previous,
+            previous_items,
+        )
     if score_motion_evidence is not None:
         manifest["score_motion_evidence"] = score_motion_evidence
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")

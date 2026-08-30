@@ -1222,6 +1222,47 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 errors,
             )
 
+        for kind in ("concat", "segment"):
+            with self.subTest(receipt=kind), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                if kind == "concat":
+                    target = fixture.producer_paths["with_score"]
+                    trigger = "with_score render concat"
+                    expected = "with_score review-media producer receipt changed during authentication"
+                else:
+                    segment = fixture.producer_media_paths["with_score"]["segments"][0]
+                    target = segment.with_name(segment.name + ".receipt.json")
+                    trigger = "with_score render segment 0"
+                    expected = "review-media render segment 0 receipt changed during authentication"
+                payload = target.read_bytes()
+                original_probe = fixture.producer_probe
+                swapped = False
+
+                def swapping_receipt_probe(path, **kwargs):
+                    nonlocal swapped
+                    identity = original_probe(path, **kwargs)
+                    if not swapped and kwargs["label"] == trigger:
+                        swapped = True
+                        target.rename(target.with_name(target.name + ".pinned-original"))
+                        target.write_bytes(payload)
+                    return identity
+
+                with mock.patch.object(
+                    AB,
+                    "_producer_decoded_video_identity",
+                    side_effect=swapping_receipt_probe,
+                ), mock.patch.object(
+                    AB, "ffprobe_media", side_effect=fixture.probe
+                ), mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ):
+                    errors = AB.production_receipt_errors(
+                        fixture.receipt,
+                        expected=fixture.context,
+                        recompute_samples=False,
+                    )
+                self.assertTrue(any(expected in error for error in errors), errors)
+
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "producer.mov.receipt.json"
             path.write_text('{"schema":"danse.render.concat.v1"}\n')
@@ -1439,6 +1480,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
 
             self.assertEqual(AB._production_review_position(0), (0, 0.0))
             self.assertEqual(AB.production_audio_frame_count(1.0, 48000), 48000)
+            self.assertEqual(AB.production_audio_frame_count(0.02084375, 48000), 1001)
             for case, value in {
                 "bool": True,
                 "negative": -1,

@@ -28,6 +28,7 @@ import sys
 import tempfile
 import wave
 from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -147,7 +148,11 @@ def production_audio_frame_count(
     maximum_samples = PRODUCTION_FRAME_MAX * sample_rate / PRODUCTION_FPS
     if not math.isfinite(sample_value) or sample_value > maximum_samples:
         raise EvidenceError(f"{label} has an unreasonable production audio frame count")
-    samples = round(sample_value)
+    samples = int(
+        (Decimal(str(duration)) * sample_rate).to_integral_value(
+            rounding=ROUND_HALF_UP
+        )
+    )
     if samples < 1:
         raise EvidenceError(f"{label} does not contain one complete production audio frame")
     return samples
@@ -404,6 +409,46 @@ def _bounded_json_snapshot(
 ) -> tuple[dict[str, Any], bytes]:
     with _pinned_json_snapshot(path, label, max_bytes=max_bytes) as snapshot:
         return snapshot
+
+
+def _bounded_json_snapshot_token(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> tuple[dict[str, Any], bytes, tuple[tuple[int, ...], str, int]]:
+    """Return parsed bytes plus a file-identity token for later revalidation."""
+
+    with _pinned_regular_file(path, label) as (file_fd, info):
+        if info.st_size > max_bytes:
+            raise EvidenceError(f"{label} exceeds its {max_bytes}-byte limit")
+        payload = _read_pinned_bytes(file_fd, maximum=max_bytes, label=label)
+        if len(payload) != info.st_size:
+            raise EvidenceError(f"{label} changed during authentication")
+        value = _json_object_from_payload(payload, label)
+        token = (_stat_identity(info), hashlib.sha256(payload).hexdigest(), len(payload))
+        return value, payload, token
+
+
+def _revalidate_json_snapshot_token(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+    token: tuple[tuple[int, ...], str, int],
+) -> None:
+    """Reject a receipt replaced or rewritten after its parsed snapshot closed."""
+
+    with _pinned_regular_file(path, label) as (file_fd, info):
+        if _stat_identity(info) != token[0] or info.st_size > max_bytes:
+            raise EvidenceError(f"{label} changed during authentication")
+        payload = _read_pinned_bytes(file_fd, maximum=max_bytes, label=label)
+        if (
+            len(payload) != info.st_size
+            or len(payload) != token[2]
+            or hashlib.sha256(payload).hexdigest() != token[1]
+        ):
+            raise EvidenceError(f"{label} changed during authentication")
 
 
 def _bounded_binary_snapshot(
@@ -760,6 +805,38 @@ def _artifact_json_snapshot(
     if reference.get("bytes") != len(payload):
         errors.append(f"{label} byte count is stale")
     return errors, path, value
+
+
+def _artifact_json_snapshot_token(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    max_bytes: int,
+) -> tuple[
+    list[str],
+    Path | None,
+    dict[str, Any] | None,
+    tuple[tuple[int, ...], str, int] | None,
+]:
+    """Authenticate one JSON artifact and retain its exact identity token."""
+
+    try:
+        path = local_artifact(receipt_path, reference, label)
+        value, payload, token = _bounded_json_snapshot_token(
+            path,
+            label,
+            max_bytes=max_bytes,
+        )
+    except EvidenceError as exc:
+        return [str(exc)], None, None, None
+    assert isinstance(reference, dict)
+    errors = []
+    if reference.get("sha256") != token[1]:
+        errors.append(f"{label} digest is stale")
+    if reference.get("bytes") != token[2]:
+        errors.append(f"{label} byte count is stale")
+    return errors, path, value, token
 
 
 def _artifact_binary_snapshot(
@@ -1617,6 +1694,9 @@ def _producer_segment_chain(
     *,
     concat: dict[str, Any] | None = None,
     maximum_segments: int | None = None,
+    snapshot_tokens: list[
+        tuple[Path, str, int, tuple[tuple[int, ...], str, int]]
+    ] | None = None,
 ) -> list[tuple[Path, Path, dict[str, Any]]]:
     """Resolve the exact ordered renderer media/receipt chain owned by one concat."""
 
@@ -1666,11 +1746,16 @@ def _producer_segment_chain(
             f"{name}.receipt.json",
             f"review-media render segment {index} receipt",
         )
-        segment, payload = _bounded_json_snapshot(
+        label = f"review-media render segment {index} receipt"
+        segment, payload, token = _bounded_json_snapshot_token(
             receipt_path,
-            f"review-media render segment {index} receipt",
+            label,
             max_bytes=PRODUCER_SEGMENT_RECEIPT_MAX_BYTES,
         )
+        if snapshot_tokens is not None:
+            snapshot_tokens.append(
+                (receipt_path, label, PRODUCER_SEGMENT_RECEIPT_MAX_BYTES, token)
+            )
         receipt_bytes += len(payload)
         if receipt_bytes > PRODUCER_SEGMENT_RECEIPT_TOTAL_MAX_BYTES:
             raise EvidenceError(
@@ -1864,13 +1949,14 @@ def _producer_receipt_errors(
     root: Path,
 ) -> tuple[list[str], Path | None]:
     """Bind every review frame to one exact canonical renderer receipt chain."""
-    errors, concat_path, concat = _artifact_json_snapshot(
+    concat_label = f"{mode} review-media producer receipt"
+    errors, concat_path, concat, concat_token = _artifact_json_snapshot_token(
         receipt_path,
         reference,
-        f"{mode} review-media producer receipt",
+        concat_label,
         max_bytes=PRODUCER_CONCAT_RECEIPT_MAX_BYTES,
     )
-    if concat_path is None or concat is None:
+    if concat_path is None or concat is None or concat_token is None:
         return errors, None
     if concat.get("schema") != "danse.render.concat.v1":
         errors.append(f"{mode} review-media producer has the wrong schema")
@@ -1899,11 +1985,15 @@ def _producer_receipt_errors(
     if decoded.get("frames") != expected_frames:
         errors.append(f"{mode} review-media producer does not cover the exact frame span")
 
+    segment_tokens: list[
+        tuple[Path, str, int, tuple[tuple[int, ...], str, int]]
+    ] = []
     try:
         segment_chain = _producer_segment_chain(
             concat_path,
             concat=concat,
             maximum_segments=expected_frames,
+            snapshot_tokens=segment_tokens,
         )
     except EvidenceError as exc:
         errors.append(str(exc))
@@ -2090,6 +2180,22 @@ def _producer_receipt_errors(
                 errors.append(
                     f"{mode} render segment decoded chain differs from its actual concat"
                 )
+    try:
+        _revalidate_json_snapshot_token(
+            concat_path,
+            concat_label,
+            max_bytes=PRODUCER_CONCAT_RECEIPT_MAX_BYTES,
+            token=concat_token,
+        )
+        for segment_path, label, maximum, token in segment_tokens:
+            _revalidate_json_snapshot_token(
+                segment_path,
+                label,
+                max_bytes=maximum,
+                token=token,
+            )
+    except EvidenceError as exc:
+        errors.append(str(exc))
     return errors, concat_path
 
 
