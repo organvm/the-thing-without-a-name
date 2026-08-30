@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import importlib.util
 import json
 import re
 import subprocess
 from collections.abc import Iterable, Iterator
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 import jsonschema
 
@@ -18,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = Path("release/manifest.json")
 SCHEMA = Path("release/manifest.schema.json")
 RELEASE_SCHEMA = "danse.release.v1"
+RELEASE_GATE_RECEIPT_SCHEMA_PATH = Path("release/gate-receipt.schema.json")
 EXPECTED_OPPORTUNITY_ID = "omega-20260829"
 EXPECTED_OPPORTUNITY_FROZEN_AT = "2026-08-29T22:12:19Z"
 EXPECTED_OPPORTUNITY_SHA256 = "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294"
@@ -42,6 +46,22 @@ PROGRESSIVE_CONTROLS_CHECKS = (
     "console-clean",
     "http-clean",
 )
+RELEASE_GATE_RECEIPT_SCHEMA = "danse.release.gate.v1"
+RELEASE_GATE_REQUIRED_EVIDENCE = {
+    "final-artistic-approval": {"final-cut", "human-decision"},
+    "final-cut-evidence-gate": {"final-package", "machine-verification"},
+    "installation-evidence": {"installation", "machine-verification"},
+    "rights-register": {"rights"},
+    "press-stills-clearance": {"rights", "stills"},
+    "accessibility-review": {"accessibility", "human-decision"},
+    "contact-route-approval": {"contact", "human-decision"},
+    "public-identity-copy-approval": {"human-decision", "identity"},
+    "publication-approval": {"human-decision", "publication"},
+    "release-custody": {"custody"},
+    "restore-rehearsal": {"machine-verification", "restore"},
+    "actual-presentation": {"presentation"},
+}
+RELEASE_GATE_EVIDENCE_KINDS = set().union(*RELEASE_GATE_REQUIRED_EVIDENCE.values())
 PHASES = ("draft", "public", "release")
 GENERATED_PRODUCT_PATHS = {
     "project-page-copy": "project/index.html",
@@ -54,6 +74,28 @@ GENERATED_PRODUCT_PATHS = {
 }
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+UTC_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
+)
+EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE = re.compile(
+    r"(?<!\d)(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?!\d)"
+    r"|(?<![\w])\+(?:\d[ .()/-]*){7,14}\d(?!\d)"
+)
+SENSITIVE_KEYS = {
+    "address",
+    "credential",
+    "credentials",
+    "email",
+    "local_path",
+    "password",
+    "phone",
+    "private_path",
+    "secret",
+    "signature",
+    "token",
+}
 PRIVATE_PREFIXES = (
     ".git/",
     ".work/",
@@ -167,6 +209,193 @@ def strings(value: Any) -> Iterator[str]:
     elif isinstance(value, list):
         for item in value:
             yield from strings(item)
+
+
+def keys(value: Any) -> Iterator[str]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from keys(item)
+
+
+def _safe_receipt_reference(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ReleaseError(f"{label} must be a non-empty HTTPS URL or SHA-256 URN")
+    if value.startswith("urn:sha256:"):
+        digest = value.removeprefix("urn:sha256:")
+        if not HEX64.fullmatch(digest):
+            raise ReleaseError(f"{label} has a malformed SHA-256 URN")
+        return value
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ReleaseError(f"{label} has an invalid network authority") from exc
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or hostname == "localhost"
+        or hostname.endswith((".localhost", ".local", ".internal"))
+        or (address is not None and not address.is_global)
+    ):
+        raise ReleaseError(f"{label} must be a public HTTPS URL without credentials")
+    return value
+
+
+def validate_release_gate_receipt(
+    root: Path,
+    path: Path,
+    gate: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    """Authenticate one public-safe completion receipt for a non-live gate.
+
+    A digest-bound arbitrary file is not evidence that a human decision, final
+    package, restore, custody copy, deployment, or presentation occurred. The
+    receipt therefore binds the exact gate and issue, the release identity, an
+    accountable authority, and the evidence classes that gate actually needs.
+    Private evidence can remain external and be represented by its digest URN.
+    """
+
+    receipt = load_json(path, f"release gate {gate['id']} receipt")
+    schema = load_json(
+        source_file(root, RELEASE_GATE_RECEIPT_SCHEMA_PATH.as_posix(), "release gate receipt schema"),
+        "release gate receipt schema",
+    )
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        schema_errors = sorted(
+            jsonschema.Draft202012Validator(
+                schema,
+                format_checker=jsonschema.FormatChecker(),
+            ).iter_errors(receipt),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+    except jsonschema.exceptions.SchemaError as exc:
+        raise ReleaseError(f"release gate receipt schema is invalid: {exc.message}") from exc
+    if schema_errors:
+        error = schema_errors[0]
+        location = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        raise ReleaseError(
+            f"release gate {gate['id']} receipt schema failure at {location}: {error.message}"
+        )
+    expected_keys = {
+        "schema",
+        "gate_id",
+        "issue",
+        "result",
+        "recorded_at",
+        "authority",
+        "subject",
+        "evidence",
+        "non_actions",
+    }
+    if set(receipt) != expected_keys:
+        raise ReleaseError(f"release gate {gate['id']} receipt has an unknown shape")
+    if receipt["schema"] != RELEASE_GATE_RECEIPT_SCHEMA:
+        raise ReleaseError(f"release gate {gate['id']} receipt has the wrong schema")
+    if receipt["gate_id"] != gate["id"] or receipt["issue"] != gate["issue"]:
+        raise ReleaseError(f"release gate {gate['id']} receipt names a different owner gate")
+    if receipt["result"] != "satisfied":
+        raise ReleaseError(f"release gate {gate['id']} receipt is not satisfied")
+    recorded_at = receipt["recorded_at"]
+    if not isinstance(recorded_at, str) or not UTC_TIMESTAMP.fullmatch(recorded_at):
+        raise ReleaseError(f"release gate {gate['id']} receipt has no canonical UTC time")
+    try:
+        datetime.fromisoformat(recorded_at.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ReleaseError(f"release gate {gate['id']} receipt has an invalid UTC time") from exc
+
+    authority = receipt["authority"]
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != {"owner", "recorded_by"}
+        or authority.get("owner") != gate["owner"]
+        or not isinstance(authority.get("recorded_by"), str)
+        or not authority["recorded_by"].strip()
+    ):
+        raise ReleaseError(f"release gate {gate['id']} receipt has no exact accountable authority")
+
+    subject = receipt["subject"]
+    if (
+        not isinstance(subject, dict)
+        or set(subject) != {"release_id", "release_version", "repository_head"}
+        or subject.get("release_id") != manifest["release_id"]
+        or subject.get("release_version") != manifest["version"]
+        or not isinstance(subject.get("repository_head"), str)
+        or not HEX40.fullmatch(subject["repository_head"])
+    ):
+        raise ReleaseError(f"release gate {gate['id']} receipt names a different release subject")
+
+    evidence = receipt["evidence"]
+    if not isinstance(evidence, list) or not evidence:
+        raise ReleaseError(f"release gate {gate['id']} receipt has no evidence rows")
+    evidence_ids: set[str] = set()
+    evidence_kinds: set[str] = set()
+    for index, row in enumerate(evidence):
+        label = f"release gate {gate['id']} evidence row {index + 1}"
+        if not isinstance(row, dict) or set(row) != {
+            "id",
+            "kind",
+            "receipt_sha256",
+            "reference",
+            "summary",
+        }:
+            raise ReleaseError(f"{label} has an unknown shape")
+        row_id = row.get("id")
+        kind = row.get("kind")
+        digest = row.get("receipt_sha256")
+        summary = row.get("summary")
+        if not isinstance(row_id, str) or not SAFE_ID.fullmatch(row_id) or row_id in evidence_ids:
+            raise ReleaseError(f"{label} has a malformed or duplicate id")
+        evidence_ids.add(row_id)
+        if kind not in RELEASE_GATE_EVIDENCE_KINDS:
+            raise ReleaseError(f"{label} has an unsupported evidence kind")
+        evidence_kinds.add(kind)
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            raise ReleaseError(f"{label} has no exact receipt digest")
+        reference = _safe_receipt_reference(row.get("reference"), f"{label} reference")
+        if reference.startswith("urn:sha256:") and reference.removeprefix("urn:sha256:") != digest:
+            raise ReleaseError(f"{label} digest URN disagrees with its receipt digest")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ReleaseError(f"{label} has no public-safe summary")
+
+    required = RELEASE_GATE_REQUIRED_EVIDENCE.get(gate["id"])
+    if required is None:
+        raise ReleaseError(f"release gate {gate['id']} has no typed evidence contract")
+    missing = sorted(required - evidence_kinds)
+    if missing:
+        raise ReleaseError(
+            f"release gate {gate['id']} receipt lacks required evidence: {', '.join(missing)}"
+        )
+
+    non_actions = receipt["non_actions"]
+    if (
+        not isinstance(non_actions, list)
+        or not non_actions
+        or not all(isinstance(item, str) and item.strip() for item in non_actions)
+        or len(non_actions) != len(set(non_actions))
+    ):
+        raise ReleaseError(f"release gate {gate['id']} receipt has no exact non-action boundary")
+
+    sensitive_key = next((key for key in keys(receipt) if key.lower() in SENSITIVE_KEYS), None)
+    if sensitive_key:
+        raise ReleaseError(f"release gate {gate['id']} receipt exposes sensitive field {sensitive_key!r}")
+    for value in strings(receipt):
+        if PRIVATE_PATH_MARKER.search(value) or EMAIL.search(value) or PHONE.search(value):
+            raise ReleaseError(f"release gate {gate['id']} receipt exposes private contact or path data")
 
 
 def public_copy_strings(manifest: dict[str, Any]) -> Iterator[str]:
@@ -577,6 +806,8 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
                 if evidence["path"] != PROGRESSIVE_CONTROLS_EVIDENCE_PATH:
                     raise ReleaseError("progressive controls replay names the wrong evidence receipt")
                 validate_progressive_controls_receipt(root, evidence_path)
+            else:
+                validate_release_gate_receipt(root, evidence_path, gate, manifest)
         elif evidence is not None:
             raise ReleaseError(f"pending gate {gate['id']} may not carry completion evidence")
 

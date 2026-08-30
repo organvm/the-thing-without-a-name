@@ -30,6 +30,7 @@ FIXTURE_FILES = (
     ".gitignore",
     "release/manifest.json",
     "release/manifest.schema.json",
+    "release/gate-receipt.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
     "release/progressive-controls-replay.schema.json",
     "opportunities/omega-20260829.json",
@@ -257,7 +258,47 @@ def complete_manifest(root: Path) -> dict:
         if gate["id"] == "progressive-controls-replay":
             gate["evidence"] = copy.deepcopy(progressive_evidence)
         elif gate["id"] != "live-interaction-replay":
-            gate["evidence"] = copy.deepcopy(evidence)
+            receipt_path = root / f"release/evidence/{gate['id']}-receipt.json"
+            required_kinds = sorted(CONTRACT.RELEASE_GATE_REQUIRED_EVIDENCE[gate["id"]])
+            rows = [
+                {
+                    "id": f"{kind}-receipt",
+                    "kind": kind,
+                    "receipt_sha256": evidence["sha256"],
+                    "reference": f"urn:sha256:{evidence['sha256']}",
+                    "summary": f"Synthetic {kind} evidence for the release-contract fixture.",
+                }
+                for kind in required_kinds
+            ]
+            receipt_path.write_bytes(
+                CONTRACT.canonical_json(
+                    {
+                        "schema": CONTRACT.RELEASE_GATE_RECEIPT_SCHEMA,
+                        "gate_id": gate["id"],
+                        "issue": gate["issue"],
+                        "result": "satisfied",
+                        "recorded_at": "2026-08-30T12:00:00Z",
+                        "authority": {
+                            "owner": gate["owner"],
+                            "recorded_by": "Synthetic release fixture",
+                        },
+                        "subject": {
+                            "release_id": manifest["release_id"],
+                            "release_version": manifest["version"],
+                            "repository_head": TEST_COMMIT,
+                        },
+                        "evidence": rows,
+                        "non_actions": [
+                            "The fixture performs no deployment, account action, or legal attestation."
+                        ],
+                    }
+                )
+            )
+            gate["evidence"] = {
+                "path": receipt_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(receipt_path),
+                "summary": "Synthetic typed gate receipt for release-contract verification.",
+            }
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
             requirement["status"] = "verified"
@@ -796,6 +837,71 @@ class AdversarialManifestTest(unittest.TestCase):
         temporary, root = self.mutate(change)
         with temporary:
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "satisfied gate .* has no evidence"):
+                CONTRACT.validate_release(root)
+
+    def test_arbitrary_digest_bound_file_cannot_satisfy_a_release_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "release-custody"
+            )
+            arbitrary = root / "release/evidence/public-receipt.json"
+            gate["evidence"] = {
+                "path": arbitrary.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(arbitrary),
+                "summary": "A digest alone must not impersonate custody evidence.",
+            }
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "receipt schema failure"):
+                CONTRACT.validate_release(root)
+
+    def test_release_gate_receipt_binds_gate_owner_subject_and_required_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "restore-rehearsal"
+            )
+            receipt_path = root / gate["evidence"]["path"]
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["evidence"] = [
+                row
+                for row in receipt["evidence"]
+                if row["kind"] != "machine-verification"
+            ]
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "lacks required evidence: machine-verification",
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_release_gate_receipt_rejects_private_contact_or_path_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "actual-presentation"
+            )
+            receipt_path = root / gate["evidence"]["path"]
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["evidence"][0]["summary"] = "Private source at /Users/operator/presentation.mov"
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "exposes private contact or path data",
+            ):
                 CONTRACT.validate_release(root)
 
     def test_completed_live_interaction_gate_cannot_regress(self) -> None:
