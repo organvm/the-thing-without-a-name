@@ -1,23 +1,25 @@
-import { ACTIONS, initialControlState, reduceControlState } from "./state.js";
+import { ACTIONS, PRESENCE, initialControlState, reduceControlState } from "./state.js";
 
 /** Buttons, shortcuts, and browser probes all call this one named action API. */
 export function createControlActions(adapter, options = {}) {
   let state = initialControlState(options);
   let programIntent = state.program;
   let programIntentRevision = 0;
+  let presenceIntent = state.presence;
+  let presenceRevision = 0;
   const listeners = new Set();
   const emit = () => { for (const listener of listeners) listener(state); };
   const dispatch = (action) => { state = reduceControlState(state, action); emit(); return state; };
-  const run = async (name, operation, stateAction = null) => {
+  const run = async (name, operation, stateAction = null, isCurrent = () => true) => {
     try {
       const result = await operation();
-      if (stateAction) {
+      if (stateAction && isCurrent()) {
         const action = typeof stateAction === "function" ? stateAction(result) : stateAction;
         if (action) dispatch(action);
       }
       return result;
     } catch (error) {
-      adapter.reportError?.(name, error);
+      if (isCurrent()) adapter.reportError?.(name, error);
       return undefined;
     }
   };
@@ -35,10 +37,28 @@ export function createControlActions(adapter, options = {}) {
       if (revision === programIntentRevision) programIntent = state.program;
     });
   };
+  const setPresence = (value) => {
+    const intent = PRESENCE.includes(value) ? value : state.presence;
+    const revision = ++presenceRevision;
+    presenceIntent = intent;
+    dispatch({ type: ACTIONS.SET_STATUS, category: "presence", message: "" });
+    return run(
+      "presence",
+      () => adapter.presence(value),
+      (result) => ({ type: ACTIONS.SET_PRESENCE, value: result ?? state.presence }),
+      () => revision === presenceRevision,
+    ).finally(() => {
+      if (revision === presenceRevision) presenceIntent = state.presence;
+    });
+  };
   const sync = (action) => {
     if (action?.type === ACTIONS.SET_PROGRAM) {
       programIntentRevision += 1;
       programIntent = action.value === "free" ? "free" : "score-led";
+    }
+    if (action?.type === ACTIONS.SET_PRESENCE && PRESENCE.includes(action.value)) {
+      if (action.value !== presenceIntent) presenceRevision += 1;
+      presenceIntent = action.value;
     }
     return dispatch(action);
   };
@@ -62,15 +82,15 @@ export function createControlActions(adapter, options = {}) {
     toggleCutout: () => run("figure-cutout", adapter.toggleCutout, { type: ACTIONS.TOGGLE_CUTOUT }),
     music: () => run("music", adapter.music, (value) => ({ type: ACTIONS.SET_MUSIC, value })),
     conductor: (value) => run("conductor", () => adapter.conductor(value), (result) => ({ type: ACTIONS.SET_CONDUCTOR, ...result })),
-    presence: (value) => {
-      dispatch({ type: ACTIONS.SET_STATUS, category: "presence", message: "" });
-      return run("presence", () => adapter.presence(value), (result) => ({ type: ACTIONS.SET_PRESENCE, value: result ?? state.presence }));
-    },
+    presence: setPresence,
     openTray: (category) => dispatch({ type: ACTIONS.OPEN_TRAY, category }),
     openSheet: (section) => dispatch({ type: ACTIONS.OPEN_SHEET, section }),
     openMap: () => dispatch({ type: ACTIONS.OPEN_MAP }),
     close: () => { adapter.close?.(); return dispatch({ type: ACTIONS.CLOSE_SURFACE }); },
-    status: (category, message) => dispatch({ type: ACTIONS.SET_STATUS, category, message }),
+    status: (category, message) => {
+      if (category === "presence") presenceRevision += 1;
+      return dispatch({ type: ACTIONS.SET_STATUS, category, message });
+    },
     sync,
   };
   return Object.freeze({

@@ -8,6 +8,7 @@ import {
   initialControlState,
   reduceControlState,
   sharePresentationState,
+  sharePresentationUrl,
   shortcutAction,
 } from "../../interface/state.js";
 
@@ -126,6 +127,56 @@ await test("rapid program toggles derive from pending intent and settle on the l
   assert.equal(bus.getState().program, "free");
 });
 
+await test("stale Presence completions cannot replace newer modes or status", async () => {
+  const cameraSettlements = [];
+  const reports = [];
+  const bus = createControlActions({
+    presence: (value) => value === "camera"
+      ? new Promise((resolve, reject) => { cameraSettlements.push({ resolve, reject }); })
+      : value,
+    reportError: (name, error) => reports.push([name, error.message]),
+  });
+  const camera = bus.actions.presence("camera");
+  await bus.actions.presence("keyboard-touch");
+  bus.actions.status("presence", "Keyboard-touch remains selected.");
+  cameraSettlements.shift().resolve("off");
+  await camera;
+  assert.deepEqual([bus.getState().presence, bus.getState().status.presence], ["keyboard-touch", "Keyboard-touch remains selected."]);
+
+  const retriedCamera = bus.actions.presence("camera");
+  bus.actions.sync({ type: ACTIONS.SET_PRESENCE, value: "replay" });
+  bus.actions.status("presence", "Replay receipt loaded.");
+  cameraSettlements.shift().reject(new Error("stale camera failure"));
+  await retriedCamera;
+  assert.deepEqual([bus.getState().presence, bus.getState().status.presence], ["replay", "Replay receipt loaded."]);
+  assert.deepEqual(reports, []);
+
+  const latestCamera = bus.actions.presence("camera");
+  cameraSettlements.shift().reject(new Error("latest camera failure"));
+  await latestCamera;
+  assert.deepEqual(reports, [["presence", "latest camera failure"]]);
+});
+
+await test("Presence status and authoritative sync participate in intent ordering", async () => {
+  const cameraResolvers = [];
+  const bus = createControlActions({
+    presence: (value) => value === "camera"
+      ? new Promise((resolve) => { cameraResolvers.push(resolve); })
+      : value,
+  });
+  const echoedCamera = bus.actions.presence("camera");
+  bus.actions.sync({ type: ACTIONS.SET_PRESENCE, value: "camera" });
+  cameraResolvers.shift()("off");
+  await echoedCamera;
+  assert.equal(bus.getState().presence, "off");
+
+  const statusGuardedCamera = bus.actions.presence("camera");
+  bus.actions.status("presence", "A newer Presence receipt is authoritative.");
+  cameraResolvers.shift()("camera");
+  await statusGuardedCamera;
+  assert.deepEqual([bus.getState().presence, bus.getState().status.presence], ["off", "A newer Presence receipt is authoritative."]);
+});
+
 await test("button and shortcut callers share one action bus", async () => {
   const calls = [];
   const adapter = {
@@ -155,7 +206,22 @@ await test("button and shortcut callers share one action bus", async () => {
 });
 
 await test("only program and Figure cutout enter shareable presentation state", () => {
-  assert.deepEqual(sharePresentationState({ program: "free", cutout: "on", playback: "held-user", music: "playing" }), { mode: "free", cutout: true });
+  const presentation = sharePresentationState({ program: "free", cutout: "on", playback: "held-user", music: "playing" });
+  assert.deepEqual(presentation, { mode: "free", cutout: true });
+  const shared = new URL(sharePresentationUrl(
+    "https://example.test/danse/?score=fixture.json&choreography=debug.json&conductor=waltz&meter=4%2F4&bpm=96&token=SECRET#s=42&e=99&u=7&debug=SECRET",
+    presentation,
+  ));
+  assert.equal(shared.pathname, "/danse/");
+  assert.deepEqual([...shared.searchParams], [["cutout", "1"]]);
+  assert.equal(shared.hash, "#s=42&e=99&u=7&p=free");
+
+  const scoreLed = new URL(sharePresentationUrl(
+    "https://example.test/danse/?cutout=1&score=fixture.json#s=42&e=99&u=7&p=free",
+    sharePresentationState({ program: "score-led", cutout: "off" }),
+  ));
+  assert.equal(scoreLed.search, "");
+  assert.equal(scoreLed.hash, "#s=42&e=99&u=7");
 });
 
 await test("reported action failures are consumed at the UI action boundary", async () => {

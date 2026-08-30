@@ -143,3 +143,18 @@ export function shortcutAction(event) {
 export function sharePresentationState({ program, cutout }) {
   return Object.freeze({ mode: program === "free" ? "free" : null, cutout: cutout === "on" });
 }
+
+/** Admit only declared presentation state into a River link. */
+export function sharePresentationUrl(href, { mode = null, cutout = false } = {}) {
+  const url = new URL(String(href));
+  url.search = "";
+  if (cutout === true) url.searchParams.set("cutout", "1");
+  const source = new URLSearchParams(url.hash.replace(/^#/, ""));
+  const fragment = new URLSearchParams();
+  for (const key of ["s", "e", "u"]) {
+    if (source.has(key)) fragment.set(key, source.get(key));
+  }
+  if (mode === "free") fragment.set("p", "free");
+  url.hash = fragment.toString();
+  return url.href;
+}

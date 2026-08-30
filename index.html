@@ -239,7 +239,7 @@ import { Renderer } from "./engine/renderer.js";
 import { InteractionRenderer } from "./interaction/adapter.js";
 import { InteractionController } from "./interaction/controller.js";
 import { ScoreAudio } from "./sound/browser-midi.js";
-import { ACTIONS, shortcutAction } from "./interface/state.js";
+import { ACTIONS, sharePresentationState, sharePresentationUrl, shortcutAction } from "./interface/state.js";
 import { createControlActions } from "./interface/actions.js";
 import { renderControlSurface, renderProjectMap } from "./interface/render.js";
 
@@ -281,6 +281,7 @@ let projectMapData = null;
 let previousRiver = null;
 let previousRiverWasRemembered = false;
 let controlBus = null;
+let presenceOperationGeneration = 0;
 
 function setHudVisible(visible) {
   hud.hidden = !visible;
@@ -509,11 +510,16 @@ el("receipt-save").addEventListener("click", () => {
 el("receipt-load").addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
+  const generation = ++presenceOperationGeneration;
+  controlBus?.actions.status("presence", "Loading replay receipt…");
   try {
-    interaction.loadReceipt(JSON.parse(await file.text()));
+    const receipt = JSON.parse(await file.text());
+    if (generation !== presenceOperationGeneration) return;
+    interaction.loadReceipt(receipt);
     controlBus?.actions.sync({ type: ACTIONS.SET_PRESENCE, value: "replay" });
     flash("derived interaction receipt loaded");
   } catch (error) {
+    if (generation !== presenceOperationGeneration) return;
     controlBus?.actions.status("presence", `Receipt rejected: ${error.message}`);
     flash(`receipt rejected — ${error.message}`);
   } finally {
@@ -647,7 +653,8 @@ function undoRiver() {
 }
 
 async function shareRiver() {
-  const link = Arrival.href(river, { mode: program ? null : "free" });
+  const presentation = sharePresentationState(controlBus.getState());
+  const link = sharePresentationUrl(Arrival.href(river), presentation);
   try {
     if (navigator.share) {
       await navigator.share({ title: "Danse", text: "Join this Danse river.", url: link });
@@ -723,10 +730,12 @@ function toggleCutout() {
 }
 
 async function setPresence(value) {
+  const generation = ++presenceOperationGeneration;
   if (value === "off") { interaction.stop(at()); return "off"; }
   if (value === "camera") {
     if (interaction.snapshot().retryable) await interaction.retryCamera(at());
     else await interaction.startCamera(at());
+    if (generation !== presenceOperationGeneration) return controlBus.getState().presence;
     return interaction.snapshot().mode === "camera" ? "camera" : "off";
   }
   if (value === "keyboard-touch") { interaction.startFallback(at()); return "keyboard-touch"; }

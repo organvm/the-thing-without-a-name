@@ -776,6 +776,21 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('value: program ? "score-led" : "free"', self.script)
         self.assertIn("describeProgram();", self.script)
 
+    def test_shared_river_uses_only_allowlisted_presentation_state(self) -> None:
+        share = self.script.split("async function shareRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("sharePresentationState(controlBus.getState())", share)
+        self.assertIn("sharePresentationUrl(Arrival.href(river), presentation)", share)
+        self.assertNotIn("location.href", share)
+
+    def test_slow_replay_receipt_cannot_replace_a_later_presence_choice(self) -> None:
+        receipt = self.script.split('el("receipt-load").addEventListener("change", async (event) => {', 1)[1].split("\n});", 1)[0]
+        presence = self.script.split("async function setPresence(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const generation = ++presenceOperationGeneration;", receipt)
+        self.assertIn('controlBus?.actions.status("presence", "Loading replay receipt…")', receipt)
+        self.assertGreaterEqual(receipt.count("generation !== presenceOperationGeneration"), 2)
+        self.assertIn("const generation = ++presenceOperationGeneration;", presence)
+        self.assertIn("if (generation !== presenceOperationGeneration) return controlBus.getState().presence;", presence)
+
     def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
         self.assertIn('#project-map [aria-disabled="true"]', self.styles)
         browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")

@@ -381,7 +381,12 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     }""")
     page.click("#river-share")
     page.wait_for_function("() => !!window.__sharedRiver")
-    want("#s=" in page.evaluate("() => window.__sharedRiver"), "clipboard fallback did not receive a river link")
+    shared = page.evaluate("""() => {
+      const url = new URL(window.__sharedRiver);
+      return { search:url.search, hash:url.hash };
+    }""")
+    want("#s=" in shared["hash"], "clipboard fallback did not receive a river link")
+    want(shared["search"] == "", "shared River retained the debug score query")
     shot("desktop-river-tray")
 
     page.click('[data-category="score"]')
@@ -398,6 +403,14 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#hud").is_visible(), "visual audition sheet did not open")
     page.select_option("#conductor-model", "waltz")
     want(page.evaluate("() => danse.controlState.audition") == "override-active", "conductor override did not become active")
+    shared = page.evaluate("""async () => {
+      window.__sharedRiver = null;
+      await danse.actions.share();
+      const url = new URL(window.__sharedRiver);
+      return { query:[...url.searchParams], mode:new URLSearchParams(url.hash.slice(1)).get('p') };
+    }""")
+    want(shared["query"] == [["cutout", "1"]], "shared River retained non-presentation query state")
+    want(shared["mode"] is None, "Score-led shared River carried the wrong program")
     page.click("#conductor-reset")
     want(page.evaluate("() => danse.controlState.audition") == "override-ready", "conductor reset did not report override-ready")
     shot("desktop-score-sheet")
@@ -419,9 +432,46 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.focus("#fallback-x")
     page.press("#fallback-x", "ArrowRight")
     want(page.evaluate("() => danse.interaction.snapshot().mode") == "off", "a slider activated Presence implicitly")
+    presence_race = page.evaluate("""async () => {
+      const startCamera = danse.interaction.startCamera;
+      let finishCamera;
+      danse.interaction.startCamera = () => new Promise((resolve) => { finishCamera = resolve; });
+      try {
+        const camera = danse.actions.presence('camera');
+        await danse.actions.presence('keyboard-touch');
+        danse.actions.status('presence', 'Keyboard-touch remains selected.');
+        finishCamera(false);
+        await camera;
+        return { presence:danse.controlState.presence, status:danse.controlState.status.presence };
+      } finally {
+        danse.interaction.startCamera = startCamera;
+      }
+    }""")
+    want(presence_race == {"presence": "keyboard-touch", "status": "Keyboard-touch remains selected."}, "stale Camera completion replaced newer Presence state")
     page.click("#fallback-start")
     want(page.evaluate("() => danse.controlState.presence") == "keyboard-touch", "keyboard-touch Presence did not activate")
     want(not page.locator("#receipt-save").is_disabled(), "receipt Save stayed disabled after samples existed")
+    page.click("#interaction-stop")
+    page.evaluate("""() => {
+      window.__originalFileText = File.prototype.text;
+      const receipt = JSON.stringify(danse.interaction.receipt());
+      File.prototype.text = () => new Promise((resolve) => {
+        window.__finishReceiptText = () => resolve(receipt);
+      });
+    }""")
+    page.set_input_files("#receipt-load", files=[{"name": "slow.json", "mimeType": "application/json", "buffer": b"{}"}])
+    page.wait_for_function("() => typeof window.__finishReceiptText === 'function'")
+    page.evaluate("""async () => {
+      await danse.actions.presence('keyboard-touch');
+      window.__finishReceiptText();
+      await new Promise((resolve) => setTimeout(resolve));
+    }""")
+    want(page.evaluate("() => danse.controlState.presence") == "keyboard-touch", "slow replay receipt replaced a later Presence choice")
+    page.evaluate("""() => {
+      File.prototype.text = window.__originalFileText;
+      delete window.__originalFileText;
+      delete window.__finishReceiptText;
+    }""")
     page.click("#interaction-stop")
     page.set_input_files("#receipt-load", files=[{"name": "invalid.json", "mimeType": "application/json", "buffer": b"{}"}])
     page.wait_for_function(
