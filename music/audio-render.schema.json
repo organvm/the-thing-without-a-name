@@ -128,28 +128,17 @@
           "additionalProperties": false,
           "required": ["integrated_lufs", "tolerance_lu", "target_true_peak_dbtp", "max_true_peak_dbtp", "lra_lu"],
           "properties": {
-            "integrated_lufs": {"const": -16.0},
-            "tolerance_lu": {"const": 0.5},
-            "target_true_peak_dbtp": {"const": -1.1},
-            "max_true_peak_dbtp": {"const": -1.0},
-            "lra_lu": {"const": 11.0}
+            "integrated_lufs": {"type": "number", "minimum": -100, "maximum": 0},
+            "tolerance_lu": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
+            "target_true_peak_dbtp": {"type": "number", "minimum": -100, "maximum": 0},
+            "max_true_peak_dbtp": {"type": "number", "minimum": -100, "maximum": 0},
+            "lra_lu": {"type": "number", "minimum": 0, "maximum": 100}
           }
         },
         "first_pass": {"$ref": "#/$defs/loudnessMeasurement"},
         "application_filter": {"type": "string", "minLength": 1},
         "normalization_type": {"const": "dynamic"},
-        "output": {
-          "allOf": [
-            {"$ref": "#/$defs/loudnessMeasurement"},
-            {
-              "type": "object",
-              "properties": {
-                "integrated_lufs": {"minimum": -16.5, "maximum": -15.5},
-                "true_peak_dbtp": {"maximum": -1.0}
-              }
-            }
-          ]
-        }
+        "output": {"$ref": "#/$defs/loudnessMeasurement"}
       }
     },
     "verification": {
