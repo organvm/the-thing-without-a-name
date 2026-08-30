@@ -139,6 +139,24 @@ await test("rapid program toggles derive from pending intent and settle on the l
   assert.equal(bus.getState().program, "free");
 });
 
+await test("stale program failures cannot report over a newer choice", async () => {
+  const reports = [];
+  let rejectScore;
+  const bus = createControlActions({
+    setProgram: (value) => value === "score-led"
+      ? new Promise((resolve, reject) => { rejectScore = reject; })
+      : true,
+    reportError: (name, error) => reports.push([name, error.message]),
+  });
+  bus.actions.sync({ type: ACTIONS.SET_PROGRAM, value: "free" });
+  const score = bus.actions.setProgram("score-led");
+  await bus.actions.setProgram("free");
+  rejectScore(new Error("stale score failure"));
+  await score;
+  assert.equal(bus.getState().program, "free");
+  assert.deepEqual(reports, []);
+});
+
 await test("rapid music toggles serialize pending intent and settle stopped", async () => {
   const calls = [];
   let finishStart;

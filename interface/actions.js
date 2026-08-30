@@ -36,6 +36,7 @@ export function createControlActions(adapter, options = {}) {
       (changed) => changed === false || revision !== programIntentRevision
         ? null
         : { type: ACTIONS.SET_PROGRAM, value: intent },
+      () => revision === programIntentRevision,
     ).finally(() => {
       if (revision === programIntentRevision) programIntent = state.program;
     });
