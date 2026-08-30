@@ -1050,7 +1050,21 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.rehash_project()
-        with self.assertRaisesRegex(CONTRACT.ReleaseError, "exactly once inside head"):
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_reenter_head_after_body(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(referrer, "").replace(
+                "</head>", f"<body></body>{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_referrer_policy_override_fails(self) -> None:

@@ -90,6 +90,7 @@ HTML_VOID_ELEMENTS = {
     "track",
     "wbr",
 }
+PROJECT_HEAD_ELEMENTS = {"link", "meta", "style", "title"}
 
 
 class _ProjectMarkup(HTMLParser):
@@ -120,6 +121,8 @@ class _ProjectMarkup(HTMLParser):
         elif self.in_head:
             if not self.head_stack:
                 self.head_elements.append((tag, values))
+                if tag not in PROJECT_HEAD_ELEMENTS:
+                    self.structure_errors.add(f"prohibited head child {tag}")
             if tag not in HTML_VOID_ELEMENTS:
                 self.head_stack.append(tag)
         element_id = values.get("id")
