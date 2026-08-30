@@ -463,11 +463,15 @@ function flash(msg, duration = 2200) {
   }, duration);
 }
 
-function renderInteraction(snapshot) {
+function presenceMessage(snapshot = interaction.snapshot()) {
   const held = heldAt !== null;
-  const message = held && snapshot.mode !== "off"
+  return held && snapshot.mode !== "off"
     ? `${snapshot.message} Influence is paused while this frame is held; press Space to opt into motion.`
     : snapshot.message;
+}
+
+function renderInteraction(snapshot) {
+  const message = presenceMessage(snapshot);
   if (el("interaction-status").textContent !== message) el("interaction-status").textContent = message;
   el("camera-start").hidden = snapshot.mode === "camera" || snapshot.retryable;
   el("camera-retry").hidden = !snapshot.retryable;
@@ -485,14 +489,18 @@ el("fallback-start").addEventListener("click", () => { void controlBus.actions.p
 el("interaction-stop").addEventListener("click", () => { void controlBus.actions.presence("off"); });
 
 const fallbackInputs = ["fallback-x", "fallback-y", "fallback-open", "fallback-reach"];
-function applyFallback() {
-  if (interaction.snapshot().mode !== "fallback") return;
+function fallbackValues() {
   const value = (id) => Number(el(id).value) / 100;
-  interaction.setFallback({
+  return {
     center: [value("fallback-x"), value("fallback-y")],
     openness: value("fallback-open"),
     reach: value("fallback-reach"),
-  }, at());
+  };
+}
+
+function applyFallback() {
+  if (interaction.snapshot().mode !== "fallback") return;
+  interaction.setFallback(fallbackValues(), at());
 }
 for (const id of fallbackInputs) el(id).addEventListener("input", applyFallback);
 
@@ -622,6 +630,7 @@ function toggleHold() {
 }
 
 function newRiver() {
+  navigationGeneration += 1;
   previousRiver = river;
   const remembered = Arrival.recall();
   previousRiverWasRemembered = !river.shifted && Boolean(remembered)
@@ -640,6 +649,7 @@ function newRiver() {
 
 function undoRiver() {
   if (!previousRiver) return null;
+  navigationGeneration += 1;
   river = previousRiver;
   previousRiver = null;
   if (previousRiverWasRemembered) Arrival.remember(river);
@@ -738,7 +748,7 @@ async function setPresence(value) {
     if (generation !== presenceOperationGeneration) return controlBus.getState().presence;
     return interaction.snapshot().mode === "camera" ? "camera" : "off";
   }
-  if (value === "keyboard-touch") { interaction.startFallback(at()); return "keyboard-touch"; }
+  if (value === "keyboard-touch") { interaction.setFallback(fallbackValues(), at()); return "keyboard-touch"; }
   el("receipt-load").click();
   return controlBus.getState().presence;
 }
@@ -820,7 +830,7 @@ controlBus.subscribe((state) => {
   tray.dataset.open = trayOpen ? state.surface.split(":")[1] : "";
   if (state.status.river) el("river-receipt").textContent = state.status.river;
   if (state.status.score) el("score-receipt").textContent = state.status.score;
-  if (state.status.presence) el("presence-receipt").textContent = state.status.presence;
+  el("presence-receipt").textContent = state.status.presence || presenceMessage();
 });
 
 reducedMotion.addEventListener("change", reducedMotionChanged);

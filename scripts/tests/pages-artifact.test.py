@@ -760,6 +760,12 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("previousRiverWasRemembered = false;", handler)
         self.assertIn('el("river-undo").disabled = true;', handler)
 
+    def test_river_actions_expire_pending_hash_navigation(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("navigationGeneration += 1;", new_river)
+        self.assertLess(undo_river.index("if (!previousRiver) return null;"), undo_river.index("navigationGeneration += 1;"))
+
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
         self.assertIn('playback === "running"', handler)
@@ -790,6 +796,19 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertGreaterEqual(receipt.count("generation !== presenceOperationGeneration"), 2)
         self.assertIn("const generation = ++presenceOperationGeneration;", presence)
         self.assertIn("if (generation !== presenceOperationGeneration) return controlBus.getState().presence;", presence)
+
+    def test_presence_status_clear_renders_the_authoritative_interaction_message(self) -> None:
+        subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
+        self.assertIn('el("presence-receipt").textContent = state.status.presence || presenceMessage();', subscription)
+
+    def test_pre_activation_fallback_values_are_applied_when_presence_starts(self) -> None:
+        fallback = self.script.split("function fallbackValues() {", 1)[1].split("\n}", 1)[0]
+        presence = self.script.split("async function setPresence(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('value("fallback-x")', fallback)
+        self.assertIn('value("fallback-y")', fallback)
+        self.assertIn('value("fallback-open")', fallback)
+        self.assertIn('value("fallback-reach")', fallback)
+        self.assertIn('interaction.setFallback(fallbackValues(), at())', presence)
 
     def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
         self.assertIn('#project-map [aria-disabled="true"]', self.styles)
