@@ -8,6 +8,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +40,7 @@ def load(name: str, path: Path):
 DELIVER = load("danse_deliver_test", ROOT / "render/deliver.py")
 SCORE = load("danse_score_test", ROOT / "sound/score.py")
 CHECK = load("danse_submission_check_test", ROOT / "submission/check.py")
+RIGHTS = load("danse_rights_contract_delivery_test", ROOT / "scripts/rights_contract.py")
 BROWSER = load("danse_browser_test", ROOT / "render/browser.py")
 OFFLINE = load("danse_offline_test", ROOT / "render/render.py")
 BANK_CONTRACT = sys.modules["bank_contract"]
@@ -159,27 +162,15 @@ def bind_submission_score_receipt(package: Path, manifest: dict, sound: dict) ->
 
 
 def submission_attestation_values(register: dict) -> dict[str, object]:
-    values: dict[str, object] = {}
-    for section in CHECK.OWNED_SECTIONS:
-        for item in register.get(section, []):
-            if item.get("check") == "manual":
-                values[item["id"]] = None
-            elif item.get("check") == "choice":
-                values[item["id"]] = None
-    return values
+    return {key: None for key in CHECK.full_attestation_contracts(register)}
 
 
 def affirm_submission_phase(register: dict, values: dict[str, object], phase: str) -> None:
     selected = CHECK.PHASES.index(phase)
-    for section in CHECK.OWNED_SECTIONS:
-        for item in register.get(section, []):
-            owner = item.get("phase")
-            if owner not in CHECK.PHASES or CHECK.PHASES.index(owner) > selected:
-                continue
-            if item.get("check") == "manual":
-                values[item["id"]] = True
-            elif item.get("check") == "choice":
-                values[item["id"]] = item["values"][0]
+    for key, contract in CHECK.full_attestation_contracts(register).items():
+        if CHECK.PHASES.index(contract["phase"]) > selected:
+            continue
+        values[key] = True if contract["kind"] == "manual" else contract["values"][0]
 
 
 def write_submission_attestation(package: Path, values: dict[str, object]) -> Path:
@@ -269,6 +260,8 @@ def build_submission_receipt_chain(
     package: Path,
     register: dict,
     through: str = "submitted",
+    *,
+    values: dict[str, object] | None = None,
 ) -> dict[str, object]:
     item = package / "screener.mp4"
     item.write_text("exact package bytes\n")
@@ -286,7 +279,7 @@ def build_submission_receipt_chain(
         ],
     }
     (package / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    values = submission_attestation_values(register)
+    values = submission_attestation_values(register) if values is None else values
     timestamps = {
         "package": "2026-08-31T20:00:00Z",
         "uploaded": "2026-08-31T21:59:00Z",
@@ -525,6 +518,39 @@ class DeliveryContractTest(unittest.TestCase):
             DELIVER.delivery_source_sha256.cache_clear()
             self.assertNotEqual(third, fourth)
 
+    def test_decoded_rgb_identity_hashes_exact_frames_and_fails_closed(self) -> None:
+        first = bytes(range(6))
+        second = bytes(range(6, 12))
+        identity = OFFLINE.rgb24_stream_identity(
+            io.BytesIO(first + second),
+            width=2,
+            height=1,
+            expected_frames=2,
+        )
+        self.assertEqual(
+            identity,
+            {
+                "algorithm": "rgb24-stream-sha256-v1",
+                "sha256": hashlib.sha256(first + second).hexdigest(),
+                "frames": 2,
+                "width": 2,
+                "height": 1,
+            },
+        )
+        with self.assertRaisesRegex(OFFLINE.MediaIdentityError, "partial frame"):
+            OFFLINE.rgb24_stream_identity(
+                io.BytesIO(first + second + b"partial"),
+                width=2,
+                height=1,
+            )
+        with self.assertRaisesRegex(OFFLINE.MediaIdentityError, "expected exactly 1"):
+            OFFLINE.rgb24_stream_identity(
+                io.BytesIO(first + second),
+                width=2,
+                height=1,
+                expected_frames=1,
+            )
+
     def test_render_resume_receipt_binds_inputs_source_and_output_bytes(self) -> None:
         args = SimpleNamespace(
             window="passage",
@@ -543,10 +569,41 @@ class DeliveryContractTest(unittest.TestCase):
         ):
             dest = Path(tmp) / "passage-0-seg-000.mov"
             dest.write_bytes(b"encoded segment")
-            OFFLINE.write_segment_receipt(dest, args, 0, 30)
-            expected = OFFLINE.segment_identity(args, 0, 30)
-            probe = subprocess.CompletedProcess([], 0, stdout="30\n", stderr="")
-            with mock.patch.object(OFFLINE.subprocess, "run", return_value=probe):
+            stream = {"width": 3840, "height": 2160, "fps": 30}
+            decoded = {
+                "algorithm": "rgb24-stream-sha256-v1",
+                "sha256": "d" * 64,
+                "frames": 30,
+                "width": 3840,
+                "height": 2160,
+            }
+            capture = {
+                "frames": 30,
+                "missing": 0,
+                "sha256": "a" * 64,
+                "signature": "renderer-signature",
+                "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                "width": 3840,
+                "height": 2160,
+                "fps": 30,
+            }
+            with (
+                mock.patch.object(OFFLINE, "video_stream_info", return_value=stream),
+                mock.patch.object(OFFLINE, "decoded_video_identity", return_value=decoded),
+            ):
+                OFFLINE.write_segment_receipt(dest, args, 0, 30, capture=capture)
+                receipt = json.loads(OFFLINE.segment_receipt_path(dest).read_text())
+                self.assertEqual(receipt["decoded_video"], decoded)
+                self.assertEqual(
+                    receipt["capture"],
+                    {
+                        "renderer": capture["renderer"],
+                        "raw_rgba_sha256": "a" * 64,
+                        "missing": 0,
+                        "signature": "renderer-signature",
+                    },
+                )
+                expected = OFFLINE.segment_identity(args, 0, 30)
                 self.assertTrue(OFFLINE.complete(dest, 30, expected))
                 args.start = 1.0
                 self.assertFalse(OFFLINE.complete(dest, 30, OFFLINE.segment_identity(args, 0, 30)))
@@ -560,22 +617,55 @@ class DeliveryContractTest(unittest.TestCase):
             stem = root / "passage-default"
             args = SimpleNamespace(codec="prores")
             parts = OFFLINE.segment_paths(stem, args.codec, [0, 1])
-            for part in [*parts, root / "passage-default-seg-002.mov"]:
+            all_parts = [*parts, root / "passage-default-seg-002.mov"]
+            for index, part in enumerate(all_parts):
                 part.write_bytes(part.name.encode())
-                OFFLINE.segment_receipt_path(part).write_text(json.dumps({"name": part.name}))
+                OFFLINE.segment_receipt_path(part).write_text(
+                    json.dumps(
+                        {
+                            "schema": "danse.render.segment.v1",
+                            "segment": index,
+                            "frames": 1,
+                            "inputs": {},
+                            "file_sha256": OFFLINE.file_sha256(part),
+                        }
+                    )
+                )
 
             def fake_concat(*_args, **_kwargs):
                 stem.with_suffix(".mov").write_bytes(b"planned concat")
                 return subprocess.CompletedProcess([], 0)
 
-            with mock.patch.object(OFFLINE.subprocess, "run", side_effect=fake_concat):
+            stream = {"width": 1920, "height": 1080, "fps": 30}
+            decoded = {
+                "algorithm": "rgb24-stream-sha256-v1",
+                "sha256": "b" * 64,
+                "frames": 2,
+                "width": 1920,
+                "height": 1080,
+            }
+            with (
+                mock.patch.object(OFFLINE.subprocess, "run", side_effect=fake_concat),
+                mock.patch.object(OFFLINE, "video_stream_info", return_value=stream),
+                mock.patch.object(
+                    OFFLINE,
+                    "decoded_video_identity",
+                    side_effect=lambda *_args, **_kwargs: dict(decoded),
+                ),
+            ):
                 OFFLINE.concat(stem, args, parts)
-            listing = (root / "passage-default-segments.txt").read_text()
-            self.assertIn(parts[0].name, listing)
-            self.assertIn(parts[1].name, listing)
-            self.assertNotIn("seg-002", listing)
-            receipt = json.loads(OFFLINE.concat_receipt_path(stem.with_suffix(".mov")).read_text())
-            self.assertEqual([item["name"] for item in receipt["segments"]], [part.name for part in parts])
+                listing = (root / "passage-default-segments.txt").read_text()
+                self.assertIn(parts[0].name, listing)
+                self.assertIn(parts[1].name, listing)
+                self.assertNotIn("seg-002", listing)
+                receipt_path = OFFLINE.concat_receipt_path(stem.with_suffix(".mov"))
+                receipt = json.loads(receipt_path.read_text())
+                self.assertEqual([item["name"] for item in receipt["segments"]], [part.name for part in parts])
+                self.assertEqual(receipt["decoded_video"], {**decoded, "fps": 30})
+                self.assertTrue(OFFLINE.concat_complete(stem, args, parts))
+                receipt["decoded_video"]["sha256"] = "c" * 64
+                receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+                self.assertFalse(OFFLINE.concat_complete(stem, args, parts))
 
     def test_query_and_exact_tier_contracts_fail_closed(self) -> None:
         script = """
@@ -3067,6 +3157,138 @@ class DeliveryContractTest(unittest.TestCase):
                 next(row for row in deadline.rows if row[1] == "upload target")[3],
             )
 
+    def test_generated_full_attestation_binds_package_and_rejects_premature_rights_values(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        generated = CHECK.parse_attestation_document(
+            DELIVER.attestation_template(),
+            "generated package attestation",
+        )
+        contracts = CHECK.full_attestation_contracts(reg)
+        self.assertEqual(set(generated), set(contracts))
+        self.assertGreater(len(contracts), len(CHECK.assertion_contracts(reg, "submitted")))
+        rights_only = set(contracts) - set(CHECK.assertion_contracts(reg, "submitted"))
+        self.assertEqual(
+            {key: contracts[key]["phase"] for key in rights_only},
+            {
+                "submission-copy-approved": "package",
+                "dancer-release-and-credit": "package",
+                "pictured-objects-reviewed": "package",
+                "music-cleared": "package",
+                "press-stills-cleared": "submitted",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(
+                package,
+                reg,
+                through="package",
+                values=copy.deepcopy(generated),
+            )
+            attested, attest_path = CHECK.read_attestations(package)
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                binding, _, identity_errors = CHECK.validate_package_identity(package)
+            self.assertEqual(identity_errors, [])
+            report = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=datetime(2026, 8, 31, 20, tzinfo=timezone.utc),
+            )
+            self.assertEqual(report.failures, 0)
+            self.assertEqual(
+                RIGHTS.validate_attestation(RIGHTS.load_register(), attested),
+                [],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            premature = copy.deepcopy(generated)
+            premature["press-stills-cleared"] = True
+            build_submission_receipt_chain(
+                package,
+                reg,
+                through="package",
+                values=premature,
+            )
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=datetime(2026, 8, 31, 20, tzinfo=timezone.utc),
+            )
+            row = next(item for item in report.rows if item[1] == "package receipt")
+            self.assertEqual(row[2], CHECK.FAIL)
+            self.assertIn(
+                "prematurely asserts later-phase gate press-stills-cleared",
+                row[3],
+            )
+
+    def test_score_motion_manifest_reference_is_typed_and_rights_censused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            evidence = package / "provenance/score-to-motion/score-to-motion-production.json"
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text('{"schema":"fixture"}\n')
+            manifest = {
+                "schema": "danse.delivery.manifest.v1",
+                "title": "THE THING WITHOUT A NAME",
+                "seed": "0x0133D62C",
+                "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                "score_motion_evidence": {
+                    "path": evidence.relative_to(package).as_posix(),
+                    "sha256": CHECK.sha256(evidence),
+                },
+                "items": [
+                    {
+                        "name": evidence.relative_to(package).as_posix(),
+                        "bytes": evidence.stat().st_size,
+                        "sha256": CHECK.sha256(evidence),
+                    }
+                ],
+            }
+            (package / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                _, _, errors = CHECK.validate_package_identity(package)
+            self.assertEqual(errors, [])
+
+        rights = RIGHTS.load_register()
+        paths = (
+            "provenance/score-to-motion/score-to-motion-production.json",
+            "provenance/score-to-motion/boundary-frames/sample-000-control.png",
+        )
+        for path in paths:
+            matched = [
+                rule["id"]
+                for rule in rights["package_rules"]
+                if re.fullmatch(rule["pattern"], path)
+            ]
+            self.assertEqual(matched, ["score-motion-evidence"])
+        escaped = "provenance/score-to-motion/../outside.json"
+        self.assertFalse(
+            any(re.fullmatch(rule["pattern"], escaped) for rule in rights["package_rules"])
+        )
+
     def test_missing_stale_or_replayed_phase_receipts_fail_closed(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         now = datetime(2026, 9, 2, 12, tzinfo=ZoneInfo("America/New_York"))
@@ -3966,6 +4188,14 @@ class DeliveryContractTest(unittest.TestCase):
             )
             package = root / "package"
             package.mkdir()
+            obsolete = package / DELIVER.SCORE_MOTION_EVIDENCE_DIR / "obsolete/old.json"
+            obsolete.parent.mkdir(parents=True)
+            obsolete.write_text("stale evidence\n")
+            outside = root / "outside-shared-inode.json"
+            outside.write_text("must remain unchanged\n")
+            linked_sample = package / DELIVER.SCORE_MOTION_EVIDENCE_DIR / sample.name
+            os.link(outside, linked_sample)
+            shared_inode = outside.stat().st_ino
             with (
                 mock.patch.object(DELIVER, "SCORE_MOTION_EVIDENCE", receipt),
                 mock.patch.object(DELIVER, "score_motion_contract", return_value=contract),
@@ -3981,6 +4211,69 @@ class DeliveryContractTest(unittest.TestCase):
                 (package / DELIVER.SCORE_MOTION_EVIDENCE_DIR / sample.name).read_bytes(),
                 sample.read_bytes(),
             )
+            self.assertFalse(obsolete.exists())
+            self.assertFalse(obsolete.parent.exists())
+            self.assertEqual(outside.read_text(), "must remain unchanged\n")
+            self.assertEqual(outside.stat().st_ino, shared_inode)
+            self.assertNotEqual(linked_sample.stat().st_ino, shared_inode)
+
+    def test_score_motion_staging_rejects_every_symlink_ancestor(self) -> None:
+        for attack in ("provenance", "nested"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "evidence"
+                nested = source / "boundary-frames"
+                nested.mkdir(parents=True)
+                receipt = source / "score-to-motion-production.json"
+                frame = nested / "sample-000-control.png"
+                frame.write_bytes(b"authenticated frame")
+                receipt.write_text(
+                    json.dumps(
+                        {
+                            "repository_head": SUBMISSION_REPOSITORY_HEAD,
+                            "span": {
+                                "river_seed": 20170620,
+                                "stream": 0,
+                                "passage": SPAN["passage"],
+                                "t0": SPAN["t0"],
+                                "t1": SPAN["t1"],
+                                "duration_seconds": SPAN["duration"],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                contract = SimpleNamespace(
+                    production_receipt_errors=lambda path: [],
+                    evidence_artifact_paths=lambda path: [receipt, frame],
+                )
+                package = root / "package"
+                package.mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                sentinel = outside / "sentinel"
+                sentinel.write_text("unchanged\n")
+                if attack == "provenance":
+                    (package / "provenance").symlink_to(outside, target_is_directory=True)
+                else:
+                    boundary = package / DELIVER.SCORE_MOTION_EVIDENCE_DIR
+                    boundary.mkdir(parents=True)
+                    (boundary / "boundary-frames").symlink_to(
+                        outside,
+                        target_is_directory=True,
+                    )
+                with (
+                    mock.patch.object(DELIVER, "SCORE_MOTION_EVIDENCE", receipt),
+                    mock.patch.object(DELIVER, "score_motion_contract", return_value=contract),
+                    self.assertRaisesRegex(SystemExit, "unsafe|symlink"),
+                ):
+                    DELIVER.stage_score_motion_evidence(
+                        package,
+                        SPAN,
+                        SUBMISSION_REPOSITORY_HEAD,
+                    )
+                self.assertEqual(sentinel.read_text(), "unchanged\n")
+                self.assertFalse((outside / frame.name).exists())
 
     def test_submission_score_motion_row_never_substitutes_for_human_acceptance(self) -> None:
         contract = SimpleNamespace(packaged_receipt_errors=lambda *args, **kwargs: [])

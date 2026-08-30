@@ -72,8 +72,10 @@ BROWSER_CONTRACT = ROOT / "render/browser.py"
 
 sys.path.insert(0, str(ROOT / "sound"))
 sys.path.insert(0, str(ROOT / "pipeline"))
+sys.path.insert(0, str(ROOT / "render"))
 from choreography import load_choreography  # noqa: E402
 from corpus_contract import authorize_render_tier  # noqa: E402
+from media_identity import MediaIdentityError, decoded_video_identity  # noqa: E402
 from music_score import load_score  # noqa: E402
 
 
@@ -180,7 +182,12 @@ def git_identity(root: Path = ROOT, *, require_clean: bool = True) -> str:
     return commit
 
 
-def renderer_source_tree(tier: str, root: Path = ROOT) -> str:
+def renderer_source_tree(
+    tier: str,
+    root: Path = ROOT,
+    *,
+    with_score: bool = True,
+) -> str:
     path = root / "render/render.py"
     spec = importlib.util.spec_from_file_location("danse_score_motion_renderer", path)
     if spec is None or spec.loader is None:
@@ -189,8 +196,8 @@ def renderer_source_tree(tier: str, root: Path = ROOT) -> str:
     try:
         spec.loader.exec_module(module)
         args = SimpleNamespace(
-            score="music/score.json",
-            choreography="render/choreography.json",
+            score="music/score.json" if with_score else None,
+            choreography="render/choreography.json" if with_score else None,
             tier=tier,
         )
         value = module.source_tree_sha256(args)
@@ -457,28 +464,19 @@ def media_pcm_identity(path: Path, *, sample_rate: int = 48000, channels: int = 
 
 
 def media_video_identity(path: Path, *, width: int, height: int) -> dict[str, Any]:
-    """Hash every decoded frame so container-only differences cannot fake A/B."""
+    """Hash the canonical RGB pixels of every decoded frame in exact order."""
     path = regular_file(path, "A/B review media")
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        raise EvidenceError("ffmpeg is required to authenticate review-media video")
-    done = subprocess.run(
-        [
-            ffmpeg, "-v", "error", "-i", str(path), "-map", "0:v:0", "-an", "-sn",
-            "-f", "framehash", "-hash", "sha256", "-",
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if done.returncode:
-        detail = done.stderr.decode("utf-8", errors="replace").strip()
-        raise EvidenceError(f"ffmpeg cannot hash decoded review-media video: {detail}")
-    rows = [line.strip() for line in done.stdout.splitlines() if line and not line.startswith(b"#")]
-    if width < 1 or height < 1 or not rows:
-        raise EvidenceError("review-media video has no complete decoded-frame identity")
+    try:
+        identity = decoded_video_identity(path, width=width, height=height)
+    except MediaIdentityError as exc:
+        raise EvidenceError(str(exc)) from exc
     return {
-        "video_framehash_sha256": hashlib.sha256(b"\n".join(rows) + b"\n").hexdigest(),
-        "decoded_video_frames": len(rows),
+        # Keep the established public field while making its meaning canonical:
+        # it is now the ordered decoded RGB byte stream, independent of PTS and
+        # container metadata.  The explicit alias is what renderer producers use.
+        "video_framehash_sha256": identity["sha256"],
+        "decoded_rgb_sha256": identity["sha256"],
+        "decoded_video_frames": identity["frames"],
     }
 
 
@@ -977,6 +975,175 @@ def _load_frame_receipt(
     return frame, errors
 
 
+def _producer_segment_receipts(concat_path: Path) -> list[Path]:
+    """Resolve the exact ordered renderer receipt chain owned by one concat."""
+    concat = read_json(concat_path, "review-media render concat receipt")
+    rows = concat.get("segments")
+    if not isinstance(rows, list) or not rows:
+        raise EvidenceError("review-media render concat receipt has no segment chain")
+    receipts = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"name", "receipt_sha256"}:
+            raise EvidenceError(f"review-media render segment {index} has no exact reference")
+        name = row.get("name")
+        if not isinstance(name, str) or PurePosixPath(name).name != name:
+            raise EvidenceError(f"review-media render segment {index} has an unsafe name")
+        path = _bounded_file(
+            concat_path.parent,
+            f"{name}.receipt.json",
+            f"review-media render segment {index} receipt",
+        )
+        if row.get("receipt_sha256") != sha256(path):
+            raise EvidenceError(f"review-media render segment {index} receipt digest is stale")
+        receipts.append(path)
+    return receipts
+
+
+def _producer_receipt_errors(
+    receipt_path: Path,
+    reference: object,
+    *,
+    mode: str,
+    expected: dict[str, Any],
+    review_identity: dict[str, Any],
+    root: Path,
+) -> tuple[list[str], Path | None]:
+    """Bind every review frame to one exact canonical renderer receipt chain."""
+    errors, concat_path = _artifact_errors(
+        receipt_path,
+        reference,
+        f"{mode} review-media producer receipt",
+    )
+    if concat_path is None:
+        return errors, None
+    try:
+        concat = read_json(concat_path, f"{mode} review-media producer receipt")
+    except EvidenceError as exc:
+        return [*errors, str(exc)], concat_path
+    if concat.get("schema") != "danse.render.concat.v1":
+        errors.append(f"{mode} review-media producer has the wrong schema")
+    if concat.get("codec") != "prores":
+        errors.append(f"{mode} review-media producer is not the lossless-evidence codec")
+    if not isinstance(concat.get("file_sha256"), str) or not HEX64.fullmatch(
+        concat.get("file_sha256", "")
+    ):
+        errors.append(f"{mode} review-media producer has no encoded output digest")
+    decoded = concat.get("decoded_video") if isinstance(concat.get("decoded_video"), dict) else {}
+    expected_frames = round(float(expected["span"]["duration_seconds"]) * PRODUCTION_FPS)
+    expected_decoded = {
+        "algorithm": "rgb24-stream-sha256-v1",
+        "sha256": review_identity.get("decoded_rgb_sha256"),
+        "frames": review_identity.get("decoded_video_frames"),
+        "width": PRODUCTION_WIDTH,
+        "height": PRODUCTION_HEIGHT,
+        "fps": PRODUCTION_FPS,
+    }
+    if decoded != expected_decoded:
+        errors.append(f"{mode} review media full decoded video differs from its canonical producer")
+    if decoded.get("frames") != expected_frames:
+        errors.append(f"{mode} review-media producer does not cover the exact frame span")
+
+    try:
+        segment_paths = _producer_segment_receipts(concat_path)
+    except EvidenceError as exc:
+        errors.append(str(exc))
+        return errors, concat_path
+    segment_frames = None
+    total_frames = 0
+    control_source = None
+    if mode == "control":
+        try:
+            control_source = renderer_source_tree(PRODUCTION_TIER, root, with_score=False)
+        except EvidenceError as exc:
+            errors.append(str(exc))
+    for ordinal, segment_path in enumerate(segment_paths):
+        try:
+            segment = read_json(segment_path, f"{mode} render segment {ordinal} receipt")
+        except EvidenceError as exc:
+            errors.append(str(exc))
+            continue
+        if segment.get("schema") != "danse.render.segment.v1":
+            errors.append(f"{mode} render segment {ordinal} has the wrong schema")
+        if segment.get("segment") != ordinal:
+            errors.append(f"{mode} render segment chain is not ordered and contiguous at {ordinal}")
+        frames = segment.get("frames")
+        if type(frames) is not int or frames < 1:
+            errors.append(f"{mode} render segment {ordinal} has no exact frame count")
+            continue
+        inputs = segment.get("inputs") if isinstance(segment.get("inputs"), dict) else {}
+        current_segment_frames = inputs.get("segment_frames")
+        if type(current_segment_frames) is not int or current_segment_frames < 1:
+            errors.append(f"{mode} render segment {ordinal} has no segment-span identity")
+        elif segment_frames is None:
+            segment_frames = current_segment_frames
+        elif current_segment_frames != segment_frames:
+            errors.append(f"{mode} render segments do not share one segment span")
+        if segment_frames is not None:
+            remaining = expected_frames - ordinal * segment_frames
+            wanted = min(segment_frames, max(remaining, 0))
+            if frames != wanted:
+                errors.append(f"{mode} render segment {ordinal} does not own its exact frame range")
+        total_frames += frames
+        common = {
+            "window": "passage",
+            "start": 0,
+            "tier": PRODUCTION_TIER,
+            "seed": expected["span"]["river_seed"],
+            "stream": expected["span"]["stream"],
+            "codec": "prores",
+            "width": PRODUCTION_WIDTH,
+            "height": PRODUCTION_HEIGHT,
+            "fps": PRODUCTION_FPS,
+        }
+        for field, value in common.items():
+            if inputs.get(field) != value:
+                errors.append(f"{mode} render segment {ordinal} has stale {field}")
+        if mode == "with_score":
+            if inputs.get("source_tree_sha256") != expected["source_tree_sha256"]:
+                errors.append(f"{mode} render segment {ordinal} has a stale source tree")
+            score = inputs.get("music_score") if isinstance(inputs.get("music_score"), dict) else {}
+            for field in ("path", "file_sha256", "contract_sha256"):
+                if score.get(field) != expected["score"].get(field):
+                    errors.append(f"with_score render segment {ordinal} has stale score {field}")
+            choreography = (
+                inputs.get("choreography") if isinstance(inputs.get("choreography"), dict) else {}
+            )
+            if choreography != expected["choreography"]:
+                errors.append(f"with_score render segment {ordinal} has stale choreography")
+        else:
+            if "music_score" in inputs or "choreography" in inputs:
+                errors.append(f"control render segment {ordinal} is not score-free")
+            if control_source is not None and inputs.get("source_tree_sha256") != control_source:
+                errors.append(f"control render segment {ordinal} has a stale no-score source tree")
+        capture = segment.get("capture") if isinstance(segment.get("capture"), dict) else {}
+        renderer = str(capture.get("renderer", "")).lower()
+        if "apple" not in renderer or "metal" not in renderer:
+            errors.append(f"{mode} render segment {ordinal} is not authenticated as Apple Metal")
+        if capture.get("missing") != 0:
+            errors.append(f"{mode} render segment {ordinal} has missing photographic plates")
+        if not isinstance(capture.get("raw_rgba_sha256"), str) or not HEX64.fullmatch(
+            capture.get("raw_rgba_sha256", "")
+        ):
+            errors.append(f"{mode} render segment {ordinal} has no GPU-frame sequence digest")
+        if not isinstance(capture.get("signature"), str) or not capture.get("signature"):
+            errors.append(f"{mode} render segment {ordinal} has no renderer signature")
+        segment_decoded = (
+            segment.get("decoded_video") if isinstance(segment.get("decoded_video"), dict) else {}
+        )
+        if (
+            segment_decoded.get("algorithm") != "rgb24-stream-sha256-v1"
+            or segment_decoded.get("frames") != frames
+            or segment_decoded.get("width") != PRODUCTION_WIDTH
+            or segment_decoded.get("height") != PRODUCTION_HEIGHT
+            or not isinstance(segment_decoded.get("sha256"), str)
+            or not HEX64.fullmatch(segment_decoded.get("sha256", ""))
+        ):
+            errors.append(f"{mode} render segment {ordinal} has no full decoded-frame identity")
+    if total_frames != expected_frames:
+        errors.append(f"{mode} render producer segment chain has {total_frames}, expected {expected_frames} frames")
+    return errors, concat_path
+
+
 def _media_errors(
     receipt_path: Path,
     receipt: dict[str, Any],
@@ -984,6 +1151,7 @@ def _media_errors(
     expected: dict[str, Any],
     frame_path: Path | None,
     frame: dict[str, Any],
+    root: Path,
 ) -> list[str]:
     errors = []
     duration = float(expected["span"]["duration_seconds"])
@@ -1031,6 +1199,15 @@ def _media_errors(
             else:
                 if reference.get("anchors") != anchors:
                     errors.append(f"{name} review-media frame anchors are stale")
+        producer_errors, _ = _producer_receipt_errors(
+            receipt_path,
+            reference.get("producer_receipt"),
+            mode=name,
+            expected=expected,
+            review_identity=probed,
+            root=root,
+        )
+        errors.extend(producer_errors)
         identities[name] = (probed, path)
     if set(identities) == {"with_score", "control"}:
         with_probe, with_path = identities["with_score"]
@@ -1124,6 +1301,7 @@ def production_receipt_errors(
             expected=expected,
             frame_path=frame_path,
             frame=frame,
+            root=root,
         )
     )
     if receipt.get("human_review") != {"status": "not-attested"}:
@@ -1151,7 +1329,15 @@ def evidence_artifact_paths(receipt_path: Path) -> list[Path]:
         paths.add(local_artifact(frame_path, row.get("with_score"), f"{sample_id} with-score frame"))
         paths.add(local_artifact(frame_path, row.get("control"), f"{sample_id} control frame"))
     for name in ("with_score", "control"):
-        paths.add(local_artifact(receipt_path, receipt["review_media"][name], f"{name} review media"))
+        media = receipt["review_media"][name]
+        paths.add(local_artifact(receipt_path, media, f"{name} review media"))
+        producer = local_artifact(
+            receipt_path,
+            media.get("producer_receipt"),
+            f"{name} review-media producer receipt",
+        )
+        paths.add(producer)
+        paths.update(_producer_segment_receipts(producer))
     return sorted(paths)
 
 
@@ -1600,6 +1786,8 @@ def write_receipt(
     frame_path: Path,
     with_score: Path,
     control: Path,
+    with_score_producer: Path,
+    control_producer: Path,
     root: Path = ROOT,
 ) -> dict[str, Any]:
     """Finalize only already-measured machine artifacts; never mint acceptance."""
@@ -1607,7 +1795,14 @@ def write_receipt(
         raise EvidenceError("production A/B receipt destination is unsafe")
     destination.parent.mkdir(parents=True, exist_ok=True)
     base = destination.parent.resolve(strict=True)
-    for path in (sample_path, frame_path, with_score, control):
+    for path in (
+        sample_path,
+        frame_path,
+        with_score,
+        control,
+        with_score_producer,
+        control_producer,
+    ):
         try:
             regular_file(path, "production evidence artifact").relative_to(base)
         except ValueError as exc:
@@ -1634,6 +1829,10 @@ def write_receipt(
     duration = float(context["span"]["duration_seconds"])
     expected_video_frames = round(duration * 30)
     media = {}
+    producer_paths = {
+        "with_score": with_score_producer,
+        "control": control_producer,
+    }
     for name, path in (("with_score", with_score), ("control", control)):
         probe = ffprobe_media(path)
         if probe["video_frames"] != expected_video_frames:
@@ -1646,10 +1845,21 @@ def write_receipt(
             raise EvidenceError(f"{name} review movie has a stale audio frame count")
         if probe["decoded_video_frames"] != expected_video_frames:
             raise EvidenceError(f"{name} review movie has a stale decoded frame count")
+        producer_errors, _ = _producer_receipt_errors(
+            destination,
+            artifact_reference(producer_paths[name], base),
+            mode=name,
+            expected=context,
+            review_identity=probe,
+            root=root,
+        )
+        if producer_errors:
+            raise EvidenceError("; ".join(producer_errors))
         media[name] = {
             "path": path.relative_to(base).as_posix(),
             "mode": name,
             **probe,
+            "producer_receipt": artifact_reference(producer_paths[name], base),
             "anchors": review_frame_anchors(
                 path,
                 frame_path=frame_path,
@@ -1733,6 +1943,8 @@ def main() -> int:
     final.add_argument("--frames", type=Path, default=DEFAULT_FRAME_RECEIPT)
     final.add_argument("--with-score", type=Path, required=True)
     final.add_argument("--control", type=Path, required=True)
+    final.add_argument("--with-score-producer", type=Path, required=True)
+    final.add_argument("--control-producer", type=Path, required=True)
     final.add_argument("--out", type=Path, default=DEFAULT_PRODUCTION_RECEIPT)
 
     check = subparsers.add_parser("check", help="authenticate an existing production A/B receipt")
@@ -1770,6 +1982,8 @@ def main() -> int:
                 frame_path=args.frames,
                 with_score=args.with_score,
                 control=args.control,
+                with_score_producer=args.with_score_producer,
+                control_producer=args.control_producer,
             )
             print(f"ok: {args.out} · machine evidence only; human review remains not-attested")
             return 0

@@ -715,6 +715,21 @@
       ]
     },
     {
+      "id": "score-motion-evidence",
+      "pattern": "^provenance/score-to-motion/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "requirements": [
+        {"asset": "final-cut-derived-media", "use": "delivery"},
+        {"asset": "photographic-corpus", "use": "film"},
+        {"asset": "dancer-performance-likeness", "use": "film"},
+        {"asset": "poster-wall-and-pictured-objects", "use": "film"},
+        {"asset": "delibes-public-domain-compositions", "use": "competition-composition"},
+        {"asset": "paul-de-bra-source-arrangements", "use": "competition-arrangement"},
+        {"asset": "adapted-delibes-midi", "use": "competition-midi"},
+        {"asset": "musescore-general-soundfont", "use": "competition-soundfont"},
+        {"asset": "selected-music", "use": "score-audio"}
+      ]
+    },
+    {
       "id": "generated-still",
       "pattern": "^stills/seed-0x[0-9A-Fa-f]{4,}\\.(jpg|jpeg|png)$",
       "requirements": [

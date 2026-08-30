@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1047,13 +1048,230 @@ def score_motion_contract():
     return module
 
 
+def safe_score_motion_directory(package: Path, directory: Path) -> Path:
+    """Create one evidence directory without traversing a package symlink."""
+    package = package.absolute()
+    directory = directory.absolute()
+    if package.is_symlink() or not package.is_dir():
+        raise SystemExit("package score-to-motion evidence root is not a regular directory")
+    try:
+        relative = directory.relative_to(package)
+    except ValueError as exc:
+        raise SystemExit("package score-to-motion evidence destination escapes the package") from exc
+    current = package
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        current.mkdir(exist_ok=True)
+    return current
+
+
+def prune_score_motion_evidence(destination_root: Path, expected: set[str]) -> None:
+    """Make the owned evidence subtree equal the current graph, never a union."""
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
+    }
+    try:
+        surface = sorted(
+            destination_root.rglob("*"),
+            key=lambda candidate: (len(candidate.parts), candidate.as_posix()),
+            reverse=True,
+        )
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence boundary cannot be inventoried") from exc
+    for candidate in surface:
+        relative = candidate.relative_to(destination_root).as_posix()
+        if candidate.is_symlink():
+            raise SystemExit("package score-to-motion evidence boundary contains a symlink")
+        if candidate.is_file():
+            if relative not in expected:
+                candidate.unlink()
+        elif candidate.is_dir():
+            if relative not in expected_directories:
+                try:
+                    candidate.rmdir()
+                except OSError as exc:
+                    raise SystemExit(
+                        "package score-to-motion evidence boundary contains an unsafe entry"
+                    ) from exc
+        else:
+            raise SystemExit("package score-to-motion evidence boundary contains an unsafe entry")
+
+
+def require_score_motion_evidence_census(destination_root: Path, expected: set[str]) -> None:
+    """Authenticate the final owned subtree after every atomic replacement."""
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
+    }
+    files: set[str] = set()
+    directories: set[str] = set()
+    try:
+        surface = destination_root.rglob("*")
+        for candidate in surface:
+            relative = candidate.relative_to(destination_root).as_posix()
+            if candidate.is_symlink():
+                raise SystemExit("package score-to-motion evidence boundary contains a symlink")
+            if candidate.is_file():
+                files.add(relative)
+            elif candidate.is_dir():
+                directories.add(relative)
+            else:
+                raise SystemExit("package score-to-motion evidence boundary contains an unsafe entry")
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence boundary cannot be inventoried") from exc
+    if files != expected or directories != expected_directories:
+        raise SystemExit("package score-to-motion evidence census is not exact")
+
+
+def atomic_stage_score_motion_file(package: Path, source: Path, destination: Path) -> None:
+    """Replace one evidence path without following links or rewriting a shared inode."""
+    safe_score_motion_directory(package, destination.parent)
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise SystemExit("package score-to-motion evidence destination is unsafe")
+
+    common_flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = source_fd = temporary_fd = result_fd = None
+    temporary_name: str | None = None
+    replaced = False
+    try:
+        directory_fd = os.open(destination.parent, directory_flags)
+        opened_directory = os.fstat(directory_fd)
+        safe_score_motion_directory(package, destination.parent)
+        named_directory = os.stat(destination.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != (named_directory.st_dev, named_directory.st_ino)
+        ):
+            raise SystemExit("package score-to-motion evidence destination changed during staging")
+
+        source_fd = os.open(source, os.O_RDONLY | common_flags)
+        source_before = os.fstat(source_fd)
+        if not stat.S_ISREG(source_before.st_mode):
+            raise SystemExit("score-to-motion evidence source is not a regular file")
+        for _ in range(16):
+            candidate = f".{destination.name}.stage-{os.getpid()}-{os.urandom(8).hex()}"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | common_flags,
+                    (stat.S_IMODE(source_before.st_mode) & 0o777) | 0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise SystemExit("cannot reserve a score-to-motion evidence staging file")
+
+        source_digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(source_fd, 1 << 20)
+            if not block:
+                break
+            source_digest.update(block)
+            copied += len(block)
+            remaining = memoryview(block)
+            while remaining:
+                written = os.write(temporary_fd, remaining)
+                if written <= 0:
+                    raise OSError("short score-to-motion evidence write")
+                remaining = remaining[written:]
+        source_after = os.fstat(source_fd)
+        source_before_identity = (
+            source_before.st_dev,
+            source_before.st_ino,
+            source_before.st_mode,
+            source_before.st_size,
+            source_before.st_mtime_ns,
+            source_before.st_ctime_ns,
+        )
+        source_after_identity = (
+            source_after.st_dev,
+            source_after.st_ino,
+            source_after.st_mode,
+            source_after.st_size,
+            source_after.st_mtime_ns,
+            source_after.st_ctime_ns,
+        )
+        if (
+            source_before_identity != source_after_identity
+            or copied != source_after.st_size
+        ):
+            raise SystemExit("score-to-motion evidence source changed during staging")
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        replaced = True
+
+        result_fd = os.open(destination.name, os.O_RDONLY | common_flags, dir_fd=directory_fd)
+        result_info = os.fstat(result_fd)
+        if not stat.S_ISREG(result_info.st_mode):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        result_digest = hashlib.sha256()
+        result_bytes = 0
+        while True:
+            block = os.read(result_fd, 1 << 20)
+            if not block:
+                break
+            result_digest.update(block)
+            result_bytes += len(block)
+        if result_bytes != copied or result_digest.digest() != source_digest.digest():
+            raise SystemExit("package score-to-motion evidence copy changed bytes")
+
+        safe_score_motion_directory(package, destination.parent)
+        named_directory = os.stat(destination.parent, follow_symlinks=False)
+        named_result = os.stat(destination.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (opened_directory.st_dev, opened_directory.st_ino)
+            != (named_directory.st_dev, named_directory.st_ino)
+            or (result_info.st_dev, result_info.st_ino)
+            != (named_result.st_dev, named_result.st_ino)
+        ):
+            raise SystemExit("package score-to-motion evidence destination changed during staging")
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence could not be copied safely") from exc
+    finally:
+        for descriptor in (result_fd, temporary_fd, source_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        if directory_fd is not None:
+            if temporary_name is not None and not replaced:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(directory_fd)
+
+
 def stage_score_motion_evidence(
     package: Path,
     span: dict,
     repository_head: str,
 ) -> tuple[dict | None, list[Path]]:
     """Copy only a complete, current evidence graph; absence stays a later gate."""
+    destination_root = safe_score_motion_directory(
+        package,
+        package / SCORE_MOTION_EVIDENCE_DIR,
+    )
     if not SCORE_MOTION_EVIDENCE.is_file():
+        prune_score_motion_evidence(destination_root, set())
+        destination_root.rmdir()
         return None, []
     contract = score_motion_contract()
     errors = contract.production_receipt_errors(SCORE_MOTION_EVIDENCE)
@@ -1071,25 +1289,17 @@ def stage_score_motion_evidence(
     if receipt.get("repository_head") != repository_head or receipt.get("span") != expected_span:
         raise SystemExit("production score-to-motion evidence belongs to a different package span or Git HEAD")
     source_root = SCORE_MOTION_EVIDENCE.parent.resolve(strict=True)
-    destination_root = package / SCORE_MOTION_EVIDENCE_DIR
-    if destination_root.is_symlink() or (destination_root.exists() and not destination_root.is_dir()):
-        raise SystemExit("package score-to-motion evidence boundary is not a regular directory")
-    destination_root.mkdir(parents=True, exist_ok=True)
+    sources = contract.evidence_artifact_paths(SCORE_MOTION_EVIDENCE)
+    expected = {source.relative_to(source_root).as_posix() for source in sources}
+    prune_score_motion_evidence(destination_root, expected)
     staged = []
-    for source in contract.evidence_artifact_paths(SCORE_MOTION_EVIDENCE):
+    for source in sources:
         relative = source.relative_to(source_root)
         destination = destination_root / relative
-        if destination.parent.is_symlink() or (
-            destination.parent.exists() and not destination.parent.is_dir()
-        ):
-            raise SystemExit("package score-to-motion evidence destination is unsafe")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
-            raise SystemExit("package score-to-motion evidence destination is unsafe")
-        shutil.copy2(source, destination)
-        if digest(destination) != digest(source):
-            raise SystemExit("package score-to-motion evidence copy changed bytes")
+        atomic_stage_score_motion_file(package, source, destination)
         staged.append(destination)
+    prune_score_motion_evidence(destination_root, expected)
+    require_score_motion_evidence_census(destination_root, expected)
     receipt_copy = package / SCORE_MOTION_EVIDENCE_ITEM
     return {"path": SCORE_MOTION_EVIDENCE_ITEM, "sha256": digest(receipt_copy)}, staged
 

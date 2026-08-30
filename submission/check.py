@@ -116,6 +116,7 @@ MANIFEST_FIELDS = {
     "source_tree_sha256",
     "sound",
     "production",
+    "score_motion_evidence",
 }
 MANIFEST_ITEM_FIELDS = {
     "name",
@@ -875,6 +876,125 @@ def assertion_contracts(reg: dict, phase: str) -> dict[str, dict[str, Any]]:
     return contracts
 
 
+def full_attestation_contracts(reg: dict) -> dict[str, dict[str, Any]]:
+    """Return the exact worksheet shared with the canonical rights checker.
+
+    Phase receipts keep their compact ``assertions`` snapshot scoped to the
+    submission register. Their embedded ``attestation.document`` is the whole
+    package worksheet, though, because issue 16 consumes the same file. Bind the
+    overlapping contracts exactly and retain the earliest delivery phase that
+    may own each rights-only decision.
+    """
+    try:
+        rights, _ = read_contract_json(
+            RIGHTS_REGISTER.parent,
+            RIGHTS_REGISTER.name,
+            "rights attestation register",
+        )
+    except ValueError as exc:
+        raise ValueError("canonical full attestation register is unavailable") from exc
+    bindings = rights.get("bindings")
+    submission_binding = bindings.get("submission") if isinstance(bindings, dict) else None
+    source = submission_binding.get("source") if isinstance(submission_binding, dict) else None
+    if (
+        rights.get("schema") != "danse.rights.v1"
+        or not isinstance(source, dict)
+        or source.get("path") != "submission/screendance-2027.yaml"
+        or source.get("sha256") != sha256(REGISTER)
+    ):
+        raise ValueError("canonical full attestation register has a stale submission binding")
+
+    gates = rights.get("human_gates")
+    if not isinstance(gates, list) or not all(isinstance(gate, dict) for gate in gates):
+        raise ValueError("canonical full attestation register has malformed gates")
+    contracts: dict[str, dict[str, Any]] = {}
+    for gate in gates:
+        attestation = gate.get("attestation")
+        if attestation is None:
+            continue
+        if not isinstance(attestation, dict) or set(attestation) != {"key", "kind", "values"}:
+            raise ValueError("canonical full attestation register has a malformed contract")
+        key = attestation.get("key")
+        kind = attestation.get("kind")
+        values = attestation.get("values")
+        if not isinstance(key, str) or not key or key in contracts:
+            raise ValueError("canonical full attestation register repeats or omits a gate key")
+        if kind == "boolean":
+            normalized_kind = "manual"
+            if values != [True]:
+                raise ValueError(f"canonical full attestation gate {key} is not true-only")
+        elif kind == "choice":
+            normalized_kind = "choice"
+            if (
+                not isinstance(values, list)
+                or len(values) < 2
+                or not all(isinstance(value, str) and value for value in values)
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(f"canonical full attestation gate {key} has invalid choices")
+        else:
+            raise ValueError(f"canonical full attestation gate {key} has an unknown kind")
+        required_for = gate.get("required_for")
+        owned_phases = [
+            candidate
+            for candidate in PHASES
+            if isinstance(required_for, list) and candidate in required_for
+        ]
+        if not owned_phases:
+            raise ValueError(f"canonical full attestation gate {key} has no delivery phase")
+        contracts[key] = {
+            "kind": normalized_kind,
+            "values": values,
+            "phase": owned_phases[0],
+        }
+
+    submission_contracts = assertion_contracts(reg, "submitted")
+    submission_phases = {
+        item["id"]: item.get("phase")
+        for section in OWNED_SECTIONS
+        for item in reg.get(section, [])
+        if isinstance(item, dict)
+        and item.get("check") in {"manual", "choice"}
+        and isinstance(item.get("id"), str)
+    }
+    for key, contract in submission_contracts.items():
+        rights_contract = contracts.get(key)
+        if rights_contract is None:
+            raise ValueError(f"submission assertion {key} has no canonical rights gate")
+        if (
+            {field: rights_contract[field] for field in ("kind", "values")} != contract
+            or rights_contract["phase"] != submission_phases.get(key)
+        ):
+            raise ValueError(f"submission assertion {key} disagrees with its canonical rights gate")
+    return contracts
+
+
+def validate_full_attestation_snapshot(
+    values: object,
+    contracts: dict[str, dict[str, Any]],
+    phase: str,
+    label: str,
+) -> list[str]:
+    """Validate the complete worksheet without allowing later human acts early."""
+    if not isinstance(values, dict):
+        return [f"{label} has no full attestation snapshot"]
+    errors: list[str] = []
+    if set(values) != set(contracts):
+        errors.append(f"{label} full attestation census is not exact")
+    selected = PHASES.index(phase)
+    for key, contract in contracts.items():
+        value = values.get(key)
+        if PHASES.index(contract["phase"]) > selected:
+            if value is not None:
+                errors.append(f"{label} prematurely asserts later-phase gate {key}")
+            continue
+        if contract["kind"] == "manual" and value is not True:
+            errors.append(f"{label} does not affirm {key}")
+        elif contract["kind"] == "choice" and value not in contract["values"]:
+            errors.append(f"{label} has no registered choice for {key}")
+    return errors
+
+
 def validate_assertion_snapshot(
     values: object,
     contracts: dict[str, dict[str, Any]],
@@ -1074,12 +1194,19 @@ def attestation_binding_errors(
             embedded = parse_attestation_document(document, label)
         except ValueError as exc:
             errors.append(str(exc))
-        all_contracts = assertion_contracts(reg, "submitted")
-        if set(embedded) != set(all_contracts):
-            errors.append(f"{label} embedded attestation census is not exact")
-        later_assertions = set(all_contracts) - set(contracts)
-        if any(embedded.get(key) is not None for key in later_assertions):
-            errors.append(f"{label} prematurely asserts a later-phase gate")
+        try:
+            all_contracts = full_attestation_contracts(reg)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            errors.extend(
+                validate_full_attestation_snapshot(
+                    embedded,
+                    all_contracts,
+                    phase,
+                    label,
+                )
+            )
         if isinstance(document, str):
             document_sha256 = hashlib.sha256(document.encode("utf-8")).hexdigest()
             if attestation_value.get("sha256") != document_sha256:

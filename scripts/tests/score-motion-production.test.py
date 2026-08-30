@@ -224,6 +224,7 @@ class EvidenceFixture:
                 "audio_sample_rate": pcm["sample_rate"],
                 "audio_channels": pcm["channels"],
                 "video_framehash_sha256": ("7" if path == self.with_movie else "8") * 64,
+                "decoded_rgb_sha256": ("3" if path == self.with_movie else "4") * 64,
                 "decoded_video_frames": 30,
             }
             for path in (self.with_movie, self.control_movie)
@@ -244,6 +245,94 @@ class EvidenceFixture:
             ]
             for mode in ("with_score", "control")
         }
+        self.producer_paths = {}
+        control_source_tree = AB.renderer_source_tree(
+            AB.PRODUCTION_TIER,
+            ROOT,
+            with_score=False,
+        )
+        self.control_source_tree = control_source_tree
+        for mode, movie in (("with_score", self.with_movie), ("control", self.control_movie)):
+            producer_root = self.base / "producer-receipts" / mode
+            producer_root.mkdir(parents=True)
+            segment_name = f"{mode}-seg-000.mov"
+            segment_receipt = producer_root / f"{segment_name}.receipt.json"
+            inputs = {
+                "window": "passage",
+                "start": 0,
+                "tier": AB.PRODUCTION_TIER,
+                "seed": self.context["span"]["river_seed"],
+                "stream": self.context["span"]["stream"],
+                "codec": "prores",
+                "width": AB.PRODUCTION_WIDTH,
+                "height": AB.PRODUCTION_HEIGHT,
+                "fps": AB.PRODUCTION_FPS,
+                "segment_frames": 30,
+                "source_tree_sha256": (
+                    self.context["source_tree_sha256"]
+                    if mode == "with_score"
+                    else control_source_tree
+                ),
+            }
+            if mode == "with_score":
+                inputs["music_score"] = {
+                    field: self.context["score"][field]
+                    for field in ("path", "file_sha256", "contract_sha256")
+                }
+                inputs["choreography"] = copy.deepcopy(self.context["choreography"])
+            segment_receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "danse.render.segment.v1",
+                        "segment": 0,
+                        "frames": 30,
+                        "inputs": inputs,
+                        "capture": {
+                            "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                            "raw_rgba_sha256": "5" * 64,
+                            "missing": 0,
+                            "signature": f"fixture-{mode}",
+                        },
+                        "decoded_video": {
+                            "algorithm": "rgb24-stream-sha256-v1",
+                            "sha256": self.media[movie]["decoded_rgb_sha256"],
+                            "frames": 30,
+                            "width": AB.PRODUCTION_WIDTH,
+                            "height": AB.PRODUCTION_HEIGHT,
+                        },
+                        "file_sha256": "6" * 64,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            concat_receipt = producer_root / f"{mode}.mov.receipt.json"
+            concat_receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "danse.render.concat.v1",
+                        "codec": "prores",
+                        "segments": [
+                            {
+                                "name": segment_name,
+                                "receipt_sha256": digest(segment_receipt),
+                            }
+                        ],
+                        "file_sha256": "7" * 64,
+                        "decoded_video": {
+                            "algorithm": "rgb24-stream-sha256-v1",
+                            "sha256": self.media[movie]["decoded_rgb_sha256"],
+                            "frames": 30,
+                            "width": AB.PRODUCTION_WIDTH,
+                            "height": AB.PRODUCTION_HEIGHT,
+                            "fps": AB.PRODUCTION_FPS,
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            self.producer_paths[mode] = concat_receipt
         self.receipt = self.base / "score-to-motion-production.json"
         self.write_receipt()
         self.score_master = score_master
@@ -260,12 +349,18 @@ class EvidenceFixture:
                     "path": self.with_movie.relative_to(self.base).as_posix(),
                     "mode": "with_score",
                     **self.media[self.with_movie],
+                    "producer_receipt": reference(
+                        self.producer_paths["with_score"], self.base
+                    ),
                     "anchors": self.anchors["with_score"],
                 },
                 "control": {
                     "path": self.control_movie.relative_to(self.base).as_posix(),
                     "mode": "control",
                     **self.media[self.control_movie],
+                    "producer_receipt": reference(
+                        self.producer_paths["control"], self.base
+                    ),
                     "anchors": self.anchors["control"],
                 },
             },
@@ -410,6 +505,84 @@ class ProductionScoreMotionTest(unittest.TestCase):
             )
             self.assertIn("production A/B receipt schema failed", errors[0])
 
+    def test_non_anchor_splice_fails_full_frame_producer_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            fixture.with_movie.write_bytes(b"spliced non-anchor review frames")
+            fixture.media[fixture.with_movie] |= {
+                "sha256": digest(fixture.with_movie),
+                "bytes": fixture.with_movie.stat().st_size,
+                "video_framehash_sha256": "d" * 64,
+                "decoded_rgb_sha256": "e" * 64,
+            }
+            fixture.write_receipt()
+            with (
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertIn(
+                "with_score review media full decoded video differs from its canonical producer",
+                errors,
+            )
+
+    def test_producer_modes_and_segment_chain_fail_closed(self) -> None:
+        cases = ("scored-control", "missing-choreography", "short-segment")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                mode = "control" if case == "scored-control" else "with_score"
+                concat_path = fixture.producer_paths[mode]
+                concat = json.loads(concat_path.read_text())
+                segment_path = concat_path.parent / f"{concat['segments'][0]['name']}.receipt.json"
+                segment = json.loads(segment_path.read_text())
+                if case == "scored-control":
+                    segment["inputs"]["music_score"] = {
+                        field: fixture.context["score"][field]
+                        for field in ("path", "file_sha256", "contract_sha256")
+                    }
+                elif case == "missing-choreography":
+                    segment["inputs"].pop("choreography")
+                else:
+                    segment["frames"] = 29
+                    segment["decoded_video"]["frames"] = 29
+                segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+                concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+                concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+                fixture.write_receipt()
+                with (
+                    mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                    mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                ):
+                    errors = AB.production_receipt_errors(
+                        fixture.receipt,
+                        expected=fixture.context,
+                        recompute_samples=False,
+                    )
+                expected_error = {
+                    "scored-control": "control render segment 0 is not score-free",
+                    "missing-choreography": "with_score render segment 0 has stale choreography",
+                    "short-segment": "with_score render segment 0 does not own its exact frame range",
+                }[case]
+                self.assertIn(expected_error, errors)
+
+    def test_evidence_graph_owns_every_render_producer_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            owned = set(AB.evidence_artifact_paths(fixture.receipt))
+            for producer in fixture.producer_paths.values():
+                self.assertIn(producer.resolve(), owned)
+                concat = json.loads(producer.read_text())
+                for row in concat["segments"]:
+                    self.assertIn(
+                        (producer.parent / f"{row['name']}.receipt.json").resolve(),
+                        owned,
+                    )
+
     def test_pcm_or_frame_substitution_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = EvidenceFixture(Path(temporary))
@@ -452,7 +625,13 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
-                    AB, "renderer_source_tree", return_value=fixture.context["source_tree_sha256"]
+                    AB,
+                    "renderer_source_tree",
+                    side_effect=lambda *_args, with_score=True, **_kwargs: (
+                        fixture.context["source_tree_sha256"]
+                        if with_score
+                        else fixture.control_source_tree
+                    ),
                 ),
                 mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
                 mock.patch.object(AB, "require_production_tier", return_value=None),
@@ -468,7 +647,13 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
-                    AB, "renderer_source_tree", return_value=fixture.context["source_tree_sha256"]
+                    AB,
+                    "renderer_source_tree",
+                    side_effect=lambda *_args, with_score=True, **_kwargs: (
+                        fixture.context["source_tree_sha256"]
+                        if with_score
+                        else fixture.control_source_tree
+                    ),
                 ),
                 mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
                 mock.patch.object(AB, "require_production_tier", return_value=None),
@@ -483,7 +668,13 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
-                    AB, "renderer_source_tree", return_value=fixture.context["source_tree_sha256"]
+                    AB,
+                    "renderer_source_tree",
+                    side_effect=lambda *_args, with_score=True, **_kwargs: (
+                        fixture.context["source_tree_sha256"]
+                        if with_score
+                        else fixture.control_source_tree
+                    ),
                 ),
                 mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
                 mock.patch.object(AB, "require_production_tier", return_value=None),
@@ -507,7 +698,13 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
-                    AB, "renderer_source_tree", return_value=fixture.context["source_tree_sha256"]
+                    AB,
+                    "renderer_source_tree",
+                    side_effect=lambda *_args, with_score=True, **_kwargs: (
+                        fixture.context["source_tree_sha256"]
+                        if with_score
+                        else fixture.control_source_tree
+                    ),
                 ),
                 mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
                 mock.patch.object(AB, "require_production_tier", return_value=None),

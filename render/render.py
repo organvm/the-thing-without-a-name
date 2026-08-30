@@ -49,6 +49,12 @@ sys.path.insert(0, str(APP / "sound"))
 from browser import browser, serve  # noqa: E402
 from choreography import validate as validate_choreography  # noqa: E402
 from corpus_contract import authorize_render_tier  # noqa: E402
+from media_identity import (  # noqa: E402
+    MediaIdentityError,
+    decoded_video_identity,
+    rgb24_stream_identity,
+    video_stream_info,
+)
 from music_score import validate as validate_music_score  # noqa: E402
 
 OUT = HERE / "out"
@@ -177,6 +183,7 @@ def source_tree_sha256(args) -> str:
         APP / "render/program.json",
         APP / "render/render.py",
         APP / "render/browser.py",
+        APP / "render/media_identity.py",
         APP / "pipeline/corpus_contract.py",
         APP / "corpus/manifest.json",
         APP / "corpus/room.webp",
@@ -256,9 +263,63 @@ def segment_receipt_path(dest: Path) -> Path:
     return dest.with_name(dest.name + ".receipt.json")
 
 
-def write_segment_receipt(dest: Path, args, segment: int, frames: int) -> None:
+def write_segment_receipt(
+    dest: Path,
+    args,
+    segment: int,
+    frames: int,
+    *,
+    capture: dict | None = None,
+) -> None:
+    """Persist planned inputs plus the complete renderer/output identities.
+
+    ``capture`` is optional so callers can still read or mint the historical
+    additive v1 shape.  The real renderer always supplies it; those receipts
+    carry the GPU stream identity needed by downstream provenance checks.
+    """
+
     payload = segment_identity(args, segment, frames)
     payload["file_sha256"] = file_sha256(dest)
+    try:
+        stream = video_stream_info(dest)
+        if capture is not None:
+            if capture.get("frames") != frames:
+                raise MediaIdentityError("renderer capture frame count is stale")
+            if stream["width"] != capture.get("width") or stream["height"] != capture.get("height"):
+                raise MediaIdentityError("encoded segment dimensions differ from the renderer capture")
+            if abs(float(stream["fps"]) - float(capture.get("fps", 0))) > 1e-9:
+                raise MediaIdentityError("encoded segment rate differs from the renderer capture")
+        payload["decoded_video"] = decoded_video_identity(
+            dest,
+            width=int(stream["width"]),
+            height=int(stream["height"]),
+            expected_frames=frames,
+        )
+    except (MediaIdentityError, TypeError, ValueError) as exc:
+        raise SystemExit(f"cannot authenticate decoded segment video: {exc}") from exc
+    if capture is not None:
+        try:
+            capture_receipt = {
+                "renderer": capture["renderer"],
+                "raw_rgba_sha256": capture["sha256"],
+                "missing": capture["missing"],
+                "signature": capture["signature"],
+            }
+        except KeyError as exc:
+            raise SystemExit(f"renderer capture result is incomplete: {exc.args[0]}") from exc
+        if (
+            not isinstance(capture_receipt["renderer"], str)
+            or not capture_receipt["renderer"]
+            or not isinstance(capture_receipt["raw_rgba_sha256"], str)
+            or len(capture_receipt["raw_rgba_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in capture_receipt["raw_rgba_sha256"])
+            or type(capture_receipt["missing"]) is not int
+            or capture_receipt["missing"] < 0
+            or not isinstance(capture_receipt["signature"], str)
+            or not capture_receipt["signature"]
+        ):
+            raise SystemExit("renderer capture result has an invalid provenance identity")
+        payload["capture"] = capture_receipt
     segment_receipt_path(dest).write_text(json.dumps(payload, indent=2) + "\n")
 
 # Read the frame off the GPU without stalling the pipeline on it.
@@ -340,6 +401,7 @@ def render_segment(args, segment: int, dest: Path) -> dict:
         with browser(headless=not args.headed, width=320, height=240) as page:
             page.goto(page_url, wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
+            renderer = str(page.gl_renderer)
             film = page.evaluate(
                 "() => ({ t0: window.danseFilm.window.t0, t1: window.danseFilm.window.t1,"
                 " fps: window.danseFilm.window.fps, w: window.danseFilm.width, h: window.danseFilm.height,"
@@ -398,7 +460,10 @@ def render_segment(args, segment: int, dest: Path) -> dict:
                 "sha256": digest.hexdigest(),
                 "seconds": time.time() - began,
                 "signature": film["sig"],
+                "renderer": renderer,
                 "size": f"{film['w']}x{film['h']}",
+                "width": film["w"],
+                "height": film["h"],
                 "fps": fps,
             }
 
@@ -428,6 +493,37 @@ def complete(dest: Path, want: int, expected: dict) -> bool:
         return False
     if receipt.get("file_sha256") != file_sha256(dest):
         return False
+    capture = receipt.get("capture")
+    if capture is not None and (
+        not isinstance(capture, dict)
+        or not isinstance(capture.get("renderer"), str)
+        or not capture.get("renderer")
+        or not isinstance(capture.get("raw_rgba_sha256"), str)
+        or len(capture["raw_rgba_sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in capture["raw_rgba_sha256"])
+        or type(capture.get("missing")) is not int
+        or capture["missing"] < 0
+        or not isinstance(capture.get("signature"), str)
+        or not capture.get("signature")
+    ):
+        return False
+    decoded = receipt.get("decoded_video")
+    if decoded is not None:
+        if not isinstance(decoded, dict):
+            return False
+        try:
+            stream = video_stream_info(dest)
+            if decoded.get("width") != stream["width"] or decoded.get("height") != stream["height"]:
+                return False
+            current = decoded_video_identity(
+                dest,
+                width=int(stream["width"]),
+                height=int(stream["height"]),
+                expected_frames=want,
+            )
+        except (MediaIdentityError, TypeError, ValueError):
+            return False
+        return decoded == current
     out = subprocess.run(
         # fmt: off
         [
@@ -468,6 +564,39 @@ def concat_identity(args, parts: list[Path]) -> dict:
     }
 
 
+def planned_frame_count(parts: list[Path]) -> int:
+    """Return the exact frame count owned by the ordered segment receipts."""
+
+    total = 0
+    for part in parts:
+        receipt_path = segment_receipt_path(part)
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            frames = receipt["frames"]
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            raise MediaIdentityError(f"segment receipt has no exact frame count: {receipt_path.name}") from exc
+        if type(frames) is not int or frames < 1:
+            raise MediaIdentityError(f"segment receipt has an invalid frame count: {receipt_path.name}")
+        total += frames
+    if total < 1:
+        raise MediaIdentityError("planned concat contains no frames")
+    return total
+
+
+def concat_decoded_video_identity(dest: Path, parts: list[Path]) -> dict[str, object]:
+    """Recompute the normalized identity of one completed planned concat."""
+
+    stream = video_stream_info(dest)
+    decoded = decoded_video_identity(
+        dest,
+        width=int(stream["width"]),
+        height=int(stream["height"]),
+        expected_frames=planned_frame_count(parts),
+    )
+    decoded["fps"] = stream["fps"]
+    return decoded
+
+
 def concat_complete(stem: Path, args, parts: list[Path]) -> bool:
     dest = stem.with_suffix(SUFFIX[args.codec])
     receipt_path = concat_receipt_path(dest)
@@ -478,10 +607,21 @@ def concat_complete(stem: Path, args, parts: list[Path]) -> bool:
         expected = concat_identity(args, parts)
     except (OSError, json.JSONDecodeError):
         return False
-    return (
+    basic = (
         {key: receipt.get(key) for key in expected} == expected
         and receipt.get("file_sha256") == file_sha256(dest)
     )
+    if not basic:
+        return False
+    decoded = receipt.get("decoded_video")
+    if decoded is None:
+        return True
+    if not isinstance(decoded, dict):
+        return False
+    try:
+        return decoded == concat_decoded_video_identity(dest, parts)
+    except (MediaIdentityError, TypeError, ValueError):
+        return False
 
 
 def concat(stem: Path, args, parts: list[Path]) -> Path:
@@ -504,6 +644,10 @@ def concat(stem: Path, args, parts: list[Path]) -> Path:
     )  # fmt: skip
     receipt = concat_identity(args, parts)
     receipt["file_sha256"] = file_sha256(dest)
+    try:
+        receipt["decoded_video"] = concat_decoded_video_identity(dest, parts)
+    except (MediaIdentityError, TypeError, ValueError) as exc:
+        raise SystemExit(f"cannot authenticate decoded concat video: {exc}") from exc
     concat_receipt_path(dest).write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"  {dest.name} ← {len(parts)} segments")
     return dest
@@ -623,7 +767,7 @@ def main() -> int:
         r = render_segment(args, seg, dest)
         if r.get("skipped"):
             continue
-        write_segment_receipt(dest, args, seg, r["frames"])
+        write_segment_receipt(dest, args, seg, r["frames"], capture=r)
         note = f" · {r['missing']} MISSING PLATES" if r["missing"] else ""
         print(
             f"  {dest.name} · {r['frames']} frames · {r['size']} @{r['fps']} · "

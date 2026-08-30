@@ -142,7 +142,9 @@
         "audio_sample_rate",
         "audio_channels",
         "video_framehash_sha256",
+        "decoded_rgb_sha256",
         "decoded_video_frames",
+        "producer_receipt",
         "anchors"
       ],
       "properties": {
@@ -162,7 +164,9 @@
         "audio_sample_rate": {"const": 48000},
         "audio_channels": {"const": 2},
         "video_framehash_sha256": {"$ref": "#/$defs/sha256"},
+        "decoded_rgb_sha256": {"$ref": "#/$defs/sha256"},
         "decoded_video_frames": {"type": "integer", "minimum": 1},
+        "producer_receipt": {"$ref": "#/$defs/localArtifact"},
         "anchors": {
           "type": "array", "minItems": 3,
           "items": {"$ref": "#/$defs/reviewAnchor"}
