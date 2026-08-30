@@ -149,14 +149,17 @@ def validate_runtime_plan_contract(
             ) from exc
 
     def number(value: Any, label: str, minimum: float = 0) -> float:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) < minimum
-        ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ContractError(f"installation runtime plan {label} is not numeric")
-        return float(value)
+        try:
+            result = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ContractError(
+                f"installation runtime plan {label} is not numeric"
+            ) from exc
+        if not math.isfinite(result) or result < minimum:
+            raise ContractError(f"installation runtime plan {label} is not numeric")
+        return result
 
     if not isinstance(plan, dict) or plan.get("schema") != RUNTIME_PLAN_SCHEMA:
         raise ContractError("unknown installation runtime plan schema")

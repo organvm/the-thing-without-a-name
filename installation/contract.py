@@ -134,13 +134,14 @@ def _sha256(value: Any, label: str) -> str:
 def _finite(
     value: Any, label: str, low: float = -math.inf, high: float = math.inf
 ) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ContractError(f"{label} must be finite")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ContractError(f"{label} must be finite") from exc
+    if not math.isfinite(result):
+        raise ContractError(f"{label} must be finite")
     if result < low or result > high:
         raise ContractError(f"{label} must be in [{low}, {high}]")
     return result
@@ -2094,22 +2095,29 @@ def validate_evidence(
                     line.encode("utf-8"),
                     f"wall-plug proof {proof_id} telemetry event {index}",
                 )
+                elapsed_value = record.get("elapsed_seconds")
+                try:
+                    elapsed = (
+                        float(elapsed_value)
+                        if not isinstance(elapsed_value, bool)
+                        and isinstance(elapsed_value, (int, float))
+                        else math.nan
+                    )
+                except (OverflowError, ValueError):
+                    elapsed = math.nan
                 if (
                     record.get("schema") != "danse.installation.telemetry.v1"
                     or isinstance(record.get("sequence"), bool)
                     or not isinstance(record.get("sequence"), int)
                     or record.get("sequence") != index
-                    or isinstance(record.get("elapsed_seconds"), bool)
-                    or not isinstance(record.get("elapsed_seconds"), (int, float))
-                    or not math.isfinite(float(record["elapsed_seconds"]))
-                    or float(record["elapsed_seconds"]) < 0
+                    or not math.isfinite(elapsed)
+                    or elapsed < 0
                     or not isinstance(record.get("event"), str)
                     or not record["event"]
                 ):
                     raise ContractError(
                         f"wall-plug proof {proof_id} telemetry event sequence is malformed"
                     )
-                elapsed = float(record["elapsed_seconds"])
                 if elapsed < previous_elapsed:
                     raise ContractError(
                         f"wall-plug proof {proof_id} telemetry elapsed time moved backwards"

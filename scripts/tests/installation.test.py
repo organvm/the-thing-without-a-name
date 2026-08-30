@@ -839,6 +839,13 @@ class InstallationContractTest(unittest.TestCase):
                     evidence, self.spec, phase="runtime", release_root=release
                 )
 
+            evidence = evidence_for(self.spec, release)
+            evidence["venue"]["dimensions_m"]["width"] = 10**400
+            with self.assertRaisesRegex(ContractError, "must be finite"):
+                validate_evidence(
+                    evidence, self.spec, phase="runtime", release_root=release
+                )
+
     def test_completion_requires_three_distinct_human_wall_plug_proofs_and_restore(
         self,
     ) -> None:
@@ -1067,6 +1074,28 @@ class InstallationContractTest(unittest.TestCase):
                     release_root=release,
                 )
 
+            oversized_elapsed = copy.deepcopy(evidence)
+            oversized_proof = oversized_elapsed["wall_plug_proofs"][0]
+            oversized_records = [
+                json.loads(line)
+                for line in oversized_proof["runtime_telemetry_receipt"][
+                    "events_jsonl"
+                ].splitlines()
+            ]
+            oversized_records[-1]["elapsed_seconds"] = 10**400
+            oversized_proof["runtime_telemetry_receipt"]["events_jsonl"] = "".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                for record in oversized_records
+            )
+            refresh_telemetry_receipt(oversized_elapsed, oversized_proof)
+            with self.assertRaisesRegex(ContractError, "event sequence is malformed"):
+                validate_evidence(
+                    oversized_elapsed,
+                    self.spec,
+                    phase="complete",
+                    release_root=release,
+                )
+
             surrogate = copy.deepcopy(evidence)
             surrogate["wall_plug_proofs"][0]["runtime_telemetry_receipt"][
                 "events_jsonl"
@@ -1219,11 +1248,20 @@ class InstallationContractTest(unittest.TestCase):
                 "unbounded-policy-time": lambda plan: plan["policy"]["health"].update(
                     {"probe_interval_seconds": 1e308}
                 ),
+                "overflowing-policy-time": lambda plan: plan["policy"]["health"].update(
+                    {"probe_interval_seconds": 10**400}
+                ),
                 "drifted-spec": lambda plan: plan.__setitem__(
                     "spec_contract_sha256", digest("untrusted-runtime-spec")
                 ),
                 "drifted-outputs": lambda plan: plan.__setitem__(
                     "outputs", ["projection-counterfeit"]
+                ),
+                "nul-evidence-id": lambda plan: plan.__setitem__(
+                    "evidence_id", "bad\0evidence"
+                ),
+                "surrogate-evidence-id": lambda plan: plan.__setitem__(
+                    "evidence_id", "\ud800"
                 ),
                 "nul-argument": lambda plan: plan["argv"].append("bad\0argument"),
                 "surrogate-argument": lambda plan: plan["argv"].append("\ud800"),
