@@ -208,7 +208,12 @@ class ProductionArtifactTest(unittest.TestCase):
         cls._temporary = None
         if supplied:
             cls.output = Path(supplied)
-            cls.manifest = PAGES.verify_artifact(cls.output, expected)
+            cls.manifest = PAGES.verify_artifact(
+                cls.output,
+                expected,
+                require_source_manifest=True,
+                source_root=ROOT,
+            )
         else:
             cls._temporary = tempfile.TemporaryDirectory()
             cls.output = Path(cls._temporary.name) / "pages"
@@ -310,8 +315,12 @@ class ProductionArtifactTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("rights/") for path in paths))
 
     def test_every_recorded_sha256_and_byte_count_verifies(self) -> None:
+        supplied = bool(os.environ.get("DANSE_PAGES_ARTIFACT"))
         verified = PAGES.verify_artifact(
-            self.output, os.environ.get("DANSE_PAGES_SOURCE_SHA") or TEST_COMMIT
+            self.output,
+            os.environ.get("DANSE_PAGES_SOURCE_SHA") or TEST_COMMIT,
+            require_source_manifest=supplied,
+            source_root=ROOT,
         )
         self.assertEqual(verified, self.manifest)
 
@@ -553,7 +562,11 @@ class ArtifactBoundaryTest(unittest.TestCase):
         )
         self.rehash_project_manifest()
         with self.assertRaisesRegex(PAGES.ArtifactError, "project links failed verification"):
-            PAGES.verify_artifact(self.output, TEST_COMMIT)
+            PAGES.verify_artifact(
+                self.output,
+                TEST_COMMIT,
+                allow_unbound_release_fixture=True,
+            )
 
     def test_rehashed_pages_manifest_cannot_admit_weakened_project_security(self) -> None:
         release, release_source = release_artifact_fixture(self.base, "public")
@@ -574,7 +587,11 @@ class ArtifactBoundaryTest(unittest.TestCase):
         )
         self.rehash_project_manifest()
         with self.assertRaisesRegex(PAGES.ArtifactError, "project security failed verification"):
-            PAGES.verify_artifact(self.output, TEST_COMMIT)
+            PAGES.verify_artifact(
+                self.output,
+                TEST_COMMIT,
+                allow_unbound_release_fixture=True,
+            )
 
     def test_rehashed_pages_manifest_cannot_admit_browser_security_bypasses(self) -> None:
         attacks = {
@@ -650,7 +667,11 @@ class ArtifactBoundaryTest(unittest.TestCase):
                     PAGES.ArtifactError,
                     "project security failed verification",
                 ):
-                    PAGES.verify_artifact(output, TEST_COMMIT)
+                    PAGES.verify_artifact(
+                        output,
+                        TEST_COMMIT,
+                        allow_unbound_release_fixture=True,
+                    )
 
     def test_rehashed_pages_manifest_cannot_change_public_claims(self) -> None:
         release, release_source = release_artifact_fixture(self.base, "public")
@@ -696,8 +717,47 @@ class ArtifactBoundaryTest(unittest.TestCase):
                     PAGES.ArtifactError,
                     "project bytes drifted from the verified release receipt",
                 ):
-                    PAGES.verify_artifact(case, TEST_COMMIT)
+                    PAGES.verify_artifact(
+                        case,
+                        TEST_COMMIT,
+                        allow_unbound_release_fixture=True,
+                    )
         self.output = baseline
+
+    def test_release_bearing_artifact_cannot_skip_source_authentication(self) -> None:
+        release, release_source = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
+            release_source_root=release_source,
+        )
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "THE THING WITHOUT A NAME",
+                "UNRECEIPTED PUBLIC CLAIM",
+            ),
+            encoding="utf-8",
+        )
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            item for item in manifest["files"] if item["path"] == "project/index.html"
+        )
+        record["bytes"] = project.stat().st_size
+        record["sha256"] = PAGES.sha256(project)
+        manifest["release"]["project_sha256"] = record["sha256"]
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "release-bearing artifact verification requires source-manifest",
+        ):
+            PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_missing_or_draft_release_artifact_fails_before_pages_bytes(self) -> None:
         missing = self.base / "missing-release"

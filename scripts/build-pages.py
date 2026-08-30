@@ -557,6 +557,7 @@ def verify_artifact(
     *,
     require_source_manifest: bool = False,
     source_root: Path = ROOT,
+    allow_unbound_release_fixture: bool = False,
 ) -> dict:
     output = output.absolute()
     if output.is_symlink():
@@ -606,6 +607,11 @@ def verify_artifact(
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["project_sha256"]))
         ):
             raise ArtifactError("artifact release binding is invalid")
+        if not require_source_manifest and not allow_unbound_release_fixture:
+            raise ArtifactError(
+                "release-bearing artifact verification requires source-manifest "
+                "authentication"
+            )
 
     records = manifest.get("files")
     if not isinstance(records, list):
@@ -873,6 +879,9 @@ def build(
         commit,
         require_source_manifest=require_git_source,
         source_root=root,
+        allow_unbound_release_fixture=(
+            release_binding is not None and not require_git_source
+        ),
     )
 
 
