@@ -753,12 +753,35 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("renderer-fallback", self.markup.by_id)
         initialization = self.script.split("let baseRenderer = null;", 1)[1].split("// Non-null", 1)[0]
         self.assertIn("try {", initialization)
-        self.assertIn("baseRenderer = new Renderer(canvas, corpus);", initialization)
+        self.assertIn("const candidateRenderer = new Renderer(canvas, corpus);", initialization)
+        self.assertIn("await corpus.prime(candidateRenderer.gl", initialization)
+        self.assertLess(
+            initialization.index("await corpus.prime(candidateRenderer.gl"),
+            initialization.index("baseRenderer = candidateRenderer;"),
+        )
+        self.assertIn("baseRenderer = null;", initialization.split("catch (error)", 1)[1])
         self.assertIn('el("renderer-fallback").hidden = false;', initialization)
         self.assertIn('console.warn("Danse visual renderer unavailable; controls remain available", error);', initialization)
-        self.assertIn("if (!renderer) return;", self.script.split("function frame() {", 1)[1].split("\n}", 1)[0])
-        self.assertIn("if (renderer) requestAnimationFrame(frame);", self.script)
+        frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(frame.index("interaction.tick("), frame.index("if (!renderer)"))
+        self.assertIn("requestAnimationFrame(frame);", frame.split("if (!renderer)", 1)[1])
+        self.assertIn("requestAnimationFrame(frame);", self.script)
         self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
+
+    def test_live_frame_synchronizes_the_pressed_score_movement(self) -> None:
+        frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("movement.id === r.state.movement", frame)
+        self.assertIn("controlBus.getState().movement !== liveMovement", frame)
+        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", frame)
+
+    def test_map_atomically_replaces_the_visual_details_sheet(self) -> None:
+        helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openMap()"))
+
+    def test_transient_feedback_stays_above_every_progressive_surface(self) -> None:
+        self.assertIn("#toast {\n    position: fixed; z-index: 8;", self.html)
+        self.assertIn("#danse-dock {\n  position:fixed; z-index:6;", self.styles)
+        self.assertIn("#hud {\n  position:fixed; z-index:7;", self.styles)
 
     def test_opening_a_tray_closes_the_visual_details_sheet_first(self) -> None:
         helper = self.script.split("function openTray(category, trigger) {", 1)[1].split("\n}", 1)[0]
@@ -806,7 +829,9 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('if (intent === "stopped")', music)
         self.assertIn("await scoreAudio.start(scoreSecondAt(at()))", music)
         self.assertIn("if (heldAt !== null)", music)
-        self.assertIn("scoreAudio.stop();", music.split("if (heldAt !== null)", 1)[1])
+        held = music.split("if (heldAt !== null)", 1)[1]
+        self.assertIn("scoreAudio.sync(scoreSecondAt(at()), true);", held)
+        self.assertNotIn("scoreAudio.stop();", held.split("return", 1)[0])
         self.assertIn("scoreAudio.stop();", music.split("catch (error)", 1)[1])
         self.assertIn("const previousHeldAt = heldAt;", hold)
         self.assertIn("heldAt = previousHeldAt;", hold.split("catch (error)", 1)[1])

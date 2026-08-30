@@ -496,6 +496,34 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
     check_ids = [check["id"] for check in receipt["checks"]]
     if check_ids != list(PROGRESSIVE_CONTROLS_CHECKS):
         raise ReleaseError("progressive controls replay check inventory drifted")
+
+    source = receipt["source"]
+    exact_head = source["exact_head"]
+    resolved_head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{exact_head}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if resolved_head.returncode != 0 or resolved_head.stdout.strip() != exact_head:
+        raise ReleaseError("progressive controls replay exact head is not a repository commit")
+    resolved_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{exact_head}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if resolved_tree.returncode != 0 or resolved_tree.stdout.strip() != source["tree"]:
+        raise ReleaseError("progressive controls replay tree does not belong to its exact head")
+    source_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if source_tree.returncode != 0 or source_tree.stdout.strip() != source["tree"]:
+        raise ReleaseError("progressive controls replay does not bind the reviewed source tree")
+
     renderer = receipt["runtime"]["graphics_renderer"].lower()
     if "apple" not in renderer or "metal" not in renderer:
         raise ReleaseError("progressive controls replay is not authenticated as Apple Metal")

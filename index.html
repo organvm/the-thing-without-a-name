@@ -111,7 +111,7 @@
   #hud-toggle:focus-visible { outline: 2px solid #e8e8ee; outline-offset: 3px; }
 
   #toast {
-    position: fixed; z-index: 5; left: 50%; top: max(16px, env(safe-area-inset-top));
+    position: fixed; z-index: 8; left: 50%; top: max(16px, env(safe-area-inset-top));
     transform: translateX(-50%); width: max-content; max-width: calc(100% - 32px);
     padding: 9px 12px; border-radius: 4px; background: rgba(14, 14, 16, .94);
     color: #e8e8ee; overflow-wrap: anywhere; text-align: center;
@@ -322,11 +322,13 @@ const veil = el("veil");
 let baseRenderer = null;
 let rendererFailure = null;
 try {
-  baseRenderer = new Renderer(canvas, corpus);
-  await corpus.prime(baseRenderer.gl, {
+  const candidateRenderer = new Renderer(canvas, corpus);
+  await corpus.prime(candidateRenderer.gl, {
     onProgress: (p) => { el("bar").firstElementChild.style.width = `${p * 100}%`; },
   });
+  baseRenderer = candidateRenderer;
 } catch (error) {
+  baseRenderer = null;
   rendererFailure = error;
   canvas.hidden = true;
   el("renderer-fallback").hidden = false;
@@ -391,9 +393,13 @@ function reducedMotionChanged({ matches }) {
 }
 
 function frame() {
-  if (!renderer) return;
   const t = at();
   interaction.tick(t, river, { motion: heldAt === null });
+  if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(t), heldAt !== null);
+  if (!renderer) {
+    requestAnimationFrame(frame);
+    return;
+  }
   // Time is not wrapped. The piece has no duration to reach and nothing to
   // restart: each passage of the phrase draws its own length and its own
   // material, so running longer means seeing further, never seeing again.
@@ -406,7 +412,12 @@ function frame() {
     conductor,
     matteK,
   });
-  if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(t), heldAt !== null);
+  if (program && controlBus) {
+    const liveMovement = program.movements.findIndex((movement) => movement.id === r.state.movement) + 1;
+    if (liveMovement > 0 && controlBus.getState().movement !== liveMovement) {
+      controlBus.actions.sync({ type: ACTIONS.SET_MOVEMENT, value: liveMovement });
+    }
+  }
 
   // Elapsed within the current passage, so the readout says where you are in
   // this one rather than counting up forever into a number nobody can hold.
@@ -424,7 +435,7 @@ function frame() {
   el("interaction-summary").textContent = `${interaction.mode}${embodied}`;
   requestAnimationFrame(frame);
 }
-if (renderer) requestAnimationFrame(frame);
+requestAnimationFrame(frame);
 
 // Keep the address bar honest without thrashing history — and note what it does
 // NOT write. Persisting `t` would make a reload resume where you left, which is
@@ -591,7 +602,7 @@ async function toggleMusic(intent) {
     }
     await scoreAudio.start(scoreSecondAt(at()));
     if (heldAt !== null) {
-      scoreAudio.stop();
+      scoreAudio.sync(scoreSecondAt(at()), true);
       return "suspended-by-hold";
     }
     return "playing";
@@ -837,6 +848,7 @@ function openTray(category, trigger) {
 }
 
 async function openMap(trigger) {
+  if (!hud.hidden) setHudVisible(false);
   surfaceTrigger = trigger;
   controlBus.actions.openMap();
   if (!projectMap.open) projectMap.showModal();
