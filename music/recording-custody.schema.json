@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://danse.example/schemas/recording-custody.v1.json",
+  "title": "Danse public-safe deterministic recording custody receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "status",
+    "profile",
+    "work_id",
+    "recorded_on",
+    "audio_render",
+    "pre_normalized_master",
+    "master",
+    "stems",
+    "contracts",
+    "verification",
+    "clearance"
+  ],
+  "properties": {
+    "schema": {"const": "danse.music.recording-custody.v1"},
+    "status": {"const": "custody-only"},
+    "profile": {"const": "competition-classical"},
+    "work_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "recorded_on": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "audio_render": {"$ref": "#/$defs/derivedArtifact"},
+    "pre_normalized_master": {"$ref": "#/$defs/audioArtifact"},
+    "master": {"$ref": "#/$defs/audioArtifact"},
+    "stems": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/stemArtifact"}
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "score",
+        "choreography",
+        "midi",
+        "adaptation",
+        "toolchain",
+        "mix",
+        "audio_uses",
+        "soundfont"
+      ],
+      "properties": {
+        "score": {"$ref": "#/$defs/contract"},
+        "choreography": {"$ref": "#/$defs/contract"},
+        "midi": {"$ref": "#/$defs/contract"},
+        "adaptation": {"$ref": "#/$defs/contract"},
+        "toolchain": {"$ref": "#/$defs/contract"},
+        "mix": {"$ref": "#/$defs/contract"},
+        "audio_uses": {"$ref": "#/$defs/contract"},
+        "soundfont": {"$ref": "#/$defs/contract"}
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat_master_sha256",
+        "deterministic",
+        "non_silent",
+        "stems_non_silent",
+        "polyphonic",
+        "normalization_deterministic",
+        "loudness_in_target",
+        "true_peak_in_target",
+        "duration_matches_score",
+        "seek_safe"
+      ],
+      "properties": {
+        "repeat_master_sha256": {"$ref": "#/$defs/sha256"},
+        "deterministic": {"const": true},
+        "non_silent": {"const": true},
+        "stems_non_silent": {"const": true},
+        "polyphonic": {"const": true},
+        "normalization_deterministic": {"const": true},
+        "loudness_in_target": {"const": true},
+        "true_peak_in_target": {"const": true},
+        "duration_matches_score": {"const": true},
+        "seek_safe": {"const": true}
+      }
+    },
+    "clearance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate", "state", "note"],
+      "properties": {
+        "gate": {"const": "music-cleared"},
+        "state": {"const": "pending"},
+        "note": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "workPath": {"type": "string", "pattern": "^\\.work/[A-Za-z0-9._/-]+$"},
+    "repoPath": {"type": "string", "pattern": "^[A-Za-z0-9._/-]+$"},
+    "derivedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": {"$ref": "#/$defs/workPath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "audioArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "frames", "sample_rate", "channels"],
+      "properties": {
+        "path": {"$ref": "#/$defs/workPath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "frames": {"type": "integer", "minimum": 1},
+        "sample_rate": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1}
+      }
+    },
+    "stemArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256", "bytes", "frames", "sample_rate", "channels"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+        "path": {"$ref": "#/$defs/workPath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "frames": {"type": "integer", "minimum": 1},
+        "sample_rate": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/repoPath"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

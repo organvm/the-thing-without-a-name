@@ -10,6 +10,7 @@ edition, MIDI, performance, recording, or sample clearance.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
@@ -20,9 +21,12 @@ from typing import Any
 
 import yaml
 
+from record_recording_custody import hydrated_receipt_errors
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTER = ROOT / "music" / "repertoire.yaml"
 DEFAULT_SCHEMA = ROOT / "music" / "repertoire.schema.json"
+RECORDING_CUSTODY_SCHEMA = ROOT / "music" / "recording-custody.schema.json"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LAYERS = ("composition", "edition", "arrangement_midi", "performance", "recording", "samples")
 RIGHTS_STATUSES = {
@@ -130,6 +134,9 @@ def _schema_errors(
         minimum = rule.get("minItems")
         if isinstance(minimum, int) and len(value) < minimum:
             errors.append(f"{location}: must contain at least {minimum} item(s)")
+        maximum = rule.get("maxItems")
+        if isinstance(maximum, int) and len(value) > maximum:
+            errors.append(f"{location}: must contain at most {maximum} item(s)")
         child = rule.get("items")
         if isinstance(child, dict):
             for index, item in enumerate(value):
@@ -165,6 +172,46 @@ def validate_schema_instance(
     if not isinstance(schema, dict):
         return ["schema document: root must be an object"]
     return _schema_errors(register, schema, schema, "register")
+
+
+def validate_recording_custody_schema(
+    receipt: Any,
+    path: Path = RECORDING_CUSTODY_SCHEMA,
+) -> list[str]:
+    try:
+        schema = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"recording custody schema: {exc}"]
+    if not isinstance(schema, dict):
+        return ["recording custody schema: root must be an object"]
+    errors = _schema_errors(receipt, schema, schema, "recording custody receipt")
+    if not isinstance(receipt, dict):
+        return errors
+    recorded_on = receipt.get("recorded_on")
+    if isinstance(recorded_on, str):
+        try:
+            dt.date.fromisoformat(recorded_on)
+        except ValueError:
+            errors.append("recording custody receipt.recorded_on: must be a valid calendar date")
+    master = receipt.get("master")
+    verification = receipt.get("verification")
+    if isinstance(master, dict) and isinstance(verification, dict):
+        if verification.get("repeat_master_sha256") != master.get("sha256"):
+            errors.append(
+                "recording custody receipt.verification.repeat_master_sha256: "
+                "must equal the final master digest"
+            )
+    stems = receipt.get("stems")
+    artifacts = [receipt.get("pre_normalized_master"), master]
+    if isinstance(stems, list):
+        artifacts.extend(stems)
+        stem_ids = [row.get("id") for row in stems if isinstance(row, dict)]
+        if len(stem_ids) != len(set(stem_ids)):
+            errors.append("recording custody receipt.stems: ids must be unique")
+    paths = [row.get("path") for row in artifacts if isinstance(row, dict)]
+    if len(paths) != len(set(paths)):
+        errors.append("recording custody receipt: audio output paths must be unique")
+    return errors
 
 
 def sha256(path: Path) -> str:
@@ -250,6 +297,7 @@ def validate_document(
         *,
         required: bool,
         allow_hydrated: bool = False,
+        allow_derived: bool = False,
     ) -> tuple[str, str] | None:
         if value is None:
             if required:
@@ -266,9 +314,12 @@ def validate_document(
             return None
         normalized = Path(relative).as_posix()
         custody = row.get("custody")
-        if custody == "hydrated-local":
-            if not allow_hydrated:
+        if custody in {"hydrated-local", "hydrated-derived"}:
+            if custody == "hydrated-local" and not allow_hydrated:
                 error(f"{location}.custody", "hydrated-local is not allowed for this provenance layer")
+                return relative, digest
+            if custody == "hydrated-derived" and not allow_derived:
+                error(f"{location}.custody", "hydrated-derived is allowed only for a rendered recording")
                 return relative, digest
             relative_path = Path(relative)
             work_root = (root / ".work").resolve()
@@ -277,13 +328,16 @@ def validate_document(
                 or any(part in {"", ".", ".."} for part in relative_path.parts)
                 or not _inside(work_root, (root / relative_path).resolve())
             ):
-                error(f"{location}.path", "hydrated-local bytes must live below .work/")
+                error(f"{location}.path", f"{custody} bytes must live below .work/")
             if tracked is not None and normalized in tracked:
-                error(f"{location}.path", "hydrated-local bytes must remain untracked")
-            if not isinstance(row.get("source_url"), str) or not row["source_url"].strip():
-                error(f"{location}.source_url", "must identify the hydration source")
-            notice = row.get("license_notice")
-            source(notice, f"{location}.license_notice", required=True)
+                error(f"{location}.path", f"{custody} bytes must remain untracked")
+            if custody == "hydrated-local":
+                if not isinstance(row.get("source_url"), str) or not row["source_url"].strip():
+                    error(f"{location}.source_url", "must identify the hydration source")
+                notice = row.get("license_notice")
+                source(notice, f"{location}.license_notice", required=True)
+            else:
+                source(row.get("receipt"), f"{location}.receipt", required=True)
             candidate = root / relative
             if not candidate.exists():
                 if require_hydrated:
@@ -404,11 +458,47 @@ def validate_document(
             layer = layer_rows[layer_name]
             source(layer.get("source"), f"{location}.{layer_name}.source", required=False)
         recording = layer_rows["recording"]
-        source(
+        recording_source = source(
             recording.get("source"),
             f"{location}.recording.source",
             required=recording.get("status") in {"project-authored", "licensed"},
+            allow_derived=True,
         )
+        recording_source_row = recording.get("source")
+        if isinstance(recording_source_row, dict) and recording_source_row.get("custody") == "hydrated-derived":
+            receipt_reference = recording_source_row.get("receipt")
+            if isinstance(receipt_reference, dict) and isinstance(receipt_reference.get("path"), str):
+                receipt_path = root / receipt_reference["path"]
+                try:
+                    receipt_document = json.loads(receipt_path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    error(f"{location}.recording.source.receipt", f"cannot read recording custody receipt: {exc}")
+                else:
+                    for receipt_error in validate_recording_custody_schema(receipt_document):
+                        error(f"{location}.recording.source.receipt", receipt_error)
+                    if isinstance(receipt_document, dict):
+                        if receipt_document.get("work_id") != work_id:
+                            error(
+                                f"{location}.recording.source.receipt.work_id",
+                                "must identify the repertoire work",
+                            )
+                        master = receipt_document.get("master")
+                        master_identity = (
+                            (master.get("path"), master.get("sha256"))
+                            if isinstance(master, dict)
+                            else None
+                        )
+                        if recording_source is not None and master_identity != recording_source:
+                            error(
+                                f"{location}.recording.source",
+                                "must equal the master identity in its tracked custody receipt",
+                            )
+                        for receipt_error in hydrated_receipt_errors(
+                            receipt_document,
+                            root=root,
+                            require_hydrated=require_hydrated,
+                        ):
+                            error(f"{location}.recording.source.receipt", receipt_error)
         source(
             recording.get("render_contract"),
             f"{location}.recording.render_contract",
