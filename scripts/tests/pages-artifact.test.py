@@ -426,6 +426,46 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertIn("tracked changes", dirty.stderr)
         self.assertFalse(dirty_output.exists())
 
+    def test_clean_checkout_transform_cannot_change_published_runtime_bytes(self) -> None:
+        source = self.base / "transform-source"
+        public_fixture(source)
+        (source / ".gitattributes").write_text(
+            "arrival.js text eol=crlf\n",
+            encoding="utf-8",
+        )
+        commit = RELEASE_SUPPORT.initialize_git_fixture(source)
+        root = self.base / "transform-checkout"
+        subprocess.run(
+            ["git", "clone", "-q", str(source), str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn(b"\r\n", (root / "arrival.js").read_bytes())
+        committed = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertNotIn(b"\r\n", committed)
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "allowlisted source bytes drifted from the declared commit: arrival.js",
+        ):
+            PAGES.build(
+                root,
+                self.base / "transformed-pages",
+                commit,
+                require_git_source=True,
+            )
+
     def test_verified_public_release_adds_only_declared_outputs_and_keeps_artwork_at_root(self) -> None:
         release, release_source = release_artifact_fixture(self.base, "public")
         selected, binding = PAGES.public_release_files(

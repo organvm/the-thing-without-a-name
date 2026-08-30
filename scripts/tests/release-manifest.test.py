@@ -817,6 +817,25 @@ class ProductionCliSourceTest(unittest.TestCase):
             )
             self.assertNotEqual(CONTRACT.sha256(manifest_path), committed_sha)
 
+    def test_source_commit_manifest_rejects_duplicate_json_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest_path = root / "release/manifest.json"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    '"status": "draft",',
+                    '"status": "draft",\n  "status": "released",',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            commit = initialize_git_fixture(root)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "JSON contains duplicate key 'status'",
+            ):
+                BUILD.source_release_manifest(root, commit)
+
 
 class AdversarialManifestTest(unittest.TestCase):
     def mutate(self, callback) -> tuple[tempfile.TemporaryDirectory, Path]:

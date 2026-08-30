@@ -83,6 +83,20 @@ def _no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def decode_json_object(data: bytes, label: str) -> dict[str, Any]:
+    """Decode one UTF-8 JSON object while rejecting duplicate keys."""
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_no_duplicate_object,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"{label} is invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} must be a JSON object")
+    return value
+
+
 def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_object)

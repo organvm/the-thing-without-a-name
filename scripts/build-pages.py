@@ -497,6 +497,41 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
         raise ArtifactError("source checkout has tracked changes")
 
 
+def source_commit_records(
+    root: Path,
+    commit: str,
+    files: tuple[str, ...],
+) -> dict[str, dict]:
+    """Bind every allowlisted worktree byte to its exact committed blob."""
+    records: dict[str, dict] = {}
+    for relative in files:
+        path = source_file(root, relative)
+        committed = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{relative}"],
+            capture_output=True,
+            check=False,
+        )
+        if committed.returncode != 0:
+            detail = committed.stderr.decode("utf-8", errors="replace").strip()
+            raise ArtifactError(
+                f"cannot resolve allowlisted source at {commit}:{relative}: {detail}"
+            )
+        try:
+            worktree = path.read_bytes()
+        except OSError as exc:
+            raise ArtifactError(f"cannot read allowlisted source {relative}: {exc}") from exc
+        if worktree != committed.stdout:
+            raise ArtifactError(
+                f"allowlisted source bytes drifted from the declared commit: {relative}"
+            )
+        records[relative] = {
+            "path": relative,
+            "bytes": len(committed.stdout),
+            "sha256": hashlib.sha256(committed.stdout).hexdigest(),
+        }
+    return records
+
+
 def artifact_inventory(root: Path) -> set[str]:
     if root.is_symlink() or not root.is_dir():
         raise ArtifactError(f"artifact root is not a regular directory: {root}")
@@ -613,14 +648,11 @@ def verify_artifact(
     if require_source_manifest:
         source_root = source_root.absolute().resolve()
         validate_git_source(source_root, source["commit"])
-        expected_records: dict[str, dict] = {}
-        for relative in source_files(source_root):
-            path = source_file(source_root, relative)
-            expected_records[relative] = {
-                "path": relative,
-                "bytes": path.stat().st_size,
-                "sha256": sha256(path),
-            }
+        expected_records = source_commit_records(
+            source_root,
+            source["commit"],
+            source_files(source_root),
+        )
         builder = _load_release_builder()
         try:
             source_manifest, manifest_sha256 = builder.source_release_manifest(
@@ -770,6 +802,11 @@ def build(
     if require_git_source:
         validate_git_source(root, commit)
     files = source_files(root)
+    committed_records = (
+        source_commit_records(root, commit, files)
+        if require_git_source
+        else None
+    )
     release_files: dict[str, tuple[Path, dict]] = {}
     release_binding = None
     if release_artifact is not None:
@@ -791,9 +828,20 @@ def build(
         shutil.copyfile(source, target, follow_symlinks=False)
         target.chmod(0o644)
         os.utime(target, (0, 0), follow_symlinks=False)
-        records.append(
-            {"path": relative, "bytes": target.stat().st_size, "sha256": sha256(target)}
+        record = (
+            dict(committed_records[relative])
+            if committed_records is not None
+            else {
+                "path": relative,
+                "bytes": target.stat().st_size,
+                "sha256": sha256(target),
+            }
         )
+        if target.stat().st_size != record["bytes"] or sha256(target) != record["sha256"]:
+            raise ArtifactError(
+                f"allowlisted source changed while copying: {relative}"
+            )
+        records.append(record)
     for relative in sorted(release_files):
         source, expected = release_files[relative]
         target = output / PurePosixPath(relative)

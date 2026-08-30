@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import html
 import io
-import json
 import os
 import platform
 import posixpath
@@ -33,6 +32,7 @@ from release_contract import (
     ROOT,
     ReleaseError,
     canonical_json,
+    decode_json_object,
     load_json,
     phase_blockers,
     safe_relative,
@@ -1580,12 +1580,7 @@ def source_release_manifest(
         raise ReleaseError(
             f"cannot resolve release manifest at source commit {commit}: {detail}"
         )
-    try:
-        manifest = json.loads(data)
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ReleaseError(f"source-commit release manifest is invalid JSON: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise ReleaseError("source-commit release manifest must be an object")
+    manifest = decode_json_object(data, "source-commit release manifest")
     return manifest, hashlib.sha256(data).hexdigest()
 
 
