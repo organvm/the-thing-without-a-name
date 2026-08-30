@@ -191,6 +191,10 @@ class _ProjectMarkup(HTMLParser):
             else:
                 self.head_stack.pop()
 
+    def handle_data(self, data: str) -> None:
+        if self.in_head and not self.head_stack and data.strip():
+            self.structure_errors.add("non-whitespace head text")
+
 
 def _h(value: object) -> str:
     return html.escape(str(value), quote=True)

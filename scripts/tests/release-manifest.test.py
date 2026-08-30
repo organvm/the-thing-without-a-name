@@ -1082,6 +1082,21 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_self_rehashed_project_cannot_reenter_head_after_text(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"not-head-text{csp}{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-whitespace head text"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
     def test_self_rehashed_project_with_unmanifested_image_fails(self) -> None:
         project = self.output / "project/index.html"
         project.write_text(
