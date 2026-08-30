@@ -496,6 +496,53 @@ class ArtifactBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(PAGES.ArtifactError, "project security failed verification"):
             PAGES.verify_artifact(self.output, TEST_COMMIT)
 
+    def test_rehashed_pages_manifest_cannot_admit_browser_security_bypasses(self) -> None:
+        attacks = {
+            "inert-template": lambda value: value.replace(
+                f'  <meta http-equiv="Content-Security-Policy" content="{RELEASE_BUILD.PROJECT_CSP}">\n',
+                "",
+            ).replace(
+                '  <meta name="referrer" content="no-referrer">\n',
+                "",
+            ).replace(
+                "</head>",
+                '<template><meta http-equiv="Content-Security-Policy" '
+                f'content="{RELEASE_BUILD.PROJECT_CSP}">'
+                '<meta name="referrer" content="no-referrer"></template></head>',
+            ),
+            "referrer-override": lambda value: value.replace(
+                '<a class="skip" href="#content">',
+                '<a class="skip" href="#content" referrerpolicy="unsafe-url">',
+            ),
+            "dns-prefetch": lambda value: value.replace(
+                "</head>",
+                '<link rel="dns-prefetch" href="//attacker.example"></head>',
+            ),
+        }
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / label
+                output = case / "pages"
+                release = release_artifact_fixture(case, "public")
+                PAGES.build(
+                    self.root,
+                    output,
+                    TEST_COMMIT,
+                    release_artifact=release,
+                )
+                self.output = output
+                project = output / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_manifest()
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "project security failed verification",
+                ):
+                    PAGES.verify_artifact(output, TEST_COMMIT)
+
     def test_missing_or_draft_release_artifact_fails_before_pages_bytes(self) -> None:
         missing = self.base / "missing-release"
         with self.assertRaisesRegex(PAGES.ArtifactError, "missing or symlinked"):

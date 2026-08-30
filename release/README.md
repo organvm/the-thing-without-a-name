@@ -76,10 +76,11 @@ fail-closed Content Security Policy blocks scripts, connections, frames, objects
 workers, and remote media, while a no-referrer policy prevents outbound link
 navigation from disclosing the project path. Artifact verification rejects a weakened
 policy, active elements, redirect metadata, duplicate attributes, or inline event
-handlers even if a modified artifact is self-rehashed. Generated outputs are not
-committed from the draft phase. The Pages verifier reapplies the same policy after
-composing the artwork and public release, so rehashing the outer Pages manifest cannot
-admit weakened project markup.
+handlers even if a modified artifact is self-rehashed. Inert security metadata,
+element-level referrer overrides, and background network resource hints also fail
+closed. Generated outputs are not committed from the draft phase. The Pages verifier
+reapplies the same policy after composing the artwork and public release, so rehashing
+the outer Pages manifest cannot admit weakened project markup.
 
 ## Closing a gate
 

@@ -886,8 +886,11 @@ class AdversarialArtifactTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def rehash_project(self) -> None:
-        project = self.output / "project/index.html"
-        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        self.rehash_project_at(self.output)
+
+    def rehash_project_at(self, output: Path) -> None:
+        project = output / "project/index.html"
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         record = next(
             record for record in receipt["files"] if record["path"] == "project/index.html"
@@ -1007,6 +1010,73 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTP-equivalent metadata: refresh"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_inert_security_metadata_fails(self) -> None:
+        for container in ("template", "noscript"):
+            with self.subTest(container=container):
+                case = self.base / f"inert-{container}"
+                shutil.copytree(self.output, case)
+                project = case / "project/index.html"
+                original = project.read_text(encoding="utf-8")
+                csp = (
+                    f'  <meta http-equiv="Content-Security-Policy" '
+                    f'content="{BUILD.PROJECT_CSP}">\n'
+                )
+                referrer = '  <meta name="referrer" content="no-referrer">\n'
+                project.write_text(
+                    original.replace(csp, "").replace(referrer, "").replace(
+                        "</head>",
+                        f"<{container}>\n{csp}{referrer}</{container}>\n</head>",
+                    ),
+                    encoding="utf-8",
+                )
+                self.rehash_project_at(case)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    f"prohibited active elements: {container}",
+                ):
+                    BUILD.verify_artifact(case, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_nested_security_metadata_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"<div>{csp}{referrer}</div></head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "exactly once inside head"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_referrer_policy_override_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                '<a class="skip" href="#content">',
+                '<a class="skip" href="#content" referrerpolicy="unsafe-url">',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "referrer-policy overrides"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_resource_hint_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<link rel="dns-prefetch" href="//attacker.example">\n</head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTPS canonical link element"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_security_metadata_outside_head_fails(self) -> None:

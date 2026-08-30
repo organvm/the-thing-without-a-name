@@ -74,6 +74,22 @@ PROJECT_RESOURCES = (
     ("press-kit-copy", "Press kit"),
     ("credits-copy", "Credits"),
 )
+HTML_VOID_ELEMENTS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 
 
 class _ProjectMarkup(HTMLParser):
@@ -85,15 +101,27 @@ class _ProjectMarkup(HTMLParser):
         self.active_elements: set[str] = set()
         self.event_handlers: set[str] = set()
         self.duplicate_attributes: set[str] = set()
+        self.referrer_policy_overrides: set[str] = set()
+        self.link_elements: list[dict[str, str | None]] = []
         self.in_head = False
+        self.head_starts = 0
+        self.head_ends = 0
+        self.head_stack: list[str] = []
+        self.structure_errors: set[str] = set()
         self.head_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
         if tag == "head":
+            self.head_starts += 1
+            if self.in_head:
+                self.structure_errors.add("nested head")
             self.in_head = True
         elif self.in_head:
-            self.head_elements.append((tag, values))
+            if not self.head_stack:
+                self.head_elements.append((tag, values))
+            if tag not in HTML_VOID_ELEMENTS:
+                self.head_stack.append(tag)
         element_id = values.get("id")
         if element_id:
             self.ids.add(element_id)
@@ -102,10 +130,29 @@ class _ProjectMarkup(HTMLParser):
             self.hrefs.append(href)
         if tag == "meta":
             self.metas.append(values)
-        if tag in {"base", "embed", "form", "iframe", "object", "script"}:
+        if tag == "link":
+            self.link_elements.append(values)
+        if tag in {
+            "base",
+            "embed",
+            "form",
+            "iframe",
+            "math",
+            "noscript",
+            "object",
+            "script",
+            "svg",
+            "template",
+        }:
             self.active_elements.add(tag)
         self.event_handlers.update(
             name for name, _value in attrs if name.lower().startswith("on")
+        )
+        self.referrer_policy_overrides.update(
+            value or "<empty>"
+            for name, value in attrs
+            if name.lower() == "referrerpolicy"
+            and (value or "").lower() != "no-referrer"
         )
         names = [name.lower() for name, _value in attrs]
         self.duplicate_attributes.update(
@@ -116,10 +163,24 @@ class _ProjectMarkup(HTMLParser):
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
         self.handle_starttag(tag, attrs)
+        if tag not in HTML_VOID_ELEMENTS:
+            self.structure_errors.add(f"self-closing non-void element {tag}")
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "head":
+            self.head_ends += 1
+            if not self.in_head:
+                self.structure_errors.add("unmatched head end")
+            if self.head_stack:
+                self.structure_errors.add("unclosed head descendant")
+                self.head_stack.clear()
             self.in_head = False
+        elif self.in_head and tag not in HTML_VOID_ELEMENTS:
+            if not self.head_stack or self.head_stack[-1] != tag:
+                self.structure_errors.add(f"mismatched head descendant {tag}")
+            else:
+                self.head_stack.pop()
 
 
 def _h(value: object) -> str:
@@ -965,6 +1026,19 @@ def verify_project_security(project: str) -> None:
     ]
     if referrers != ["no-referrer"]:
         raise ReleaseError("project page lacks the exact no-referrer policy")
+    if parser.active_elements:
+        raise ReleaseError(
+            "project page contains prohibited active elements: "
+            + ", ".join(sorted(parser.active_elements))
+        )
+    if (
+        parser.head_starts != 1
+        or parser.head_ends != 1
+        or parser.in_head
+        or parser.structure_errors
+    ):
+        details = ", ".join(sorted(parser.structure_errors)) or "head count"
+        raise ReleaseError(f"project page has malformed head structure: {details}")
     csp_head_positions = [
         index
         for index, (tag, meta) in enumerate(parser.head_elements)
@@ -1016,15 +1090,26 @@ def verify_project_security(project: str) -> None:
             "project page contains prohibited HTTP-equivalent metadata: "
             + ", ".join(unexpected_http_equiv)
         )
-    if parser.active_elements:
+    canonical_links = [
+        link
+        for link in parser.link_elements
+        if set(link) == {"href", "rel"}
+        and (link.get("rel") or "").lower().split() == ["canonical"]
+        and urlsplit(link.get("href") or "").scheme == "https"
+    ]
+    if len(parser.link_elements) != 1 or len(canonical_links) != 1:
         raise ReleaseError(
-            "project page contains prohibited active elements: "
-            + ", ".join(sorted(parser.active_elements))
+            "project page may contain only one HTTPS canonical link element"
         )
     if parser.event_handlers:
         raise ReleaseError(
             "project page contains prohibited inline event handlers: "
             + ", ".join(sorted(parser.event_handlers))
+        )
+    if parser.referrer_policy_overrides:
+        raise ReleaseError(
+            "project page contains referrer-policy overrides: "
+            + ", ".join(sorted(parser.referrer_policy_overrides))
         )
     if parser.duplicate_attributes:
         raise ReleaseError(
