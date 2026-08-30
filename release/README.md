@@ -79,9 +79,13 @@ policy, active elements, redirect metadata, duplicate attributes, or inline even
 handlers even if a modified artifact is self-rehashed. Inert security metadata,
 element-level referrer overrides, and background network resource hints also fail
 closed. Image or media elements remain prohibited until a future integration binds
-every displayed source to the release-media receipt. Generated outputs are not committed from the draft phase. The Pages verifier
-reapplies the same policy after composing the artwork and public release, so rehashing
-the outer Pages manifest cannot admit weakened project markup.
+every displayed source to the release-media receipt. The opening document attributes
+and first two head records are exact, so no attribute can initiate a request before the
+CSP and referrer policy. Canonical and Open Graph discovery metadata are bound to the
+manifest-derived project URL and, when cleared, the exact receipted social-card bytes.
+Generated outputs are not committed from the draft phase. The Pages verifier reapplies
+the same policy and discovery binding after composing the artwork and public release,
+so rehashing the outer Pages manifest cannot admit weakened project markup.
 
 ## Closing a gate
 

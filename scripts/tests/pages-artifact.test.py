@@ -532,6 +532,20 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 '<input type="image" alt="unmanifested" '
                 'src="https://attacker.example/pixel.png"></main>',
             ),
+            "external-open-graph-image": lambda value: value.replace(
+                "</head>",
+                '<meta property="og:image" '
+                'content="https://attacker.example/unproven.jpg"></head>',
+            ),
+            "external-canonical": lambda value: value.replace(
+                RELEASE_BUILD.PROJECT_CANONICAL_URL,
+                "https://attacker.example/project/",
+            ),
+            "pre-csp-html-style": lambda value: value.replace(
+                '<html lang="en">',
+                '<html lang="en" '
+                'style="background-image:url(https://attacker.example/pixel.png)">',
+            ),
         }
         for label, attack in attacks.items():
             with self.subTest(attack=label):

@@ -1159,7 +1159,51 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.rehash_project()
-        with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTPS canonical link element"):
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_external_open_graph_image_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<meta property="og:image" '
+                'content="https://attacker.example/unproven.jpg">\n</head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "prohibited property metadata: og:image",
+        ):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_external_canonical_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                BUILD.PROJECT_CANONICAL_URL,
+                "https://attacker.example/project/",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_pre_csp_html_style_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                '<html lang="en">',
+                '<html lang="en" '
+                'style="background-image:url(https://attacker.example/pixel.png)">',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "opening document attributes"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_security_metadata_outside_head_fails(self) -> None:
@@ -1174,7 +1218,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.rehash_project()
-        with self.assertRaisesRegex(CONTRACT.ReleaseError, "exactly once inside head"):
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_self_rehashed_project_with_late_csp_fails(self) -> None:
@@ -1186,7 +1230,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.rehash_project()
-        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede load-bearing markup"):
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")

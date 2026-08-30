@@ -66,6 +66,8 @@ PROJECT_CSP = (
     "script-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
     "base-uri 'none'; form-action 'none'"
 )
+PROJECT_SITE_URL = "https://organvm.github.io/the-thing-without-a-name/"
+PROJECT_CANONICAL_URL = PROJECT_SITE_URL + "project/"
 PROJECT_RESOURCES = (
     ("pitch-pdf-copy", "Installation pitch (PDF)"),
     ("accessibility-copy", "Accessibility statement"),
@@ -107,9 +109,11 @@ class _ProjectMarkup(HTMLParser):
         self.doctypes = 0
         self.html_starts = 0
         self.html_ends = 0
+        self.html_attributes: list[dict[str, str | None]] = []
         self.in_head = False
         self.head_starts = 0
         self.head_ends = 0
+        self.head_attributes: list[dict[str, str | None]] = []
         self.head_stack: list[str] = []
         self.in_body = False
         self.body_starts = 0
@@ -121,6 +125,7 @@ class _ProjectMarkup(HTMLParser):
         values = dict(attrs)
         if tag == "html":
             self.html_starts += 1
+            self.html_attributes.append(values)
             if (
                 self.html_starts != 1
                 or self.html_ends
@@ -130,6 +135,7 @@ class _ProjectMarkup(HTMLParser):
                 self.structure_errors.add("misordered html start")
         elif tag == "head":
             self.head_starts += 1
+            self.head_attributes.append(values)
             if (
                 self.html_starts != 1
                 or self.html_ends
@@ -282,6 +288,38 @@ def _status(value: str) -> str:
     return f'<span class="status status-{_h(value)}">{_h(value.replace("-", " "))}</span>'
 
 
+def project_security_contract(manifest: dict) -> dict:
+    """Bind project discovery metadata to the canonical site and cleared media."""
+    identity = manifest["identity"]
+    canonical = identity["canonical_url"] + identity["project_path"]
+    if identity["canonical_url"] != PROJECT_SITE_URL or canonical != PROJECT_CANONICAL_URL:
+        raise ReleaseError("release manifest project URL drifted from the canonical site")
+    social_card = next(
+        (
+            medium
+            for medium in manifest["media"]
+            if medium["id"] == "project-social-card"
+            and medium["status"] == "ready"
+            and medium["clearance"]["status"] == "cleared"
+            and medium["source"] is not None
+        ),
+        None,
+    )
+    social_image = None
+    if social_card is not None:
+        source = social_card["source"]
+        destination = safe_relative(
+            source["destination"], "project social-card destination"
+        )
+        social_image = {
+            "url": PROJECT_SITE_URL + destination,
+            "path": destination,
+            "bytes": source["bytes"],
+            "sha256": source["sha256"],
+        }
+    return {"canonical_url": canonical, "social_image": social_image}
+
+
 def project_html(manifest: dict, phase: str, commit: str) -> bytes:
     identity = manifest["identity"]
     copy = manifest["copy"]
@@ -289,7 +327,8 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
     accessibility = manifest["accessibility"]
     press = manifest["press"]
     draft = phase == "draft"
-    canonical = identity["canonical_url"] + identity["project_path"]
+    security_contract = project_security_contract(manifest)
+    canonical = security_contract["canonical_url"]
     reference = installation["reference_contract"]
     twin_url = _repo_evidence_url(commit, reference["digital_twin"]["path"])
     gates_url = _repo_evidence_url(commit, reference["gate_ledger"]["path"])
@@ -399,18 +438,8 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
         else ""
     )
     robots = '<meta name="robots" content="noindex,nofollow">' if draft else '<meta name="robots" content="index,follow">'
-    social_card = next(
-        (
-            medium
-            for medium in manifest["media"]
-            if medium["id"] == "project-social-card"
-            and medium["status"] == "ready"
-            and medium["clearance"]["status"] == "cleared"
-            and medium["source"] is not None
-        ),
-        None,
-    )
-    social_image = identity["canonical_url"] + social_card["source"]["destination"] if social_card else None
+    social_image_record = security_contract["social_image"]
+    social_image = social_image_record["url"] if social_image_record else None
     social_meta = (
         f'<meta property="og:image" content="{_h(social_image)}">\n'
         f'  <meta name="twitter:card" content="summary_large_image">'
@@ -421,10 +450,10 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
     document = f"""<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta http-equiv="Content-Security-Policy" content="{PROJECT_CSP}">
   <meta name="referrer" content="no-referrer">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   {robots}
   <title>{_h(identity['public_title'])} | Project</title>
   <meta name="description" content="{_h(copy['logline'])}">
@@ -1095,8 +1124,54 @@ def verify_project_links(
             raise ReleaseError(f"project page names a missing fragment: #{parsed.fragment}")
 
 
-def verify_project_security(project: str) -> None:
+def verify_project_security_contract(
+    contract: object,
+    delivered_records: dict[str, dict],
+) -> tuple[str, str | None]:
+    """Validate the manifest-derived discovery URLs against receipted bytes."""
+    if not isinstance(contract, dict) or set(contract) != {
+        "canonical_url",
+        "social_image",
+    }:
+        raise ReleaseError("project security binding has an unknown shape")
+    canonical = contract["canonical_url"]
+    if canonical != PROJECT_CANONICAL_URL:
+        raise ReleaseError("project canonical URL is not manifest-bound")
+    social = contract["social_image"]
+    if social is None:
+        return canonical, None
+    if not isinstance(social, dict) or set(social) != {
+        "url",
+        "path",
+        "bytes",
+        "sha256",
+    }:
+        raise ReleaseError("project social-image binding has an unknown shape")
+    path = safe_relative(social["path"], "project social-image path")
+    if not path.startswith("media/assets/"):
+        raise ReleaseError("project social image is outside the released media boundary")
+    if social["url"] != PROJECT_SITE_URL + path:
+        raise ReleaseError("project social image URL is not manifest-bound")
+    identity = {
+        "path": path,
+        "bytes": social["bytes"],
+        "sha256": social["sha256"],
+    }
+    if delivered_records.get(path) != identity:
+        raise ReleaseError("project social image is not bound by the media receipt")
+    return canonical, social["url"]
+
+
+def verify_project_security(
+    project: str,
+    contract: object,
+    delivered_records: dict[str, dict],
+) -> None:
     """Require the generated project page to remain passive and network-closed."""
+    canonical_url, social_image_url = verify_project_security_contract(
+        contract,
+        delivered_records,
+    )
     parser = _ProjectMarkup()
     parser.feed(project)
     policies = [
@@ -1113,6 +1188,8 @@ def verify_project_security(project: str) -> None:
     ]
     if referrers != ["no-referrer"]:
         raise ReleaseError("project page lacks the exact no-referrer policy")
+    if parser.html_attributes != [{"lang": "en"}] or parser.head_attributes != [{}]:
+        raise ReleaseError("project page opening document attributes are not exact")
     if parser.active_elements:
         raise ReleaseError(
             "project page contains prohibited active elements: "
@@ -1132,22 +1209,20 @@ def verify_project_security(project: str) -> None:
     ):
         details = ", ".join(sorted(parser.structure_errors)) or "head count"
         raise ReleaseError(f"project page has malformed head structure: {details}")
-    csp_head_positions = [
-        index
-        for index, (tag, meta) in enumerate(parser.head_elements)
-        if tag == "meta"
-        and (meta.get("http-equiv") or "").lower() == "content-security-policy"
-        and meta.get("content") == PROJECT_CSP
-    ]
-    referrer_head_positions = [
-        index
-        for index, (tag, meta) in enumerate(parser.head_elements)
-        if tag == "meta"
-        and (meta.get("name") or "").lower() == "referrer"
-        and meta.get("content") == "no-referrer"
-    ]
-    if len(csp_head_positions) != 1 or len(referrer_head_positions) != 1:
-        raise ReleaseError("project security metadata must occur exactly once inside head")
+    exact_csp = {
+        "http-equiv": "Content-Security-Policy",
+        "content": PROJECT_CSP,
+    }
+    exact_referrer = {"name": "referrer", "content": "no-referrer"}
+    if (
+        len(parser.head_elements) < 2
+        or parser.head_elements[0] != ("meta", exact_csp)
+        or parser.head_elements[1] != ("meta", exact_referrer)
+    ):
+        raise ReleaseError(
+            "project security metadata must be exact and precede all head markup"
+        )
+    csp_head_positions = [0]
     loading_positions = [
         index
         for index, (tag, _attrs) in enumerate(parser.head_elements)
@@ -1188,12 +1263,62 @@ def verify_project_security(project: str) -> None:
         for link in parser.link_elements
         if set(link) == {"href", "rel"}
         and (link.get("rel") or "").lower().split() == ["canonical"]
-        and urlsplit(link.get("href") or "").scheme == "https"
+        and link.get("href") == canonical_url
     ]
     if len(parser.link_elements) != 1 or len(canonical_links) != 1:
         raise ReleaseError(
-            "project page may contain only one HTTPS canonical link element"
+            "project page must contain only its manifest-bound canonical link"
         )
+    allowed_names = {
+        "viewport",
+        "referrer",
+        "robots",
+        "description",
+        "twitter:card",
+    }
+    allowed_properties = {"og:title", "og:description", "og:type", "og:url"}
+    if social_image_url is not None:
+        allowed_properties.add("og:image")
+    named: dict[str, list[str | None]] = {}
+    properties: dict[str, list[str | None]] = {}
+    charsets: list[str | None] = []
+    for meta in parser.metas:
+        if set(meta) == {"charset"}:
+            charsets.append(meta["charset"])
+            continue
+        if "http-equiv" in meta:
+            if meta != exact_csp:
+                raise ReleaseError("project page contains non-canonical HTTP metadata")
+            continue
+        if set(meta) == {"name", "content"}:
+            name = (meta.get("name") or "").lower()
+            if name not in allowed_names:
+                raise ReleaseError(f"project page contains prohibited named metadata: {name}")
+            named.setdefault(name, []).append(meta.get("content"))
+            continue
+        if set(meta) == {"property", "content"}:
+            prop = (meta.get("property") or "").lower()
+            if prop not in allowed_properties:
+                raise ReleaseError(f"project page contains prohibited property metadata: {prop}")
+            properties.setdefault(prop, []).append(meta.get("content"))
+            continue
+        raise ReleaseError("project page contains metadata outside the generated contract")
+    if charsets != ["utf-8"]:
+        raise ReleaseError("project page charset metadata drifted")
+    if set(named) != allowed_names or any(len(values) != 1 for values in named.values()):
+        raise ReleaseError("project page named metadata inventory drifted")
+    if named["twitter:card"] != [
+        "summary_large_image" if social_image_url is not None else "summary"
+    ]:
+        raise ReleaseError("project social-card metadata drifted")
+    if set(properties) != allowed_properties or any(
+        len(values) != 1 for values in properties.values()
+    ):
+        raise ReleaseError("project page property metadata inventory drifted")
+    if properties["og:type"] != ["website"] or properties["og:url"] != [canonical_url]:
+        raise ReleaseError("project Open Graph identity is not manifest-bound")
+    if social_image_url is not None and properties["og:image"] != [social_image_url]:
+        raise ReleaseError("project social image metadata is not receipt-bound")
     if parser.event_handlers:
         raise ReleaseError(
             "project page contains prohibited inline event handlers: "
@@ -1265,6 +1390,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         "id",
         "version",
         "manifest",
+        "project_security",
         "installation_reference",
         "opportunity_snapshot",
         "opportunity_receipt",
@@ -1340,6 +1466,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
     if not isinstance(records, list):
         raise ReleaseError("release artifact file inventory must be a list")
     paths: list[str] = []
+    delivered_records: dict[str, dict] = {}
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
             raise ReleaseError("release artifact contains a malformed file record")
@@ -1356,6 +1483,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
             raise ReleaseError(f"release artifact digest mismatch: {relative}")
         paths.append(relative)
+        delivered_records[relative] = {
+            "path": relative,
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ReleaseError("release artifact paths must be sorted and unique")
     inventory = artifact_inventory(output)
@@ -1372,7 +1504,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
 
     project = _read_utf8_artifact(output, "project/index.html", "project page")
     verify_project_links(output, set(paths))
-    verify_project_security(project)
+    verify_project_security(
+        project,
+        release["project_security"],
+        delivered_records,
+    )
     draft = receipt["phase"] == "draft"
     if ('name="robots" content="noindex,nofollow"' in project) != draft:
         raise ReleaseError("project-page robot policy does not match artifact phase")
@@ -1517,6 +1653,7 @@ def build(
             "id": manifest["release_id"],
             "version": manifest["version"],
             "manifest": {"path": MANIFEST.as_posix(), "sha256": sha256(manifest_path)},
+            "project_security": project_security_contract(manifest),
             "installation_reference": {
                 "schema": installation_reference["schema"],
                 "status": installation_reference["status"],

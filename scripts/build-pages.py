@@ -391,6 +391,7 @@ def public_release_files(
         "release_id": receipt["release"]["id"],
         "version": receipt["release"]["version"],
         "receipt_sha256": sha256(release_receipt),
+        "project_security": receipt["release"]["project_security"],
     }
     return selected, binding
 
@@ -538,6 +539,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             "release_id",
             "version",
             "receipt_sha256",
+            "project_security",
         }:
             raise ArtifactError("artifact release binding has an unknown shape")
         if (
@@ -555,6 +557,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
     if not isinstance(records, list):
         raise ArtifactError("artifact manifest files must be a list")
     paths: list[str] = []
+    delivered_records: dict[str, dict] = {}
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
             raise ArtifactError("artifact manifest contains a malformed file record")
@@ -571,6 +574,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
             raise ArtifactError(f"artifact digest mismatch: {relative}")
         paths.append(relative)
+        delivered_records[relative] = {
+            "path": relative,
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
 
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ArtifactError("artifact manifest paths must be unique and sorted")
@@ -595,7 +603,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             raise ArtifactError(f"artifact project links failed verification: {exc}") from exc
         try:
             project = (output / "project/index.html").read_text(encoding="utf-8")
-            builder.verify_project_security(project)
+            builder.verify_project_security(
+                project,
+                release["project_security"],
+                delivered_records,
+            )
         except Exception as exc:
             raise ArtifactError(f"artifact project security failed verification: {exc}") from exc
     return manifest
