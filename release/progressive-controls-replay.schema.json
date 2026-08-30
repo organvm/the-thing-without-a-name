@@ -56,7 +56,10 @@
           "required": ["name", "version"],
           "type": "object"
         },
-        "graphics_renderer": {"minLength": 1, "type": "string"},
+        "graphics_renderer": {
+          "pattern": "^ANGLE \\(Apple, ANGLE Metal Renderer: Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, [^()\\r\\n]+\\)$",
+          "type": "string"
+        },
         "platform": {"const": "darwin"}
       },
       "required": ["platform", "browser", "graphics_renderer"],

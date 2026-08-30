@@ -245,7 +245,7 @@ import * as Corpus from "./engine/corpus.js";
 import * as Program from "./engine/program.js";
 import * as MusicalScore from "./engine/score.js";
 import { scoreAt } from "./engine/score.js";
-import { frameAt, hex } from "./engine/engine.js";
+import { frameAt, hex, step } from "./engine/engine.js";
 import { cutAt } from "./engine/grammar.js";
 import { Renderer } from "./engine/renderer.js";
 import { InteractionRenderer } from "./interaction/adapter.js";
@@ -290,6 +290,8 @@ const dock = document.getElementById("danse-dock");
 const tray = document.getElementById("surface-tray");
 const projectMap = document.getElementById("project-map");
 let projectMapData = null;
+let projectMapRequest = null;
+let projectMapOperationGeneration = 0;
 let previousRiver = null;
 let previousRiverWasRemembered = false;
 let controlBus = null;
@@ -403,6 +405,14 @@ function frame() {
   interaction.tick(t, river, { motion: heldAt === null });
   if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(t), heldAt !== null);
   if (!renderer) {
+    const fallback = step(corpus, river.seed, t, program, {
+      quantise: RECAST,
+      stream: river.stream,
+      score: musicalScore,
+      choreography,
+      conductor,
+    });
+    renderDetails(t, fallback.state);
     requestAnimationFrame(frame);
     return;
   }
@@ -425,21 +435,27 @@ function frame() {
     }
   }
 
+  renderDetails(t, r.state, r);
+  requestAnimationFrame(frame);
+}
+
+function renderDetails(t, state, rendered = null) {
   // Elapsed within the current passage, so the readout says where you are in
   // this one rather than counting up forever into a number nobody can hold.
-  const local = t - (r.state.passageT0 ?? 0);
+  const local = t - (state.passageT0 ?? 0);
   el("clock").textContent = `${Math.floor(local / 60)}:${String(Math.floor(local % 60)).padStart(2, "0")}`;
   // Your river, then which passage of it you are in. The first number is the one
   // that is yours and shareable; the second is the one that will never recur.
   el("river").textContent = hex(river.seed);
-  el("passage").textContent = program ? `· ${hex(r.state.passageSeed)} · passage ${r.state.passage}` : "";
+  el("passage").textContent = program ? `· ${hex(state.passageSeed)} · passage ${state.passage}` : "";
   el("cut").textContent = program
-    ? `${r.state.movement} · ${r.state.cut}${r.state.epoch ? ` · reseed ${r.state.epoch}` : ""}`
-    : cutAt(river.seed, t, r.state.reveal) + (r.state.reveal < 0.02 ? " · 2017" : "");
-  el("planes").textContent = r.missing ? `${r.planes}−${r.missing}` : r.planes;
-  const embodied = r.interaction?.count ? ` · ${r.interaction.count} present` : "";
+    ? `${state.movement} · ${state.cut}${state.epoch ? ` · reseed ${state.epoch}` : ""}`
+    : cutAt(river.seed, t, state.reveal) + (state.reveal < 0.02 ? " · 2017" : "");
+  el("planes").textContent = rendered
+    ? rendered.missing ? `${rendered.planes}−${rendered.missing}` : rendered.planes
+    : "unavailable";
+  const embodied = rendered?.interaction?.count ? ` · ${rendered.interaction.count} present` : "";
   el("interaction-summary").textContent = `${interaction.mode}${embodied}`;
-  requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
@@ -823,7 +839,10 @@ async function setPresence(value) {
 }
 
 function closeVisualSurfaces() {
-  if (projectMap.open) projectMap.close();
+  if (projectMap.open) {
+    projectMapOperationGeneration += 1;
+    projectMap.close();
+  }
   if (!hud.hidden) setHudVisible(false);
   const trigger = surfaceTrigger;
   surfaceTrigger = null;
@@ -853,21 +872,39 @@ function openTray(category, trigger) {
   controlBus.actions.openTray(category);
 }
 
+async function loadProjectMap() {
+  if (projectMapData) return projectMapData;
+  if (!projectMapRequest) {
+    projectMapRequest = (async () => {
+      const response = await fetch("./interface/map.v1.json");
+      if (!response.ok) throw new Error(`map request returned ${response.status}`);
+      return response.json();
+    })();
+  }
+  try {
+    projectMapData = await projectMapRequest;
+    return projectMapData;
+  } catch (error) {
+    projectMapRequest = null;
+    throw error;
+  }
+}
+
 async function openMap(trigger) {
+  const operation = ++projectMapOperationGeneration;
   if (!hud.hidden) setHudVisible(false);
   surfaceTrigger = trigger;
   controlBus.actions.openMap();
   if (!projectMap.open) projectMap.showModal();
   try {
-    if (!projectMapData) {
-      const response = await fetch("./interface/map.v1.json");
-      if (!response.ok) throw new Error(`map request returned ${response.status}`);
-      projectMapData = await response.json();
-    }
-    renderProjectMap(el("project-map-list"), el("project-map-status"), projectMapData);
+    const mapData = await loadProjectMap();
+    if (operation !== projectMapOperationGeneration || !projectMap.open) return;
+    renderProjectMap(el("project-map-list"), el("project-map-status"), mapData);
   } catch (error) {
+    if (operation !== projectMapOperationGeneration || !projectMap.open) return;
     el("project-map-status").textContent = `Project map unavailable: ${error.message}`;
   }
+  if (operation !== projectMapOperationGeneration || !projectMap.open) return;
   el("map-close").focus();
 }
 

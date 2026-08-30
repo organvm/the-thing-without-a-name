@@ -223,7 +223,7 @@ def complete_manifest(root: Path) -> dict:
         "runtime": {
             "platform": "darwin",
             "browser": {"name": "Google Chrome", "version": "fixture"},
-            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: fixture)",
+            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
         },
         "checks": [
             {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
@@ -918,6 +918,34 @@ class AdversarialManifestTest(unittest.TestCase):
             write_manifest(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
                 CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_requires_canonical_apple_metal_identity(self) -> None:
+        impostors = (
+            "not Apple and not Metal",
+            "Apple software renderer without Metal",
+            "ANGLE (Apple, ANGLE Metal Renderer: software rasterizer, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+        )
+        for renderer in impostors:
+            with self.subTest(renderer=renderer), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["runtime"]["graphics_renderer"] = renderer
+                receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+                gate = next(
+                    gate
+                    for gate in manifest["gates"]
+                    if gate["id"] == "progressive-controls-replay"
+                )
+                gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "violates schema|not authenticated as Apple Metal",
+                ):
+                    CONTRACT.validate_release(root)
 
     def test_progressive_controls_receipt_requires_a_real_exact_head_and_tree(self) -> None:
         for mutation, message in (

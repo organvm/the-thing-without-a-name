@@ -54,6 +54,10 @@ GENERATED_PRODUCT_PATHS = {
 }
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, [^()\r\n]+\)\Z"
+)
 PRIVATE_PREFIXES = (
     ".git/",
     ".work/",
@@ -554,8 +558,8 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
             + ", ".join(unexpected_paths)
         )
 
-    renderer = receipt["runtime"]["graphics_renderer"].lower()
-    if "apple" not in renderer or "metal" not in renderer:
+    renderer = receipt["runtime"]["graphics_renderer"]
+    if APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer) is None:
         raise ReleaseError("progressive controls replay is not authenticated as Apple Metal")
     leaked = next(
         (

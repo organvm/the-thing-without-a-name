@@ -777,7 +777,13 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("Danse visual renderer unavailable: ${rendererUnavailableReason}", initialization)
         frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
         self.assertLess(frame.index("interaction.tick("), frame.index("if (!renderer)"))
+        self.assertIn("const fallback = step(corpus, river.seed, t, program", frame)
+        self.assertIn("renderDetails(t, fallback.state);", frame)
         self.assertIn("requestAnimationFrame(frame);", frame.split("if (!renderer)", 1)[1])
+        details = self.script.split("function renderDetails(t, state, rendered = null) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('el("river").textContent = hex(river.seed);', details)
+        self.assertIn(': "unavailable";', details)
+        self.assertIn('el("interaction-summary").textContent = `${interaction.mode}${embodied}`;', details)
         self.assertIn("requestAnimationFrame(frame);", self.script)
         self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
 
@@ -790,6 +796,20 @@ class InterfaceContractTest(unittest.TestCase):
     def test_map_atomically_replaces_the_visual_details_sheet(self) -> None:
         helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
         self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openMap()"))
+
+    def test_map_ignores_stale_fetch_completions_after_close_and_reopen(self) -> None:
+        loader = self.script.split("async function loadProjectMap() {", 1)[1].split("\n}", 1)[0]
+        helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
+        close = self.script.split("function closeVisualSurfaces() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if (!projectMapRequest)", loader)
+        self.assertIn("projectMapData = await projectMapRequest;", loader)
+        self.assertIn("projectMapRequest = null;", loader)
+        self.assertIn("const operation = ++projectMapOperationGeneration;", helper)
+        self.assertGreaterEqual(
+            helper.count("operation !== projectMapOperationGeneration || !projectMap.open"),
+            3,
+        )
+        self.assertIn("projectMapOperationGeneration += 1;", close)
 
     def test_transient_feedback_stays_above_every_progressive_surface(self) -> None:
         self.assertIn("#toast {\n    position: fixed; z-index: 8;", self.html)

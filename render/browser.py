@@ -514,8 +514,44 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => danse.controlState.cutout") == "on", "letter shortcut fired while a slider held focus")
     page.press("#fallback-x", "Escape")
 
+    page.evaluate("""async () => {
+      const original = window.fetch.bind(window);
+      const payload = await original('./interface/map.v1.json').then((response) => response.json());
+      const requests = [];
+      window.__projectMapRace = {
+        requests,
+        resolve(index) {
+          requests[index].resolve(new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: {'Content-Type': 'application/json'},
+          }));
+        },
+        reject(index) { requests[index].reject(new Error('stale map request failed')); },
+        restore() { window.fetch = original; delete window.__projectMapRace; },
+      };
+      window.fetch = (url, ...args) => String(url).endsWith('interface/map.v1.json')
+        ? new Promise((resolve, reject) => requests.push({resolve, reject}))
+        : original(url, ...args);
+    }""")
     page.click('[data-category="map"]')
+    page.wait_for_function("() => window.__projectMapRace.requests.length === 1")
+    page.press("#map-close", "Escape")
+    page.click('[data-category="map"]')
+    page.wait_for_timeout(50)
+    map_request_count = page.evaluate("() => window.__projectMapRace.requests.length")
+    if map_request_count == 1:
+        page.evaluate("() => window.__projectMapRace.resolve(0)")
+    else:
+        page.evaluate("() => window.__projectMapRace.resolve(window.__projectMapRace.requests.length - 1)")
     page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
+    if map_request_count > 1:
+        page.evaluate("() => window.__projectMapRace.reject(0)")
+        page.wait_for_timeout(50)
+    want(
+        "Available routes" in page.locator("#project-map-status").inner_text(),
+        "a stale Map request overwrote the reopened Map",
+    )
+    page.evaluate("() => window.__projectMapRace.restore()")
     want(page.locator("#project-map").is_visible(), "Map did not open")
     want(page.locator('#project-map-list a[href="./project/"]').count() == 0, "gated Study was rendered as a link")
     want("unavailable" in page.locator("#project-map-list").inner_text().lower(), "gated Study was not visibly unavailable")
@@ -597,6 +633,13 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#danse-dock").is_visible(), "no-WebGL visit did not initialize the primary controls")
     page.press("body", "h")
     want(page.locator("#hud").is_visible(), "H did not open Details without WebGL")
+    page.wait_for_function("() => document.getElementById('river').textContent !== '—'")
+    want(page.locator("#planes").inner_text() == "unavailable", "renderer fallback reported a fake plane count")
+    want(page.locator("#cut").inner_text() != "—", "renderer fallback left the deterministic cut unknown")
+    page.click("#fallback-start")
+    page.wait_for_function("() => document.getElementById('interaction-summary').textContent === 'fallback'")
+    want(page.locator("#interaction-summary").inner_text() == "fallback", "renderer fallback left Details interaction stale")
+    page.click("#interaction-stop")
     page.press("#sheet-close", "Escape")
     want(page.locator("#hud").is_hidden(), "Escape did not close Details without WebGL")
     page.click('[data-category="map"]')
