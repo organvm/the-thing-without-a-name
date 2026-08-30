@@ -31,6 +31,7 @@ FIXTURE_FILES = (
     "release/manifest.json",
     "release/manifest.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
+    "release/progressive-controls-replay.schema.json",
     "opportunities/omega-20260829.json",
     "opportunities/omega-20260829.receipt.json",
     "opportunities/source-evidence-20260826.json",
@@ -192,6 +193,38 @@ def complete_manifest(root: Path) -> dict:
         "sha256": CONTRACT.sha256(evidence_path),
         "summary": "Synthetic public-safe evidence fixture.",
     }
+    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    progressive_path.write_bytes(CONTRACT.canonical_json({
+        "schema": "danse.progressive-controls-replay.v1",
+        "gate_id": "progressive-controls-replay",
+        "result": "satisfied",
+        "observed_at": "2026-08-30T20:00:00Z",
+        "source": {
+            "repository": "organvm/the-thing-without-a-name",
+            "pull_request": 43,
+            "exact_head": "a" * 40,
+            "tree": "b" * 40,
+        },
+        "runtime": {
+            "platform": "darwin",
+            "browser": {"name": "Google Chrome", "version": "fixture"},
+            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: fixture)",
+        },
+        "checks": [
+            {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
+            for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
+        ],
+        "non_actions": [
+            "No deployment, upload, submission, or publication action was performed by this receipt.",
+            "No rights, biography, final-cut, or archive-participation claim was made.",
+            "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
+        ],
+    }))
+    progressive_evidence = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(progressive_path),
+        "summary": "Synthetic exact-head progressive-controls replay fixture.",
+    }
 
     for claim in manifest["claims"]:
         claim["status"] = "verified"
@@ -221,7 +254,9 @@ def complete_manifest(root: Path) -> dict:
         product["status"] = "ready"
     for gate in manifest["gates"]:
         gate["state"] = "satisfied"
-        if gate["id"] != "live-interaction-replay":
+        if gate["id"] == "progressive-controls-replay":
+            gate["evidence"] = copy.deepcopy(progressive_evidence)
+        elif gate["id"] != "live-interaction-replay":
             gate["evidence"] = copy.deepcopy(evidence)
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
@@ -372,6 +407,29 @@ class ProductionManifestTest(unittest.TestCase):
         )
         self.assertEqual(publication["state"], "pending")
         self.assertIsNone(publication["evidence"])
+
+    def test_progressive_controls_gate_has_a_distinct_fail_closed_receipt_contract(self) -> None:
+        gate = next(
+            gate
+            for gate in self.manifest["gates"]
+            if gate["id"] == "progressive-controls-replay"
+        )
+        self.assertEqual(gate["state"], "pending")
+        self.assertIsNone(gate["evidence"])
+        self.assertFalse((ROOT / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH).exists())
+        schema = CONTRACT.load_json(
+            ROOT / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH,
+            "progressive controls replay schema",
+        )
+        CONTRACT.jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertEqual(
+            schema["properties"]["gate_id"]["const"],
+            "progressive-controls-replay",
+        )
+        self.assertEqual(
+            schema["properties"]["checks"]["minItems"],
+            len(CONTRACT.PROGRESSIVE_CONTROLS_CHECKS),
+        )
 
     def test_tracked_manifest_is_honest_draft_but_public_and_release_fail_closed(self) -> None:
         public = CONTRACT.phase_blockers(self.manifest, "public")
@@ -789,6 +847,43 @@ class AdversarialManifestTest(unittest.TestCase):
             gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
             write_manifest(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "check inventory drifted"):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_gate_rejects_a_generic_digested_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            generic = root / "release/evidence/public-receipt.json"
+            gate["evidence"] = {
+                "path": "release/evidence/public-receipt.json",
+                "sha256": CONTRACT.sha256(generic),
+                "summary": "A matching digest without the gate-specific contract.",
+            }
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "names the wrong evidence receipt"):
+                CONTRACT.validate_release(root)
+
+    def test_rehashed_progressive_controls_receipt_with_missing_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["checks"].pop()
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
                 CONTRACT.validate_release(root)
 
     def test_duplicate_ids_fail(self) -> None:

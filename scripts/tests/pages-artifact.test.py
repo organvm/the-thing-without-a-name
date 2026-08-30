@@ -749,10 +749,21 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("if (!controlBus) return;", toggle)
         self.assertIn("if (projectMap.open) controlBus.actions.close();", toggle)
 
+    def test_renderer_failure_keeps_the_controls_and_keyboard_fail_readable(self) -> None:
+        self.assertIn("renderer-fallback", self.markup.by_id)
+        initialization = self.script.split("let baseRenderer = null;", 1)[1].split("// Non-null", 1)[0]
+        self.assertIn("try {", initialization)
+        self.assertIn("baseRenderer = new Renderer(canvas, corpus);", initialization)
+        self.assertIn('el("renderer-fallback").hidden = false;', initialization)
+        self.assertIn('console.warn("Danse visual renderer unavailable; controls remain available", error);', initialization)
+        self.assertIn("if (!renderer) return;", self.script.split("function frame() {", 1)[1].split("\n}", 1)[0])
+        self.assertIn("if (renderer) requestAnimationFrame(frame);", self.script)
+        self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
+
     def test_opening_a_tray_closes_the_visual_details_sheet_first(self) -> None:
         helper = self.script.split("function openTray(category, trigger) {", 1)[1].split("\n}", 1)[0]
         self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openTray(category)"))
-        self.assertIn("surfaceTrigger = trigger;", helper)
+        self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;', helper)
 
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
         handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
@@ -790,10 +801,16 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_music_toggle_and_advanced_receipt_follow_authoritative_state(self) -> None:
         music = self.script.split("async function toggleMusic(intent) {", 1)[1].split("\n}", 1)[0]
+        hold = self.script.split("function toggleHold() {", 1)[1].split("\n}", 1)[0]
         subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
         self.assertIn('if (intent === "stopped")', music)
         self.assertIn("await scoreAudio.start(scoreSecondAt(at()))", music)
+        self.assertIn("if (heldAt !== null)", music)
+        self.assertIn("scoreAudio.stop();", music.split("if (heldAt !== null)", 1)[1])
         self.assertIn("scoreAudio.stop();", music.split("catch (error)", 1)[1])
+        self.assertIn("const previousHeldAt = heldAt;", hold)
+        self.assertIn("heldAt = previousHeldAt;", hold.split("catch (error)", 1)[1])
+        self.assertIn("throw error;", hold.split("catch (error)", 1)[1])
         self.assertIn("renderMusicReceipt(state);", subscription)
 
     def test_shared_river_uses_only_allowlisted_presentation_state(self) -> None:

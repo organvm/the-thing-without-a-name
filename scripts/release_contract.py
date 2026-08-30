@@ -26,6 +26,22 @@ EXPECTED_SOURCE_EVIDENCE_SHA256 = "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c
 LIVE_INTERACTION_EVIDENCE_PATH = "release/evidence/live-interaction-replay-20260804.json"
 LIVE_INTERACTION_COMMENT_BODY_SHA256 = "4cc41f9ed353c92c27b172907800b123c7b4e85ef4ba7165ed210133f40952bf"
 LIVE_INTERACTION_DEPLOYED_COMMIT = "f19244afbce94015e78b7f746b07d267ed9e67ae"
+PROGRESSIVE_CONTROLS_EVIDENCE_PATH = "release/evidence/progressive-controls-replay.json"
+PROGRESSIVE_CONTROLS_SCHEMA_PATH = "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CONTROLS_CHECKS = (
+    "exact-head",
+    "desktop-layout",
+    "mobile-320-layout",
+    "mobile-390-layout",
+    "zoom-200-layout",
+    "touch-targets",
+    "keyboard-focus",
+    "reduced-motion",
+    "receipt-state",
+    "map-gating",
+    "console-clean",
+    "http-clean",
+)
 PHASES = ("draft", "public", "release")
 GENERATED_PRODUCT_PATHS = {
     "project-page-copy": "project/index.html",
@@ -454,6 +470,47 @@ def validate_live_interaction_receipt(path: Path) -> None:
         raise ReleaseError(f"live interaction replay exposes a private/local path marker: {leaked}")
 
 
+def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
+    """Validate the distinct exact-head browser receipt for the progressive UI gate."""
+    receipt = load_json(path, "progressive controls replay receipt")
+    schema_path = source_file(
+        root,
+        PROGRESSIVE_CONTROLS_SCHEMA_PATH,
+        "progressive controls replay schema",
+    )
+    schema = load_json(schema_path, "progressive controls replay schema")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(
+            schema,
+            format_checker=jsonschema.FormatChecker(),
+        ).validate(receipt)
+    except jsonschema.SchemaError as exc:
+        raise ReleaseError(f"progressive controls replay schema is invalid: {exc.message}") from exc
+    except jsonschema.ValidationError as exc:
+        location = ".".join(str(item) for item in exc.absolute_path) or "root"
+        raise ReleaseError(
+            f"progressive controls replay receipt violates schema at {location}: {exc.message}"
+        ) from exc
+
+    check_ids = [check["id"] for check in receipt["checks"]]
+    if check_ids != list(PROGRESSIVE_CONTROLS_CHECKS):
+        raise ReleaseError("progressive controls replay check inventory drifted")
+    renderer = receipt["runtime"]["graphics_renderer"].lower()
+    if "apple" not in renderer or "metal" not in renderer:
+        raise ReleaseError("progressive controls replay is not authenticated as Apple Metal")
+    leaked = next(
+        (
+            marker.group(0).strip()
+            for value in strings(receipt)
+            if (marker := PRIVATE_PATH_MARKER.search(value))
+        ),
+        None,
+    )
+    if leaked:
+        raise ReleaseError(f"progressive controls replay exposes a private/local path marker: {leaked}")
+
+
 def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
     for claim in manifest["claims"]:
         evidence = claim["evidence"]
@@ -516,6 +573,10 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
                 if evidence["path"] != LIVE_INTERACTION_EVIDENCE_PATH:
                     raise ReleaseError("live interaction replay names the wrong evidence receipt")
                 validate_live_interaction_receipt(evidence_path)
+            elif gate["id"] == "progressive-controls-replay":
+                if evidence["path"] != PROGRESSIVE_CONTROLS_EVIDENCE_PATH:
+                    raise ReleaseError("progressive controls replay names the wrong evidence receipt")
+                validate_progressive_controls_receipt(root, evidence_path)
         elif evidence is not None:
             raise ReleaseError(f"pending gate {gate['id']} may not carry completion evidence")
 

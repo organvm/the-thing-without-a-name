@@ -39,7 +39,10 @@ The completed historical HUD keyboard/touch replay is bound by an immutable publ
 [`live-interaction-replay-20260804.json`](evidence/live-interaction-replay-20260804.json)
 receipt; it closes only the legacy machine gate and does not prove the progressive
 interface. `progressive-controls-replay` requires a separate exact-head browser receipt
-before public admission. Neither receipt satisfies publication approval.
+at `release/evidence/progressive-controls-replay.json`, validated by the
+[`danse.progressive-controls-replay.v1` schema](progressive-controls-replay.schema.json)
+and its gate-specific identity, check-inventory, Apple-Metal, and privacy-boundary
+validator before public admission. Neither receipt satisfies publication approval.
 
 ## Validate and build
 

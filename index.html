@@ -41,6 +41,13 @@
   #veil p { color: #6a6a78; letter-spacing: .12em; }
   #bar { width: 260px; height: 1px; background: #26262e; margin: 0 auto; }
   #bar i { display: block; height: 100%; width: 0; background: #cfcfe0; transition: width .2s; }
+  #renderer-fallback {
+    position: fixed; z-index: 1; inset: 0; display: grid; place-content: center;
+    gap: 14px; padding: 24px; background: #0e0e10; text-align: center;
+  }
+  #renderer-fallback[hidden] { display: none; }
+  #renderer-fallback h1 { font: 300 34px/1 ui-serif, Georgia, serif; letter-spacing: .32em; color: #e8e8ee; }
+  #renderer-fallback p { max-width: 56ch; color: #9292a0; letter-spacing: .06em; }
 
   #hud {
     position: fixed; z-index: 2;
@@ -142,6 +149,11 @@
   <p>161 photographs &middot; 1 archival composite</p>
   <div id="bar"><i></i></div>
 </div>
+
+<section id="renderer-fallback" hidden role="status" aria-live="polite" aria-atomic="true">
+  <h1>Danse</h1>
+  <p>Visual renderer unavailable in this browser. Danse requires WebGL2; controls, project map, and accessibility information remain available.</p>
+</section>
 
 <section id="hud" hidden aria-hidden="true" aria-label="Danse controls and current state">
   <header class="sheet-header"><h2>Details</h2><button class="danse-action" id="sheet-close" type="button">Close</button></header>
@@ -306,11 +318,21 @@ let conductor = Choreography.normalizeConductor({
   tempo: query.get("bpm"),
 });
 const scoreAudio = musicalScore ? new ScoreAudio(musicalScore) : null;
-const baseRenderer = new Renderer(canvas, corpus);
-await corpus.prime(baseRenderer.gl, {
-  onProgress: (p) => { el("bar").firstElementChild.style.width = `${p * 100}%`; },
-});
 const veil = el("veil");
+let baseRenderer = null;
+let rendererFailure = null;
+try {
+  baseRenderer = new Renderer(canvas, corpus);
+  await corpus.prime(baseRenderer.gl, {
+    onProgress: (p) => { el("bar").firstElementChild.style.width = `${p * 100}%`; },
+  });
+} catch (error) {
+  rendererFailure = error;
+  canvas.hidden = true;
+  el("renderer-fallback").hidden = false;
+  el("stage-description").textContent = "The Danse visual renderer is unavailable in this browser because WebGL2 could not initialize. Controls, project map, and accessibility information remain available.";
+  console.warn("Danse visual renderer unavailable; controls remain available", error);
+}
 veil.classList.add("gone");
 veil.setAttribute("aria-hidden", "true");
 if (reducedMotion.matches) veil.hidden = true;
@@ -331,10 +353,12 @@ const interaction = new InteractionController({
   video: el("pose-video"),
   camera: { hz: navigator.connection?.saveData ? 5 : 10 },
 });
-const renderer = new InteractionRenderer(baseRenderer, (t) => interaction.inputAt(t), {
-  enabled: () => heldAt === null,
-  reducedMotion: () => reducedMotion.matches && heldAt !== null,
-});
+const renderer = baseRenderer
+  ? new InteractionRenderer(baseRenderer, (t) => interaction.inputAt(t), {
+      enabled: () => heldAt === null,
+      reducedMotion: () => reducedMotion.matches && heldAt !== null,
+    })
+  : null;
 
 // The cast is held for an eighth of a second rather than rebuilt every frame:
 // casting cells walks 162 index entries per cell, and at 60fps that is work
@@ -367,6 +391,7 @@ function reducedMotionChanged({ matches }) {
 }
 
 function frame() {
+  if (!renderer) return;
   const t = at();
   interaction.tick(t, river, { motion: heldAt === null });
   // Time is not wrapped. The piece has no duration to reach and nothing to
@@ -399,7 +424,7 @@ function frame() {
   el("interaction-summary").textContent = `${interaction.mode}${embodied}`;
   requestAnimationFrame(frame);
 }
-requestAnimationFrame(frame);
+if (renderer) requestAnimationFrame(frame);
 
 // Keep the address bar honest without thrashing history — and note what it does
 // NOT write. Persisting `t` would make a reload resume where you left, which is
@@ -565,7 +590,11 @@ async function toggleMusic(intent) {
       return "stopped";
     }
     await scoreAudio.start(scoreSecondAt(at()));
-    return heldAt === null ? "playing" : "suspended-by-hold";
+    if (heldAt !== null) {
+      scoreAudio.stop();
+      return "suspended-by-hold";
+    }
+    return "playing";
   } catch (error) {
     scoreAudio.stop();
     musicErrorMessage = `Music could not start: ${error.message}`;
@@ -636,8 +665,14 @@ el("conductor-reset").addEventListener("click", () => {
 let surfaceTrigger = null;
 
 function toggleHold() {
-  heldAt = heldAt === null ? at() : null;
-  if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(at()), heldAt !== null);
+  const previousHeldAt = heldAt;
+  heldAt = previousHeldAt === null ? at() : null;
+  try {
+    if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(at()), heldAt !== null);
+  } catch (error) {
+    heldAt = previousHeldAt;
+    throw error;
+  }
   renderInteraction(interaction.snapshot());
 }
 
@@ -797,7 +832,7 @@ function toggleControls() {
 
 function openTray(category, trigger) {
   if (!hud.hidden) setHudVisible(false);
-  surfaceTrigger = trigger;
+  surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;
   controlBus.actions.openTray(category);
 }
 
@@ -900,6 +935,7 @@ window.danse = {
   get t() { return at(); }, set t(v) { jump(v); },
   get river() { return river; },
   get seed() { return river.seed; }, set seed(v) { river = { ...river, seed: v >>> 0 }; },
+  get rendererAvailable() { return rendererFailure === null; },
   get controlState() { return controlBus.getState(); },
   actions: controlBus.actions,
 };

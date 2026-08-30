@@ -443,6 +443,14 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => danse.controlState.surface") == "tray:river", "River replacement left surface state inconsistent")
     page.press('[data-category="river"]', "Escape")
     want(page.evaluate("() => document.activeElement?.dataset.category") == "river", "closing the replacement tray lost its trigger")
+    page.click('[data-category="river"]')
+    page.click('[data-category="river"]')
+    page.focus('[data-category="hold"]')
+    page.press('[data-category="hold"]', "Escape")
+    want(
+        page.evaluate("() => document.activeElement?.dataset.category") == "hold",
+        "a toggle-closed tray retained a stale focus-return target",
+    )
     page.click('[data-category="score"]')
     page.click("#score-details")
     page.press("#conductor-model", "Escape")
@@ -572,6 +580,29 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.emulate_media(reduced_motion="no-preference")
     page.wait_for_function("() => danse.controlState.playback === 'running'")
     shot("reduced-motion-opt-in")
+
+    page.add_init_script("""(() => {
+      const getContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function(kind, ...args) {
+        if (kind === 'webgl2') return null;
+        return getContext.call(this, kind, ...args);
+      };
+    })();""")
+    page.emulate_media(reduced_motion="no-preference")
+    page.goto(f"{base}/index.html?score=", wait_until="load")
+    page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    page.wait_for_function("() => document.getElementById('veil').hidden", timeout=180_000)
+    want(page.evaluate("() => danse.rendererAvailable") is False, "forced no-WebGL visit reported a renderer")
+    want(page.locator("#renderer-fallback").is_visible(), "no-WebGL visit did not show a readable fallback")
+    want(page.locator("#danse-dock").is_visible(), "no-WebGL visit did not initialize the primary controls")
+    page.press("body", "h")
+    want(page.locator("#hud").is_visible(), "H did not open Details without WebGL")
+    page.press("#sheet-close", "Escape")
+    want(page.locator("#hud").is_hidden(), "Escape did not close Details without WebGL")
+    page.click('[data-category="map"]')
+    page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
+    want(page.locator("#project-map").is_visible(), "Map did not open without WebGL")
+    page.press("#map-close", "Escape")
 
     if console_errors:
         failures.extend(f"console error: {message}" for message in console_errors)
