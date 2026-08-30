@@ -901,6 +901,24 @@ class AdversarialManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
                 CONTRACT.validate_release(root)
 
+    def test_rehashed_progressive_controls_receipt_with_blank_observation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["checks"][0]["observation"] = " \t\n"
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
+                CONTRACT.validate_release(root)
+
     def test_progressive_controls_receipt_requires_a_real_exact_head_and_tree(self) -> None:
         for mutation, message in (
             (("exact_head", "f" * 40), "exact head is not a repository commit"),
@@ -955,6 +973,51 @@ class AdversarialManifestTest(unittest.TestCase):
                     "commit",
                     "-qm",
                     "different reviewed tree",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "reviewed source includes non-receipt changes"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_a_deleted_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            (root / ".gitignore").unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-u", ".gitignore"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "delete reviewed source",
                 ],
                 check=True,
                 capture_output=True,

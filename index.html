@@ -152,7 +152,7 @@
 
 <section id="renderer-fallback" hidden role="status" aria-live="polite" aria-atomic="true">
   <h1>Danse</h1>
-  <p>Visual renderer unavailable in this browser. Danse requires WebGL2; controls, project map, and accessibility information remain available.</p>
+  <p id="renderer-fallback-reason">Visual renderer unavailable in this browser. Danse requires WebGL2; controls, project map, and accessibility information remain available.</p>
 </section>
 
 <section id="hud" hidden aria-hidden="true" aria-label="Danse controls and current state">
@@ -336,7 +336,9 @@ try {
     : "WebGL2 could not initialize";
   canvas.hidden = true;
   el("renderer-fallback").hidden = false;
-  el("stage-description").textContent = `The Danse visual renderer is unavailable because ${rendererUnavailableReason}. Controls, project map, and accessibility information remain available.`;
+  const rendererFallbackMessage = `The Danse visual renderer is unavailable because ${rendererUnavailableReason}. Controls, project map, and accessibility information remain available.`;
+  el("renderer-fallback-reason").textContent = rendererFallbackMessage;
+  el("stage-description").textContent = rendererFallbackMessage;
   console.warn(`Danse visual renderer unavailable: ${rendererUnavailableReason}; controls remain available`, error);
 }
 veil.classList.add("gone");

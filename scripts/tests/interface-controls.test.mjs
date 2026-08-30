@@ -207,6 +207,43 @@ await test("music startup fails closed when Web Audio scheduling throws", async 
   }
 });
 
+await test("held score audio invalidates canceled scheduling before a short resume", async () => {
+  const originalWindow = globalThis.window;
+  class AudioContext {
+    constructor() {
+      this.currentTime = 0;
+      this.destination = {};
+    }
+    createGain() {
+      return { gain: { value: 0 }, connect() {} };
+    }
+    async resume() {}
+  }
+  globalThis.window = { AudioContext };
+  try {
+    const audio = new ScoreAudio({
+      time: { duration_seconds: 8 },
+      notes: [{ start_second: 0.1, end_second: 1, stem: "violin-1", pitch: 60, velocity: 64 }],
+    });
+    const scheduled = [];
+    audio.scheduleNote = (...args) => scheduled.push(args);
+    await audio.start(0);
+    assert.equal(scheduled.length, 1);
+    assert.equal(audio.scheduledThrough, 4);
+
+    audio.sync(0, true);
+    assert.equal(audio.scheduledThrough, Number.NEGATIVE_INFINITY);
+    audio.context.currentTime = 0.05;
+    audio.sync(0.05, false);
+
+    assert.equal(scheduled.length, 2);
+    assert.equal(audio.scheduledThrough, 4.05);
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+});
+
 await test("stale Presence completions cannot replace newer modes or status", async () => {
   const cameraSettlements = [];
   const reports = [];

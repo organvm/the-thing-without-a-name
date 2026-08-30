@@ -529,7 +529,7 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
             str(root),
             "diff",
             "--name-only",
-            "--diff-filter=ACMRTUXB",
+            "--diff-filter=ACDMRTUXB",
             "-z",
             exact_head,
             "HEAD",

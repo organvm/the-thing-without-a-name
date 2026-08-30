@@ -762,6 +762,15 @@ class InterfaceContractTest(unittest.TestCase):
         )
         self.assertIn("baseRenderer = null;", initialization.split("catch (error)", 1)[1])
         self.assertIn('el("renderer-fallback").hidden = false;', initialization)
+        self.assertIn("renderer-fallback-reason", self.markup.by_id)
+        self.assertIn(
+            'el("renderer-fallback-reason").textContent = rendererFallbackMessage;',
+            initialization,
+        )
+        self.assertIn(
+            'el("stage-description").textContent = rendererFallbackMessage;',
+            initialization,
+        )
         self.assertIn("const rendererUnavailableReason = candidateRenderer", initialization)
         self.assertIn('"a required corpus image or texture could not be prepared"', initialization)
         self.assertIn('"WebGL2 could not initialize"', initialization)

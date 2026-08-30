@@ -23,7 +23,7 @@
               "http-clean"
             ]
           },
-          "observation": {"minLength": 1, "type": "string"},
+          "observation": {"minLength": 1, "pattern": "\\S", "type": "string"},
           "result": {"const": "passed"}
         },
         "required": ["id", "result", "observation"],
