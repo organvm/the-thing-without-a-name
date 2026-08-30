@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -452,7 +453,7 @@ class DeliveryContractTest(unittest.TestCase):
             width=3840,
             height=2160,
             fps=24,
-            duration_seconds=350.896343125,
+            timing_score="music/score.json",
         )
         query = parse_qs(urlparse(OFFLINE.film_url("http://render.test", args)).query)
         self.assertEqual(
@@ -466,9 +467,50 @@ class DeliveryContractTest(unittest.TestCase):
                 "width": ["3840"],
                 "height": ["2160"],
                 "fps": ["24"],
-                "duration": ["350.896343125"],
+                "passage-seconds": ["350.896343125"],
             },
         )
+        with self.assertRaisesRegex(SystemExit, "non-empty score file"):
+            OFFLINE.music_score_identity(SimpleNamespace(score=""))
+        with self.assertRaisesRegex(SystemExit, "non-empty score file"):
+            OFFLINE.timing_score_identity(SimpleNamespace(timing_score=""))
+
+    def test_timing_control_output_stem_cannot_overwrite_the_scored_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            common = {
+                "window": "passage",
+                "seed": 20170620,
+                "stream": 0,
+                "out": Path(tmp),
+            }
+            scored = SimpleNamespace(**common, timing_score=None)
+            control = SimpleNamespace(**common, timing_score="music/score.json")
+            ordinary = SimpleNamespace(**common)
+            scored_stem = OFFLINE.output_stem(scored)
+            control_stem = OFFLINE.output_stem(control)
+            self.assertEqual(scored_stem.name, "passage-20170620")
+            self.assertEqual(ordinary.out / "passage-20170620", OFFLINE.output_stem(ordinary))
+            self.assertEqual(control_stem.name, "passage-20170620-control")
+            self.assertNotEqual(scored_stem, control_stem)
+            scored_segments = OFFLINE.segment_paths(scored_stem, "prores", [0, 1])
+            control_segments = OFFLINE.segment_paths(control_stem, "prores", [0, 1])
+            scored_paths = {
+                *scored_segments,
+                *(OFFLINE.segment_receipt_path(path) for path in scored_segments),
+                OFFLINE.concat_listing_path(scored_stem),
+                scored_stem.with_suffix(".mov"),
+                OFFLINE.concat_receipt_path(scored_stem.with_suffix(".mov")),
+                *(OFFLINE.determinism_path(scored_stem, "prores", pass_) for pass_ in (1, 2)),
+            }
+            control_paths = {
+                *control_segments,
+                *(OFFLINE.segment_receipt_path(path) for path in control_segments),
+                OFFLINE.concat_listing_path(control_stem),
+                control_stem.with_suffix(".mov"),
+                OFFLINE.concat_receipt_path(control_stem.with_suffix(".mov")),
+                *(OFFLINE.determinism_path(control_stem, "prores", pass_) for pass_ in (1, 2)),
+            }
+            self.assertTrue(scored_paths.isdisjoint(control_paths))
 
     def test_offline_render_rejects_an_unauthorized_tier_before_capture(self) -> None:
         render = mock.Mock(side_effect=AssertionError("unauthorized tier reached the renderer"))
@@ -565,7 +607,7 @@ class DeliveryContractTest(unittest.TestCase):
             height=2160,
             fps=30,
             segment_frames=900,
-            duration_seconds=350.896343125,
+            timing_score="music/score.json",
         )
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             OFFLINE, "source_tree_sha256", return_value="source-tree"
@@ -589,6 +631,12 @@ class DeliveryContractTest(unittest.TestCase):
                 "width": 3840,
                 "height": 2160,
                 "fps": 30,
+                "passage": {
+                    "index": 0,
+                    "seed": OFFLINE.passage_seed(0, 0, 7),
+                    "t0": 0.0,
+                    "seconds": 350.896343125,
+                },
             }
             with (
                 mock.patch.object(OFFLINE, "video_stream_info", return_value=stream),
@@ -604,19 +652,61 @@ class DeliveryContractTest(unittest.TestCase):
                         "raw_rgba_sha256": "a" * 64,
                         "missing": 0,
                         "signature": "renderer-signature",
+                        "passage": capture["passage"],
                     },
                 )
                 expected = OFFLINE.segment_identity(args, 0, 30)
-                self.assertEqual(expected["inputs"]["duration_seconds"], 350.896343125)
+                self.assertEqual(
+                    expected["inputs"]["passage_timing"],
+                    {"mode": "fixed-passage", "seconds": 350.896343125},
+                )
+                self.assertEqual(
+                    expected["inputs"]["timing_score"]["contract_sha256"],
+                    json.loads((ROOT / "music/score.json").read_text())["identity"]["contract_sha256"],
+                )
                 self.assertTrue(OFFLINE.complete(dest, 30, expected))
-                args.duration_seconds = 312.540051998
+                receipt_without_capture = copy.deepcopy(receipt)
+                receipt_without_capture.pop("capture")
+                OFFLINE.segment_receipt_path(dest).write_text(
+                    json.dumps(receipt_without_capture, indent=2) + "\n"
+                )
+                self.assertFalse(OFFLINE.complete(dest, 30, expected))
+                stale_capture = copy.deepcopy(receipt)
+                stale_capture["capture"]["passage"]["seed"] ^= 1
+                OFFLINE.segment_receipt_path(dest).write_text(
+                    json.dumps(stale_capture, indent=2) + "\n"
+                )
+                self.assertFalse(OFFLINE.complete(dest, 30, expected))
+                for field in ("index", "t0"):
+                    with self.subTest(falsy_passage_field=field):
+                        falsy_capture = copy.deepcopy(receipt)
+                        falsy_capture["capture"]["passage"][field] = False
+                        OFFLINE.segment_receipt_path(dest).write_text(
+                            json.dumps(falsy_capture, indent=2) + "\n"
+                        )
+                        self.assertFalse(OFFLINE.complete(dest, 30, expected))
+                invalid_capture = copy.deepcopy(capture)
+                invalid_capture["passage"]["t0"] = False
+                with self.assertRaisesRegex(SystemExit, "invalid provenance identity"):
+                    OFFLINE.write_segment_receipt(dest, args, 0, 30, capture=invalid_capture)
+                OFFLINE.segment_receipt_path(dest).write_text(json.dumps(receipt, indent=2) + "\n")
+                args._timing_score_identity = {
+                    **expected["inputs"]["timing_score"],
+                    "duration_seconds": 312.540051998,
+                }
                 self.assertFalse(OFFLINE.complete(dest, 30, OFFLINE.segment_identity(args, 0, 30)))
-                args.duration_seconds = 350.896343125
+                args._timing_score_identity = expected["inputs"]["timing_score"]
                 args.start = 1.0
                 self.assertFalse(OFFLINE.complete(dest, 30, OFFLINE.segment_identity(args, 0, 30)))
                 args.start = 0.0
                 dest.write_bytes(b"different segment")
                 self.assertFalse(OFFLINE.complete(dest, 30, expected))
+
+    def test_film_rejects_legacy_duration_and_uses_exact_passage_span_selection(self) -> None:
+        film = (ROOT / "film.html").read_text(encoding="utf-8")
+        self.assertIn('if (q.has("duration"))', film)
+        self.assertIn("Program.captureSpan", film)
+        self.assertNotIn("t1 + 1e-6", film)
 
     def test_concat_uses_only_explicitly_planned_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3576,6 +3666,12 @@ class DeliveryContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "repeats JSON field"):
                 CHECK.read_contract_json(package, "receipt.json", "receipt")
 
+            with (
+                mock.patch.object(CHECK.json, "loads", side_effect=RecursionError),
+                self.assertRaisesRegex(ValueError, "readable unique-key JSON"),
+            ):
+                CHECK.unique_json_bytes(b"{}", "receipt")
+
             (package / "attest.yaml").write_text("final-cut-only: false\nfinal-cut-only: true\n")
             with self.assertRaisesRegex(ValueError, "unique-key YAML"):
                 CHECK.read_attestations(package)
@@ -3749,6 +3845,8 @@ class DeliveryContractTest(unittest.TestCase):
                 receipt_path = package / relative
                 receipt_path.parent.mkdir(exist_ok=True)
                 receipt_path.write_bytes(b"PRIVATE ARBITRARY RECEIPT BYTES\n")
+                if relative in CHECK.DONE_RECEIPTS.values():
+                    receipt_path.chmod(0o400)
                 with mock.patch.object(
                     CHECK,
                     "repository_state",
@@ -3808,7 +3906,9 @@ class DeliveryContractTest(unittest.TestCase):
                 )
             done = json.loads(done_path.read_text())
             done["package"]["manifest_sha256"] = "0" * 64
+            done_path.chmod(0o600)
             done_path.write_text(json.dumps(done, indent=2) + "\n")
+            done_path.chmod(0o400)
             report = CHECK.Report()
             with mock.patch.object(
                 CHECK,
@@ -3901,6 +4001,102 @@ class DeliveryContractTest(unittest.TestCase):
                 )
             self.assertTrue(any("changed" in error for error in errors))
 
+    def test_ordinary_done_receipt_validation_requires_private_single_link_bytes(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        for case in (
+            "world-writable",
+            "external-hardlink",
+            "unsafe-directory",
+            "unsafe-package-root",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                boundary = Path(tmp)
+                package = boundary / "package"
+                package.mkdir()
+                build_submission_receipt_chain(package, reg, through="package")
+                attested, attest_path = CHECK.read_attestations(package)
+                binding = submission_package_binding(package)
+                initial = CHECK.Report()
+                records = CHECK.check_phase_receipts(
+                    reg,
+                    package,
+                    "package",
+                    binding,
+                    attested,
+                    attest_path,
+                    initial,
+                    now=now,
+                )
+                self.assertEqual(initial.failures, 0)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    done_path, _ = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                done_value = json.loads(done_path.read_text())
+                if case == "world-writable":
+                    done_path.chmod(0o666)
+                elif case == "external-hardlink":
+                    os.link(done_path, boundary / "external-validation-receipt.json")
+                elif case == "unsafe-directory":
+                    done_path.parent.chmod(0o777)
+                else:
+                    package.chmod(0o777)
+
+                with self.assertRaisesRegex(ValueError, "unsafe|wrong mode"):
+                    CHECK.read_contract_json(
+                        package,
+                        CHECK.DONE_RECEIPTS["package"],
+                        "validated-package receipt",
+                    )
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    direct_errors = CHECK.validate_done_receipt(
+                        done_value,
+                        done_path,
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertTrue(
+                    any("unsafe" in error or "wrong mode" in error for error in direct_errors),
+                    direct_errors,
+                )
+                report = CHECK.Report()
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    CHECK.check_phase_receipts(
+                        reg,
+                        package,
+                        "package",
+                        binding,
+                        attested,
+                        attest_path,
+                        report,
+                        now=now,
+                    )
+                local = next(
+                    row for row in report.rows if row[1] == "validated-package receipt"
+                )
+                self.assertEqual(local[2], CHECK.FAIL)
+                self.assertIn("unsafe", local[3])
+
     def test_done_receipt_fullsyncs_on_darwin_before_atomic_publication(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
         now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
@@ -3930,16 +4126,16 @@ class DeliveryContractTest(unittest.TestCase):
             fullsync.fcntl.side_effect = lambda _descriptor, operation: events.append(
                 ("fullsync", operation)
             )
-            real_replace = os.replace
+            real_link = CHECK.exclusive_receipt_link
 
-            def replace(source, destination):
-                events.append("replace")
-                return real_replace(source, destination)
+            def link(source, destination, directory_fd):
+                events.append("link")
+                return real_link(source, destination, directory_fd)
 
             with (
                 mock.patch.object(CHECK.sys, "platform", "darwin"),
                 mock.patch.object(CHECK, "fcntl", fullsync),
-                mock.patch.object(CHECK.os, "replace", side_effect=replace),
+                mock.patch.object(CHECK, "exclusive_receipt_link", side_effect=link),
                 mock.patch.object(
                     CHECK,
                     "repository_state",
@@ -3954,7 +4150,7 @@ class DeliveryContractTest(unittest.TestCase):
                     now=now,
                 )
             self.assertEqual(events[0], ("fullsync", CHECK.F_FULLFSYNC))
-            self.assertEqual(events[1], "replace")
+            self.assertEqual(events[1], "link")
 
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp)
@@ -3964,7 +4160,7 @@ class DeliveryContractTest(unittest.TestCase):
             with (
                 mock.patch.object(CHECK.sys, "platform", "darwin"),
                 mock.patch.object(CHECK, "fcntl", blocked_fullsync),
-                mock.patch.object(CHECK.os, "replace") as replace,
+                mock.patch.object(CHECK, "exclusive_receipt_link") as link,
                 mock.patch.object(
                     CHECK,
                     "repository_state",
@@ -3979,8 +4175,1097 @@ class DeliveryContractTest(unittest.TestCase):
                     records,
                     now=now,
                 )
-            replace.assert_not_called()
+            link.assert_not_called()
             self.assertFalse((package / CHECK.DONE_RECEIPTS["package"]).exists())
+
+    def test_done_receipt_dirfd_rail_rejects_receipts_symlink_swap(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            boundary = Path(tmp)
+            package = boundary / "package"
+            outside = boundary / "outside"
+            parked = boundary / "parked-receipts"
+            package.mkdir()
+            outside.mkdir()
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            real_sync = CHECK.sync_regular_descriptor
+            swapped = False
+
+            def swap_after_sync(descriptor):
+                nonlocal swapped
+                real_sync(descriptor)
+                if not swapped:
+                    (package / "receipts").rename(parked)
+                    (package / "receipts").symlink_to(outside, target_is_directory=True)
+                    swapped = True
+
+            try:
+                with (
+                    mock.patch.object(CHECK, "sync_regular_descriptor", side_effect=swap_after_sync),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(
+                        (OSError, ValueError),
+                        "directory changed|publication boundary|package changed",
+                    ),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertFalse((outside / "validated-package.json").exists())
+                self.assertFalse((parked / "validated-package.json").exists())
+                self.assertEqual(list(outside.iterdir()), [])
+                self.assertFalse(any(path.name.endswith(".tmp") for path in parked.iterdir()))
+            finally:
+                linked = package / "receipts"
+                if linked.is_symlink():
+                    linked.unlink()
+                if parked.exists():
+                    parked.rename(linked)
+
+    def test_done_receipt_validates_the_pinned_root_during_a_transient_clone_swap(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            boundary = Path(tmp)
+            package = boundary / "package"
+            replacement = boundary / "replacement"
+            parked = boundary / "parked-package"
+            package.mkdir()
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            binding = submission_package_binding(package)
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            shutil.copytree(package, replacement)
+            (package / "screener.mp4").write_bytes(b"corrupt pinned package bytes")
+
+            real_repository_state = CHECK.repository_state
+            real_descriptor_file = CHECK.descriptor_file_identity
+            swapped = False
+            restored = False
+
+            def swap_to_valid_clone(*args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    package.rename(parked)
+                    replacement.rename(package)
+                    swapped = True
+                return SUBMISSION_REPOSITORY_HEAD, True
+
+            def restore_before_item_result(root_fd, relative, label, **kwargs):
+                nonlocal restored
+                result = real_descriptor_file(root_fd, relative, label, **kwargs)
+                if relative == "screener.mp4" and swapped and not restored:
+                    package.rename(replacement)
+                    parked.rename(package)
+                    restored = True
+                return result
+
+            try:
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        side_effect=swap_to_valid_clone,
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "descriptor_file_identity",
+                        side_effect=restore_before_item_result,
+                    ),
+                    self.assertRaisesRegex(ValueError, "digest is stale"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertTrue(swapped)
+                self.assertTrue(restored)
+                self.assertFalse((package / CHECK.DONE_RECEIPTS["package"]).exists())
+                self.assertFalse((replacement / CHECK.DONE_RECEIPTS["package"]).exists())
+            finally:
+                CHECK.repository_state = real_repository_state
+                if package.exists() and parked.exists():
+                    package.rename(replacement)
+                    parked.rename(package)
+                elif not package.exists() and parked.exists():
+                    parked.rename(package)
+
+    def test_done_receipt_atomic_commit_is_never_simulated_as_rollback(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+
+        def ready_package(root: Path) -> dict[str, dict[str, object]]:
+            build_submission_receipt_chain(root, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(root)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                root,
+                "package",
+                submission_package_binding(root),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            return records
+
+        with self.subTest("directory durability failure"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                real_fsync = os.fsync
+                def fail_publication_sync(descriptor):
+                    info = os.fstat(descriptor)
+                    if stat.S_ISDIR(info.st_mode) and destination.exists():
+                        raise OSError("injected post-link directory sync failure")
+                    return real_fsync(descriptor)
+
+                with (
+                    mock.patch.object(CHECK.os, "fsync", side_effect=fail_publication_sync),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertTrue(destination.is_file())
+                self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+        with self.subTest("post-link directory rebinding"):
+            with tempfile.TemporaryDirectory() as tmp:
+                boundary = Path(tmp)
+                package = boundary / "package"
+                outside = boundary / "outside"
+                parked = boundary / "parked-receipts"
+                package.mkdir()
+                outside.mkdir()
+                records = ready_package(package)
+                real_link = CHECK.exclusive_receipt_link
+
+                def swap_during_link(source, destination, directory_fd):
+                    (package / "receipts").rename(parked)
+                    (package / "receipts").symlink_to(outside, target_is_directory=True)
+                    return real_link(source, destination, directory_fd)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            CHECK,
+                            "exclusive_receipt_link",
+                            side_effect=swap_during_link,
+                        ),
+                        mock.patch.object(
+                            CHECK,
+                            "repository_state",
+                            return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                        ),
+                        self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                    ):
+                        CHECK.write_done_receipt(
+                            package,
+                            "package",
+                            submission_package_binding(package),
+                            records,
+                            now=now,
+                        )
+                    self.assertTrue((parked / "validated-package.json").is_file())
+                    self.assertEqual(list(outside.iterdir()), [])
+                    self.assertFalse(any(path.name.endswith(".tmp") for path in parked.iterdir()))
+                finally:
+                    linked = package / "receipts"
+                    if linked.is_symlink():
+                        linked.unlink()
+                    if parked.exists():
+                        parked.rename(linked)
+
+        with self.subTest("semantic validation failure"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                prior = destination.read_bytes()
+                prior_inode = destination.stat().st_ino
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "validate_done_receipt",
+                        return_value=["injected pre-publication validation failure"],
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "pre-publication validation failure"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(destination.read_bytes(), prior)
+                self.assertEqual(destination.stat().st_ino, prior_inode)
+                self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+        with self.subTest("staged bytes change during final package census"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                real_validate = CHECK.validate_pinned_publication_inputs
+                calls = 0
+
+                def mutate_during_final_census(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    result = real_validate(*args, **kwargs)
+                    if calls == 2:
+                        staged = [
+                            path
+                            for path in (package / "receipts").iterdir()
+                            if path.name.endswith(".tmp")
+                        ]
+                        self.assertEqual(len(staged), 1)
+                        staged[0].chmod(0o600)
+                        staged[0].write_bytes(b"mutated staged receipt")
+                    return result
+
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "validate_pinned_publication_inputs",
+                        side_effect=mutate_during_final_census,
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "staging file changed before atomic commit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertFalse(destination.exists())
+                self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+        with self.subTest("concurrent replacement inode is preserved"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                replacement = b"concurrent replacement\n"
+                real_fsync = os.fsync
+                def replace_after_commit(descriptor):
+                    info = os.fstat(descriptor)
+                    if stat.S_ISDIR(info.st_mode) and destination.exists():
+                        destination.unlink()
+                        destination.write_bytes(replacement)
+                        raise OSError("injected failure after concurrent replacement")
+                    return real_fsync(descriptor)
+
+                with (
+                    mock.patch.object(CHECK.os, "fsync", side_effect=replace_after_commit),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(destination.read_bytes(), replacement)
+
+        with self.subTest("same destination inode mutates in the final binding hook"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                real_binding = CHECK.assert_receipt_directory_binding
+                mutated = False
+
+                def mutate_during_final_binding(*args, **kwargs):
+                    nonlocal mutated
+                    result = real_binding(*args, **kwargs)
+                    if destination.exists() and not mutated:
+                        destination.chmod(0o600)
+                        destination.write_bytes(b"mutated same receipt inode\n")
+                        mutated = True
+                    return result
+
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "assert_receipt_directory_binding",
+                        side_effect=mutate_during_final_binding,
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertTrue(mutated)
+                self.assertEqual(destination.read_bytes(), b"mutated same receipt inode\n")
+
+        with self.subTest("receipt directory permissions weaken in the final binding hook"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                receipt_directory = destination.parent
+                real_binding = CHECK.assert_receipt_directory_binding
+                weakened = False
+
+                def weaken_during_final_binding(*args, **kwargs):
+                    nonlocal weakened
+                    result = real_binding(*args, **kwargs)
+                    if destination.exists() and not weakened:
+                        receipt_directory.chmod(0o777)
+                        weakened = True
+                    return result
+
+                try:
+                    with (
+                        mock.patch.object(
+                            CHECK,
+                            "assert_receipt_directory_binding",
+                            side_effect=weaken_during_final_binding,
+                        ),
+                        mock.patch.object(
+                            CHECK,
+                            "repository_state",
+                            return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                        ),
+                        self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                    ):
+                        CHECK.write_done_receipt(
+                            package,
+                            "package",
+                            submission_package_binding(package),
+                            records,
+                            now=now,
+                        )
+                    self.assertTrue(weakened)
+                    self.assertTrue(destination.is_file())
+                finally:
+                    receipt_directory.chmod(0o755)
+
+    def test_done_receipt_publication_is_attestation_fresh_exclusive_and_idempotent(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+
+        def ready_package(root: Path) -> dict[str, dict[str, object]]:
+            build_submission_receipt_chain(root, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(root)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                root,
+                "package",
+                submission_package_binding(root),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            return records
+
+        with self.subTest("live attestation drift is rejected before publication"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                attestation = package / "attest.yaml"
+                attestation.write_text(attestation.read_text() + "\n")
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "live attestation"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertFalse((package / CHECK.DONE_RECEIPTS["package"]).exists())
+
+        with self.subTest("package drift in the commit hook is indeterminate"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                real_link = CHECK.exclusive_receipt_link
+
+                def mutate_after_link(source, target, directory_fd):
+                    result = real_link(source, target, directory_fd)
+                    (package / "screener.mp4").write_bytes(b"changed during commit")
+                    return result
+
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "exclusive_receipt_link",
+                        side_effect=mutate_after_link,
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertTrue(destination.is_file())
+                self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+        with self.subTest("a concurrent destination is never overwritten"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                concurrent = b'{"schema":"concurrent-winner"}\n'
+                real_link = CHECK.exclusive_receipt_link
+
+                def publish_concurrently(source, target, directory_fd):
+                    destination.write_bytes(concurrent)
+                    return real_link(source, target, directory_fd)
+
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "exclusive_receipt_link",
+                        side_effect=publish_concurrently,
+                    ),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        submission_package_binding(package),
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(destination.read_bytes(), concurrent)
+                self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+        with self.subTest("an exact existing receipt is immutable and idempotent"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                records = ready_package(package)
+                binding = submission_package_binding(package)
+                destination = package / CHECK.DONE_RECEIPTS["package"]
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    first_path, first_digest = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                first_bytes = destination.read_bytes()
+                first_inode = destination.stat().st_ino
+                with (
+                    mock.patch.object(CHECK, "exclusive_receipt_link") as link,
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                ):
+                    second_path, second_digest = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                link.assert_not_called()
+                self.assertEqual((second_path, second_digest), (first_path, first_digest))
+                self.assertEqual(destination.read_bytes(), first_bytes)
+                self.assertEqual(destination.stat().st_ino, first_inode)
+
+    def test_done_receipt_final_composite_census_catches_package_drift(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            binding = submission_package_binding(package)
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            destination = package / CHECK.DONE_RECEIPTS["package"]
+            manifested = package / "screener.mp4"
+            real_snapshot = CHECK.assert_final_receipt_snapshot
+            mutated = False
+
+            def mutate_after_former_final_hook(*args, **kwargs):
+                nonlocal mutated
+                result = real_snapshot(*args, **kwargs)
+                if not mutated:
+                    manifested.write_bytes(b"mutation after the receipt-only snapshot")
+                    mutated = True
+                return result
+
+            with (
+                mock.patch.object(
+                    CHECK,
+                    "assert_final_receipt_snapshot",
+                    side_effect=mutate_after_former_final_hook,
+                ),
+                mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ),
+                self.assertRaisesRegex(OSError, "indeterminate after atomic commit"),
+            ):
+                CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    binding,
+                    records,
+                    now=now,
+                )
+            self.assertTrue(mutated)
+            self.assertTrue(destination.is_file())
+            self.assertFalse(
+                any(path.name.endswith(".tmp") for path in destination.parent.iterdir())
+            )
+
+    def test_done_receipt_recovers_only_safe_owned_crash_residue(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+
+        def ready(root: Path) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+            build_submission_receipt_chain(root, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(root)
+            report = CHECK.Report()
+            binding = submission_package_binding(root)
+            records = CHECK.check_phase_receipts(
+                reg,
+                root,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            return binding, records
+
+        residue_name = ".validated-package.json.1234-0123456789abcdef.tmp"
+        with self.subTest("staging-only crash residue"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                residue = package / "receipts" / residue_name
+                residue.write_bytes(b"interrupted staging bytes")
+                residue.chmod(0o600)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    destination, _ = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertFalse(residue.exists())
+                self.assertTrue(destination.is_file())
+                self.assertEqual(destination.stat().st_nlink, 1)
+
+        with self.subTest("post-link crash residue"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    destination, first_digest = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                first_inode = destination.stat().st_ino
+                residue = destination.parent / residue_name
+                os.link(destination, residue)
+                self.assertEqual(destination.stat().st_nlink, 2)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    reused, second_digest = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertFalse(residue.exists())
+                self.assertEqual(reused.stat().st_ino, first_inode)
+                self.assertEqual(reused.stat().st_nlink, 1)
+                self.assertEqual(second_digest, first_digest)
+
+        with self.subTest("unsafe exact residue is preserved and rejected"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                residue = package / "receipts" / residue_name
+                residue.write_bytes(b"untrusted staging bytes")
+                residue.chmod(0o666)
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "staging residue is unsafe"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(residue.read_bytes(), b"untrusted staging bytes")
+
+    def test_done_receipt_rejects_missing_link_dirfd_capability_before_staging(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            capabilities = set(os.supports_dir_fd)
+            capabilities.discard(os.link)
+            with (
+                mock.patch.object(CHECK.os, "supports_dir_fd", capabilities),
+                self.assertRaisesRegex(OSError, "dir-fd operations are unsupported"),
+            ):
+                CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            destination = package / CHECK.DONE_RECEIPTS["package"]
+            self.assertFalse(destination.exists())
+            self.assertFalse(any(path.name.endswith(".tmp") for path in destination.parent.iterdir()))
+
+    def test_done_receipt_lease_blocks_a_second_staging_writer(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            binding = submission_package_binding(package)
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            receipt_fd = os.open(package / "receipts", os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                CHECK.fcntl.flock(receipt_fd, CHECK.FLOCK_EX | CHECK.FLOCK_NB)
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(OSError, "publication lease is busy"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertFalse(any(path.name.endswith(".tmp") for path in (package / "receipts").iterdir()))
+                self.assertFalse((package / CHECK.DONE_RECEIPTS["package"]).exists())
+            finally:
+                CHECK.fcntl.flock(receipt_fd, CHECK.fcntl.LOCK_UN)
+                os.close(receipt_fd)
+            with mock.patch.object(
+                CHECK,
+                "repository_state",
+                return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+            ):
+                done, _ = CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    binding,
+                    records,
+                    now=now,
+                )
+            self.assertTrue(done.is_file())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            build_submission_receipt_chain(package, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(package)
+            report = CHECK.Report()
+            records = CHECK.check_phase_receipts(
+                reg,
+                package,
+                "package",
+                submission_package_binding(package),
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            with (
+                mock.patch.object(CHECK, "fcntl", None),
+                self.assertRaisesRegex(OSError, "publication lease is unsupported"),
+            ):
+                CHECK.write_done_receipt(
+                    package,
+                    "package",
+                    submission_package_binding(package),
+                    records,
+                    now=now,
+                )
+            self.assertFalse(any(path.name.endswith(".tmp") for path in (package / "receipts").iterdir()))
+
+    def test_existing_done_receipt_is_bounded_private_and_durably_rechecked(self) -> None:
+        reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())
+        now = datetime(2026, 8, 31, 20, 1, tzinfo=timezone.utc)
+
+        def ready(root: Path) -> tuple[dict[str, str], dict[str, dict[str, object]]]:
+            build_submission_receipt_chain(root, reg, through="package")
+            attested, attest_path = CHECK.read_attestations(root)
+            report = CHECK.Report()
+            binding = submission_package_binding(root)
+            records = CHECK.check_phase_receipts(
+                reg,
+                root,
+                "package",
+                binding,
+                attested,
+                attest_path,
+                report,
+                now=now,
+            )
+            self.assertEqual(report.failures, 0)
+            return binding, records
+
+        with self.subTest("oversized valid JSON is rejected before allocation"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    destination, _ = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                destination.chmod(0o600)
+                with destination.open("ab") as handle:
+                    handle.write(b" " * (CHECK.DONE_RECEIPT_MAX_BYTES + 1 - destination.stat().st_size))
+                destination.chmod(0o400)
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "byte limit"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+
+        with self.subTest("group-world-writable exact receipt is never reused"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    destination, _ = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                original = destination.read_bytes()
+                inode = destination.stat().st_ino
+                destination.chmod(0o666)
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                    self.assertRaisesRegex(ValueError, "destination is unsafe"),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(destination.read_bytes(), original)
+                self.assertEqual(destination.stat().st_ino, inode)
+
+        with self.subTest("existing exact receipt is file-then-directory synced"):
+            with tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp)
+                binding, records = ready(package)
+                with mock.patch.object(
+                    CHECK,
+                    "repository_state",
+                    return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                ):
+                    destination, _ = CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                receipt_directory = destination.parent.stat()
+                events: list[str] = []
+                real_sync = CHECK.sync_regular_descriptor
+                real_fsync = CHECK.os.fsync
+
+                def record_file_sync(descriptor):
+                    if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        events.append("file")
+                    return real_sync(descriptor)
+
+                def record_directory_sync(descriptor):
+                    info = os.fstat(descriptor)
+                    if (info.st_dev, info.st_ino) == (
+                        receipt_directory.st_dev,
+                        receipt_directory.st_ino,
+                    ):
+                        events.append("directory")
+                    return real_fsync(descriptor)
+
+                with (
+                    mock.patch.object(
+                        CHECK,
+                        "sync_regular_descriptor",
+                        side_effect=record_file_sync,
+                    ),
+                    mock.patch.object(CHECK.os, "fsync", side_effect=record_directory_sync),
+                    mock.patch.object(
+                        CHECK,
+                        "repository_state",
+                        return_value=(SUBMISSION_REPOSITORY_HEAD, True),
+                    ),
+                ):
+                    CHECK.write_done_receipt(
+                        package,
+                        "package",
+                        binding,
+                        records,
+                        now=now,
+                    )
+                self.assertEqual(events, ["file", "directory"])
+
+    def test_descriptor_contract_caps_separate_done_phase_and_manifest_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            receipts = package / "receipts"
+            receipts.mkdir()
+            done = receipts / "validated-package.json"
+            phase = receipts / "package.json"
+            document = b"{}" + b" " * CHECK.DONE_RECEIPT_MAX_BYTES
+            done.write_bytes(document)
+            phase.write_bytes(document)
+            root_fd = os.open(package, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(ValueError, "byte limit"):
+                    CHECK.descriptor_file_identity(
+                        root_fd,
+                        CHECK.DONE_RECEIPTS["package"],
+                        "validated-package receipt",
+                        capture=True,
+                        max_bytes=CHECK.DONE_RECEIPT_MAX_BYTES,
+                    )
+                captured, _, size = CHECK.descriptor_file_identity(
+                    root_fd,
+                    CHECK.PHASE_RECEIPTS["package"],
+                    "package receipt",
+                    capture=True,
+                    max_bytes=CHECK.PHASE_RECEIPT_MAX_BYTES,
+                )
+                self.assertEqual(captured, document)
+                self.assertEqual(size, len(document))
+
+                manifest = package / "manifest.json"
+                with manifest.open("wb") as handle:
+                    handle.truncate(CHECK.PACKAGE_MANIFEST_MAX_BYTES + 1)
+                with self.assertRaisesRegex(ValueError, "byte limit"):
+                    CHECK.descriptor_file_identity(
+                        root_fd,
+                        "manifest.json",
+                        "package manifest",
+                        capture=True,
+                        max_bytes=CHECK.PACKAGE_MANIFEST_MAX_BYTES,
+                    )
+            finally:
+                os.close(root_fd)
 
     def test_done_receipt_revalidates_manifested_bytes_and_repository_state(self) -> None:
         reg = yaml.safe_load((ROOT / "submission/screendance-2027.yaml").read_text())

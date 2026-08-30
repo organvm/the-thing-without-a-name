@@ -66,6 +66,7 @@ PRODUCTION_TIER = "film"
 PRODUCTION_WIDTH = 1920
 PRODUCTION_HEIGHT = 1080
 PRODUCTION_FPS = 30
+PRODUCTION_PASSAGE_SEED = 2943173797
 REVIEW_ANCHOR_PSNR_FLOOR = 30.0
 CAPTURE_TOOL = ROOT / "scripts/score_motion_production.py"
 BROWSER_CONTRACT = ROOT / "render/browser.py"
@@ -81,6 +82,14 @@ from music_score import load_score  # noqa: E402
 
 class EvidenceError(ValueError):
     """A production claim cannot be authenticated."""
+
+
+def finite_receipt_number(value: object) -> bool:
+    """Accept exact JSON numbers while excluding bool and non-finite values."""
+    return (
+        type(value) in (int, float)
+        and -sys.float_info.max <= value <= sys.float_info.max
+    )
 
 
 def sha256(path: Path) -> str:
@@ -198,6 +207,7 @@ def renderer_source_tree(
         args = SimpleNamespace(
             score="music/score.json" if with_score else None,
             choreography="render/choreography.json" if with_score else None,
+            timing_score=None if with_score else "music/score.json",
             tier=tier,
         )
         value = module.source_tree_sha256(args)
@@ -562,7 +572,7 @@ import crypto from 'node:crypto';
 import { fromData } from './engine/corpus.js';
 import { validate as validateChoreography } from './engine/choreography.js';
 import { step } from './engine/engine.js';
-import { validate as validateProgram } from './engine/program.js';
+import { fixedPassageTiming, validate as validateProgram } from './engine/program.js';
 import { validate as validateScore } from './engine/score.js';
 
 const bytes = (path) => fs.readFileSync(path);
@@ -571,6 +581,7 @@ const scoreBytes = bytes('music/score.json');
 const score = validateScore(JSON.parse(scoreBytes));
 Object.defineProperty(score, 'fileSha256', {value: hash(scoreBytes), enumerable: false});
 const choreography = validateChoreography(JSON.parse(bytes('render/choreography.json')), {score});
+const controlTiming = fixedPassageTiming(score.time.duration_seconds);
 const program = validateProgram(JSON.parse(bytes('render/program.json')));
 const manifestBytes = bytes('corpus/manifest.json');
 const manifest = JSON.parse(manifestBytes);
@@ -615,7 +626,7 @@ for (const [key, at] of [...boundaries.entries()].sort((a, b) => Number(a[0]) - 
     quantise: 0, stream: 0, score, choreography,
   });
   const controlResult = step(corpus, 20170620, second, program, {
-    quantise: 0, stream: 0, score: null, choreography: null,
+    quantise: 0, stream: 0, score: null, choreography: null, timing: controlTiming,
   });
   const withScore = compact(withResult);
   const control = compact(controlResult);
@@ -1099,8 +1110,8 @@ def _producer_receipt_errors(
             if inputs.get(field) != value:
                 errors.append(f"{mode} render segment {ordinal} has stale {field}")
         if mode == "with_score":
-            if "duration_seconds" in inputs:
-                errors.append("with_score render segment span is not owned by its score")
+            if any(field in inputs for field in ("duration_seconds", "timing_score", "passage_timing")):
+                errors.append("with_score render segment timing is not owned solely by its score")
             if inputs.get("source_tree_sha256") != expected["source_tree_sha256"]:
                 errors.append(f"{mode} render segment {ordinal} has a stale source tree")
             score = inputs.get("music_score") if isinstance(inputs.get("music_score"), dict) else {}
@@ -1115,16 +1126,24 @@ def _producer_receipt_errors(
         else:
             if "music_score" in inputs or "choreography" in inputs:
                 errors.append(f"control render segment {ordinal} is not score-free")
-            duration_seconds = inputs.get("duration_seconds")
-            if (
-                not isinstance(duration_seconds, (int, float))
-                or isinstance(duration_seconds, bool)
-                or not math.isfinite(float(duration_seconds))
-                or duration_seconds != expected["span"]["duration_seconds"]
-            ):
+            expected_timing_score = {
+                "path": expected["score"]["path"],
+                "file_sha256": expected["score"]["file_sha256"],
+                "contract_sha256": expected["score"]["contract_sha256"],
+                "passage_mapping": "native-tempo",
+                "duration_seconds": expected["span"]["duration_seconds"],
+            }
+            if inputs.get("timing_score") != expected_timing_score:
+                errors.append(f"control render segment {ordinal} has stale timing-score identity")
+            if inputs.get("passage_timing") != {
+                "mode": "fixed-passage",
+                "seconds": expected["span"]["duration_seconds"],
+            }:
                 errors.append(
                     f"control render segment {ordinal} does not bind the selected production span"
                 )
+            if "duration_seconds" in inputs:
+                errors.append(f"control render segment {ordinal} uses the obsolete length-only override")
             if control_source is not None and inputs.get("source_tree_sha256") != control_source:
                 errors.append(f"control render segment {ordinal} has a stale no-score source tree")
         capture = segment.get("capture") if isinstance(segment.get("capture"), dict) else {}
@@ -1139,6 +1158,20 @@ def _producer_receipt_errors(
             errors.append(f"{mode} render segment {ordinal} has no GPU-frame sequence digest")
         if not isinstance(capture.get("signature"), str) or not capture.get("signature"):
             errors.append(f"{mode} render segment {ordinal} has no renderer signature")
+        passage = capture.get("passage") if isinstance(capture.get("passage"), dict) else {}
+        if (
+            set(passage) != {"index", "seed", "t0", "seconds"}
+            or type(passage.get("index")) is not int
+            or passage.get("index") != expected["span"]["passage"]
+            or type(passage.get("seed")) is not int
+            or passage.get("seed") != PRODUCTION_PASSAGE_SEED
+            or not finite_receipt_number(passage.get("t0"))
+            or passage.get("t0") != expected["span"]["t0"]
+            or not finite_receipt_number(passage.get("seconds"))
+            or passage.get("seconds") <= 0
+            or passage.get("seconds") != expected["span"]["duration_seconds"]
+        ):
+            errors.append(f"{mode} render segment {ordinal} left the selected production passage")
         segment_decoded = (
             segment.get("decoded_video") if isinstance(segment.get("decoded_video"), dict) else {}
         )
@@ -1580,7 +1613,16 @@ def _rgba_png(payload: bytes, width: int, height: int) -> bytes:
     return output.getvalue()
 
 
-def _capture_query(*, tier: str, width: int, height: int, with_score: bool) -> dict[str, str]:
+def _capture_query(
+    *,
+    tier: str,
+    width: int,
+    height: int,
+    with_score: bool,
+    passage_seconds: object,
+) -> dict[str, str]:
+    if not finite_receipt_number(passage_seconds) or passage_seconds <= 0:
+        raise EvidenceError("production boundary capture has no finite positive passage clock")
     query = {
         "capture": "passage",
         "from": "0",
@@ -1592,7 +1634,32 @@ def _capture_query(*, tier: str, width: int, height: int, with_score: bool) -> d
     }
     if with_score:
         query |= {"score": "music/score.json", "choreography": "render/choreography.json"}
+    else:
+        # The control may share the selected score's clock, but never its score or
+        # choreography inputs.  Without this the natural unscored passage crosses
+        # into a new material seed before the production score has finished.
+        query["passage-seconds"] = str(passage_seconds)
     return query
+
+
+def _assert_control_frame_identity(rendered: object, passage_seconds: object) -> None:
+    """Prove every captured control frame stayed in the selected score-free passage."""
+    if (
+        not isinstance(rendered, dict)
+        or rendered.get("hasMusic") is not False
+        or rendered.get("hasChoreography") is not False
+        or type(rendered.get("passage")) is not int
+        or rendered.get("passage") != 0
+        or type(rendered.get("passageSeed")) is not int
+        or rendered.get("passageSeed") != PRODUCTION_PASSAGE_SEED
+        or not finite_receipt_number(rendered.get("passageT0"))
+        or rendered.get("passageT0") != 0
+        or not finite_receipt_number(rendered.get("passageSeconds"))
+        or rendered.get("passageSeconds") != passage_seconds
+    ):
+        raise EvidenceError(
+            "production control frame left its selected score-free passage identity"
+        )
 
 
 def _capture_boundary_payloads(
@@ -1601,6 +1668,7 @@ def _capture_boundary_payloads(
     tier: str,
     width: int,
     height: int,
+    passage_seconds: object,
 ) -> tuple[dict[str, dict[str, bytes]], str, bytes]:
     try:
         sys.path.insert(0, str(ROOT / "render"))
@@ -1617,12 +1685,17 @@ def _capture_boundary_payloads(
     with serve(sink=sink) as base:
         with browser(headless=True, width=width, height=height) as page:
             for mode, with_score in (("control", False), ("with_score", True)):
-                page.goto(f"{base}/film.html?{urlencode(_capture_query(tier=tier, width=width, height=height, with_score=with_score))}", wait_until="load")
+                page.goto(
+                    f"{base}/film.html?{urlencode(_capture_query(tier=tier, width=width, height=height, with_score=with_score, passage_seconds=passage_seconds))}",
+                    wait_until="load",
+                )
                 page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
                 renderer = str(page.gl_renderer)
                 page.evaluate(CAPTURE_JS)
                 for index, row in enumerate(rows):
                     rendered = page.evaluate("(t) => window.danseFilm.renderAt(t)", row["review_second"])
+                    if mode == "control":
+                        _assert_control_frame_identity(rendered, passage_seconds)
                     if rendered.get("missing"):
                         raise EvidenceError(
                             f"production frame {row['sample_id']} has {rendered['missing']} missing plates"
@@ -1635,7 +1708,10 @@ def _capture_boundary_payloads(
         # deterministic control; WITH versus control is expected to differ.
         first = rows[0]
         with browser(headless=True, width=width, height=height) as page:
-            page.goto(f"{base}/film.html?{urlencode(_capture_query(tier=tier, width=width, height=height, with_score=True))}", wait_until="load")
+            page.goto(
+                f"{base}/film.html?{urlencode(_capture_query(tier=tier, width=width, height=height, with_score=True, passage_seconds=passage_seconds))}",
+                wait_until="load",
+            )
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
             page.evaluate(CAPTURE_JS)
             page.evaluate("(t) => window.danseFilm.renderAt(t)", first["review_second"])
@@ -1712,7 +1788,11 @@ def write_frame_receipt(
             {**row, "review_frame_index": frame_index, "review_second": review_second}
         )
     payloads, renderer, repeat = _capture_boundary_payloads(
-        capture_rows, tier=tier, width=width, height=height
+        capture_rows,
+        tier=tier,
+        width=width,
+        height=height,
+        passage_seconds=context["span"]["duration_seconds"],
     )
     frames_root = base / "boundary-frames"
     if frames_root.is_symlink() or (frames_root.exists() and not frames_root.is_dir()):

@@ -281,7 +281,17 @@ class EvidenceFixture:
                 }
                 inputs["choreography"] = copy.deepcopy(self.context["choreography"])
             else:
-                inputs["duration_seconds"] = self.context["span"]["duration_seconds"]
+                inputs["timing_score"] = {
+                    "path": self.context["score"]["path"],
+                    "file_sha256": self.context["score"]["file_sha256"],
+                    "contract_sha256": self.context["score"]["contract_sha256"],
+                    "passage_mapping": "native-tempo",
+                    "duration_seconds": self.context["span"]["duration_seconds"],
+                }
+                inputs["passage_timing"] = {
+                    "mode": "fixed-passage",
+                    "seconds": self.context["span"]["duration_seconds"],
+                }
             segment_receipt.write_text(
                 json.dumps(
                     {
@@ -294,6 +304,12 @@ class EvidenceFixture:
                             "raw_rgba_sha256": "5" * 64,
                             "missing": 0,
                             "signature": f"fixture-{mode}",
+                            "passage": {
+                                "index": self.context["span"]["passage"],
+                                "seed": AB.PRODUCTION_PASSAGE_SEED,
+                                "t0": self.context["span"]["t0"],
+                                "seconds": self.context["span"]["duration_seconds"],
+                            },
                         },
                         "decoded_video": {
                             "algorithm": "rgb24-stream-sha256-v1",
@@ -459,6 +475,59 @@ class ProductionScoreMotionTest(unittest.TestCase):
         self.assertTrue(all(row["with_score"]["choreography_pose_sha256"] for row in rows))
         self.assertTrue(all(row["control"]["choreography_pose_sha256"] is None for row in rows))
 
+    def test_boundary_capture_control_uses_and_proves_the_selected_passage_clock(self) -> None:
+        duration = json.loads((ROOT / "music/score.json").read_text())["time"][
+            "duration_seconds"
+        ]
+        common = {"tier": "film", "width": 1920, "height": 1080}
+        control = AB._capture_query(
+            **common,
+            with_score=False,
+            passage_seconds=duration,
+        )
+        scored = AB._capture_query(
+            **common,
+            with_score=True,
+            passage_seconds=duration,
+        )
+        self.assertEqual(control["passage-seconds"], str(duration))
+        self.assertNotIn("score", control)
+        self.assertNotIn("choreography", control)
+        self.assertNotIn("passage-seconds", scored)
+        self.assertEqual(scored["score"], "music/score.json")
+        self.assertEqual(scored["choreography"], "render/choreography.json")
+
+        rendered = {
+            "hasMusic": False,
+            "hasChoreography": False,
+            "passage": 0,
+            "passageSeed": AB.PRODUCTION_PASSAGE_SEED,
+            "passageT0": 0,
+            "passageSeconds": duration,
+        }
+        AB._assert_control_frame_identity(rendered, duration)
+        for field, value in (
+            ("hasMusic", True),
+            ("hasChoreography", True),
+            ("passage", 1),
+            ("passage", False),
+            ("passageSeed", 1),
+            ("passageT0", 1),
+            ("passageSeconds", duration - 1),
+        ):
+            with self.subTest(field=field, value=value):
+                stale = {**rendered, field: value}
+                with self.assertRaisesRegex(AB.EvidenceError, "score-free passage identity"):
+                    AB._assert_control_frame_identity(stale, duration)
+        for invalid in (False, 0, float("nan")):
+            with self.subTest(invalid_passage_seconds=invalid):
+                with self.assertRaisesRegex(AB.EvidenceError, "finite positive passage clock"):
+                    AB._capture_query(
+                        **common,
+                        with_score=False,
+                        passage_seconds=invalid,
+                    )
+
     def test_historical_tracked_receipts_are_explicit_and_never_production(self) -> None:
         for relative in (
             "docs/evidence/score-to-motion-ab.json",
@@ -535,9 +604,13 @@ class ProductionScoreMotionTest(unittest.TestCase):
     def test_producer_modes_and_segment_chain_fail_closed(self) -> None:
         cases = (
             "scored-control",
-            "missing-control-span",
-            "stale-control-span",
-            "overridden-with-score-span",
+            "missing-control-timing",
+            "stale-control-timing",
+            "length-only-control",
+            "crossed-control-passage",
+            "stale-control-passage-seed",
+            "falsy-control-passage",
+            "timing-on-with-score",
             "missing-choreography",
             "short-segment",
         )
@@ -546,7 +619,15 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 fixture = EvidenceFixture(Path(temporary))
                 mode = (
                     "control"
-                    if case in {"scored-control", "missing-control-span", "stale-control-span"}
+                    if case in {
+                        "scored-control",
+                        "missing-control-timing",
+                        "stale-control-timing",
+                        "length-only-control",
+                        "crossed-control-passage",
+                        "stale-control-passage-seed",
+                        "falsy-control-passage",
+                    }
                     else "with_score"
                 )
                 concat_path = fixture.producer_paths[mode]
@@ -558,14 +639,31 @@ class ProductionScoreMotionTest(unittest.TestCase):
                         field: fixture.context["score"][field]
                         for field in ("path", "file_sha256", "contract_sha256")
                     }
-                elif case == "missing-control-span":
-                    segment["inputs"].pop("duration_seconds")
-                elif case == "stale-control-span":
-                    segment["inputs"]["duration_seconds"] = 312.540051998
-                elif case == "overridden-with-score-span":
+                elif case == "missing-control-timing":
+                    segment["inputs"].pop("passage_timing")
+                elif case == "stale-control-timing":
+                    segment["inputs"]["timing_score"]["duration_seconds"] = 312.540051998
+                elif case == "length-only-control":
+                    segment["inputs"].pop("timing_score")
+                    segment["inputs"].pop("passage_timing")
                     segment["inputs"]["duration_seconds"] = fixture.context["span"][
                         "duration_seconds"
                     ]
+                elif case == "crossed-control-passage":
+                    segment["capture"]["passage"]["index"] = 1
+                elif case == "stale-control-passage-seed":
+                    segment["capture"]["passage"]["seed"] = 1
+                elif case == "falsy-control-passage":
+                    segment["capture"]["passage"]["index"] = False
+                    segment["capture"]["passage"]["t0"] = False
+                elif case == "timing-on-with-score":
+                    segment["inputs"]["timing_score"] = {
+                        "path": fixture.context["score"]["path"],
+                        "file_sha256": fixture.context["score"]["file_sha256"],
+                        "contract_sha256": fixture.context["score"]["contract_sha256"],
+                        "passage_mapping": "native-tempo",
+                        "duration_seconds": fixture.context["span"]["duration_seconds"],
+                    }
                 elif case == "missing-choreography":
                     segment["inputs"].pop("choreography")
                 else:
@@ -586,14 +684,26 @@ class ProductionScoreMotionTest(unittest.TestCase):
                     )
                 expected_error = {
                     "scored-control": "control render segment 0 is not score-free",
-                    "missing-control-span": (
+                    "missing-control-timing": (
                         "control render segment 0 does not bind the selected production span"
                     ),
-                    "stale-control-span": (
-                        "control render segment 0 does not bind the selected production span"
+                    "stale-control-timing": (
+                        "control render segment 0 has stale timing-score identity"
                     ),
-                    "overridden-with-score-span": (
-                        "with_score render segment span is not owned by its score"
+                    "length-only-control": (
+                        "control render segment 0 uses the obsolete length-only override"
+                    ),
+                    "crossed-control-passage": (
+                        "control render segment 0 left the selected production passage"
+                    ),
+                    "stale-control-passage-seed": (
+                        "control render segment 0 left the selected production passage"
+                    ),
+                    "falsy-control-passage": (
+                        "control render segment 0 left the selected production passage"
+                    ),
+                    "timing-on-with-score": (
+                        "with_score render segment timing is not owned solely by its score"
                     ),
                     "missing-choreography": "with_score render segment 0 has stale choreography",
                     "short-segment": "with_score render segment 0 does not own its exact frame range",

@@ -86,8 +86,10 @@ def hydrated_work_root() -> Path:
 def music_score_identity(args) -> dict | None:
     """Receipt-safe score identity with no local absolute path."""
     raw = getattr(args, "score", None)
-    if not raw:
+    if raw is None:
         return None
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit("--score must name a non-empty score file")
     cached = getattr(args, "_music_score_identity", None)
     if cached:
         return cached
@@ -129,11 +131,51 @@ def music_score_identity(args) -> dict | None:
     return got
 
 
+def timing_score_identity(args) -> dict | None:
+    """Bind a selected score while exposing only its passage clock to film.html."""
+    raw = getattr(args, "timing_score", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit("--timing-score must name a non-empty score file")
+    cached = getattr(args, "_timing_score_identity", None)
+    if cached:
+        return cached
+    candidate = Path(raw)
+    candidate = candidate if candidate.is_absolute() else APP / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(APP.resolve())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"--timing-score must name a score file inside the repository: {raw} ({exc})"
+        ) from exc
+    if candidate.is_symlink() or not resolved.is_file():
+        raise SystemExit(f"--timing-score must name a regular score file: {raw}")
+    try:
+        score = validate_music_score(json.loads(resolved.read_text()))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid --timing-score contract {raw}: {exc}") from exc
+    timing = score.get("time") if isinstance(score.get("time"), dict) else {}
+    got = {
+        "path": str(relative),
+        "file_sha256": file_sha256(resolved),
+        "contract_sha256": (score.get("identity") or {}).get("contract_sha256"),
+        "passage_mapping": timing.get("passage_mapping"),
+        "duration_seconds": timing.get("duration_seconds"),
+    }
+    args._timing_score_contract = score
+    args._timing_score_identity = got
+    return got
+
+
 def choreography_identity(args) -> dict | None:
     """Validate and identify the choreography bound to picture and score."""
     raw = getattr(args, "choreography", None)
-    if not raw:
+    if raw is None:
         return None
+    if not isinstance(raw, str) or not raw:
+        raise SystemExit("--choreography must name a non-empty contract file")
     cached = getattr(args, "_choreography_identity", None)
     if cached:
         return cached
@@ -197,6 +239,9 @@ def source_tree_sha256(args) -> str:
     score_identity = music_score_identity(args)
     if score_identity:
         roots.append(APP / score_identity["path"])
+    timing_identity = timing_score_identity(args)
+    if timing_identity:
+        roots.append(APP / timing_identity["path"])
     choreography = choreography_identity(args)
     if choreography:
         roots.append(APP / choreography["path"])
@@ -216,6 +261,7 @@ def film_url(base: str, args) -> str:
     """The one URL used by planning and rendering, including seed zero."""
     params = {"capture": args.window, "from": args.start, "tier": args.tier}
     score = music_score_identity(args)
+    timing_score = timing_score_identity(args)
     choreography = choreography_identity(args)
     for key, value in (
         ("s", args.seed),
@@ -223,7 +269,7 @@ def film_url(base: str, args) -> str:
         ("width", args.width),
         ("height", args.height),
         ("fps", args.fps),
-        ("duration", getattr(args, "duration_seconds", None)),
+        ("passage-seconds", timing_score["duration_seconds"] if timing_score else None),
         ("score", score["path"] if score else None),
         ("choreography", choreography["path"] if choreography else None),
     ):
@@ -257,14 +303,111 @@ def segment_identity(args, segment: int, frames: int) -> dict:
     choreography = choreography_identity(args)
     if choreography:
         payload["inputs"]["choreography"] = choreography
-    duration_seconds = getattr(args, "duration_seconds", None)
-    if duration_seconds is not None:
-        payload["inputs"]["duration_seconds"] = duration_seconds
+    timing_score = timing_score_identity(args)
+    if timing_score:
+        payload["inputs"]["timing_score"] = timing_score
+        payload["inputs"]["passage_timing"] = {
+            "mode": "fixed-passage",
+            "seconds": timing_score["duration_seconds"],
+        }
     return payload
+
+
+def output_stem(args) -> Path:
+    """Keep canonical A/B producers disjoint without renaming legacy delivery output."""
+    stem_seed = args.seed if args.seed is not None else "default"
+    stream_suffix = f"-stream-{args.stream}" if args.stream else ""
+    control_suffix = "-control" if timing_score_identity(args) else ""
+    return args.out / f"{args.window}-{stem_seed}{stream_suffix}{control_suffix}"
 
 
 def segment_receipt_path(dest: Path) -> Path:
     return dest.with_name(dest.name + ".receipt.json")
+
+
+def concat_listing_path(stem: Path) -> Path:
+    return stem.parent / f"{stem.name}-segments.txt"
+
+
+def determinism_path(stem: Path, codec: str, pass_: int) -> Path:
+    return stem.parent / f".{stem.name}.determinism-{pass_}{SUFFIX[codec]}"
+
+
+def passage_seed(seed: int, index: int, stream: int = 0) -> int:
+    """Mirror engine/rng.js uint32 hashing for receipt-only passage identity."""
+    mask = 0xFFFFFFFF
+    words = (seed, 0x1A1, stream, index) if stream else (seed, 0x1A1, index)
+    value = 0x9E3779B9
+    for word in words:
+        value = ((value ^ (word & mask)) * 0x5BD1E995) & mask
+        value = ((value << 15) | (value >> 17)) & mask
+    value ^= value >> 16
+    value = (value * 0x85EBCA6B) & mask
+    value ^= value >> 13
+    value = (value * 0xC2B2AE35) & mask
+    value ^= value >> 16
+    return value & mask
+
+
+def finite_receipt_number(value: object) -> bool:
+    """Accept JSON numbers, never booleans, infinities, NaN, or oversized integers."""
+    return (
+        type(value) in (int, float)
+        and -sys.float_info.max <= value <= sys.float_info.max
+    )
+
+
+def valid_passage_identity(value: object) -> bool:
+    """Require the exact numeric passage shape emitted by the browser harness."""
+    if not isinstance(value, dict) or set(value) != {"index", "seed", "t0", "seconds"}:
+        return False
+    index = value.get("index")
+    seed = value.get("seed")
+    t0 = value.get("t0")
+    seconds = value.get("seconds")
+    return (
+        type(index) is int
+        and index >= 0
+        and type(seed) is int
+        and 0 <= seed <= 0xFFFFFFFF
+        and finite_receipt_number(t0)
+        and t0 >= 0
+        and finite_receipt_number(seconds)
+        and seconds > 0
+    )
+
+
+def timing_capture_identity(expected: dict) -> dict | None:
+    """Derive the one score-free passage a timing-control receipt must prove."""
+    inputs = expected.get("inputs") if isinstance(expected.get("inputs"), dict) else {}
+    timing = inputs.get("passage_timing")
+    if not isinstance(timing, dict):
+        return None
+    seconds = timing.get("seconds")
+    start = inputs.get("start")
+    seed = inputs.get("seed")
+    stream = inputs.get("stream")
+    if seed is None:
+        try:
+            seed = json.loads((APP / "render/program.json").read_text())["seed"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+    if (
+        not finite_receipt_number(seconds)
+        or seconds <= 0
+        or not finite_receipt_number(start)
+        or start < 0
+        or type(seed) is not int
+        or type(stream) is not int
+    ):
+        return None
+    index = math.floor(start / seconds)
+    return {
+        "index": index,
+        "seed": passage_seed(seed, index, stream),
+        "t0": index * seconds,
+        "seconds": seconds,
+    }
 
 
 def write_segment_receipt(
@@ -308,6 +451,7 @@ def write_segment_receipt(
                 "raw_rgba_sha256": capture["sha256"],
                 "missing": capture["missing"],
                 "signature": capture["signature"],
+                "passage": capture["passage"],
             }
         except KeyError as exc:
             raise SystemExit(f"renderer capture result is incomplete: {exc.args[0]}") from exc
@@ -321,6 +465,7 @@ def write_segment_receipt(
             or capture_receipt["missing"] < 0
             or not isinstance(capture_receipt["signature"], str)
             or not capture_receipt["signature"]
+            or not valid_passage_identity(capture_receipt["passage"])
         ):
             raise SystemExit("renderer capture result has an invalid provenance identity")
         payload["capture"] = capture_receipt
@@ -410,7 +555,10 @@ def render_segment(args, segment: int, dest: Path) -> dict:
                 "() => ({ t0: window.danseFilm.window.t0, t1: window.danseFilm.window.t1,"
                 " fps: window.danseFilm.window.fps, w: window.danseFilm.width, h: window.danseFilm.height,"
                 " sig: window.danseFilm.signature, seed: window.danseFilm.seed,"
-                " passage: window.danseFilm.passage, passageHex: window.danseFilm.passageHex })"
+                " passage: window.danseFilm.passage, passageSeed: window.danseFilm.passageSeed,"
+                " passageT0: window.danseFilm.passageT0,"
+                " passageSeconds: window.danseFilm.passageSeconds,"
+                " passageHex: window.danseFilm.passageHex })"
             )
 
             fps = args.fps or film["fps"]
@@ -436,6 +584,17 @@ def render_segment(args, segment: int, dest: Path) -> dict:
             for i in range(count):
                 t = film["t0"] + (start + i) / fps
                 r = page.evaluate("(t) => window.danseFilm.renderAt(t)", t)
+                if timing_score_identity(args) and (
+                    r.get("passage") != film["passage"]
+                    or r.get("passageSeed") != film["passageSeed"]
+                    or r.get("passageT0") != film["passageT0"]
+                    or r.get("passageSeconds") != film["passageSeconds"]
+                    or r.get("hasMusic") is not False
+                    or r.get("hasChoreography") is not False
+                ):
+                    raise SystemExit(
+                        "timing-only control left its selected score-free passage or admitted score motion"
+                    )
                 missing += r["missing"]
                 page.evaluate("(u) => window.danseCapture(u)", f"{base}/frame")
                 if args.progress and (i % 30 == 0 or i == count - 1):
@@ -469,6 +628,12 @@ def render_segment(args, segment: int, dest: Path) -> dict:
                 "width": film["w"],
                 "height": film["h"],
                 "fps": fps,
+                "passage": {
+                    "index": film["passage"],
+                    "seed": film["passageSeed"],
+                    "t0": film["passageT0"],
+                    "seconds": film["passageSeconds"],
+                },
             }
 
 
@@ -509,6 +674,14 @@ def complete(dest: Path, want: int, expected: dict) -> bool:
         or capture["missing"] < 0
         or not isinstance(capture.get("signature"), str)
         or not capture.get("signature")
+        or not valid_passage_identity(capture.get("passage"))
+    ):
+        return False
+    expected_timing_capture = timing_capture_identity(expected)
+    if "timing_score" in expected["inputs"] and (
+        capture is None
+        or expected_timing_capture is None
+        or capture.get("passage") != expected_timing_capture
     ):
         return False
     decoded = receipt.get("decoded_video")
@@ -638,7 +811,7 @@ def concat(stem: Path, args, parts: list[Path]) -> Path:
     extras = sorted(set(stem.parent.glob(f"{stem.name}-seg-*{SUFFIX[args.codec]}")) - set(parts))
     if extras:
         print(f"  ignoring {len(extras)} surplus segment(s) outside the current plan")
-    listing = stem.parent / f"{stem.name}-segments.txt"
+    listing = concat_listing_path(stem)
     listing.write_text("".join(f"file '{p.name}'\n" for p in parts))
     dest = stem.with_suffix(SUFFIX[args.codec])
     subprocess.run(
@@ -672,13 +845,12 @@ def main() -> int:
     ap.add_argument("--height", type=int, help="override the window's height")
     ap.add_argument("--fps", type=float, help="override the window's frame rate")
     ap.add_argument(
-        "--duration-seconds",
-        type=float,
-        help="fix a score-free capture to an exact positive span in seconds",
-    )
-    ap.add_argument(
         "--score",
         help="opt into a compiled score contract (for example music/score.json); omitted keeps the current artwork",
+    )
+    ap.add_argument(
+        "--timing-score",
+        help="bind a score's fixed passage clock without admitting score motion or choreography",
     )
     ap.add_argument(
         "--choreography",
@@ -706,18 +878,24 @@ def main() -> int:
     args = ap.parse_args()
 
     score = music_score_identity(args)
+    timing_score = timing_score_identity(args)
     choreography = choreography_identity(args)
-    if args.duration_seconds is not None:
-        if not math.isfinite(args.duration_seconds) or args.duration_seconds <= 0:
-            ap.error("--duration-seconds must be finite and positive")
-        if score:
-            ap.error("--duration-seconds is only valid for a score-free capture")
+    if score and timing_score:
+        ap.error("--score and --timing-score are mutually exclusive")
+    if timing_score and choreography:
+        ap.error("--timing-score cannot admit choreography")
+    if timing_score and (
+        timing_score["passage_mapping"] != "native-tempo"
+        or not isinstance(timing_score["duration_seconds"], (int, float))
+        or isinstance(timing_score["duration_seconds"], bool)
+        or not math.isfinite(float(timing_score["duration_seconds"]))
+        or timing_score["duration_seconds"] <= 0
+    ):
+        ap.error("--timing-score requires a finite positive native-tempo passage")
     if score and args._music_score_contract["release_status"] != "fixture-only" and not choreography:
         ap.error("a production --score requires --choreography")
 
-    stem_seed = args.seed if args.seed is not None else "default"
-    stream_suffix = f"-stream-{args.stream}" if args.stream else ""
-    stem = args.out / f"{args.window}-{stem_seed}{stream_suffix}"
+    stem = output_stem(args)
     if (args.concat or args.check_concat) and args.segment is not None:
         ap.error("--concat/--check-concat cannot be combined with --segment")
 
@@ -731,11 +909,12 @@ def main() -> int:
         args.progress = False
         hashes = []
         for pass_ in (1, 2):
-            r = render_segment(args, seg, args.out / f".determinism-{pass_}{SUFFIX[args.codec]}")
+            deterministic_path = determinism_path(stem, args.codec, pass_)
+            r = render_segment(args, seg, deterministic_path)
             hashes.append(r["sha256"])
             print(f"  pass {pass_}: {r['frames']} frames · {r['sha256'][:16]}… · {r['seconds']:.1f}s")
         for p in (1, 2):
-            (args.out / f".determinism-{p}{SUFFIX[args.codec]}").unlink(missing_ok=True)
+            determinism_path(stem, args.codec, p).unlink(missing_ok=True)
         if hashes[0] != hashes[1]:
             print("\nDETERMINISM BROKEN — the same segment rendered two different films.")
             print("Something in engine/ is reading a clock, an rAF timestamp, or Math.random.")
