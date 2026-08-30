@@ -753,7 +753,8 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("renderer-fallback", self.markup.by_id)
         initialization = self.script.split("let baseRenderer = null;", 1)[1].split("// Non-null", 1)[0]
         self.assertIn("try {", initialization)
-        self.assertIn("const candidateRenderer = new Renderer(canvas, corpus);", initialization)
+        self.assertIn("let candidateRenderer = null;", initialization)
+        self.assertIn("candidateRenderer = new Renderer(canvas, corpus);", initialization)
         self.assertIn("await corpus.prime(candidateRenderer.gl", initialization)
         self.assertLess(
             initialization.index("await corpus.prime(candidateRenderer.gl"),
@@ -761,7 +762,10 @@ class InterfaceContractTest(unittest.TestCase):
         )
         self.assertIn("baseRenderer = null;", initialization.split("catch (error)", 1)[1])
         self.assertIn('el("renderer-fallback").hidden = false;', initialization)
-        self.assertIn('console.warn("Danse visual renderer unavailable; controls remain available", error);', initialization)
+        self.assertIn("const rendererUnavailableReason = candidateRenderer", initialization)
+        self.assertIn('"a required corpus image or texture could not be prepared"', initialization)
+        self.assertIn('"WebGL2 could not initialize"', initialization)
+        self.assertIn("Danse visual renderer unavailable: ${rendererUnavailableReason}", initialization)
         frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
         self.assertLess(frame.index("interaction.tick("), frame.index("if (!renderer)"))
         self.assertIn("requestAnimationFrame(frame);", frame.split("if (!renderer)", 1)[1])

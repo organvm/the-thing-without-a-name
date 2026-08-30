@@ -321,8 +321,9 @@ const scoreAudio = musicalScore ? new ScoreAudio(musicalScore) : null;
 const veil = el("veil");
 let baseRenderer = null;
 let rendererFailure = null;
+let candidateRenderer = null;
 try {
-  const candidateRenderer = new Renderer(canvas, corpus);
+  candidateRenderer = new Renderer(canvas, corpus);
   await corpus.prime(candidateRenderer.gl, {
     onProgress: (p) => { el("bar").firstElementChild.style.width = `${p * 100}%`; },
   });
@@ -330,10 +331,13 @@ try {
 } catch (error) {
   baseRenderer = null;
   rendererFailure = error;
+  const rendererUnavailableReason = candidateRenderer
+    ? "a required corpus image or texture could not be prepared"
+    : "WebGL2 could not initialize";
   canvas.hidden = true;
   el("renderer-fallback").hidden = false;
-  el("stage-description").textContent = "The Danse visual renderer is unavailable in this browser because WebGL2 could not initialize. Controls, project map, and accessibility information remain available.";
-  console.warn("Danse visual renderer unavailable; controls remain available", error);
+  el("stage-description").textContent = `The Danse visual renderer is unavailable because ${rendererUnavailableReason}. Controls, project map, and accessibility information remain available.`;
+  console.warn(`Danse visual renderer unavailable: ${rendererUnavailableReason}; controls remain available`, error);
 }
 veil.classList.add("gone");
 veil.setAttribute("aria-hidden", "true");

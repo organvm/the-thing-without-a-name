@@ -515,14 +515,44 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
     )
     if resolved_tree.returncode != 0 or resolved_tree.stdout.strip() != source["tree"]:
         raise ReleaseError("progressive controls replay tree does not belong to its exact head")
-    source_tree = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{tree}"],
+    is_ancestor = subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", exact_head, "HEAD"],
         capture_output=True,
-        text=True,
         check=False,
     )
-    if source_tree.returncode != 0 or source_tree.stdout.strip() != source["tree"]:
-        raise ReleaseError("progressive controls replay does not bind the reviewed source tree")
+    if is_ancestor.returncode != 0:
+        raise ReleaseError("progressive controls replay exact head is not an ancestor of the checkout")
+    source_diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMRTUXB",
+            "-z",
+            exact_head,
+            "HEAD",
+            "--",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if source_diff.returncode != 0:
+        raise ReleaseError("cannot compare the progressive controls reviewed source tree")
+    try:
+        changed_paths = {
+            item.decode("utf-8") for item in source_diff.stdout.split(b"\0") if item
+        }
+    except UnicodeDecodeError as exc:
+        raise ReleaseError("progressive controls source diff contains a non-UTF-8 path") from exc
+    completion_paths = {MANIFEST.as_posix(), PROGRESSIVE_CONTROLS_EVIDENCE_PATH}
+    unexpected_paths = sorted(changed_paths - completion_paths)
+    if unexpected_paths:
+        raise ReleaseError(
+            "progressive controls reviewed source includes non-receipt changes: "
+            + ", ".join(unexpected_paths)
+        )
 
     renderer = receipt["runtime"]["graphics_renderer"].lower()
     if "apple" not in renderer or "metal" not in renderer:

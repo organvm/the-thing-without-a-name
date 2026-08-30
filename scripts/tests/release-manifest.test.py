@@ -969,9 +969,48 @@ class AdversarialManifestTest(unittest.TestCase):
             gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
             write_manifest(root, manifest)
             with self.assertRaisesRegex(
-                CONTRACT.ReleaseError, "does not bind the reviewed source tree"
+                CONTRACT.ReleaseError, "reviewed source includes non-receipt changes"
             ):
                 CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_allows_committed_completion_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            write_manifest(root, manifest)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "add",
+                    "release/manifest.json",
+                    CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "record progressive controls completion",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            CONTRACT.validate_release(root)
 
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
