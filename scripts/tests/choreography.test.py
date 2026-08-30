@@ -102,8 +102,9 @@ NODE_SETUP = r"""
   import crypto from 'node:crypto';
   import { fromData } from './engine/corpus.js';
   import { validate as validateChoreography, poseAt } from './engine/choreography.js';
+  import { state } from './engine/clock.js';
   import { step } from './engine/engine.js';
-  import { validate as validateProgram } from './engine/program.js';
+  import { captureSpan, fixedPassageTiming, passageAt, validate as validateProgram } from './engine/program.js';
   import { validate as validateScore } from './engine/score.js';
 
   const scoreBytes = fs.readFileSync('music/score.json');
@@ -602,6 +603,67 @@ class ChoreographyContractTest(unittest.TestCase):
         url = renderer.film_url("http://127.0.0.1:8000", args)
         self.assertIn("score=music%2Fscore.json", url)
         self.assertIn("choreography=render%2Fchoreography.json", url)
+
+    def test_timing_only_control_keeps_one_selected_passage_without_score_motion(self) -> None:
+        observed = node_json(
+            NODE_SETUP
+            + """
+          const timing = fixedPassageTiming(score.time.duration_seconds);
+          const firstNaturalPassage = passageAt(program, seed, 0);
+          const naturalEdge = firstNaturalPassage.t0 + firstNaturalPassage.seconds;
+          const moments = [naturalEdge + 1 / 30, score.time.duration_seconds - 1 / 30];
+          const states = moments.map((at) => step(corpus, seed, at, program, {timing}).state);
+          const boundary = step(corpus, seed, score.time.duration_seconds, program, {timing}).state;
+          let mixedRejected = false;
+          try { step(corpus, seed, 1, program, {score, timing}); }
+          catch (error) { mixedRejected = /mutually exclusive/.test(error.message); }
+          let poseRejected = false;
+          try { state(seed, 1, program, 0, null, {}, timing); }
+          catch (error) { poseRejected = /cannot admit choreography poses/.test(error.message); }
+          let falsyTimingRejected = false;
+          try { state(seed, 1, program, 0, null, null, ''); }
+          catch (error) { falsyTimingRejected = /invalid fixed passage timing/.test(error.message); }
+          let falsyScoreRejected = false;
+          try { state(seed, 1, program, 0, ''); }
+          catch (error) { falsyScoreRejected = /invalid music score contract/.test(error.message); }
+          const tiny = fixedPassageTiming(5e-7);
+          const tinySpan = captureSpan(
+            program, seed, 0, {seconds: 0, passages: 1}, 0, null, tiny,
+          );
+          const tinyBoundary = step(corpus, seed, tinySpan.t1, program, {timing: tiny}).state;
+          console.log(JSON.stringify({
+            mixedRejected,
+            poseRejected,
+            falsyTimingRejected,
+            falsyScoreRejected,
+            tinySpan,
+            tinyBoundary: {passage: tinyBoundary.passage},
+            boundary: {passage: boundary.passage, passageSeed: boundary.passageSeed},
+            states: states.map((state) => ({
+              passage: state.passage,
+              passageSeed: state.passageSeed,
+              passageSeconds: state.passageSeconds,
+              movement: state.movement,
+              hasMusic: Object.hasOwn(state, 'music'),
+              hasChoreography: Object.hasOwn(state, 'choreography'),
+            })),
+          }));
+        """
+        )
+        self.assertTrue(observed["mixedRejected"])
+        self.assertTrue(observed["poseRejected"])
+        self.assertTrue(observed["falsyTimingRejected"])
+        self.assertTrue(observed["falsyScoreRejected"])
+        self.assertEqual(observed["tinySpan"], {"t0": 0, "t1": 5e-7})
+        self.assertEqual(observed["tinyBoundary"]["passage"], 1)
+        self.assertEqual(observed["boundary"]["passage"], 1)
+        for state in observed["states"]:
+            self.assertEqual(state["passage"], 0)
+            self.assertEqual(state["passageSeed"], 2943173797)
+            self.assertEqual(state["passageSeconds"], self.duration)
+            self.assertFalse(state["hasMusic"])
+            self.assertFalse(state["hasChoreography"])
+        self.assertEqual(observed["states"][-1]["movement"], "SIGNATURE")
 
 
 if __name__ == "__main__":

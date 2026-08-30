@@ -27,11 +27,12 @@ import release_contract as CONTRACT  # noqa: E402
 
 TEST_COMMIT = "a" * 40
 FIXTURE_FILES = (
+    ".gitignore",
     "release/manifest.json",
     "release/manifest.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
-    "opportunities/omega-20260826-2.json",
-    "opportunities/omega-20260826-2.receipt.json",
+    "opportunities/omega-20260829.json",
+    "opportunities/omega-20260829.receipt.json",
     "opportunities/source-evidence-20260826.json",
     "opportunities/opportunity.schema.json",
     "scripts/check-opportunities.py",
@@ -294,7 +295,7 @@ class ProductionManifestTest(unittest.TestCase):
     def test_snapshot_binding_uses_final_merged_freeze_and_source_evidence(self) -> None:
         binding = self.manifest["opportunity_snapshot"]
         self.assertEqual(binding["sha256"], CONTRACT.EXPECTED_OPPORTUNITY_SHA256)
-        self.assertEqual(binding["snapshot_id"], "omega-20260826-2")
+        self.assertEqual(binding["snapshot_id"], "omega-20260829")
         self.assertEqual(binding["frozen_at"], CONTRACT.EXPECTED_OPPORTUNITY_FROZEN_AT)
         self.assertEqual(
             binding["source_evidence_sha256"],
@@ -305,7 +306,7 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertEqual(screendance["consumer_contract"]["schema"], "danse.submission.v2")
         self.assertEqual(
             screendance["consumer_contract"]["canonical_sha256"],
-            "14fce7f2be58a62c1ee46fe3ed9cf53bbf7d9290a6bf73acdd8496a0396e6de3",
+            "0c99bad6604b7061b3a404a02980e81df66422147ee51ac768dbe5fc2f3d0a14",
         )
 
     def test_installation_binding_consumes_reference_contract_without_clearing_gates(self) -> None:
@@ -394,7 +395,7 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertEqual(self.receipt["release"]["manifest"]["path"], "release/manifest.json")
         self.assertEqual(
             self.receipt["release"]["opportunity_snapshot"]["path"],
-            "opportunities/omega-20260826-2.json",
+            "opportunities/omega-20260829.json",
         )
         self.assertEqual(
             self.receipt["release"]["source_evidence"]["sha256"],
@@ -673,6 +674,19 @@ class ProductionCliSourceTest(unittest.TestCase):
             self.assertNotEqual(dirty.returncode, 0)
             self.assertIn("tracked changes", dirty.stderr)
             self.assertFalse(dirty_output.exists())
+
+            (root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
+            (root / "untracked-source.txt").write_text("not in the source commit\n", encoding="utf-8")
+            untracked_output = base / "untracked-artifact"
+            untracked = subprocess.run(
+                [*command, "--output", str(untracked_output)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(untracked.returncode, 0)
+            self.assertIn("untracked files", untracked.stderr)
+            self.assertFalse(untracked_output.exists())
 
 
 class AdversarialManifestTest(unittest.TestCase):

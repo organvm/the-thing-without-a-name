@@ -1,5 +1,8 @@
 # Score → motion A/B capture evidence (2026-08-05)
 
+**Historical fixture evidence only.** This affine synthetic-score regression
+cannot satisfy the native-tempo production A/B or final-cut gates.
+
 For one fixed (seed, stream, passage) the same absolute time is sampled with and
 without the score clock. `score_delta` is exactly the choreography the score
 contributes; the image alone (`without_score`) is the control. `audio.notes` is

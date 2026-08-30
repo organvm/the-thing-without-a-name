@@ -326,6 +326,20 @@ Playwright. `deliver.py --preflight` reports missing modules, the Metal Chrome
 surface, the film tier, declared audio dependencies, and the registered origin
 photograph without creating output directories.
 
+Package publication additionally requires a kernel atomic no-replace rename. The
+supported delivery hosts are Linux kernel 3.15+ with glibc 2.28+ exporting
+`renameat2(RENAME_NOREPLACE)`, or macOS 10.12.3+ exporting
+`renameatx_np(RENAME_EXCL)`. `deliver.py --preflight` checks the live kernel and
+the filesystem that will contain the package with independent 128-bit,
+`O_EXCL` probe names. Each inode is captured while its creator descriptor is
+still open, matched to the named edge after every rename, and removed only on
+an exact identity match. An unowned winner is preserved and makes the gate fail;
+an uncontended probe retains no output. A non-preflight build repeats the same
+gate before creating render or package output. This protects accidental and
+uncoordinated concurrent publishers. Linux and macOS expose no portable
+inode-conditional unlink, so actively hostile same-UID code with write access to
+the package directory is outside this delivery rail's threat boundary.
+
 The ScreenDance capture is being hardened around two selected Delibes movements at
 native tempo: *Valse lente* from *Sylvia* and *Valse* from *Coppélia*, followed by the
 four-second black signature. Selection is not final-cut approval: the exact score,

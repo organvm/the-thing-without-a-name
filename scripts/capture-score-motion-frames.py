@@ -246,6 +246,7 @@ def emit(seed: int, stream: int, out: Path) -> dict:
 
     receipt = {
         "schema": "danse.evidence.score-to-motion-frames.v1",
+        "evidence_scope": "historical-fixture-only",
         "contract": ab["contract"],
         "seed": ab["seed"],
         "stream": ab["stream"],
@@ -324,6 +325,9 @@ def markdown(receipt: dict) -> str:
     d = receipt["determinism"]
     lines = [
         "# Score → motion A/B — observable frames (2026-08-05)",
+        "",
+        "**Historical fixture evidence only.** These GPU frames use the affine",
+        "synthetic score and cannot satisfy the production A/B or final-cut gates.",
         "",
         "The numeric A/B receipt proves the score moves the image in state",
         "arithmetic. This renders the actual frame at each declared boundary,",

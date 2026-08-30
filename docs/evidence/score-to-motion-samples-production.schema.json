@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://danse.example/schemas/score-to-motion-samples-production.v1.json",
+  "title": "Danse production score-to-motion deterministic sample receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "evidence_scope", "repository_head", "source_tree_sha256",
+    "span", "score", "choreography", "audio_render_receipt", "audio_master", "rows"
+  ],
+  "properties": {
+    "schema": {"const": "danse.evidence.score-to-motion-samples.production.v1"},
+    "evidence_scope": {"const": "production-input-not-final"},
+    "repository_head": {"$ref": "#/$defs/gitOid"},
+    "source_tree_sha256": {"$ref": "#/$defs/sha256"},
+    "span": {"$ref": "#/$defs/span"},
+    "score": {"$ref": "#/$defs/scoreSource"},
+    "choreography": {"$ref": "#/$defs/contractSource"},
+    "audio_render_receipt": {"$ref": "#/$defs/repositoryArtifact"},
+    "audio_master": {"$ref": "#/$defs/audioMaster"},
+    "rows": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sample_id", "absolute_second", "boundaries", "movement", "phrase",
+          "with_score", "control", "score_delta", "score_delta_max",
+          "observable_state_difference"
+        ],
+        "properties": {
+          "sample_id": {"type": "string", "pattern": "^sample-[0-9]{3}$"},
+          "absolute_second": {"type": "number", "minimum": 0},
+          "boundaries": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/boundary"}
+          },
+          "movement": {"type": "string", "minLength": 1},
+          "phrase": {"type": "string", "minLength": 1},
+          "with_score": {"$ref": "#/$defs/visualState"},
+          "control": {"$ref": "#/$defs/visualState"},
+          "score_delta": {"$ref": "#/$defs/channelState"},
+          "score_delta_max": {"type": "number", "minimum": 0},
+          "observable_state_difference": {"const": true}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitOid": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "safePath": {
+      "type": "string", "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "span": {
+      "type": "object", "additionalProperties": false,
+      "required": ["river_seed", "stream", "passage", "t0", "t1", "duration_seconds"],
+      "properties": {
+        "river_seed": {"const": 20170620}, "stream": {"const": 0},
+        "passage": {"const": 0}, "t0": {"const": 0},
+        "t1": {"type": "number", "exclusiveMinimum": 0},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "repositoryArtifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {"path": {"$ref": "#/$defs/safePath"}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "contractSource": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_sha256", "contract_sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"}, "file_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "scoreSource": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_sha256", "contract_sha256", "duration_seconds"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"}, "file_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "audioMaster": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "pcm_sha256", "frames", "sample_rate", "channels", "duration_seconds"],
+      "properties": {
+        "path": {"$ref": "#/$defs/safePath"}, "sha256": {"$ref": "#/$defs/sha256"},
+        "pcm_sha256": {"$ref": "#/$defs/sha256"}, "frames": {"type": "integer", "minimum": 1},
+        "sample_rate": {"const": 48000}, "channels": {"const": 2},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "boundary": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["origin", "movement", "phrase", "cue"]},
+        "id": {"type": "string", "minLength": 1}
+      }
+    },
+    "channelState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["divergence", "azimuth", "elevation", "spread", "projK", "turnover"],
+      "properties": {
+        "divergence": {"type": "number"}, "azimuth": {"type": "number"},
+        "elevation": {"type": "number"}, "spread": {"type": "number"},
+        "projK": {"type": "number"}, "turnover": {"type": "number"}
+      }
+    },
+    "visualState": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "channels", "movement", "cut", "material", "cast_sha256", "cast_count",
+        "choreography_pose_sha256"
+      ],
+      "properties": {
+        "channels": {"$ref": "#/$defs/channelState"},
+        "movement": {"type": "string", "minLength": 1}, "cut": {"type": "string", "minLength": 1},
+        "material": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "cast_sha256": {"$ref": "#/$defs/sha256"}, "cast_count": {"type": "integer", "minimum": 0},
+        "choreography_pose_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    }
+  }
+}

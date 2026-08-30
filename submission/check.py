@@ -23,23 +23,38 @@ An OPEN blocking unknown is not a warning. It exits non-zero, because "we assume
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
+import ipaddress
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl module.
+    fcntl = None
+
+import jsonschema
 import yaml
 
 HERE = Path(__file__).resolve().parent
 REGISTER = HERE / "screendance-2027.yaml"
+RECEIPT_SCHEMA = HERE / "receipt.schema.json"
+RIGHTS_REGISTER = HERE.parent / "rights" / "register.json"
 OPPORTUNITY_CHECKER = HERE.parent / "scripts" / "check-opportunities.py"
 RIGHTS_CHECKER = HERE.parent / "scripts" / "rights_contract.py"
+SCORE_MOTION_CHECKER = HERE.parent / "scripts" / "score_motion_production.py"
 
 PASS, FAIL, OPEN, SKIP = "PASS", "FAIL", "OPEN", "SKIP"
 GLYPH = {PASS: "\033[32m ok \033[0m", FAIL: "\033[31mFAIL\033[0m", OPEN: "\033[33mOPEN\033[0m", SKIP: "skip"}
@@ -49,6 +64,92 @@ OWNED_SECTIONS = ("requirements", "approvals", "terms")
 VIDEO_SUFFIXES = {".mov", ".mp4", ".mxf", ".m4v"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+RECEIPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$")
+DESTINATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
+UTC_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
+)
+F_FULLFSYNC = getattr(fcntl, "F_FULLFSYNC", 51) if fcntl is not None else 51
+FLOCK_EX = getattr(fcntl, "LOCK_EX", 2) if fcntl is not None else 2
+FLOCK_NB = getattr(fcntl, "LOCK_NB", 4) if fcntl is not None else 4
+PHASE_RECEIPTS = {
+    "package": "receipts/package.json",
+    "uploaded": "receipts/uploaded.json",
+    "submitted": "receipts/submitted.json",
+}
+PHASE_RECEIPT_SCHEMAS = {
+    "package": "danse.submission.package.v1",
+    "uploaded": "danse.submission.uploaded.v1",
+    "submitted": "danse.submission.submitted.v1",
+}
+PHASE_SIGNER_ROLES = {
+    "package": "package-approver",
+    "uploaded": "upload-account-owner",
+    "submitted": "submission-account-owner",
+}
+PHASE_SIGNER_GATES = {
+    "package": ("final-cut-only", "bio-approved", "rights-declaration-approved"),
+    "uploaded": ("link-password-protected", "link-downloadable"),
+    "submitted": (
+        "submitted-via-submittable",
+        "accepted-film-no-withdrawal",
+        "publicity-stills-free-of-rights",
+        "archive-library-choice",
+        "regulations-accepted",
+    ),
+}
+DONE_RECEIPT_SCHEMA = "danse.submission.validation.v1"
+ATTESTATION_MAX_BYTES = 262_144
+DONE_RECEIPT_MAX_BYTES = 262_144
+PHASE_RECEIPT_MAX_BYTES = 2_097_152
+PACKAGE_MANIFEST_MAX_BYTES = 4_194_304
+DONE_RECEIPTS = {
+    phase: f"receipts/validated-{phase}.json" for phase in PHASES
+}
+# This receipt is deliberately narrower than done.sh: it is minted by, and only
+# claims, the submission validation executing in this process.  done.sh still
+# gates the portable and browser batches before it invokes this final predicate.
+DONE_RECEIPT_SCOPE = "submission-phase-validation"
+DONE_PREDICATES = (
+    "python3 submission/check.py --package <package-root> --phase {phase}",
+)
+MANIFEST_FIELDS = {
+    "schema",
+    "title",
+    "seed",
+    "repository_head",
+    "items",
+    "passage_seed",
+    "passage",
+    "start",
+    "t0",
+    "t1",
+    "duration",
+    "corpus_tier",
+    "source_tree_sha256",
+    "sound",
+    "production",
+    "score_motion_evidence",
+}
+MANIFEST_ITEM_FIELDS = {
+    "name",
+    "bytes",
+    "sha256",
+    "width",
+    "height",
+    "fps",
+    "seconds",
+    "vcodec",
+    "vprofile",
+    "pix_fmt",
+    "acodec",
+    "channels",
+    "sample_rate",
+    "sound",
+    "source",
+    "source_sha256",
+    "copy_mode",
+}
 AUDIO_IDENTITY_HASH_FIELDS = (
     "audio_uses_sha256",
     "score_file_sha256",
@@ -69,6 +170,55 @@ AUDIO_SOUND_FIELDS = (
     "sources",
     "stems",
     "credit",
+)
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that refuses duplicate assertion ids."""
+
+    def compose_node(self, parent: yaml.Node | None, index: object) -> yaml.Node:
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.constructor.ConstructorError(
+                "while composing a mapping",
+                getattr(event, "start_mark", None),
+                "YAML aliases are not accepted in assertion contracts",
+                getattr(event, "start_mark", None),
+            )
+        return super().compose_node(parent, index)
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    value: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            repeated = key in value
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable complex mapping key",
+                key_node.start_mark,
+            ) from exc
+        if repeated:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        value[key] = loader.construct_object(value_node, deep=deep)
+    return value
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
 )
 
 
@@ -234,10 +384,16 @@ def manifest_items(root: Path) -> dict[str, dict]:
 
 def safe_contract_file(root: Path, relative: object, label: str) -> Path:
     """Resolve one regular repository/package file without following links."""
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{label} contract root is missing or unsafe")
     if not isinstance(relative, str) or not relative or "\\" in relative:
         raise ValueError(f"{label} has no safe relative path")
     pure = PurePosixPath(relative)
-    if pure.is_absolute() or "." in pure.parts or ".." in pure.parts:
+    if (
+        pure.is_absolute()
+        or relative != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
         raise ValueError(f"{label} escapes its contract root")
     current = root.resolve()
     for part in pure.parts:
@@ -255,13 +411,2847 @@ def safe_contract_file(root: Path, relative: object, label: str) -> Path:
 
 def read_contract_json(root: Path, relative: object, label: str) -> tuple[dict, Path]:
     path = safe_contract_file(root, relative, label)
+    descriptor: int | None = None
+    relative_name = relative if isinstance(relative, str) else ""
+    secure_done_receipt = relative_name in DONE_RECEIPTS.values()
+    if secure_done_receipt:
+        byte_limit = DONE_RECEIPT_MAX_BYTES
+    elif relative_name == "manifest.json":
+        byte_limit = PACKAGE_MANIFEST_MAX_BYTES
+    elif relative_name in PHASE_RECEIPTS.values() or "receipt" in label.casefold():
+        byte_limit = PHASE_RECEIPT_MAX_BYTES
+    else:
+        byte_limit = None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not readable JSON") from exc
+        if secure_done_receipt:
+            document = secure_done_receipt_bytes(root, relative_name, label)
+        else:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            document = descriptor_bytes(
+                descriptor,
+                max_bytes=byte_limit,
+            )
+        value = unique_json_bytes(document, label)
+    except (OSError, RecursionError, ValueError) as exc:
+        if isinstance(exc, ValueError) and (
+            secure_done_receipt or str(exc).startswith(label)
+        ):
+            raise
+        raise ValueError(f"{label} is not readable unique-key JSON") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if not isinstance(value, dict):
         raise ValueError(f"{label} is not a JSON object")
     return value, path
+
+
+def parse_attestation_document(document: object, label: str) -> dict[str, Any]:
+    """Parse one exact, embeddable attestation snapshot without aliases."""
+    if (
+        not isinstance(document, str)
+        or not document
+        or len(document.encode("utf-8")) > ATTESTATION_MAX_BYTES
+        or "\x00" in document
+    ):
+        raise ValueError(f"{label} has no exact UTF-8 attestation document")
+    try:
+        value = yaml.load(document, Loader=_UniqueKeySafeLoader)
+    except (UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"{label} attestation document is not unique-key YAML") from exc
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{label} attestation document must be a string-keyed mapping")
+    if any(item is not None and type(item) is not bool and not isinstance(item, str) for item in value.values()):
+        raise ValueError(f"{label} attestation values must be boolean, named choice, or null")
+    return value
+
+
+def read_attestations(root: Path) -> tuple[dict[str, Any], Path]:
+    """Load the mutable human-assertion worksheet without accepting aliases."""
+    path = safe_contract_file(root, "attest.yaml", "package attestation")
+    try:
+        document = path.read_text(encoding="utf-8")
+        value = parse_attestation_document(document, "package")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("package attestation is not readable unique-key YAML") from exc
+    return value, path
+
+
+def receipt_schema_errors(value: object, label: str) -> list[str]:
+    """Execute the tracked Draft 2020-12 receipt contract before semantics."""
+    try:
+        schema, _ = read_contract_json(
+            RECEIPT_SCHEMA.parent,
+            RECEIPT_SCHEMA.name,
+            "receipt schema",
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(
+            schema,
+            format_checker=jsonschema.FormatChecker(),
+        ).validate(value)
+    except (ValueError, jsonschema.SchemaError, jsonschema.ValidationError) as exc:
+        if isinstance(exc, jsonschema.ValidationError):
+            location = ".".join(str(part) for part in exc.absolute_path)
+            suffix = f" at {location}" if location else ""
+            return [f"{label} does not satisfy receipt.schema.json{suffix}: {exc.message}"]
+        return [f"{label} cannot use receipt.schema.json: {type(exc).__name__}"]
+    return []
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def receipt_timestamp(value: object, label: str) -> datetime:
+    if not isinstance(value, str) or not UTC_TIMESTAMP.fullmatch(value):
+        raise ValueError(f"{label} has no canonical UTC timestamp")
+    rendered = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(rendered)
+    except ValueError as exc:
+        raise ValueError(f"{label} has no canonical UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{label} timestamp is not UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def register_timestamp(value: object, label: str) -> datetime:
+    """Parse a canonical register instant without silently adding an offset."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not an offset timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} has no UTC offset")
+    return parsed
+
+
+def sync_regular_descriptor(descriptor: int) -> None:
+    """Flush a receipt through the repository's strongest file boundary.
+
+    Darwin's ``fsync`` does not force volatile drive caches to stable storage.
+    Match the private-custody publication rail: use ``F_FULLFSYNC`` for regular
+    files on macOS and retain ``fsync`` on other platforms. Directory entries
+    are synchronized separately after the exclusive publication link.
+    """
+    if sys.platform == "darwin":
+        if fcntl is None:
+            raise OSError("macOS full-file synchronization is unavailable")
+        fcntl.fcntl(descriptor, F_FULLFSYNC)
+    else:
+        os.fsync(descriptor)
+
+
+def secure_directory_read_flags() -> int:
+    """Return the non-downgradable flags for descriptor-rooted contract reads."""
+    if any(
+        not hasattr(os, flag)
+        for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")
+    ):
+        raise OSError("secure validation-receipt descriptor reads are unsupported")
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+        raise OSError("secure validation-receipt openat operations are unsupported")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def secure_directory_flags() -> int:
+    """Return the non-downgradable flags for capability-anchored publication."""
+    flags = secure_directory_read_flags()
+    # Publication uses linkat as a no-overwrite commit primitive.  Refuse to
+    # stage anything unless every capability needed by that rail is present.
+    required = (os.open, os.stat, os.mkdir, os.unlink, os.link)
+    if any(function not in os.supports_dir_fd for function in required) or (
+        os.link not in os.supports_follow_symlinks
+    ):
+        raise OSError("secure validation-receipt dir-fd operations are unsupported")
+    return flags
+
+
+def directory_identity(value: os.stat_result) -> tuple[int, int]:
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("validation receipt publication boundary is not a directory")
+    return value.st_dev, value.st_ino
+
+
+def assert_secure_receipt_file(value: os.stat_result, label: str) -> None:
+    """Reject receipt inodes that another account or group can rewrite."""
+    effective_uid = getattr(os, "geteuid", None)
+    if not callable(effective_uid):
+        raise ValueError(f"{label} owner cannot be verified on this platform")
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_nlink != 1
+        or value.st_uid != effective_uid()
+        or value.st_mode & 0o022
+    ):
+        raise ValueError(f"{label} is unsafe")
+
+
+def assert_secure_owned_directory(value: os.stat_result, label: str) -> None:
+    """Reject a directory whose binding another account or group can rewrite."""
+    effective_uid = getattr(os, "geteuid", None)
+    if not callable(effective_uid):
+        raise ValueError(f"{label} owner cannot be verified on this platform")
+    if (
+        not stat.S_ISDIR(value.st_mode)
+        or value.st_uid != effective_uid()
+        or value.st_mode & 0o022
+    ):
+        raise ValueError(f"{label} is unsafe")
+
+
+def secure_done_receipt_bytes(root: Path, relative: str, label: str) -> bytes:
+    """Read one exact done receipt through a stable owned root/directory chain."""
+    parts = descriptor_relative_parts(relative, label)
+    if len(parts) != 2 or parts[0] != "receipts" or relative not in DONE_RECEIPTS.values():
+        raise ValueError(f"{label} has no canonical validation receipt path")
+    flags = secure_directory_read_flags()
+    root_path = root.absolute()
+    root_fd = receipt_fd = result_fd = None
+    try:
+        named_root_before = os.stat(root_path, follow_symlinks=False)
+        assert_secure_owned_directory(named_root_before, "validation receipt package root")
+        root_fd = os.open(root_path, flags)
+        opened_root_before = os.fstat(root_fd)
+        assert_secure_owned_directory(opened_root_before, "validation receipt package root")
+        if directory_identity(opened_root_before) != directory_identity(named_root_before):
+            raise ValueError("validation receipt package root changed during descriptor open")
+
+        named_directory_before = os.stat(
+            "receipts",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        assert_secure_owned_directory(
+            named_directory_before,
+            "validation receipt directory",
+        )
+        receipt_fd = os.open("receipts", flags, dir_fd=root_fd)
+        opened_directory_before = os.fstat(receipt_fd)
+        assert_secure_owned_directory(
+            opened_directory_before,
+            "validation receipt directory",
+        )
+        if directory_identity(opened_directory_before) != directory_identity(
+            named_directory_before
+        ):
+            raise ValueError("validation receipt directory changed during descriptor open")
+
+        result_name = parts[-1]
+        named_result_before = os.stat(
+            result_name,
+            dir_fd=receipt_fd,
+            follow_symlinks=False,
+        )
+        assert_secure_receipt_file(named_result_before, label)
+        if stat.S_IMODE(named_result_before.st_mode) != 0o400:
+            raise ValueError(f"{label} has the wrong mode")
+        result_fd = os.open(
+            result_name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=receipt_fd,
+        )
+        opened_result_before = os.fstat(result_fd)
+        assert_secure_receipt_file(opened_result_before, label)
+        if stat.S_IMODE(opened_result_before.st_mode) != 0o400:
+            raise ValueError(f"{label} has the wrong mode")
+        if descriptor_stat_signature(opened_result_before) != descriptor_stat_signature(
+            named_result_before
+        ):
+            raise ValueError(f"{label} changed during descriptor open")
+
+        document = descriptor_bytes(result_fd, max_bytes=DONE_RECEIPT_MAX_BYTES)
+        opened_result_after = os.fstat(result_fd)
+        named_result_after = os.stat(
+            result_name,
+            dir_fd=receipt_fd,
+            follow_symlinks=False,
+        )
+        assert_secure_receipt_file(opened_result_after, label)
+        assert_secure_receipt_file(named_result_after, label)
+        if (
+            stat.S_IMODE(opened_result_after.st_mode) != 0o400
+            or stat.S_IMODE(named_result_after.st_mode) != 0o400
+            or descriptor_stat_signature(opened_result_after)
+            != descriptor_stat_signature(opened_result_before)
+            or descriptor_stat_signature(named_result_after)
+            != descriptor_stat_signature(opened_result_before)
+        ):
+            raise ValueError(f"{label} changed during descriptor read")
+
+        opened_root_after = os.fstat(root_fd)
+        named_root_after = os.stat(root_path, follow_symlinks=False)
+        named_directory_after = os.stat(
+            "receipts",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        opened_directory_after = os.fstat(receipt_fd)
+        assert_secure_owned_directory(opened_root_after, "validation receipt package root")
+        assert_secure_owned_directory(named_root_after, "validation receipt package root")
+        assert_secure_owned_directory(
+            opened_directory_after,
+            "validation receipt directory",
+        )
+        assert_secure_owned_directory(
+            named_directory_after,
+            "validation receipt directory",
+        )
+        if (
+            directory_identity(opened_root_after) != directory_identity(opened_root_before)
+            or directory_identity(named_root_after) != directory_identity(opened_root_before)
+            or directory_identity(opened_directory_after)
+            != directory_identity(opened_directory_before)
+            or directory_identity(named_directory_after)
+            != directory_identity(opened_directory_before)
+        ):
+            raise ValueError("validation receipt directory changed during descriptor read")
+        return document
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} is missing") from exc
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be read through its package descriptor") from exc
+    finally:
+        for descriptor in (result_fd, receipt_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def acquire_publication_lease(receipt_fd: int) -> None:
+    """Hold one nonblocking, descriptor-scoped writer lease through commit."""
+    if (
+        fcntl is None
+        or not hasattr(fcntl, "flock")
+        or not all(hasattr(fcntl, flag) for flag in ("LOCK_EX", "LOCK_NB"))
+    ):
+        raise OSError("secure validation-receipt publication lease is unsupported")
+    try:
+        fcntl.flock(receipt_fd, FLOCK_EX | FLOCK_NB)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            raise OSError("validation receipt publication lease is busy") from exc
+        raise
+
+
+def recover_publication_residue(receipt_fd: int, destination_name: str) -> None:
+    """Remove only this rail's exact, safely-owned crash staging names.
+
+    The portable no-overwrite commit is ``linkat(staging, destination)`` followed
+    by removal of the staging name.  A process or power failure can therefore
+    leave either a staging-only inode or the same inode linked by both names.
+    Holding the receipt-directory lease lets a later invocation finish that
+    cleanup without treating arbitrary directory content as ours.
+    """
+    pattern = re.compile(
+        rf"^\.{re.escape(destination_name)}\.[0-9]+-[0-9a-f]{{16}}\.tmp$"
+    )
+    scan_fd: int | None = None
+    names: list[str] = []
+    try:
+        scan_fd = os.open(".", secure_directory_flags(), dir_fd=receipt_fd)
+        with os.scandir(scan_fd) as iterator:
+            for index, entry in enumerate(iterator, start=1):
+                if index > 100_000:
+                    raise ValueError("validation receipt directory exceeds its recovery bound")
+                if pattern.fullmatch(entry.name):
+                    names.append(entry.name)
+    finally:
+        if scan_fd is not None:
+            os.close(scan_fd)
+
+    removed = False
+    common_flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    for name in sorted(names):
+        descriptor: int | None = None
+        try:
+            named = os.stat(name, dir_fd=receipt_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or named.st_uid != os.geteuid()
+                or named.st_mode & 0o022
+                or named.st_nlink not in {1, 2}
+            ):
+                raise ValueError("validation receipt staging residue is unsafe")
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | common_flags,
+                dir_fd=receipt_fd,
+            )
+            opened = os.fstat(descriptor)
+            if descriptor_stat_signature(opened) != descriptor_stat_signature(named):
+                raise ValueError("validation receipt staging residue changed during recovery")
+
+            expected_links = 0
+            if named.st_nlink == 2:
+                try:
+                    destination = os.stat(
+                        destination_name,
+                        dir_fd=receipt_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        "validation receipt staging residue has an unknown hard link"
+                    ) from exc
+                if (
+                    not stat.S_ISREG(destination.st_mode)
+                    or destination.st_uid != os.geteuid()
+                    or destination.st_mode & 0o022
+                    or descriptor_stat_signature(destination)
+                    != descriptor_stat_signature(named)
+                ):
+                    raise ValueError(
+                        "validation receipt staging residue has an unknown hard link"
+                    )
+                expected_links = 1
+
+            os.unlink(name, dir_fd=receipt_fd)
+            removed = True
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                or after.st_nlink != expected_links
+            ):
+                raise ValueError("validation receipt staging residue changed during recovery")
+            try:
+                os.stat(name, dir_fd=receipt_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("validation receipt staging residue survived recovery")
+        except FileNotFoundError:
+            # A cooperating writer cannot race while the lease is held.  A name
+            # that disappeared before it was opened is already safely absent.
+            continue
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    if removed:
+        os.fsync(receipt_fd)
+
+
+def assert_receipt_directory_binding(
+    root: Path,
+    root_fd: int,
+    root_info: os.stat_result,
+    receipt_fd: int,
+    receipt_info: os.stat_result,
+) -> None:
+    """Prove the pinned descriptors still name root/receipts without links."""
+    named_root = os.stat(root, follow_symlinks=False)
+    named_receipts = os.stat("receipts", dir_fd=root_fd, follow_symlinks=False)
+    current_root = os.fstat(root_fd)
+    current_receipts = os.fstat(receipt_fd)
+    assert_secure_owned_directory(named_root, "validation receipt package root")
+    assert_secure_owned_directory(current_root, "validation receipt package root")
+    assert_secure_owned_directory(named_receipts, "validation receipt directory")
+    assert_secure_owned_directory(current_receipts, "validation receipt directory")
+    if (
+        directory_identity(root_info) != directory_identity(named_root)
+        or directory_identity(receipt_info) != directory_identity(named_receipts)
+        or receipt_info.st_dev != root_info.st_dev
+        or directory_identity(current_root) != directory_identity(root_info)
+        or directory_identity(current_receipts) != directory_identity(receipt_info)
+    ):
+        raise ValueError("validation receipt directory changed during publication")
+
+
+def assert_final_receipt_snapshot(
+    root: Path,
+    root_fd: int,
+    root_info: os.stat_result,
+    receipt_fd: int,
+    receipt_info: os.stat_result,
+    result_fd: int,
+    result_info: os.stat_result,
+    destination_name: str,
+) -> None:
+    """Take the final directory snapshot, then prove the receipt stayed fixed."""
+    named_root = os.stat(root, follow_symlinks=False)
+    named_receipts = os.stat("receipts", dir_fd=root_fd, follow_symlinks=False)
+    current_root = os.fstat(root_fd)
+    current_receipts = os.fstat(receipt_fd)
+    assert_secure_owned_directory(named_root, "validation receipt package root")
+    assert_secure_owned_directory(current_root, "validation receipt package root")
+    assert_secure_owned_directory(named_receipts, "validation receipt directory")
+    assert_secure_owned_directory(current_receipts, "validation receipt directory")
+    if (
+        directory_identity(named_root) != directory_identity(root_info)
+        or directory_identity(current_root) != directory_identity(root_info)
+        or directory_identity(named_receipts) != directory_identity(receipt_info)
+        or directory_identity(current_receipts) != directory_identity(receipt_info)
+    ):
+        raise ValueError("validation receipt directory changed during publication")
+    current_result = os.fstat(result_fd)
+    named_result = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+    assert_secure_receipt_file(current_result, "validation receipt destination")
+    assert_secure_receipt_file(named_result, "validation receipt destination")
+    if (
+        descriptor_stat_signature(current_result) != descriptor_stat_signature(result_info)
+        or descriptor_stat_signature(named_result) != descriptor_stat_signature(result_info)
+    ):
+        raise ValueError("validation receipt destination changed after publication")
+
+
+def descriptor_bytes(descriptor: int, *, max_bytes: int | None = None) -> bytes:
+    """Read exactly one snapshotted regular-file size, then probe overflow."""
+    before = os.fstat(descriptor)
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise ValueError("contract file exceeds its byte limit")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1 << 20, remaining))
+        if not chunk:
+            raise ValueError("descriptor bytes changed during bounded read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    overflow = os.read(descriptor, 1)
+    after = os.fstat(descriptor)
+    if overflow or descriptor_stat_signature(after) != descriptor_stat_signature(before):
+        raise ValueError("descriptor bytes changed during bounded read")
+    return b"".join(chunks)
+
+
+def exclusive_receipt_link(source: str, destination: str, directory_fd: int) -> None:
+    """Commit one receipt name without replacing an existing publication."""
+    os.link(
+        source,
+        destination,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+
+
+def unique_json_bytes(document: bytes, label: str) -> dict[str, Any]:
+    """Parse one UTF-8 JSON object while rejecting duplicate keys."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"{label} repeats JSON field {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            document.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"{label} contains non-finite JSON value {value}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith(label):
+            raise
+        raise ValueError(f"{label} is not readable unique-key JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} is not a JSON object")
+    return value
+
+
+def descriptor_stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    """Return the mutation-sensitive identity used by pinned package reads."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def descriptor_relative_parts(relative: str, label: str) -> tuple[str, ...]:
+    """Validate one canonical package-relative name before openat traversal."""
+    if not relative or "\\" in relative:
+        raise ValueError(f"{label} has no safe relative path")
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or relative != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise ValueError(f"{label} escapes its contract root")
+    return pure.parts
+
+
+def descriptor_file_identity(
+    root_fd: int,
+    relative: str,
+    label: str,
+    *,
+    capture: bool = False,
+    max_bytes: int | None = None,
+    secure_receipt: bool = False,
+    expected_mode: int | None = None,
+) -> tuple[bytes | None, str, int]:
+    """Hash one regular file by walking only beneath a pinned root descriptor."""
+    parts = descriptor_relative_parts(relative, label)
+    directory_flags = secure_directory_flags()
+    common_flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    directory_fd = os.dup(root_fd)
+    file_fd: int | None = None
+    try:
+        for part in parts[:-1]:
+            named = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode):
+                raise ValueError(f"{label} traverses a non-directory")
+            child_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            child = os.fstat(child_fd)
+            if directory_identity(child) != directory_identity(named):
+                os.close(child_fd)
+                raise ValueError(f"{label} changed during descriptor traversal")
+            os.close(directory_fd)
+            directory_fd = child_fd
+
+        named_before = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(named_before.st_mode):
+            raise ValueError(f"{label} is not a regular file")
+        if secure_receipt:
+            assert_secure_receipt_file(named_before, label)
+            if expected_mode is not None and stat.S_IMODE(named_before.st_mode) != expected_mode:
+                raise ValueError(f"{label} has the wrong mode")
+        file_fd = os.open(
+            parts[-1],
+            os.O_RDONLY | common_flags,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino)
+        ):
+            raise ValueError(f"{label} changed during descriptor open")
+        if secure_receipt:
+            assert_secure_receipt_file(before, label)
+            if expected_mode is not None and stat.S_IMODE(before.st_mode) != expected_mode:
+                raise ValueError(f"{label} has the wrong mode")
+        if max_bytes is not None and before.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds its byte limit")
+        digest = hashlib.sha256()
+        chunks: list[bytes] | None = [] if capture else None
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(file_fd, min(1 << 20, remaining))
+            if not chunk:
+                raise ValueError(f"{label} changed during descriptor read")
+            digest.update(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+            remaining -= len(chunk)
+        overflow = os.read(file_fd, 1)
+        after = os.fstat(file_fd)
+        named_after = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        if secure_receipt:
+            assert_secure_receipt_file(after, label)
+            assert_secure_receipt_file(named_after, label)
+            if expected_mode is not None and (
+                stat.S_IMODE(after.st_mode) != expected_mode
+                or stat.S_IMODE(named_after.st_mode) != expected_mode
+            ):
+                raise ValueError(f"{label} has the wrong mode")
+        if (
+            overflow
+            or (max_bytes is not None and after.st_size > max_bytes)
+            or descriptor_stat_signature(after) != descriptor_stat_signature(before)
+            or descriptor_stat_signature(named_after) != descriptor_stat_signature(before)
+        ):
+            raise ValueError(f"{label} changed during descriptor read")
+        return (
+            b"".join(chunks) if chunks is not None else None,
+            digest.hexdigest(),
+            after.st_size,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} is missing") from exc
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be read through the package descriptor") from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def descriptor_package_surface(root_fd: int) -> tuple[list[tuple[str, str, tuple[int, ...]]], list[str]]:
+    """Recursively census a pinned package without following any pathname link."""
+    entries: list[tuple[str, str, tuple[int, ...]]] = []
+    errors: list[str] = []
+    visited = {directory_identity(os.fstat(root_fd))}
+    census_count = 0
+
+    def walk(directory_fd: int, prefix: str, depth: int) -> None:
+        nonlocal census_count
+        if depth > 64:
+            errors.append("package surface exceeds the descriptor traversal depth")
+            return
+        scan_fd: int | None = None
+        try:
+            scan_fd = os.open(".", secure_directory_flags(), dir_fd=directory_fd)
+            names: list[str] = []
+            with os.scandir(scan_fd) as iterator:
+                for entry in iterator:
+                    census_count += 1
+                    if census_count > 100_000:
+                        errors.append("package surface exceeds the descriptor census bound")
+                        return
+                    names.append(entry.name)
+            names.sort()
+        except OSError:
+            errors.append("package file census could not be read through its descriptor")
+            return
+        finally:
+            if scan_fd is not None:
+                os.close(scan_fd)
+        for name in names:
+            relative = f"{prefix}/{name}" if prefix else name
+            try:
+                named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                errors.append(f"package surface entry {relative} changed during census")
+                continue
+            signature = descriptor_stat_signature(named)
+            if stat.S_ISLNK(named.st_mode):
+                entries.append((relative, "symlink", signature))
+                continue
+            if stat.S_ISDIR(named.st_mode):
+                entries.append((relative, "directory", signature))
+                child_fd: int | None = None
+                try:
+                    child_fd = os.open(
+                        name,
+                        secure_directory_flags(),
+                        dir_fd=directory_fd,
+                    )
+                    child = os.fstat(child_fd)
+                    identity = directory_identity(child)
+                    if identity != directory_identity(named) or identity in visited:
+                        raise ValueError
+                    visited.add(identity)
+                    walk(child_fd, relative, depth + 1)
+                except (OSError, ValueError):
+                    errors.append(f"package directory {relative} changed during census")
+                finally:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                continue
+            if stat.S_ISREG(named.st_mode):
+                entries.append((relative, "file", signature))
+                continue
+            entries.append((relative, "unsupported", signature))
+
+    root_before = os.fstat(root_fd)
+    walk(root_fd, "", 0)
+    if descriptor_stat_signature(os.fstat(root_fd)) != descriptor_stat_signature(root_before):
+        errors.append("package root changed during descriptor census")
+    return sorted(entries), errors
+
+
+def validate_pinned_publication_inputs(
+    root_fd: int,
+    phase: str,
+    package: dict[str, str],
+    records: dict[str, dict[str, Any]],
+    *,
+    publication_relative: str | None = None,
+    expected_publication: bytes | None = None,
+) -> tuple[dict[str, str], list[dict[str, str]], list[str]]:
+    """Revalidate publication inputs exclusively beneath ``root_fd``.
+
+    ``publication_relative`` is the one transient or committed publication name
+    that must exist for this census. No other staging name is admitted.
+    ``expected_publication`` additionally makes the committed name an exact,
+    read-only receipt byte contract within the same stable package census.
+    """
+    errors: list[str] = []
+    first_surface, surface_errors = descriptor_package_surface(root_fd)
+    errors.extend(surface_errors)
+    surface_kinds = {relative: kind for relative, kind, _ in first_surface}
+
+    try:
+        manifest_bytes, manifest_digest, _ = descriptor_file_identity(
+            root_fd,
+            "manifest.json",
+            "package manifest",
+            capture=True,
+            max_bytes=PACKAGE_MANIFEST_MAX_BYTES,
+        )
+        assert manifest_bytes is not None
+        manifest = unique_json_bytes(manifest_bytes, "package manifest")
+    except (AssertionError, ValueError) as exc:
+        return {}, [], errors + [str(exc)]
+
+    if not {"schema", "title", "seed", "repository_head", "items"}.issubset(manifest):
+        errors.append("package manifest has no complete base identity")
+    if not set(manifest).issubset(MANIFEST_FIELDS):
+        errors.append("package manifest has fields outside its typed contract")
+    if manifest.get("schema") != "danse.delivery.manifest.v1":
+        errors.append("package manifest has the wrong schema")
+    repository_head = manifest.get("repository_head")
+    if not isinstance(repository_head, str) or not GIT_OID.fullmatch(repository_head):
+        errors.append("package manifest has no exact repository head")
+        repository_head = ""
+    try:
+        current_head, clean = repository_state()
+    except ValueError as exc:
+        errors.append(str(exc))
+    else:
+        if repository_head != current_head:
+            errors.append("package manifest repository head is not the checker HEAD")
+        if not clean:
+            errors.append("checker repository has uncommitted source changes")
+
+    items = manifest.get("items")
+    if not isinstance(items, list) or not items:
+        errors.append("package manifest has no item inventory")
+        items = []
+    seen: set[str] = set()
+    manifested_files: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(f"package item {index} is not a record")
+            continue
+        if not {"name", "bytes", "sha256"}.issubset(item) or not set(item).issubset(
+            MANIFEST_ITEM_FIELDS
+        ):
+            errors.append(f"package item {index} has fields outside its typed contract")
+        name = item.get("name")
+        if not isinstance(name, str) or name in seen:
+            errors.append(f"package item {index} has a missing or duplicate name")
+            continue
+        seen.add(name)
+        if name in {"manifest.json", "attest.yaml"} or name.startswith("receipts/"):
+            errors.append(f"package item {name} crosses the out-of-band receipt boundary")
+            continue
+        try:
+            descriptor_relative_parts(name, f"package item {name}")
+            _, actual_sha, actual_bytes = descriptor_file_identity(
+                root_fd,
+                name,
+                f"package item {name}",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        manifested_files.add(name)
+        expected_sha = item.get("sha256")
+        expected_bytes = item.get("bytes")
+        if not isinstance(expected_sha, str) or not HEX64.fullmatch(expected_sha):
+            errors.append(f"package item {name} has no exact digest")
+        elif actual_sha != expected_sha:
+            errors.append(f"package item {name} digest is stale")
+        if type(expected_bytes) is not int or expected_bytes < 0:
+            errors.append(f"package item {name} has no exact byte count")
+        elif actual_bytes != expected_bytes:
+            errors.append(f"package item {name} byte count is stale")
+
+    out_of_band = {
+        "manifest.json",
+        "attest.yaml",
+        *PHASE_RECEIPTS.values(),
+        *DONE_RECEIPTS.values(),
+    }
+    if publication_relative is not None:
+        try:
+            descriptor_relative_parts(publication_relative, "validation receipt publication")
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            out_of_band.add(publication_relative)
+            if surface_kinds.get(publication_relative) != "file":
+                errors.append("validation receipt publication name is missing or unsafe")
+    allowed_files = manifested_files | out_of_band
+    allowed_directories = {"receipts"}
+    for relative in allowed_files:
+        parent = PurePosixPath(relative).parent
+        while parent != PurePosixPath("."):
+            allowed_directories.add(parent.as_posix())
+            parent = parent.parent
+    for relative, kind, _ in first_surface:
+        if kind == "symlink":
+            errors.append(f"package surface contains symlink {relative}")
+        elif kind == "directory":
+            if relative not in allowed_directories:
+                errors.append(f"package surface contains unknown directory {relative}")
+        elif kind == "file":
+            if relative not in allowed_files:
+                errors.append(f"package surface contains unmanifested file {relative}")
+        else:
+            errors.append(f"package surface contains unsupported entry {relative}")
+
+    pinned_rows: list[dict[str, str]] = []
+    phase_values: dict[str, dict[str, Any]] = {}
+    for current in PHASES[: PHASES.index(phase) + 1]:
+        relative = PHASE_RECEIPTS[current]
+        label = f"{current} receipt"
+        try:
+            receipt_bytes, receipt_digest, _ = descriptor_file_identity(
+                root_fd,
+                relative,
+                label,
+                capture=True,
+                max_bytes=PHASE_RECEIPT_MAX_BYTES,
+            )
+            assert receipt_bytes is not None
+            receipt = unique_json_bytes(receipt_bytes, label)
+        except (AssertionError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        phase_values[current] = receipt
+        errors.extend(receipt_schema_errors(receipt, label))
+        if receipt.get("schema") != PHASE_RECEIPT_SCHEMAS[current]:
+            errors.append(f"{label} has a schema that does not match its path")
+        record = records.get(current)
+        if not isinstance(record, dict):
+            errors.append(f"{label} is unavailable for pinned validation")
+            continue
+        receipt_id = receipt.get("receipt_id")
+        if record.get("sha256") != receipt_digest or record.get("receipt_id") != receipt_id:
+            errors.append(f"{label} changed before pinned validation")
+            continue
+        pinned_rows.append(
+            {
+                "phase": current,
+                "path": relative,
+                "sha256": receipt_digest,
+                "receipt_id": str(receipt_id),
+            }
+        )
+
+    selected = phase_values.get(phase)
+    try:
+        attestation_bytes, attestation_digest, _ = descriptor_file_identity(
+            root_fd,
+            "attest.yaml",
+            "package attestation",
+            capture=True,
+            max_bytes=ATTESTATION_MAX_BYTES,
+        )
+        assert attestation_bytes is not None
+        attestation_document = attestation_bytes.decode("utf-8")
+        attested = parse_attestation_document(attestation_document, "package")
+    except (AssertionError, UnicodeDecodeError, ValueError) as exc:
+        errors.append(f"{phase} receipt cannot bind the live attestation ({type(exc).__name__})")
+    else:
+        embedded = selected.get("attestation") if isinstance(selected, dict) else None
+        if (
+            not isinstance(embedded, dict)
+            or set(embedded) != {"path", "sha256", "canonical_sha256", "document"}
+            or embedded.get("path") != "attest.yaml"
+            or embedded.get("document") != attestation_document
+            or embedded.get("sha256") != attestation_digest
+            or embedded.get("canonical_sha256") != canonical_json_sha256(attested)
+        ):
+            errors.append(f"{phase} receipt no longer matches the pinned live attestation")
+
+    # Known out-of-band receipts that are not part of the selected cumulative
+    # chain still have to be typed data rather than arbitrary bytes.
+    for current, relative in PHASE_RECEIPTS.items():
+        if relative not in surface_kinds or current in phase_values:
+            continue
+        label = f"out-of-band {current} receipt"
+        try:
+            receipt_bytes, _, _ = descriptor_file_identity(
+                root_fd,
+                relative,
+                label,
+                capture=True,
+                max_bytes=PHASE_RECEIPT_MAX_BYTES,
+            )
+            assert receipt_bytes is not None
+            receipt = unique_json_bytes(receipt_bytes, label)
+        except (AssertionError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        errors.extend(receipt_schema_errors(receipt, label))
+        if receipt.get("schema") != PHASE_RECEIPT_SCHEMAS[current]:
+            errors.append(f"{label} has a schema that does not match its path")
+    for current, relative in DONE_RECEIPTS.items():
+        if relative not in surface_kinds:
+            continue
+        label = f"out-of-band validated-{current} receipt"
+        try:
+            receipt_bytes, _, _ = descriptor_file_identity(
+                root_fd,
+                relative,
+                label,
+                capture=True,
+                max_bytes=DONE_RECEIPT_MAX_BYTES,
+            )
+            assert receipt_bytes is not None
+            receipt = unique_json_bytes(receipt_bytes, label)
+        except (AssertionError, ValueError) as exc:
+            errors.append(str(exc))
+            continue
+        errors.extend(receipt_schema_errors(receipt, label))
+        if (
+            receipt.get("schema") != DONE_RECEIPT_SCHEMA
+            or receipt.get("scope") != DONE_RECEIPT_SCOPE
+            or receipt.get("phase") != current
+        ):
+            errors.append(f"{label} has an identity that does not match its path")
+
+    if expected_publication is not None:
+        if publication_relative is None:
+            errors.append("exact validation receipt bytes have no publication path")
+        elif len(expected_publication) > DONE_RECEIPT_MAX_BYTES:
+            errors.append("exact validation receipt bytes exceed the receipt byte limit")
+        else:
+            try:
+                publication_bytes, _, _ = descriptor_file_identity(
+                    root_fd,
+                    publication_relative,
+                    "validation receipt destination",
+                    capture=True,
+                    max_bytes=DONE_RECEIPT_MAX_BYTES,
+                    secure_receipt=True,
+                    expected_mode=0o400,
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+            else:
+                if publication_bytes != expected_publication:
+                    errors.append("validation receipt destination has different exact bytes")
+
+    final_surface, final_errors = descriptor_package_surface(root_fd)
+    errors.extend(final_errors)
+    if final_surface != first_surface:
+        errors.append("package surface changed during pinned validation")
+    binding = {
+        "manifest": "manifest.json",
+        "manifest_sha256": manifest_digest,
+        "repository_head": repository_head,
+    }
+    if binding != package:
+        errors.append("package identity changed before pinned validation")
+    return binding, pinned_rows, errors
+
+
+def typed_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or not RECEIPT_ID.fullmatch(value):
+        raise ValueError(f"{label} has no typed identifier")
+    return value
+
+
+def recorded_by(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 200:
+        raise ValueError(f"{label} has no named recorder")
+    if value != value.strip() or any(ord(char) < 32 for char in value):
+        raise ValueError(f"{label} recorder is not a single public-safe name")
+    if re.search(
+        r"\b(?:todo|tbd|unknown|none|null|placeholder|anonymous)\b",
+        value.casefold(),
+    ) or value.casefold() in {
+        "account owner",
+        "package approver",
+        "upload account owner",
+        "submission account owner",
+        "signer",
+        "recorder",
+        "test user",
+    }:
+        raise ValueError(f"{label} recorder is still a placeholder")
+    return value
+
+
+def destination_safe_https(value: object, label: str) -> str:
+    """Return one unambiguous public HTTPS destination.
+
+    Filing receipts are durable evidence, so their destination must not depend on
+    browser-specific authority parsing, IDNA display, or local-network naming.
+    """
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or "\\" in value
+        or any(char.isspace() or ord(char) < 32 for char in value)
+    ):
+        raise ValueError(f"{label} has no HTTPS URL")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError(f"{label} has a malformed HTTPS authority") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+    ):
+        raise ValueError(f"{label} has no public-safe HTTPS URL")
+    if parsed.netloc.endswith(":"):
+        raise ValueError(f"{label} has an invalid HTTPS port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError(f"{label} has an invalid HTTPS port")
+
+    hostname = hostname.lower()
+    if "%" in hostname or not hostname.isascii() or any(
+        part.startswith("xn--") for part in hostname.split(".")
+    ):
+        raise ValueError(f"{label} has a malformed or IDNA HTTPS authority")
+    if hostname.endswith("."):
+        raise ValueError(f"{label} has a malformed HTTPS authority")
+
+    local_suffixes = (
+        ".localhost",
+        ".local",
+        ".localdomain",
+        ".internal",
+        ".lan",
+        ".home.arpa",
+    )
+    if hostname == "localhost" or hostname.endswith(local_suffixes):
+        raise ValueError(f"{label} points to a non-public host")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        legacy_ipv4 = len(labels) <= 4 and all(
+            re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", part) for part in labels
+        )
+        if parsed.netloc.startswith("[") or legacy_ipv4:
+            raise ValueError(f"{label} has a malformed HTTPS authority")
+        if len(labels) < 2:
+            raise ValueError(f"{label} points to a non-public host")
+        if len(hostname) > 253 or any(
+            len(part) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", part)
+            for part in labels
+        ):
+            raise ValueError(f"{label} has a malformed HTTPS authority")
+    else:
+        if not address.is_global:
+            raise ValueError(f"{label} points to a non-public host")
+    return value
+
+
+def https_url(value: object, label: str) -> str:
+    """Backward-compatible name for the destination receipt validator."""
+    return destination_safe_https(value, label)
+
+
+def repository_state(root: Path = HERE.parent) -> tuple[str, bool]:
+    """Return the commit and source cleanliness that actually run the checker."""
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError("cannot query the repository identity") from exc
+    commit = (head.stdout or "").strip().lower()
+    if head.returncode or not GIT_OID.fullmatch(commit):
+        raise ValueError("checker has no exact repository commit")
+    if status.returncode:
+        raise ValueError("checker cannot verify repository cleanliness")
+    return commit, not bool((status.stdout or "").strip())
+
+
+def validate_package_identity(root: Path) -> tuple[dict[str, str], dict, list[str]]:
+    """Authenticate the delivery manifest and every byte it inventories."""
+    errors: list[str] = []
+    try:
+        manifest, path = read_contract_json(root, "manifest.json", "package manifest")
+    except ValueError as exc:
+        return {}, {}, [str(exc)]
+    manifest_digest = sha256(path)
+    if not {"schema", "title", "seed", "repository_head", "items"}.issubset(manifest):
+        errors.append("package manifest has no complete base identity")
+    if not set(manifest).issubset(MANIFEST_FIELDS):
+        errors.append("package manifest has fields outside its typed contract")
+    if manifest.get("schema") != "danse.delivery.manifest.v1":
+        errors.append("package manifest has the wrong schema")
+    repository_head = manifest.get("repository_head")
+    if not isinstance(repository_head, str) or not GIT_OID.fullmatch(repository_head):
+        errors.append("package manifest has no exact repository head")
+        repository_head = ""
+    try:
+        current_head, clean = repository_state()
+    except ValueError as exc:
+        errors.append(str(exc))
+    else:
+        if repository_head != current_head:
+            errors.append("package manifest repository head is not the checker HEAD")
+        if not clean:
+            errors.append("checker repository has uncommitted source changes")
+
+    items = manifest.get("items")
+    if not isinstance(items, list) or not items:
+        errors.append("package manifest has no item inventory")
+        items = []
+    seen: set[str] = set()
+    census_manifest_files: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            errors.append(f"package item {index} is not a record")
+            continue
+        if not {"name", "bytes", "sha256"}.issubset(item) or not set(item).issubset(
+            MANIFEST_ITEM_FIELDS
+        ):
+            errors.append(f"package item {index} has fields outside its typed contract")
+        name = item.get("name")
+        if not isinstance(name, str) or name in seen:
+            errors.append(f"package item {index} has a missing or duplicate name")
+            continue
+        seen.add(name)
+        if name in {"manifest.json", "attest.yaml"} or name.startswith("receipts/"):
+            errors.append(f"package item {name} crosses the out-of-band receipt boundary")
+            continue
+        try:
+            item_path = safe_contract_file(root, name, f"package item {name}")
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        census_manifest_files.add(name)
+        expected_sha = item.get("sha256")
+        expected_bytes = item.get("bytes")
+        try:
+            actual_sha = sha256(item_path)
+            actual_bytes = item_path.stat().st_size
+        except OSError:
+            errors.append(f"package item {name} changed during validation")
+            continue
+        if not isinstance(expected_sha, str) or not HEX64.fullmatch(expected_sha):
+            errors.append(f"package item {name} has no exact digest")
+        elif actual_sha != expected_sha:
+            errors.append(f"package item {name} digest is stale")
+        if type(expected_bytes) is not int or expected_bytes < 0:
+            errors.append(f"package item {name} has no exact byte count")
+        elif actual_bytes != expected_bytes:
+            errors.append(f"package item {name} byte count is stale")
+        try:
+            changed = sha256(item_path) != actual_sha or item_path.stat().st_size != actual_bytes
+        except OSError:
+            changed = True
+        if changed:
+            errors.append(f"package item {name} changed during validation")
+
+    out_of_band = {
+        "manifest.json",
+        "attest.yaml",
+        *PHASE_RECEIPTS.values(),
+        *DONE_RECEIPTS.values(),
+    }
+    receipt_digests: dict[str, str] = {}
+    for receipt_phase, relative in PHASE_RECEIPTS.items():
+        candidate = root / relative
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        label = f"out-of-band {receipt_phase} receipt"
+        try:
+            receipt, receipt_path = read_contract_json(root, relative, label)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        errors.extend(receipt_schema_errors(receipt, label))
+        if receipt.get("schema") != PHASE_RECEIPT_SCHEMAS[receipt_phase]:
+            errors.append(f"{label} has a schema that does not match its path")
+        try:
+            receipt_digests[relative] = sha256(receipt_path)
+        except OSError:
+            errors.append(f"{label} changed during validation")
+    for receipt_phase, relative in DONE_RECEIPTS.items():
+        candidate = root / relative
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        label = f"out-of-band validated-{receipt_phase} receipt"
+        try:
+            receipt, receipt_path = read_contract_json(root, relative, label)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        errors.extend(receipt_schema_errors(receipt, label))
+        if (
+            receipt.get("schema") != DONE_RECEIPT_SCHEMA
+            or receipt.get("scope") != DONE_RECEIPT_SCOPE
+            or receipt.get("phase") != receipt_phase
+        ):
+            errors.append(f"{label} has an identity that does not match its path")
+        try:
+            receipt_digests[relative] = sha256(receipt_path)
+        except OSError:
+            errors.append(f"{label} changed during validation")
+    allowed_files = census_manifest_files | out_of_band
+    allowed_directories = {"receipts"}
+    for relative in allowed_files:
+        parent = PurePosixPath(relative).parent
+        while parent != PurePosixPath("."):
+            allowed_directories.add(parent.as_posix())
+            parent = parent.parent
+    try:
+        surface = sorted(root.rglob("*"), key=lambda candidate: candidate.as_posix())
+    except OSError:
+        errors.append("package file census could not be read")
+        surface = []
+    surface_signature: list[tuple[str, str]] = []
+    for candidate in surface:
+        try:
+            relative = candidate.relative_to(root).as_posix()
+            if candidate.is_symlink():
+                surface_signature.append((relative, "symlink"))
+                errors.append(f"package surface contains symlink {relative}")
+            elif candidate.is_dir():
+                surface_signature.append((relative, "directory"))
+                if relative not in allowed_directories:
+                    errors.append(f"package surface contains unknown directory {relative}")
+            elif candidate.is_file():
+                surface_signature.append((relative, "file"))
+                if relative not in allowed_files:
+                    errors.append(f"package surface contains unmanifested file {relative}")
+            else:
+                errors.append(f"package surface contains unsupported entry {relative}")
+        except OSError:
+            errors.append("package surface changed during its file census")
+
+    try:
+        manifest_changed = sha256(path) != manifest_digest
+    except OSError:
+        manifest_changed = True
+    if manifest_changed:
+        errors.append("package manifest changed during validation")
+    try:
+        final_surface_signature = []
+        for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            relative = candidate.relative_to(root).as_posix()
+            kind = (
+                "symlink"
+                if candidate.is_symlink()
+                else "directory"
+                if candidate.is_dir()
+                else "file"
+                if candidate.is_file()
+                else "unsupported"
+            )
+            final_surface_signature.append((relative, kind))
+    except OSError:
+        final_surface_signature = []
+    if final_surface_signature != surface_signature:
+        errors.append("package surface changed during validation")
+    for relative, digest in receipt_digests.items():
+        try:
+            if sha256(root / relative) != digest:
+                errors.append(f"out-of-band receipt {relative} changed during validation")
+        except OSError:
+            errors.append(f"out-of-band receipt {relative} changed during validation")
+
+    binding = {
+        "manifest": "manifest.json",
+        "manifest_sha256": manifest_digest,
+        "repository_head": repository_head,
+    }
+    return binding, manifest, errors
+
+
+def check_package_identity(root: Path, rep: Report) -> tuple[dict[str, str], dict]:
+    binding, manifest, errors = validate_package_identity(root)
+    rep.add(
+        "package identity",
+        "exact manifest and repository head",
+        FAIL if errors else PASS,
+        "; ".join(errors[:6])
+        if errors
+        else f"manifest {binding['manifest_sha256'][:16]}… · head {binding['repository_head'][:12]}",
+    )
+    return binding, manifest
+
+
+def assertion_contracts(reg: dict, phase: str) -> dict[str, dict[str, Any]]:
+    selected = PHASES.index(phase)
+    contracts: dict[str, dict[str, Any]] = {}
+    for section in OWNED_SECTIONS:
+        for item in reg.get(section, []):
+            owner = item.get("phase")
+            kind = item.get("check")
+            assertion_id = item.get("id")
+            if (
+                kind not in {"manual", "choice"}
+                or owner not in PHASES
+                or PHASES.index(owner) > selected
+                or not isinstance(assertion_id, str)
+            ):
+                continue
+            contracts[assertion_id] = {
+                "kind": kind,
+                "values": item.get("values", [True] if kind == "manual" else []),
+            }
+    return contracts
+
+
+def full_attestation_contracts(reg: dict) -> dict[str, dict[str, Any]]:
+    """Return the exact worksheet shared with the canonical rights checker.
+
+    Phase receipts keep their compact ``assertions`` snapshot scoped to the
+    submission register. Their embedded ``attestation.document`` is the whole
+    package worksheet, though, because issue 16 consumes the same file. Bind the
+    overlapping contracts exactly and retain the earliest delivery phase that
+    may own each rights-only decision.
+    """
+    try:
+        rights, _ = read_contract_json(
+            RIGHTS_REGISTER.parent,
+            RIGHTS_REGISTER.name,
+            "rights attestation register",
+        )
+    except ValueError as exc:
+        raise ValueError("canonical full attestation register is unavailable") from exc
+    bindings = rights.get("bindings")
+    submission_binding = bindings.get("submission") if isinstance(bindings, dict) else None
+    source = submission_binding.get("source") if isinstance(submission_binding, dict) else None
+    if (
+        rights.get("schema") != "danse.rights.v1"
+        or not isinstance(source, dict)
+        or source.get("path") != "submission/screendance-2027.yaml"
+        or source.get("sha256") != sha256(REGISTER)
+    ):
+        raise ValueError("canonical full attestation register has a stale submission binding")
+
+    gates = rights.get("human_gates")
+    if not isinstance(gates, list) or not all(isinstance(gate, dict) for gate in gates):
+        raise ValueError("canonical full attestation register has malformed gates")
+    contracts: dict[str, dict[str, Any]] = {}
+    for gate in gates:
+        attestation = gate.get("attestation")
+        if attestation is None:
+            continue
+        if not isinstance(attestation, dict) or set(attestation) != {"key", "kind", "values"}:
+            raise ValueError("canonical full attestation register has a malformed contract")
+        key = attestation.get("key")
+        kind = attestation.get("kind")
+        values = attestation.get("values")
+        if not isinstance(key, str) or not key or key in contracts:
+            raise ValueError("canonical full attestation register repeats or omits a gate key")
+        if kind == "boolean":
+            normalized_kind = "manual"
+            if values != [True]:
+                raise ValueError(f"canonical full attestation gate {key} is not true-only")
+        elif kind == "choice":
+            normalized_kind = "choice"
+            if (
+                not isinstance(values, list)
+                or len(values) < 2
+                or not all(isinstance(value, str) and value for value in values)
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(f"canonical full attestation gate {key} has invalid choices")
+        else:
+            raise ValueError(f"canonical full attestation gate {key} has an unknown kind")
+        required_for = gate.get("required_for")
+        owned_phases = [
+            candidate
+            for candidate in PHASES
+            if isinstance(required_for, list) and candidate in required_for
+        ]
+        if not owned_phases:
+            raise ValueError(f"canonical full attestation gate {key} has no delivery phase")
+        contracts[key] = {
+            "kind": normalized_kind,
+            "values": values,
+            "phase": owned_phases[0],
+        }
+
+    submission_contracts = assertion_contracts(reg, "submitted")
+    submission_phases = {
+        item["id"]: item.get("phase")
+        for section in OWNED_SECTIONS
+        for item in reg.get(section, [])
+        if isinstance(item, dict)
+        and item.get("check") in {"manual", "choice"}
+        and isinstance(item.get("id"), str)
+    }
+    for key, contract in submission_contracts.items():
+        rights_contract = contracts.get(key)
+        if rights_contract is None:
+            raise ValueError(f"submission assertion {key} has no canonical rights gate")
+        if (
+            {field: rights_contract[field] for field in ("kind", "values")} != contract
+            or rights_contract["phase"] != submission_phases.get(key)
+        ):
+            raise ValueError(f"submission assertion {key} disagrees with its canonical rights gate")
+    return contracts
+
+
+def validate_full_attestation_snapshot(
+    values: object,
+    contracts: dict[str, dict[str, Any]],
+    phase: str,
+    label: str,
+) -> list[str]:
+    """Validate the complete worksheet without allowing later human acts early."""
+    if not isinstance(values, dict):
+        return [f"{label} has no full attestation snapshot"]
+    errors: list[str] = []
+    if set(values) != set(contracts):
+        errors.append(f"{label} full attestation census is not exact")
+    selected = PHASES.index(phase)
+    for key, contract in contracts.items():
+        value = values.get(key)
+        if PHASES.index(contract["phase"]) > selected:
+            if value is not None:
+                errors.append(f"{label} prematurely asserts later-phase gate {key}")
+            continue
+        if contract["kind"] == "manual" and value is not True:
+            errors.append(f"{label} does not affirm {key}")
+        elif contract["kind"] == "choice" and value not in contract["values"]:
+            errors.append(f"{label} has no registered choice for {key}")
+    return errors
+
+
+def validate_assertion_snapshot(
+    values: object,
+    contracts: dict[str, dict[str, Any]],
+    label: str,
+) -> list[str]:
+    if not isinstance(values, dict):
+        return [f"{label} has no assertion snapshot"]
+    errors: list[str] = []
+    if set(values) != set(contracts):
+        errors.append(f"{label} assertion census is not exact")
+    for key, contract in contracts.items():
+        value = values.get(key)
+        if contract["kind"] == "manual" and value is not True:
+            errors.append(f"{label} does not affirm {key}")
+        elif contract["kind"] == "choice" and value not in contract["values"]:
+            errors.append(f"{label} has no registered choice for {key}")
+    return errors
+
+
+def package_binding_errors(
+    value: object,
+    expected: dict[str, str],
+    label: str,
+) -> list[str]:
+    if not isinstance(value, dict) or set(value) != {
+        "manifest",
+        "manifest_sha256",
+        "repository_head",
+    }:
+        return [f"{label} has no exact package binding"]
+    errors: list[str] = []
+    if value != expected:
+        errors.append(f"{label} names a different package manifest or repository head")
+    return errors
+
+
+def opportunity_binding_errors(value: object, reg: dict, label: str) -> list[str]:
+    snapshot = reg.get("opportunity_snapshot") or {}
+    expected = {
+        "snapshot_id": snapshot.get("snapshot_id"),
+        "sha256": snapshot.get("sha256"),
+    }
+    if not isinstance(value, dict) or set(value) != set(expected) or value != expected:
+        return [f"{label} names a different opportunity snapshot"]
+    if not isinstance(expected["sha256"], str) or not HEX64.fullmatch(expected["sha256"]):
+        return ["submission register has no exact opportunity digest"]
+    return []
+
+
+def deadline_binding(reg: dict) -> tuple[dict[str, str], datetime, datetime]:
+    """Return the exact named-zone operational instants owned by the register."""
+    deadline = reg.get("deadline")
+    snapshot = reg.get("opportunity_snapshot")
+    if not isinstance(deadline, dict) or not isinstance(snapshot, dict):
+        raise ValueError("submission register has no deadline contract")
+    zone_name = snapshot.get("timezone")
+    if not isinstance(zone_name, str):
+        raise ValueError("submission register has no named deadline timezone")
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("submission register deadline timezone is unavailable") from exc
+    upload_target = register_timestamp(
+        deadline.get("upload_target"),
+        "submission register upload target",
+    )
+    hard_wall = register_timestamp(
+        deadline.get("hard_wall"),
+        "submission register hard wall",
+    )
+    for label, instant in (("upload target", upload_target), ("hard wall", hard_wall)):
+        local = instant.astimezone(zone)
+        if (
+            local.replace(tzinfo=None) != instant.replace(tzinfo=None)
+            or local.utcoffset() != instant.utcoffset()
+        ):
+            raise ValueError(f"submission register {label} disagrees with its named timezone")
+    if upload_target >= hard_wall:
+        raise ValueError("submission register upload target is not before its hard wall")
+    return (
+        {
+            "timezone": zone_name,
+            "upload_target": deadline["upload_target"],
+            "hard_wall": deadline["hard_wall"],
+        },
+        upload_target,
+        hard_wall,
+    )
+
+
+def canonical_phase_signer(phase: str) -> str:
+    """Derive the public signer identity from the canonical redacted rights gate."""
+    try:
+        rights, _ = read_contract_json(
+            RIGHTS_REGISTER.parent,
+            RIGHTS_REGISTER.name,
+            "rights authority register",
+        )
+    except ValueError as exc:
+        raise ValueError("canonical signer authority register is unavailable") from exc
+    bindings = rights.get("bindings")
+    submission_binding = bindings.get("submission") if isinstance(bindings, dict) else None
+    binding = submission_binding.get("source") if isinstance(submission_binding, dict) else None
+    if (
+        rights.get("schema") != "danse.rights.v1"
+        or not isinstance(binding, dict)
+        or binding.get("path") != "submission/screendance-2027.yaml"
+        or binding.get("sha256") != sha256(REGISTER)
+    ):
+        raise ValueError("canonical signer authority register has a stale submission binding")
+    gates = rights.get("human_gates")
+    if not isinstance(gates, list) or not all(isinstance(gate, dict) for gate in gates):
+        raise ValueError("canonical signer authority register has malformed gates")
+    by_key: dict[str, str] = {}
+    for gate in gates:
+        attestation = gate.get("attestation")
+        if not isinstance(attestation, dict) or not isinstance(attestation.get("key"), str):
+            continue
+        authority = gate.get("authority")
+        if not isinstance(authority, str):
+            continue
+        key = attestation["key"]
+        if key in by_key:
+            raise ValueError(f"canonical signer authority repeats gate {key}")
+        by_key[key] = authority
+    names: set[str] = set()
+    for key in PHASE_SIGNER_GATES[phase]:
+        authority = by_key.get(key)
+        if authority is None:
+            raise ValueError(f"canonical signer authority is missing gate {key}")
+        for suffix in (" as the account owner", " as the applicant"):
+            if authority.endswith(suffix):
+                authority = authority[: -len(suffix)]
+                break
+        names.add(recorded_by(authority, "canonical signer authority"))
+    if len(names) != 1:
+        raise ValueError("canonical signer gates do not name one exact public authority")
+    return names.pop()
+
+
+def signer_errors(value: object, phase: str, label: str) -> list[str]:
+    if not isinstance(value, dict) or set(value) != {"name", "role"}:
+        return [f"{label} has no exact signer identity"]
+    errors: list[str] = []
+    try:
+        name = recorded_by(value.get("name"), f"{label} signer")
+    except ValueError as exc:
+        errors.append(str(exc))
+    else:
+        try:
+            expected_name = canonical_phase_signer(phase)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            if name != expected_name:
+                errors.append(f"{label} signer is not the canonical phase authority")
+    if value.get("role") != PHASE_SIGNER_ROLES[phase]:
+        errors.append(f"{label} signer has the wrong phase role")
+    return errors
+
+
+def attestation_snapshot(
+    reg: dict,
+    attested: dict[str, Any],
+    phase: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    contracts = assertion_contracts(reg, phase)
+    values = {key: attested.get(key) for key in sorted(contracts)}
+    return values, contracts
+
+
+def attestation_binding_errors(
+    attestation_value: object,
+    assertions_value: object,
+    reg: dict,
+    attested: dict[str, Any],
+    attestation_path: Path | None,
+    phase: str,
+    label: str,
+    *,
+    selected: bool,
+) -> list[str]:
+    current_values, contracts = attestation_snapshot(reg, attested, phase)
+    if attestation_path is None:
+        return [
+            *validate_assertion_snapshot(current_values, contracts, "package attestation"),
+            f"{label} cannot bind a missing or invalid attest.yaml",
+        ]
+    errors = validate_assertion_snapshot(current_values, contracts, "package attestation")
+    embedded: dict[str, Any] = {}
+    expected_attestation_fields = {"path", "sha256", "canonical_sha256", "document"}
+    if not isinstance(attestation_value, dict) or set(attestation_value) != expected_attestation_fields:
+        errors.append(f"{label} has no exact full-attestation binding")
+    else:
+        document = attestation_value.get("document")
+        try:
+            embedded = parse_attestation_document(document, label)
+        except ValueError as exc:
+            errors.append(str(exc))
+        try:
+            all_contracts = full_attestation_contracts(reg)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            errors.extend(
+                validate_full_attestation_snapshot(
+                    embedded,
+                    all_contracts,
+                    phase,
+                    label,
+                )
+            )
+        if isinstance(document, str):
+            document_sha256 = hashlib.sha256(document.encode("utf-8")).hexdigest()
+            if attestation_value.get("sha256") != document_sha256:
+                errors.append(f"{label} attestation document digest is stale")
+        if attestation_value.get("canonical_sha256") != canonical_json_sha256(embedded):
+            errors.append(f"{label} canonical attestation digest is stale")
+        for field in ("sha256", "canonical_sha256"):
+            candidate = attestation_value.get(field)
+            if not isinstance(candidate, str) or not HEX64.fullmatch(candidate):
+                errors.append(f"{label} has no exact attestation {field}")
+        if attestation_value.get("path") != "attest.yaml":
+            errors.append(f"{label} names a different attestation source")
+        if selected:
+            try:
+                live_document = attestation_path.read_text(encoding="utf-8")
+                live_sha256 = sha256(attestation_path)
+            except (OSError, UnicodeDecodeError):
+                errors.append(f"{label} attestation source changed during validation")
+            else:
+                if (
+                    embedded != attested
+                    or document != live_document
+                    or attestation_value.get("sha256") != live_sha256
+                ):
+                    errors.append(f"{label} names a different full attestation snapshot")
+    embedded_values, _ = attestation_snapshot(reg, embedded, phase)
+    errors.extend(validate_assertion_snapshot(embedded_values, contracts, label))
+    if embedded_values != current_values:
+        errors.append(f"{label} cumulative assertions disagree with the current attestation")
+    expected_assertions = {
+        "sha256": canonical_json_sha256(embedded_values),
+        "values": embedded_values,
+    }
+    if not isinstance(assertions_value, dict) or set(assertions_value) != set(expected_assertions):
+        errors.append(f"{label} has no exact cumulative assertion binding")
+    elif assertions_value != expected_assertions:
+        errors.append(f"{label} names a different cumulative assertion snapshot")
+    return errors
+
+
+def prior_receipt_errors(
+    value: object,
+    prior_phase: str,
+    prior_path: Path,
+    prior_value: dict[str, Any],
+    label: str,
+) -> list[str]:
+    expected = {
+        "phase": prior_phase,
+        "path": PHASE_RECEIPTS[prior_phase],
+        "sha256": sha256(prior_path),
+        "receipt_id": prior_value.get("receipt_id"),
+    }
+    if not isinstance(value, dict) or set(value) != set(expected) or value != expected:
+        return [f"{label} has no exact prior-phase receipt binding"]
+    return []
+
+
+def phase_receipt_contract(
+    value: dict,
+    path: Path,
+    phase: str,
+    reg: dict,
+    package: dict[str, str],
+    attested: dict[str, Any],
+    attestation_path: Path | None,
+    *,
+    now: datetime,
+    selected: bool,
+    prior_phase: str | None = None,
+    prior_path: Path | None = None,
+    prior_value: dict[str, Any] | None = None,
+    prior_valid: bool = True,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate one strict human-authored phase receipt and its chain edge."""
+    label = f"{phase} receipt"
+    common = {
+        "schema",
+        "receipt_id",
+        "recorded_at",
+        "signer",
+        "package",
+        "opportunity",
+        "deadline",
+        "attestation",
+        "assertions",
+    }
+    event_key = None if phase == "package" else ("upload" if phase == "uploaded" else "submission")
+    expected_keys = common | ({"prior_receipt", event_key} if event_key else set())
+    errors: list[str] = receipt_schema_errors(value, label)
+    if set(value) != expected_keys:
+        errors.append(f"{label} has fields outside its typed contract")
+    if value.get("schema") != PHASE_RECEIPT_SCHEMAS[phase]:
+        errors.append(f"{label} has the wrong schema")
+    try:
+        receipt_id = typed_id(value.get("receipt_id"), label)
+    except ValueError as exc:
+        receipt_id = ""
+        errors.append(str(exc))
+    try:
+        recorded_at = receipt_timestamp(value.get("recorded_at"), label)
+    except ValueError as exc:
+        recorded_at = None
+        errors.append(str(exc))
+    else:
+        if recorded_at > now.astimezone(timezone.utc):
+            errors.append(f"{label} is dated in the future")
+    if prior_phase is None:
+        snapshot = reg.get("opportunity_snapshot")
+        try:
+            frozen_at = register_timestamp(
+                snapshot.get("frozen_at") if isinstance(snapshot, dict) else None,
+                "submission register opportunity freeze",
+            ).astimezone(timezone.utc)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            if recorded_at is not None and recorded_at < frozen_at:
+                errors.append(f"{label} predates the frozen opportunity snapshot")
+    errors.extend(signer_errors(value.get("signer"), phase, label))
+    errors.extend(package_binding_errors(value.get("package"), package, label))
+    errors.extend(opportunity_binding_errors(value.get("opportunity"), reg, label))
+    try:
+        expected_deadline, upload_target, hard_wall = deadline_binding(reg)
+    except ValueError as exc:
+        expected_deadline, upload_target, hard_wall = {}, None, None
+        errors.append(str(exc))
+    if (
+        not isinstance(value.get("deadline"), dict)
+        or set(value["deadline"]) != set(expected_deadline)
+        or value["deadline"] != expected_deadline
+    ):
+        errors.append(f"{label} names a different deadline contract")
+    errors.extend(
+        attestation_binding_errors(
+            value.get("attestation"),
+            value.get("assertions"),
+            reg,
+            attested,
+            attestation_path,
+            phase,
+            label,
+            selected=selected,
+        )
+    )
+
+    prior_recorded_at = None
+    if prior_phase is not None:
+        if prior_path is None or prior_value is None:
+            errors.append(f"{label} has no readable prior-phase receipt")
+        else:
+            errors.extend(
+                prior_receipt_errors(
+                    value.get("prior_receipt"),
+                    prior_phase,
+                    prior_path,
+                    prior_value,
+                    label,
+                )
+            )
+            try:
+                prior_recorded_at = receipt_timestamp(
+                    prior_value.get("recorded_at"),
+                    f"{prior_phase} receipt",
+                )
+            except ValueError:
+                errors.append(f"{label} chains from an invalid prior timestamp")
+        if not prior_valid:
+            errors.append(f"{label} chains from an invalid prior-phase receipt")
+        if recorded_at is not None and prior_recorded_at is not None and recorded_at < prior_recorded_at:
+            errors.append(f"{label} predates its prior-phase receipt")
+
+    event_at = None
+    if phase == "uploaded":
+        upload = value.get("upload")
+        if not isinstance(upload, dict) or set(upload) != {
+            "provider",
+            "asset_id",
+            "url",
+            "uploaded_at",
+            "manifest_item",
+            "sha256",
+        }:
+            errors.append("uploaded receipt has no exact destination-safe upload evidence")
+        else:
+            provider = upload.get("provider")
+            if not isinstance(provider, str) or not DESTINATION_ID.fullmatch(provider):
+                errors.append("uploaded receipt has no typed provider")
+            asset_id = upload.get("asset_id")
+            if not isinstance(asset_id, str) or not DESTINATION_ID.fullmatch(asset_id):
+                errors.append("uploaded receipt has no typed provider asset identifier")
+            try:
+                upload_url = https_url(upload.get("url"), "uploaded receipt destination")
+            except ValueError as exc:
+                upload_url = None
+                errors.append(str(exc))
+            if upload_url is not None:
+                parsed_upload = urlsplit(upload_url)
+                if provider != parsed_upload.hostname:
+                    errors.append("uploaded receipt provider does not equal its destination host")
+                if asset_id not in PurePosixPath(parsed_upload.path).parts:
+                    errors.append("uploaded receipt asset identifier is not bound into its destination URL")
+            item_name = upload.get("manifest_item")
+            item_digest = upload.get("sha256")
+            if (
+                not isinstance(item_name, str)
+                or PurePosixPath(item_name).name != item_name
+                or not item_name.startswith("screener.")
+                or Path(item_name).suffix.lower() not in VIDEO_SUFFIXES
+                or not isinstance(item_digest, str)
+                or not HEX64.fullmatch(item_digest)
+            ):
+                errors.append("uploaded receipt has no exact manifested screener identity")
+            else:
+                try:
+                    manifest, _ = read_contract_json(
+                        path.parent.parent,
+                        "manifest.json",
+                        "uploaded receipt package manifest",
+                    )
+                except ValueError as exc:
+                    errors.append(str(exc))
+                else:
+                    matches = [
+                        item
+                        for item in manifest.get("items", [])
+                        if isinstance(item, dict) and item.get("name") == item_name
+                    ] if isinstance(manifest.get("items"), list) else []
+                    if len(matches) != 1 or matches[0].get("sha256") != item_digest:
+                        errors.append("uploaded receipt does not bind the exact manifested screener digest")
+            try:
+                event_at = receipt_timestamp(upload.get("uploaded_at"), "uploaded receipt event")
+            except ValueError as exc:
+                errors.append(str(exc))
+            # A late upload remains truthful chain evidence.  The independent
+            # deadline gate below still fails closed unless this timestamp is at
+            # or before the canonical 18:00 target.
+    elif phase == "submitted":
+        submission = value.get("submission")
+        if not isinstance(submission, dict) or set(submission) != {
+            "portal",
+            "confirmation_id",
+            "submitted_at",
+        }:
+            errors.append("submitted receipt has no exact destination-safe filing evidence")
+        else:
+            try:
+                portal = https_url(submission.get("portal"), "submitted receipt portal")
+            except ValueError as exc:
+                portal = None
+                errors.append(str(exc))
+            if portal is not None and portal != reg.get("portal"):
+                errors.append("submitted receipt names a different filing portal")
+            confirmation = submission.get("confirmation_id")
+            if not isinstance(confirmation, str) or not DESTINATION_ID.fullmatch(confirmation):
+                errors.append("submitted receipt has no typed confirmation identifier")
+            try:
+                event_at = receipt_timestamp(
+                    submission.get("submitted_at"),
+                    "submitted receipt event",
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+            # A post-wall filing remains authentic historical evidence.  The
+            # independent deadline gate still fails closed unless this event is
+            # at or before the conservative 22:00 filing wall.
+
+    if event_at is not None:
+        if recorded_at is not None and event_at > recorded_at:
+            errors.append(f"{label} was recorded before its claimed event")
+        if prior_recorded_at is not None and event_at < prior_recorded_at:
+            errors.append(f"{label} event predates its prior-phase receipt")
+        if event_at > now.astimezone(timezone.utc):
+            errors.append(f"{label} event is dated in the future")
+    return {
+        "phase": phase,
+        "receipt_id": receipt_id,
+        "recorded_at": recorded_at,
+        "event_at": event_at,
+        "path": path,
+        "sha256": sha256(path),
+    }, errors
+
+
+def check_phase_receipts(
+    reg: dict,
+    root: Path,
+    phase: str,
+    package: dict[str, str],
+    attested: dict[str, Any],
+    attestation_path: Path | None,
+    rep: Report,
+    *,
+    now: datetime | None = None,
+    replace_done_phase: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Require every human receipt through the selected cumulative phase."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    later_receipts: list[str] = []
+    for later in PHASES[PHASES.index(phase) + 1 :]:
+        for relative in (PHASE_RECEIPTS[later], DONE_RECEIPTS[later]):
+            candidate = root / relative
+            if candidate.exists() or candidate.is_symlink():
+                later_receipts.append(relative)
+    if later_receipts:
+        rep.add(
+            "phase receipts",
+            "phase-bounded receipt surface",
+            FAIL,
+            "later-phase receipts are not valid at this selected phase: "
+            + ", ".join(later_receipts),
+        )
+    try:
+        current_attested, current_attestation_path = read_attestations(root)
+    except ValueError as exc:
+        rep.add("phase receipts", "stable attestation input", FAIL, str(exc))
+        current_attested, current_attestation_path = {}, None
+    if current_attested != attested or current_attestation_path != attestation_path:
+        rep.add(
+            "phase receipts",
+            "stable attestation input",
+            FAIL,
+            "attest.yaml changed before receipt validation",
+        )
+    attested = current_attested
+    attestation_path = current_attestation_path
+    initial_attestation_digest = sha256(attestation_path) if attestation_path is not None else None
+    records: dict[str, dict[str, Any]] = {}
+    raw_values: dict[str, dict[str, Any]] = {}
+    paths: dict[str, Path] = {}
+    digests: dict[str, str] = {}
+    valid: dict[str, bool] = {}
+    seen_ids: set[str] = set()
+    for index, current in enumerate(PHASES[: PHASES.index(phase) + 1]):
+        label = f"{current} receipt"
+        try:
+            value, path = read_contract_json(root, PHASE_RECEIPTS[current], label)
+        except ValueError as exc:
+            rep.add("phase receipts", label, FAIL, str(exc))
+            valid[current] = False
+            continue
+        prior = PHASES[index - 1] if index else None
+        record, errors = phase_receipt_contract(
+            value,
+            path,
+            current,
+            reg,
+            package,
+            attested,
+            attestation_path,
+            now=now,
+            selected=current == phase,
+            prior_phase=prior,
+            prior_path=paths.get(prior) if prior else None,
+            prior_value=raw_values.get(prior) if prior else None,
+            prior_valid=valid.get(prior, False) if prior else True,
+        )
+        if record["receipt_id"] in seen_ids:
+            errors.append(f"{label} reuses an earlier receipt identifier")
+        elif record["receipt_id"]:
+            seen_ids.add(record["receipt_id"])
+        raw_values[current] = value
+        paths[current] = path
+        digests[current] = record["sha256"]
+        valid[current] = not errors
+        if not errors:
+            records[current] = record
+        rep.add(
+            "phase receipts",
+            label,
+            FAIL if errors else PASS,
+            "; ".join(errors[:6])
+            if errors
+            else f"{record['receipt_id']} · {record['sha256'][:16]}…",
+        )
+    changed: list[str] = []
+    for current, path in paths.items():
+        try:
+            if sha256(path) != digests[current]:
+                changed.append(current)
+        except OSError:
+            changed.append(current)
+    try:
+        final_attested, final_attestation_path = read_attestations(root)
+        final_attestation_digest = sha256(final_attestation_path)
+    except (ValueError, OSError):
+        final_attested, final_attestation_path, final_attestation_digest = None, None, None
+    if (
+        changed
+        or final_attested != attested
+        or final_attestation_path != attestation_path
+        or final_attestation_digest != initial_attestation_digest
+    ):
+        detail = (
+            f"phase receipt bytes changed: {', '.join(changed)}"
+            if changed
+            else "attest.yaml changed during receipt validation"
+        )
+        rep.add("phase receipts", "stable receipt inputs", FAIL, detail)
+        records = {}
+    for current in PHASES[: PHASES.index(phase) + 1]:
+        if current == replace_done_phase:
+            continue
+        relative = DONE_RECEIPTS[current]
+        candidate = root / relative
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        label = f"validated-{current} receipt"
+        try:
+            value, path = read_contract_json(root, relative, label)
+        except ValueError as exc:
+            local_errors = [str(exc)]
+        else:
+            local_errors = validate_done_receipt(
+                value,
+                path,
+                root,
+                current,
+                package,
+                {
+                    receipt_phase: records[receipt_phase]
+                    for receipt_phase in PHASES[: PHASES.index(current) + 1]
+                    if receipt_phase in records
+                },
+                now=now,
+            )
+        rep.add(
+            "phase receipts",
+            label,
+            FAIL if local_errors else PASS,
+            "; ".join(local_errors[:6]) if local_errors else "exact local validation binding",
+        )
+    return records
+
+
+def canonical_utc(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def done_receipt_rows(
+    phase: str,
+    records: dict[str, dict[str, Any]],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for current in PHASES[: PHASES.index(phase) + 1]:
+        record = records.get(current)
+        if not record:
+            raise ValueError(f"cannot record validation without a valid {current} receipt")
+        path = record.get("path")
+        if not isinstance(path, Path) or not path.is_file() or path.is_symlink():
+            raise ValueError(f"cannot record validation with an unsafe {current} receipt")
+        digest = sha256(path)
+        if digest != record.get("sha256"):
+            raise ValueError(f"{current} receipt changed before validation was recorded")
+        rows.append(
+            {
+                "phase": current,
+                "path": PHASE_RECEIPTS[current],
+                "sha256": digest,
+                "receipt_id": str(record["receipt_id"]),
+            }
+        )
+    return rows
+
+
+def live_attestation_binding_errors(
+    root: Path,
+    phase: str,
+    records: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Bind the selected human receipt to the still-live attest.yaml bytes."""
+    label = f"{phase} receipt"
+    record = records.get(phase)
+    if not isinstance(record, dict):
+        return [f"{label} is unavailable for live attestation validation"]
+    try:
+        receipt, receipt_path = read_contract_json(root, PHASE_RECEIPTS[phase], label)
+        receipt_digest = sha256(receipt_path)
+        live_values, live_path = read_attestations(root)
+        live_document = live_path.read_text(encoding="utf-8")
+        live_digest = sha256(live_path)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return [f"{label} cannot bind the live attestation ({type(exc).__name__})"]
+    record_path = record.get("path")
+    try:
+        same_receipt = isinstance(record_path, Path) and record_path.samefile(receipt_path)
+    except OSError:
+        same_receipt = False
+    if not same_receipt or record.get("sha256") != receipt_digest:
+        return [f"{label} changed before live attestation validation"]
+    attestation = receipt.get("attestation")
+    if not isinstance(attestation, dict):
+        return [f"{label} has no exact live attestation binding"]
+    if (
+        set(attestation) != {"path", "sha256", "canonical_sha256", "document"}
+        or attestation.get("path") != "attest.yaml"
+        or attestation.get("document") != live_document
+        or attestation.get("sha256") != live_digest
+        or attestation.get("canonical_sha256") != canonical_json_sha256(live_values)
+    ):
+        return [f"{label} no longer matches the live attestation"]
+    try:
+        if sha256(receipt_path) != receipt_digest or sha256(live_path) != live_digest:
+            return [f"{label} or attest.yaml changed during live attestation validation"]
+    except OSError:
+        return [f"{label} or attest.yaml changed during live attestation validation"]
+    return []
+
+
+def validate_done_receipt(
+    value: dict,
+    path: Path,
+    root: Path,
+    phase: str,
+    package: dict[str, str],
+    records: dict[str, dict[str, Any]],
+    *,
+    now: datetime,
+    require_destination: bool = True,
+    require_live_attestation: bool = False,
+) -> list[str]:
+    """Validate the machine-only record emitted after done.sh's full batch."""
+    label = "local validation receipt"
+    errors: list[str] = receipt_schema_errors(value, label)
+    if set(value) != {
+        "schema",
+        "scope",
+        "phase",
+        "validated_at",
+        "repository_head",
+        "package",
+        "phase_receipts",
+        "predicates",
+    }:
+        errors.append(f"{label} has fields outside its typed contract")
+    if value.get("schema") != DONE_RECEIPT_SCHEMA:
+        errors.append(f"{label} has the wrong schema")
+    if value.get("scope") != DONE_RECEIPT_SCOPE:
+        errors.append(f"{label} claims a different validation scope")
+    if value.get("phase") != phase:
+        errors.append(f"{label} names a different phase")
+    try:
+        validated_at = receipt_timestamp(value.get("validated_at"), label)
+    except ValueError as exc:
+        validated_at = None
+        errors.append(str(exc))
+    else:
+        if validated_at > now.astimezone(timezone.utc) + timedelta(seconds=1):
+            errors.append(f"{label} is dated in the future")
+    if value.get("repository_head") != package.get("repository_head"):
+        errors.append(f"{label} names a different repository head")
+    errors.extend(package_binding_errors(value.get("package"), package, label))
+    fresh_package, _, identity_errors = validate_package_identity(root)
+    if identity_errors:
+        errors.append(f"{label} package identity is no longer valid: {identity_errors[0]}")
+    elif fresh_package != package:
+        errors.append(f"{label} package identity changed after phase validation")
+    try:
+        expected_rows = done_receipt_rows(phase, records)
+    except ValueError as exc:
+        expected_rows = []
+        errors.append(str(exc))
+    if value.get("phase_receipts") != expected_rows:
+        errors.append(f"{label} does not bind the exact cumulative receipt chain")
+    if require_live_attestation:
+        errors.extend(live_attestation_binding_errors(root, phase, records))
+    expected_predicates = [command.format(phase=phase) for command in DONE_PREDICATES]
+    if value.get("predicates") != expected_predicates:
+        errors.append(f"{label} has a different predicate census")
+    if require_destination:
+        try:
+            destination_value, destination_path = read_contract_json(
+                root,
+                DONE_RECEIPTS[phase],
+                label,
+            )
+            same_destination = path.samefile(destination_path)
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+        else:
+            if not same_destination:
+                errors.append(f"{label} destination is not its canonical phase path")
+            if destination_value != value:
+                errors.append(f"{label} value does not equal its secure destination bytes")
+    return errors
+
+
+def write_done_receipt(
+    root: Path,
+    phase: str,
+    package: dict[str, str],
+    records: dict[str, dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> tuple[Path, str]:
+    """Atomically persist, then descriptor-re-read, the machine validation record."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    root = root.absolute()
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("cannot write a validation receipt into an unsafe package root")
+    directory_flags = secure_directory_flags()
+    relative = DONE_RECEIPTS[phase]
+    destination = root / relative
+    destination_name = PurePosixPath(relative).name
+    root_fd = receipt_fd = temporary_fd = result_fd = None
+    temporary_name: str | None = None
+    temporary_info: os.stat_result | None = None
+    try:
+        root_fd = os.open(root, directory_flags)
+        root_info = os.fstat(root_fd)
+        if directory_identity(root_info) != directory_identity(os.stat(root, follow_symlinks=False)):
+            raise ValueError("validation receipt package root changed during publication")
+
+        try:
+            os.mkdir("receipts", mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        receipt_fd = os.open("receipts", directory_flags, dir_fd=root_fd)
+        receipt_info = os.fstat(receipt_fd)
+        acquire_publication_lease(receipt_fd)
+        assert_receipt_directory_binding(root, root_fd, root_info, receipt_fd, receipt_info)
+        # Synchronize the parent even when another process created ``receipts``
+        # immediately before this invocation opened it.  That makes the pinned
+        # child directory entry durable before any receipt can be published.
+        os.fsync(root_fd)
+        recover_publication_residue(receipt_fd, destination_name)
+        assert_receipt_directory_binding(root, root_fd, root_info, receipt_fd, receipt_info)
+
+        fresh_package, pinned_rows, identity_errors = validate_pinned_publication_inputs(
+            root_fd,
+            phase,
+            package,
+            records,
+        )
+        if identity_errors:
+            raise ValueError(
+                f"cannot record validation for an invalid current package: {identity_errors[0]}"
+            )
+        if fresh_package != package:
+            raise ValueError("cannot record validation after the package identity changed")
+        if directory_identity(root_info) != directory_identity(os.stat(root, follow_symlinks=False)):
+            raise ValueError("validation receipt package root changed during validation")
+
+        common_flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+        def existing_done_receipt() -> tuple[Path, str]:
+            """Return one already-published exact receipt without rewriting it."""
+            assert_receipt_directory_binding(root, root_fd, root_info, receipt_fd, receipt_info)
+            descriptor = os.open(
+                destination_name,
+                os.O_RDONLY | common_flags,
+                dir_fd=receipt_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                assert_secure_receipt_file(before, "validation receipt destination")
+                anchored = descriptor_bytes(
+                    descriptor,
+                    max_bytes=DONE_RECEIPT_MAX_BYTES,
+                )
+                after = os.fstat(descriptor)
+                named = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+                assert_secure_receipt_file(after, "validation receipt destination")
+                assert_secure_receipt_file(named, "validation receipt destination")
+                if (
+                    (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    )
+                    != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    )
+                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                ):
+                    raise ValueError("validation receipt destination changed during validation")
+                value = unique_json_bytes(anchored, "local validation receipt")
+                errors = validate_done_receipt(
+                    value,
+                    destination,
+                    root,
+                    phase,
+                    package,
+                    records,
+                    now=now,
+                    require_destination=False,
+                    require_live_attestation=True,
+                )
+                if errors:
+                    raise ValueError("; ".join(errors[:6]))
+                _, final_rows, pinned_errors = validate_pinned_publication_inputs(
+                    root_fd,
+                    phase,
+                    package,
+                    records,
+                    publication_relative=relative,
+                )
+                if pinned_errors:
+                    raise ValueError("; ".join(pinned_errors[:6]))
+                if value.get("phase_receipts") != final_rows:
+                    raise ValueError(
+                        "local validation receipt does not bind the pinned cumulative receipt chain"
+                    )
+                sync_regular_descriptor(descriptor)
+                os.fsync(receipt_fd)
+                durable_before = os.fstat(descriptor)
+                durable = descriptor_bytes(
+                    descriptor,
+                    max_bytes=DONE_RECEIPT_MAX_BYTES,
+                )
+                durable_after = os.fstat(descriptor)
+                durable_named = os.stat(
+                    destination_name,
+                    dir_fd=receipt_fd,
+                    follow_symlinks=False,
+                )
+                assert_secure_receipt_file(
+                    durable_after,
+                    "validation receipt destination",
+                )
+                assert_secure_receipt_file(
+                    durable_named,
+                    "validation receipt destination",
+                )
+                if (
+                    durable != anchored
+                    or descriptor_stat_signature(durable_after)
+                    != descriptor_stat_signature(durable_before)
+                    or descriptor_stat_signature(durable_named)
+                    != descriptor_stat_signature(durable_after)
+                ):
+                    raise ValueError(
+                        "validation receipt destination changed during durable validation"
+                    )
+                assert_receipt_directory_binding(
+                    root,
+                    root_fd,
+                    root_info,
+                    receipt_fd,
+                    receipt_info,
+                )
+                assert_final_receipt_snapshot(
+                    root,
+                    root_fd,
+                    root_info,
+                    receipt_fd,
+                    receipt_info,
+                    descriptor,
+                    durable_after,
+                    destination_name,
+                )
+                # This composite descriptor-rooted census is deliberately the
+                # last substantive operation. It revalidates every package,
+                # repository, attestation, and chain input together with the
+                # exact secure destination inode and bytes.
+                _, durable_rows, durable_errors = validate_pinned_publication_inputs(
+                    root_fd,
+                    phase,
+                    package,
+                    records,
+                    publication_relative=relative,
+                    expected_publication=anchored,
+                )
+                if durable_errors:
+                    raise ValueError("; ".join(durable_errors[:6]))
+                if value.get("phase_receipts") != durable_rows:
+                    raise ValueError(
+                        "local validation receipt does not bind the durable cumulative receipt chain"
+                    )
+                return destination, hashlib.sha256(anchored).hexdigest()
+            finally:
+                os.close(descriptor)
+
+        try:
+            existing = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            assert_secure_receipt_file(existing, "validation receipt destination")
+            return existing_done_receipt()
+
+        payload = {
+            "schema": DONE_RECEIPT_SCHEMA,
+            "scope": DONE_RECEIPT_SCOPE,
+            "phase": phase,
+            "validated_at": canonical_utc(now),
+            "repository_head": package.get("repository_head"),
+            "package": package,
+            "phase_receipts": pinned_rows,
+            "predicates": [command.format(phase=phase) for command in DONE_PREDICATES],
+        }
+        rendered = (
+            json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        if len(rendered) > DONE_RECEIPT_MAX_BYTES:
+            raise ValueError("validation receipt exceeds the receipt byte limit")
+        errors = validate_done_receipt(
+            payload,
+            destination,
+            root,
+            phase,
+            package,
+            records,
+            now=now,
+            require_destination=False,
+            require_live_attestation=True,
+        )
+        if errors:
+            raise ValueError("; ".join(errors[:6]))
+
+        for _ in range(16):
+            candidate = f".{destination_name}.{os.getpid()}-{os.urandom(8).hex()}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | common_flags,
+                    0o600,
+                    dir_fd=receipt_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise OSError("cannot reserve a validation receipt staging file")
+        temporary_info = os.fstat(temporary_fd)
+        assert_secure_receipt_file(temporary_info, "validation receipt staging file")
+        remaining = memoryview(rendered)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("short validation receipt write")
+            remaining = remaining[written:]
+        os.fchmod(temporary_fd, 0o400)
+        temporary_info = os.fstat(temporary_fd)
+        assert_secure_receipt_file(temporary_info, "validation receipt staging file")
+        sync_regular_descriptor(temporary_fd)
+        temporary_before_read = os.fstat(temporary_fd)
+        staged = descriptor_bytes(
+            temporary_fd,
+            max_bytes=DONE_RECEIPT_MAX_BYTES,
+        )
+        temporary_after = os.fstat(temporary_fd)
+        named_temporary = os.stat(
+            temporary_name,
+            dir_fd=receipt_fd,
+            follow_symlinks=False,
+        )
+        assert_secure_receipt_file(temporary_after, "validation receipt staging file")
+        assert_secure_receipt_file(named_temporary, "validation receipt staging file")
+        if (
+            not stat.S_ISREG(temporary_after.st_mode)
+            or temporary_after.st_nlink != 1
+            or temporary_after.st_size != len(rendered)
+            or staged != rendered
+            or (
+                temporary_after.st_dev,
+                temporary_after.st_ino,
+                temporary_after.st_size,
+                temporary_after.st_mtime_ns,
+                temporary_after.st_ctime_ns,
+            )
+            != (
+                temporary_before_read.st_dev,
+                temporary_before_read.st_ino,
+                temporary_before_read.st_size,
+                temporary_before_read.st_mtime_ns,
+                temporary_before_read.st_ctime_ns,
+            )
+            or (temporary_after.st_dev, temporary_after.st_ino)
+            != (temporary_info.st_dev, temporary_info.st_ino)
+            or (named_temporary.st_dev, named_temporary.st_ino)
+            != (temporary_info.st_dev, temporary_info.st_ino)
+        ):
+            raise ValueError("validation receipt staging file changed before publication")
+
+        # Re-run the complete package/repository/attestation/chain census after
+        # the staged bytes exist. The pinned descriptor admits only this exact
+        # transient name in addition to the typed package surface.
+        staging_relative = f"receipts/{temporary_name}"
+        fresh_package, final_rows, identity_errors = validate_pinned_publication_inputs(
+            root_fd,
+            phase,
+            package,
+            records,
+            publication_relative=staging_relative,
+        )
+        if identity_errors:
+            detail = identity_errors[0]
+            raise ValueError(f"package changed before validation receipt publication: {detail}")
+        if fresh_package != package:
+            raise ValueError("package identity changed before validation receipt publication")
+        if payload["phase_receipts"] != final_rows:
+            raise ValueError("phase receipt chain changed before validation receipt publication")
+        assert_receipt_directory_binding(root, root_fd, root_info, receipt_fd, receipt_info)
+        final_before_read = os.fstat(temporary_fd)
+        final_staged = descriptor_bytes(
+            temporary_fd,
+            max_bytes=DONE_RECEIPT_MAX_BYTES,
+        )
+        final_after_read = os.fstat(temporary_fd)
+        final_temporary = os.stat(
+            temporary_name,
+            dir_fd=receipt_fd,
+            follow_symlinks=False,
+        )
+        assert_secure_receipt_file(final_after_read, "validation receipt staging file")
+        assert_secure_receipt_file(final_temporary, "validation receipt staging file")
+        if (
+            not stat.S_ISREG(final_after_read.st_mode)
+            or final_after_read.st_nlink != 1
+            or final_after_read.st_size != len(rendered)
+            or final_staged != rendered
+            or (
+                final_after_read.st_dev,
+                final_after_read.st_ino,
+                final_after_read.st_size,
+                final_after_read.st_mtime_ns,
+                final_after_read.st_ctime_ns,
+            )
+            != (
+                final_before_read.st_dev,
+                final_before_read.st_ino,
+                final_before_read.st_size,
+                final_before_read.st_mtime_ns,
+                final_before_read.st_ctime_ns,
+            )
+            or (final_after_read.st_dev, final_after_read.st_ino)
+            != (temporary_info.st_dev, temporary_info.st_ino)
+            or (final_temporary.st_dev, final_temporary.st_ino)
+            != (temporary_info.st_dev, temporary_info.st_ino)
+        ):
+            raise ValueError("validation receipt staging file changed before atomic commit")
+        try:
+            exclusive_receipt_link(temporary_name, destination_name, receipt_fd)
+        except FileExistsError:
+            # Another publisher won the no-overwrite commit.  Remove only this
+            # writer's staging name, then accept the winner iff it is already the
+            # exact valid receipt for the same package and cumulative chain.
+            os.unlink(temporary_name, dir_fd=receipt_fd)
+            temporary_name = None
+            os.fsync(receipt_fd)
+            return existing_done_receipt()
+        except OSError:
+            # Some filesystems can report an ambiguous link result.  Continue as
+            # committed only when the fixed destination names our exact inode.
+            try:
+                linked = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+            except OSError:
+                raise
+            if (linked.st_dev, linked.st_ino) != (
+                temporary_info.st_dev,
+                temporary_info.st_ino,
+            ):
+                raise
+        try:
+            os.unlink(temporary_name, dir_fd=receipt_fd)
+            temporary_name = None
+            os.fsync(receipt_fd)
+
+            result_fd = os.open(destination_name, os.O_RDONLY | common_flags, dir_fd=receipt_fd)
+            result_before = os.fstat(result_fd)
+            named_result = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+            assert_secure_receipt_file(result_before, "validation receipt destination")
+            assert_secure_receipt_file(named_result, "validation receipt destination")
+            if (
+                not stat.S_ISREG(result_before.st_mode)
+                or result_before.st_nlink != 1
+                or (result_before.st_dev, result_before.st_ino)
+                != (temporary_info.st_dev, temporary_info.st_ino)
+                or (named_result.st_dev, named_result.st_ino)
+                != (temporary_info.st_dev, temporary_info.st_ino)
+            ):
+                raise ValueError("validation receipt destination changed during publication")
+            anchored = descriptor_bytes(
+                result_fd,
+                max_bytes=DONE_RECEIPT_MAX_BYTES,
+            )
+            result_after = os.fstat(result_fd)
+            assert_secure_receipt_file(result_after, "validation receipt destination")
+            if (
+                anchored != rendered
+                or (
+                    result_after.st_dev,
+                    result_after.st_ino,
+                    result_after.st_size,
+                    result_after.st_mtime_ns,
+                    result_after.st_ctime_ns,
+                )
+                != (
+                    result_before.st_dev,
+                    result_before.st_ino,
+                    result_before.st_size,
+                    result_before.st_mtime_ns,
+                    result_before.st_ctime_ns,
+                )
+            ):
+                raise ValueError("validation receipt bytes changed during publication")
+
+            # A successful commit may not be reported as ready if any package,
+            # repository, human receipt, or live-attestation input drifted in the
+            # final commit window.  The immutable receipt remains as evidence and
+            # the caller receives an explicit indeterminate result.
+            errors = validate_done_receipt(
+                payload,
+                destination,
+                root,
+                phase,
+                package,
+                records,
+                now=now,
+                require_destination=False,
+                require_live_attestation=True,
+            )
+            if errors:
+                raise ValueError("; ".join(errors[:6]))
+
+            assert_receipt_directory_binding(root, root_fd, root_info, receipt_fd, receipt_info)
+            final_result = os.stat(destination_name, dir_fd=receipt_fd, follow_symlinks=False)
+            final_descriptor_before = os.fstat(result_fd)
+            final_anchored = descriptor_bytes(
+                result_fd,
+                max_bytes=DONE_RECEIPT_MAX_BYTES,
+            )
+            final_descriptor_after = os.fstat(result_fd)
+            final_named = os.stat(
+                destination_name,
+                dir_fd=receipt_fd,
+                follow_symlinks=False,
+            )
+            assert_secure_receipt_file(
+                final_descriptor_after,
+                "validation receipt destination",
+            )
+            assert_secure_receipt_file(final_named, "validation receipt destination")
+            if (
+                final_anchored != rendered
+                or descriptor_stat_signature(final_descriptor_after)
+                != descriptor_stat_signature(final_descriptor_before)
+                or (final_descriptor_after.st_dev, final_descriptor_after.st_ino)
+                != (temporary_info.st_dev, temporary_info.st_ino)
+                or (final_result.st_dev, final_result.st_ino)
+                != (temporary_info.st_dev, temporary_info.st_ino)
+                or descriptor_stat_signature(final_named)
+                != descriptor_stat_signature(final_descriptor_after)
+            ):
+                raise ValueError("validation receipt destination changed after publication")
+            assert_final_receipt_snapshot(
+                root,
+                root_fd,
+                root_info,
+                receipt_fd,
+                receipt_info,
+                result_fd,
+                final_descriptor_after,
+                destination_name,
+            )
+            # Make the descriptor-root package/chain/attestation census and the
+            # exact destination-byte contract one final stable observation.
+            _, committed_rows, pinned_errors = validate_pinned_publication_inputs(
+                root_fd,
+                phase,
+                package,
+                records,
+                publication_relative=relative,
+                expected_publication=rendered,
+            )
+            if pinned_errors:
+                raise ValueError("; ".join(pinned_errors[:6]))
+            if payload["phase_receipts"] != committed_rows:
+                raise ValueError(
+                    "phase receipt chain changed after validation receipt publication"
+                )
+        except (OSError, ValueError) as exc:
+            raise OSError(
+                "validation receipt publication is indeterminate after atomic commit"
+            ) from exc
+        return destination, hashlib.sha256(anchored).hexdigest()
+    finally:
+        removed_temporary = False
+        if temporary_name is not None and receipt_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=receipt_fd)
+                removed_temporary = True
+            except FileNotFoundError:
+                pass
+        if removed_temporary and receipt_fd is not None:
+            try:
+                os.fsync(receipt_fd)
+            except OSError:
+                # Publication has already failed.  Preserve that primary error;
+                # this best-effort sync only prevents a cleaned staging name from
+                # reappearing after a crash.
+                pass
+        for descriptor in (result_fd, temporary_fd, receipt_fd, root_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def competition_audio_profile(spec: dict) -> tuple[dict, str, list[str]]:
@@ -463,47 +3453,75 @@ def durable_audio_render_receipt_errors(
 # ── register-level checks (no package needed) ──────────────────────────────────
 
 
-def check_deadline(reg: dict, phase: str, rep: Report, now: datetime | None = None) -> None:
-    d = reg["deadline"]
+def check_deadline(
+    reg: dict,
+    phase: str,
+    rep: Report,
+    now: datetime | None = None,
+    receipts: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    d = reg.get("deadline")
+    if not isinstance(d, dict):
+        rep.add("deadline", "contract", FAIL, "canonical deadline mapping is missing")
+        return
     try:
         zone = ZoneInfo(reg["opportunity_snapshot"]["timezone"])
     except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
         rep.add("deadline", "timezone", FAIL, "canonical named timezone is missing or unavailable")
         return
-    wall = datetime.fromisoformat(d["hard_wall"])
+    try:
+        _, target, wall = deadline_binding(reg)
+    except ValueError as exc:
+        rep.add("deadline", "contract", FAIL, str(exc))
+        return
     now = now or datetime.now(zone)
-    left = wall - now
-    days = left.days + left.seconds / 86400
+    if now.tzinfo is None or now.utcoffset() is None:
+        rep.add("deadline", "clock", FAIL, "validation clock has no UTC offset")
+        return
+    now = now.astimezone(zone)
+    receipts = receipts or {}
+    submitted_at = (receipts.get("submitted") or {}).get("event_at")
+    uploaded_at = (receipts.get("uploaded") or {}).get("event_at")
 
-    if days < 0:
-        if phase != "submitted":
-            rep.add("deadline", "hard wall", FAIL, f"passed {abs(days):.1f} days ago ({d['stated']})")
-            return
+    wall_left = (wall - now).total_seconds() / 86400
+    if wall_left < 0:
+        timely = isinstance(submitted_at, datetime) and submitted_at <= wall
+        rep.add(
+            "deadline",
+            "hard wall",
+            PASS if timely else FAIL,
+            f"passed {abs(wall_left):.1f} days ago; "
+            + (
+                f"submitted receipt proves filing at {submitted_at.astimezone(zone):%a %d %b %H:%M %Z}"
+                if timely
+                else "no timely submitted receipt closes the historical filing gate"
+            ),
+        )
+    else:
         rep.add(
             "deadline",
             "hard wall",
             PASS,
-            f"passed {abs(days):.1f} days ago; the submitted attestation owns historical filing proof",
+            f"{wall_left:.1f} days left → {wall.astimezone(zone):%a %d %b %H:%M %Z}",
+        )
+
+    target_left = (target - now).total_seconds() / 86400
+    if target_left < 0:
+        timely = isinstance(uploaded_at, datetime) and uploaded_at <= target
+        status = PASS if timely else FAIL
+        detail = (
+            f"uploaded receipt proves completion at {uploaded_at.astimezone(zone):%a %d %b %H:%M %Z}"
+            if timely
+            else "no timely uploaded receipt closes the elapsed target"
         )
     else:
-        # The register's wall is an internal filing buffer chosen ahead of both
-        # conflicting official statements. It is not a conversion of either one.
-        # Report against that operational wall, never against the stated string.
-        rep.add("deadline", "hard wall", PASS, f"{days:.1f} days left → {wall:%a %d %b %H:%M %Z}")
-
-    target = datetime.fromisoformat(d["target_file_date"] + "T12:00:00").replace(tzinfo=zone)
-    tdays = (target - now).days
-    status = PASS if tdays >= 0 or phase == "submitted" else OPEN
-    detail = (
-        "target passed; submitted-phase receipt now owns closure"
-        if tdays < 0 and phase == "submitted"
-        else "file early; panel sees timestamps"
-    )
+        status = PASS
+        detail = "upload early; the panel sees timestamps"
     rep.add(
         "deadline",
-        "target file date",
+        "upload target",
         status,
-        f"{d['target_file_date']} ({tdays:+d} days) — {detail}",
+        f"{target.astimezone(zone):%a %d %b %H:%M %Z} ({target_left:+.1f} days) — {detail}",
     )
 
 
@@ -526,6 +3544,49 @@ def check_unknowns(reg: dict, rep: Report) -> None:
 # ── package checks ─────────────────────────────────────────────────────────────
 
 
+def register_structure_errors(reg: dict) -> list[str]:
+    """Describe register shapes that downstream checks cannot interpret."""
+    errors: list[str] = []
+    for field in ("call", "presenter", "portal"):
+        if not isinstance(reg.get(field), str) or not reg[field]:
+            errors.append(f"{field} must be a non-empty string")
+    for section in OWNED_SECTIONS:
+        rows = reg.get(section)
+        if not isinstance(rows, list):
+            errors.append(f"{section} must be a list")
+            continue
+        errors.extend(
+            f"{section}[{index}] must be a mapping"
+            for index, item in enumerate(rows)
+            if not isinstance(item, dict)
+        )
+
+    for field in ("deadline", "opportunity_snapshot", "package"):
+        if not isinstance(reg.get(field), dict):
+            errors.append(f"{field} must be a mapping")
+
+    package = reg.get("package")
+    if isinstance(package, dict):
+        package_sections = (
+            "master",
+            "screener",
+            "stills",
+            "origin_still",
+            "trailer",
+            "audio",
+            "text",
+        )
+        for field in package_sections:
+            if not isinstance(package.get(field), dict):
+                errors.append(f"package.{field} must be a mapping")
+    unstated = reg.get("unstated")
+    if not isinstance(unstated, list):
+        errors.append("unstated must be a list")
+    elif not all(isinstance(item, dict) for item in unstated):
+        errors.append("unstated rows must be mappings")
+    return errors
+
+
 def check_requirement_phases(reg: dict, rep: Report) -> None:
     rep.add(
         "register",
@@ -533,8 +3594,20 @@ def check_requirement_phases(reg: dict, rep: Report) -> None:
         PASS if reg.get("schema") == "danse.submission.v2" else FAIL,
         str(reg.get("schema")),
     )
-    owned = [item for section in OWNED_SECTIONS for item in reg.get(section, [])]
-    invalid = [item.get("id", "<unnamed>") for item in owned if item.get("phase") not in PHASES]
+    structure_errors = register_structure_errors(reg)
+    raw_owned = [
+        item
+        for section in OWNED_SECTIONS
+        for item in (reg.get(section) if isinstance(reg.get(section), list) else [])
+    ]
+    owned = [item for item in raw_owned if isinstance(item, dict)]
+    invalid = [
+        str(item.get("id", "<unnamed>"))
+        for item in owned
+        if item.get("phase") not in PHASES
+    ]
+    invalid.extend("<non-record>" for item in raw_owned if not isinstance(item, dict))
+    invalid.extend(structure_errors)
     rep.add(
         "register",
         "requirement phase ownership",
@@ -543,8 +3616,37 @@ def check_requirement_phases(reg: dict, rep: Report) -> None:
         if not invalid
         else f"missing/invalid phase: {', '.join(invalid)}",
     )
-    term_errors = []
-    for item in reg.get("terms", []):
+    assertion_ids = [
+        item.get("id")
+        for item in owned
+        if item.get("check") in {"manual", "choice"}
+    ]
+    malformed_ids = [
+        value
+        for value in assertion_ids
+        if not isinstance(value, str) or not value or value != value.strip()
+    ]
+    duplicate_ids = sorted(
+        {
+            value
+            for value in assertion_ids
+            if isinstance(value, str) and assertion_ids.count(value) > 1
+        }
+    )
+    rep.add(
+        "register",
+        "unique assertion identity census",
+        PASS if not malformed_ids and not duplicate_ids else FAIL,
+        f"{len(assertion_ids)} unique typed assertion(s)"
+        if not malformed_ids and not duplicate_ids
+        else "malformed or duplicate assertion ids: "
+        + ", ".join([*(str(value) for value in malformed_ids[:3]), *duplicate_ids[:3]]),
+    )
+    terms = reg.get("terms") if isinstance(reg.get("terms"), list) else []
+    term_errors = [error for error in structure_errors if error.startswith("terms")]
+    for item in terms:
+        if not isinstance(item, dict):
+            continue
         name = item.get("id", "<unnamed>")
         source = item.get("source")
         if item.get("status") != "verified" or not item.get("checked") or not (
@@ -567,9 +3669,34 @@ def check_requirement_phases(reg: dict, rep: Report) -> None:
         "register",
         "published term provenance and choice contract",
         PASS if not term_errors else FAIL,
-        f"{len(reg.get('terms', []))} source-verified term(s)"
+        f"{len(terms)} source-verified term(s)"
         if not term_errors
         else "; ".join(term_errors),
+    )
+
+    package_errors: list[str] = []
+    package = reg.get("package")
+    if not isinstance(package, dict):
+        package_errors.append("package contract is missing")
+        audio = {}
+    else:
+        if package.get("classification") != "internal-delivery-spec":
+            package_errors.append("delivery specifications are not labelled internal")
+        if package.get("published_requirement") is not False:
+            package_errors.append("delivery specifications are misrepresented as published")
+        note = package.get("note")
+        if not isinstance(note, str) or "does not publish" not in note:
+            package_errors.append("delivery specification provenance note is missing")
+        audio = package.get("audio") if isinstance(package.get("audio"), dict) else {}
+    _, _, audio_errors = competition_audio_profile(audio)
+    package_errors.extend(audio_errors)
+    rep.add(
+        "register",
+        "internal delivery and audio-use contract",
+        PASS if not package_errors else FAIL,
+        "internal delivery targets · exact competition audio-use digest"
+        if not package_errors
+        else "; ".join(package_errors),
     )
 
 
@@ -629,10 +3756,18 @@ def check_rights(package: Path, phase: str, rep: Report) -> None:
     rep.add("rights", "redacted exact-manifest contract", PASS if not blockers else FAIL, detail)
 
 
-def check_attestations(reg: dict, root: Path, phase: str, rep: Report) -> None:
-    path = root / "attest.yaml"
-    attested = yaml.safe_load(path.read_text()) if path.exists() else {}
-    attested = attested or {}
+def check_attestations(
+    reg: dict,
+    root: Path,
+    phase: str,
+    rep: Report,
+) -> tuple[dict[str, Any], Path | None]:
+    try:
+        attested, path = read_attestations(root)
+    except ValueError as exc:
+        rep.add("attested through " + phase, "attest.yaml contract", FAIL, str(exc))
+        return {}, None
+    initial_digest = sha256(path)
     selected = PHASES.index(phase)
     for req in [item for section in OWNED_SECTIONS for item in reg.get(section, [])]:
         owner = req.get("phase")
@@ -661,6 +3796,19 @@ def check_attestations(reg: dict, root: Path, phase: str, rep: Report) -> None:
                 FAIL,
                 f"unattested in attest.yaml (owned by {owner}) — {req['rule']}",
             )
+    try:
+        final, final_path = read_attestations(root)
+    except ValueError:
+        final, final_path = None, None
+    if final != attested or final_path != path or sha256(path) != initial_digest:
+        rep.add(
+            f"attested through {phase}",
+            "stable attestation snapshot",
+            FAIL,
+            "attest.yaml changed during validation",
+        )
+        return {}, None
+    return attested, path
 
 
 def check_master(spec: dict, reg: dict, root: Path, rep: Report) -> None:
@@ -1052,6 +4200,37 @@ def check_audio(spec: dict, root: Path, rep: Report) -> None:
     )
 
 
+def check_score_motion(root: Path, rep: Report) -> None:
+    """Require machine-bound production A/B proof without implying acceptance."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "danse_submission_score_motion_contract",
+            SCORE_MOTION_CHECKER,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("score-to-motion contract loader is unavailable")
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        manifest = read_manifest(root)
+        errors = contract.packaged_receipt_errors(root, manifest, schema_root=HERE.parent)
+    except Exception as exc:
+        rep.add(
+            "score-to-motion",
+            "production A/B machine evidence",
+            FAIL,
+            f"validation failed ({type(exc).__name__}); human acceptance remains a separate attestation",
+        )
+        return
+    rep.add(
+        "score-to-motion",
+        "production A/B machine evidence",
+        FAIL if errors else PASS,
+        "; ".join(errors[:6])
+        if errors
+        else "exact score, choreography, span, audio PCM, renderer, and Git HEAD · human review not attested",
+    )
+
+
 def check_text(spec: dict, root: Path, rep: Report) -> None:
     folder = root / "text"
     for name, rule in spec.items():
@@ -1067,40 +4246,111 @@ def check_text(spec: dict, root: Path, rep: Report) -> None:
 # ── entry ──────────────────────────────────────────────────────────────────────
 
 
-def main() -> int:
+def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--package", type=Path, help="staged submission directory")
     ap.add_argument("--register", type=Path, default=REGISTER)
     ap.add_argument("--phase", choices=PHASES, default="package", help="cumulative delivery phase to validate")
+    ap.add_argument(
+        "--write-done-receipt",
+        action="store_true",
+        help="after every predicate passes, atomically record this machine-only validation",
+    )
     args = ap.parse_args()
 
-    reg = yaml.safe_load(args.register.read_text())
+    try:
+        reg = yaml.load(args.register.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        print(f"submission register is not readable unique-key YAML: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    if not isinstance(reg, dict):
+        print("submission register is not a mapping", file=sys.stderr)
+        return 1
+    structure_errors = register_structure_errors(reg)
+    if structure_errors:
+        print(
+            "submission register has malformed structure: "
+            + "; ".join(structure_errors[:8]),
+            file=sys.stderr,
+        )
+        return 1
     rep = Report()
+    root: Path | None = None
+    package_binding: dict[str, str] = {}
+    receipts: dict[str, dict[str, Any]] = {}
 
     print(f"\033[1m{reg['call']}\033[0m — {reg['presenter']}")
 
     check_requirement_phases(reg, rep)
     check_opportunity_snapshot(args.register, rep)
-    check_deadline(reg, args.phase, rep)
-    check_unknowns(reg, rep)
 
     if args.package:
-        root = args.package
-        if not root.is_dir():
-            rep.add("package", "directory", FAIL, f"{root} does not exist")
+        candidate = args.package
+        if candidate.is_symlink() or not candidate.is_dir():
+            rep.add("package", "directory", FAIL, f"{candidate} does not exist or is unsafe")
         else:
-            pkg = reg["package"]
-            check_attestations(reg, root, args.phase, rep)
-            check_master(pkg["master"], reg, root, rep)
-            check_screener(pkg["screener"], root, rep)
-            check_stills(pkg["stills"], root, rep, exempt={pkg["origin_still"]["filename"]})
-            check_origin_still(pkg["origin_still"], root, rep)
-            check_trailer(pkg["trailer"], root, rep)
-            check_audio(pkg["audio"], root, rep)
-            check_text(pkg["text"], root, rep)
-            check_rights(root, args.phase, rep)
-    else:
+            root = candidate
+            package_binding, _ = check_package_identity(root, rep)
+            attested, attestation_path = check_attestations(reg, root, args.phase, rep)
+            receipts = check_phase_receipts(
+                reg,
+                root,
+                args.phase,
+                package_binding,
+                attested,
+                attestation_path,
+                rep,
+                replace_done_phase=args.phase if args.write_done_receipt else None,
+            )
+
+    check_deadline(reg, args.phase, rep, receipts=receipts)
+    check_unknowns(reg, rep)
+
+    if root is not None:
+        pkg = reg["package"]
+        check_master(pkg["master"], reg, root, rep)
+        check_screener(pkg["screener"], root, rep)
+        check_stills(pkg["stills"], root, rep, exempt={pkg["origin_still"]["filename"]})
+        check_origin_still(pkg["origin_still"], root, rep)
+        check_trailer(pkg["trailer"], root, rep)
+        check_audio(pkg["audio"], root, rep)
+        check_score_motion(root, rep)
+        check_text(pkg["text"], root, rep)
+        check_rights(root, args.phase, rep)
+    elif not args.package:
         rep.add("package", "not staged", OPEN, "re-run with --package <dir> once the cut exists")
+
+    if args.write_done_receipt:
+        if root is None:
+            rep.add("validation receipt", "durable local record", FAIL, "--package is required")
+        elif rep.failures == 0:
+            try:
+                receipt_path, receipt_digest = write_done_receipt(
+                    root,
+                    args.phase,
+                    package_binding,
+                    receipts,
+                )
+            except ValueError as exc:
+                rep.add("validation receipt", "durable local record", FAIL, str(exc))
+            except OSError as exc:
+                rep.add(
+                    "validation receipt",
+                    "durable local record",
+                    FAIL,
+                    f"local validation receipt I/O failed ({type(exc).__name__})",
+                )
+            else:
+                rep.add(
+                    "validation receipt",
+                    "durable local record",
+                    PASS,
+                    f"{receipt_path.relative_to(root).as_posix()} {receipt_digest[:16]}… · "
+                    f"{args.phase} {receipts[args.phase]['receipt_id']} "
+                    f"{receipts[args.phase]['sha256'][:16]}… · manifest "
+                    f"{package_binding['manifest_sha256'][:16]}… · head "
+                    f"{package_binding['repository_head'][:12]}",
+                )
 
     rep.print()
 
@@ -1111,6 +4361,18 @@ def main() -> int:
         return 0
     print(f"\033[31m{args.phase.upper()} PHASE NOT READY — {n} item(s) failing or open\033[0m")
     return 1
+
+
+def main() -> int:
+    """Run the CLI without turning caller-owned malformed input into a traceback."""
+    try:
+        return _main()
+    except (AttributeError, IndexError, KeyError, OSError, TypeError, UnicodeError, ValueError) as exc:
+        print(
+            f"submission validation failed closed on malformed input ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

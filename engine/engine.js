@@ -23,17 +23,30 @@ export function step(
   seed,
   t,
   program = null,
-  { quantise = 0, stream = 0, score = null, choreography = null, conductor = null } = {},
+  {
+    quantise = 0,
+    stream = 0,
+    score = null,
+    choreography = null,
+    conductor = null,
+    timing = null,
+  } = {},
 ) {
-  if (choreography && !score) throw new Error("score-led choreography requires a music score");
+  const hasScore = score !== null && score !== undefined;
+  const hasChoreography = choreography !== null && choreography !== undefined;
+  const hasTiming = timing !== null && timing !== undefined;
+  if (hasChoreography && hasTiming) throw new Error("timing-only clocks cannot admit choreography");
+  if (hasChoreography && !hasScore) throw new Error("score-led choreography requires a music score");
+  if (hasScore && hasTiming) throw new Error("score and timing-only clocks are mutually exclusive");
+  if (hasTiming && !program) throw new Error("timing-only clocks require a bounded program");
   // A bounded film supplies a passage window; the free river deliberately does
   // not.  Both still query the same score/choreography contract, so changing the
   // visitor mode cannot silently remove the conducted panel score.
-  const posePassage = choreography && program ? passageAt(program, seed, t, stream, score) : null;
-  const pose = choreography
+  const posePassage = hasChoreography && program ? passageAt(program, seed, t, stream, score) : null;
+  const pose = hasChoreography
     ? poseAt(score, choreography, seed, t, posePassage ? { t0: posePassage.t0, seconds: posePassage.seconds } : null, conductor)
     : null;
-  const s = state(seed, t, program, stream, score, pose);
+  const s = state(seed, t, program, stream, score, pose, timing);
   // The state is always sampled at the exact t; only the cast may be held.
   const ct = quantise > 0 ? Math.floor(t / quantise) * quantise : t;
   const castAt = s.turnoverAt ?? ct;
@@ -48,8 +61,23 @@ export function step(
 
 /** Step and draw. Returns the renderer's stats plus the state that produced them. */
 export function frameAt(renderer, corpus, seed, t, program = null, opts = {}) {
-  const { quantise = 0, stream = 0, score = null, choreography = null, conductor = null, ...draw } = opts;
-  const { state: s, cast } = step(corpus, seed, t, program, { quantise, stream, score, choreography, conductor });
+  const {
+    quantise = 0,
+    stream = 0,
+    score = null,
+    choreography = null,
+    conductor = null,
+    timing = null,
+    ...draw
+  } = opts;
+  const { state: s, cast } = step(corpus, seed, t, program, {
+    quantise,
+    stream,
+    score,
+    choreography,
+    conductor,
+    timing,
+  });
   // The signature is not an overlay added afterwards — it is the last movement,
   // and it comes through the same canvas as every frame before it.
   const closing =

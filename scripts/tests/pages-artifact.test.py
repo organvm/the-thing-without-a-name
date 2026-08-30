@@ -701,7 +701,7 @@ class InterfaceContractTest(unittest.TestCase):
             self.script,
         )
         film = (ROOT / "film.html").read_text(encoding="utf-8")
-        self.assertIn("scoreUrl ? await MusicalScore.load(scoreUrl) : null", film)
+        self.assertIn("scoreUrl !== null ? await MusicalScore.load(scoreUrl) : null", film)
         self.assertNotIn("MusicalScore.loadOptional", film)
 
     def test_canvas_has_a_text_description_and_canonical_metadata(self) -> None:

@@ -23,9 +23,9 @@ import jsonschema
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT = ROOT / "opportunities" / "omega-20260826-2.json"
+SNAPSHOT = ROOT / "opportunities" / "omega-20260829.json"
 SCHEMA = ROOT / "opportunities" / "opportunity.schema.json"
-RECEIPT = ROOT / "opportunities" / "omega-20260826-2.receipt.json"
+RECEIPT = ROOT / "opportunities" / "omega-20260829.receipt.json"
 EVIDENCE = ROOT / "opportunities" / "source-evidence-20260826.json"
 CONSUMER = ROOT / "submission" / "screendance-2027.yaml"
 
@@ -169,6 +169,22 @@ def canonical_register_digest(register: dict[str, Any]) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def checked_date(value: Any, label: str) -> date:
+    """Normalize one YAML provenance date without accepting a floating timestamp."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise RegistryError(f"{label} must be a date or timezone-aware timestamp")
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise RegistryError(f"{label} is not an ISO-8601 date") from exc
+    raise RegistryError(f"{label} is not an ISO-8601 date")
 
 
 def safe_file(root: Path, relative: str, label: str) -> Path:
@@ -530,6 +546,29 @@ def validate_binding(
     if binding["opportunity_id"] not in targets:
         raise RegistryError("ScreenDance consumer points at a missing opportunity")
     target = targets[binding["opportunity_id"]]
+    target_source_checks = {
+        source["url"]: parse_time(
+            source["checked_at"],
+            f"{binding['opportunity_id']} source checked_at",
+        ).date()
+        for source in target["sources"]
+    }
+    terms = register.get("terms")
+    if not isinstance(terms, list) or any(not isinstance(term, dict) for term in terms):
+        raise RegistryError("ScreenDance verified terms must be an object list")
+    for term in terms:
+        term_id = term.get("id", "<unnamed>")
+        source = term.get("source")
+        if term.get("status") != "verified" or source not in target_source_checks:
+            raise RegistryError(
+                f"ScreenDance term {term_id} lacks a verified frozen opportunity source"
+            )
+        if checked_date(term.get("checked"), f"ScreenDance term {term_id} checked") > (
+            target_source_checks[source]
+        ):
+            raise RegistryError(
+                f"ScreenDance term {term_id} postdates its frozen source check"
+            )
     deadline = parse_time(
         target["deadline_at"],
         "ScreenDance snapshot deadline",

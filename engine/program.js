@@ -41,7 +41,39 @@ export const CHANNELS = ["divergence", "spread", "azimuth", "elevation", "projK"
  *  bolted onto the end of the renderer. */
 export const CUTS = ["solo", "score", "grid", "bands", "figure", "black"];
 
+const PASSAGE_TIMING_SCHEMA = "danse.program.passage-timing.v1";
+
 const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+/** A minimal clock contract for a score-free, fixed-length passage.
+ *
+ * This value deliberately carries no score cues, notes, choreography, or other
+ * visual inputs.  It can only replace the generated passage length so an A/B
+ * control shares the selected film's clock without sharing its authored motion.
+ */
+export function fixedPassageTiming(seconds) {
+  if (!Number.isFinite(seconds) || !(seconds > 0)) {
+    throw new TypeError("fixed passage timing must be finite and positive");
+  }
+  return Object.freeze({
+    schema: PASSAGE_TIMING_SCHEMA,
+    mode: "fixed-passage",
+    seconds,
+  });
+}
+
+function fixedTimingSeconds(timing) {
+  if (timing === null || timing === undefined) return null;
+  if (!timing || typeof timing !== "object" || Array.isArray(timing)
+      || Object.keys(timing).sort().join(",") !== "mode,schema,seconds"
+      || timing.schema !== PASSAGE_TIMING_SCHEMA
+      || timing.mode !== "fixed-passage"
+      || !Number.isFinite(timing.seconds)
+      || !(timing.seconds > 0)) {
+    throw new TypeError("invalid fixed passage timing contract");
+  }
+  return timing.seconds;
+}
 
 export const EASE = {
   linear: (x) => x,
@@ -119,13 +151,23 @@ export function passageSeed(seed, n, stream = 0) {
   return stream ? hash(seed, 0x1a1, stream, n) : hash(seed, 0x1a1, n);
 }
 
-function nativeSeconds(score) {
+function nativeSeconds(score, timing = null) {
+  const hasScore = score !== null && score !== undefined;
+  const hasTiming = timing !== null && timing !== undefined;
+  if (hasScore && hasTiming) {
+    throw new TypeError("a passage cannot use score and timing-only clocks together");
+  }
+  if (hasScore && (!score || typeof score !== "object" || Array.isArray(score))) {
+    throw new TypeError("invalid music score contract");
+  }
+  const fixed = fixedTimingSeconds(timing);
+  if (fixed !== null) return fixed;
   return score?.time?.passage_mapping === "native-tempo" ? score.time.duration_seconds : null;
 }
 
 /** How long passage n runs. Drawn from the passage's own seed, never fixed. */
-export function passageSeconds(program, seed, n, stream = 0, score = null) {
-  const native = nativeSeconds(score);
+export function passageSeconds(program, seed, n, stream = 0, score = null, timing = null) {
+  const native = nativeSeconds(score, timing);
   if (native !== null) return native;
   const { seconds, vary } = program.passage;
   return seconds * range(1 - vary, 1 + vary, passageSeed(seed, n, stream), 0x2b2);
@@ -139,30 +181,31 @@ export function passageSeconds(program, seed, n, stream = 0, score = null) {
  * (program, seed) and re-deriving them always gives the same numbers — which is
  * what `check-danse.py` verifies by evaluating the clock out of order.
  */
-let edgeCache = { program: null, seed: null, stream: null, edges: [0] };
+let edgeCache = { program: null, seed: null, stream: null, score: null, timing: null, edges: [0] };
 
-function edgesTo(program, seed, stream, score, t) {
-  if (edgeCache.program !== program || edgeCache.seed !== seed || edgeCache.stream !== stream || edgeCache.score !== score) {
-    edgeCache = { program, seed, stream, score, edges: [0] };
+function edgesTo(program, seed, stream, score, timing, t) {
+  if (edgeCache.program !== program || edgeCache.seed !== seed || edgeCache.stream !== stream
+      || edgeCache.score !== score || edgeCache.timing !== timing) {
+    edgeCache = { program, seed, stream, score, timing, edges: [0] };
   }
   const { edges } = edgeCache;
   while (edges[edges.length - 1] <= t) {
     const n = edges.length - 1;
-    edges.push(edges[n] + passageSeconds(program, seed, n, stream, score));
+    edges.push(edges[n] + passageSeconds(program, seed, n, stream, score, timing));
   }
   return edges;
 }
 
 /** Which passage covers t, when it began, how long it runs, and its seed. */
-export function passageAt(program, seed, t, stream = 0, score = null) {
+export function passageAt(program, seed, t, stream = 0, score = null, timing = null) {
   const at = Math.max(0, t);
   if (!Number.isFinite(at) || at > 100 * 365 * 86400) throw new RangeError(`passage time is outside the 100-year bound: ${t}`);
-  const native = nativeSeconds(score);
+  const native = nativeSeconds(score, timing);
   if (native !== null) {
     const index = Math.floor(at / native);
     return { index, t0: index * native, seconds: native, seed: passageSeed(seed, index, stream) };
   }
-  const edges = edgesTo(program, seed, stream, score, at);
+  const edges = edgesTo(program, seed, stream, score, timing, at);
   let lo = 0;
   let hi = edges.length - 1;
   while (lo < hi - 1) {
@@ -184,12 +227,12 @@ export function passageAt(program, seed, t, stream = 0, score = null) {
  * to fit. Scaling is what makes the tiling exact: the shares do not have to sum
  * to anything in particular, so no edit to this file can leave a hole in time.
  */
-export function movementsIn(program, seed, n, stream = 0, score = null) {
+export function movementsIn(program, seed, n, stream = 0, score = null, timing = null) {
   const pseed = passageSeed(seed, n, stream);
   const moves = program.movements;
   const weights = moves.map((m, i) => m.share * range(1 - m.vary, 1 + m.vary, pseed, i, 0x3c3));
   const total = weights.reduce((s, w) => s + w, 0);
-  const seconds = passageSeconds(program, seed, n, stream, score);
+  const seconds = passageSeconds(program, seed, n, stream, score, timing);
 
   const out = [];
   let cursor = 0;
@@ -204,9 +247,9 @@ export function movementsIn(program, seed, n, stream = 0, score = null) {
 }
 
 /** The movement covering t anywhere in the river, and how far into it we are. */
-export function movementAt(program, seed, t, stream = 0, score = null) {
-  const passage = passageAt(program, seed, t, stream, score);
-  const laid = movementsIn(program, seed, passage.index, stream, score);
+export function movementAt(program, seed, t, stream = 0, score = null, timing = null) {
+  const passage = passageAt(program, seed, t, stream, score, timing);
+  const laid = movementsIn(program, seed, passage.index, stream, score, timing);
   const local = Math.max(0, t) - passage.t0;
   for (let i = 0; i < laid.length; i++) {
     const m = laid[i];
@@ -244,4 +287,15 @@ export function captureOf(program, name = "passage") {
   const c = program.captures?.[name];
   if (!c) throw new Error(`program: no capture "${name}"`);
   return { name, ...c };
+}
+
+/** Select a capture by passage ordinals, never by stepping over an edge epsilon. */
+export function captureSpan(program, seed, from, capture, stream = 0, score = null, timing = null) {
+  if (capture.seconds > 0) return { t0: from, t1: from + capture.seconds };
+  const opening = passageAt(program, seed, from, stream, score, timing);
+  let t1 = opening.t0;
+  for (let offset = 0; offset < capture.passages; offset++) {
+    t1 += passageSeconds(program, seed, opening.index + offset, stream, score, timing);
+  }
+  return { t0: opening.t0, t1 };
 }
