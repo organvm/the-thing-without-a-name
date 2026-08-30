@@ -587,13 +587,132 @@ class DeliveryContractTest(unittest.TestCase):
                 width=2,
                 height=1,
             )
-        with self.assertRaisesRegex(OFFLINE.MediaIdentityError, "expected exactly 1"):
+        with self.assertRaisesRegex(
+            OFFLINE.MediaIdentityError,
+            "more than the expected 1 frames",
+        ):
             OFFLINE.rgb24_stream_identity(
                 io.BytesIO(first + second),
                 width=2,
                 height=1,
                 expected_frames=1,
             )
+
+    def test_segment_encoder_uses_bounded_stderr_and_reaps_every_exit(self) -> None:
+        events: list[str] = []
+
+        class FakeStdin:
+            def __init__(self, close_error: OSError | None = None) -> None:
+                self.closed = False
+                self.close_error = close_error
+
+            def close(self) -> None:
+                events.append("close")
+                if self.close_error is not None:
+                    raise self.close_error
+                self.closed = True
+
+        class FakeProcess:
+            def __init__(
+                self,
+                returncode: int = 0,
+                close_error: OSError | None = None,
+            ) -> None:
+                self.stdin = FakeStdin(close_error)
+                self.returncode = returncode
+
+            def poll(self):
+                events.append("poll")
+                return None
+
+            def kill(self) -> None:
+                events.append("kill")
+
+            def wait(self) -> int:
+                events.append("wait")
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryFile() as stderr:
+            process = FakeProcess()
+            with mock.patch.object(OFFLINE.subprocess, "Popen", return_value=process) as popen:
+                self.assertIs(
+                    OFFLINE.ffmpeg_for(
+                        Path(tmp) / "segment.mov",
+                        1920,
+                        1080,
+                        30,
+                        "prores",
+                        stderr=stderr,
+                    ),
+                    process,
+                )
+            command = popen.call_args.args[0]
+            self.assertIn("-nostdin", command)
+            self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+            self.assertIs(popen.call_args.kwargs["stderr"], stderr)
+            self.assertNotEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
+
+        class TrackingStderr:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc) -> None:
+                events.append("stderr-close")
+
+            def flush(self) -> None:
+                events.append("flush")
+
+            def seek(self, offset: int) -> None:
+                self.assert_waited = "wait" in events
+                events.append(f"seek:{offset}")
+
+            def read(self, size: int) -> bytes:
+                if not self.assert_waited:
+                    raise AssertionError("encoder stderr read before wait")
+                events.append(f"read:{size}")
+                return b"x" * size
+
+        diagnostic = TrackingStderr()
+        failed = FakeProcess(returncode=1)
+        events.clear()
+        with (
+            mock.patch.object(OFFLINE.tempfile, "TemporaryFile", return_value=diagnostic),
+            mock.patch.object(OFFLINE, "ffmpeg_for", return_value=failed),
+            self.assertRaisesRegex(
+                SystemExit,
+                r"(?s)ffmpeg failed on segment 7:.*stderr truncated",
+            ),
+        ):
+            with OFFLINE.encoder_for_segment(Path("segment.mov"), 2, 1, 30, "prores", 7):
+                pass
+        self.assertEqual(events[:2], ["close", "wait"])
+        self.assertIn(f"read:{OFFLINE.ENCODER_DIAGNOSTIC_MAX_BYTES + 1}", events)
+        self.assertNotIn("kill", events)
+
+        close_failed = FakeProcess(close_error=OSError("refused EOF"))
+        events.clear()
+        with (
+            mock.patch.object(OFFLINE.tempfile, "TemporaryFile", return_value=diagnostic),
+            mock.patch.object(OFFLINE, "ffmpeg_for", return_value=close_failed),
+            self.assertRaisesRegex(
+                SystemExit,
+                r"(?s)ffmpeg stdin close failed: refused EOF.*stderr truncated",
+            ),
+        ):
+            with OFFLINE.encoder_for_segment(Path("segment.mov"), 2, 1, 30, "prores", 8):
+                pass
+        self.assertEqual(events[:4], ["close", "poll", "kill", "wait"])
+        self.assertIn(f"read:{OFFLINE.ENCODER_DIAGNOSTIC_MAX_BYTES + 1}", events)
+
+        interrupted = FakeProcess()
+        events.clear()
+        with (
+            mock.patch.object(OFFLINE, "ffmpeg_for", return_value=interrupted),
+            self.assertRaisesRegex(RuntimeError, "capture failed"),
+        ):
+            with OFFLINE.encoder_for_segment(Path("segment.mov"), 2, 1, 30, "prores", 9):
+                raise RuntimeError("capture failed")
+        self.assertEqual(events[:4], ["poll", "kill", "close", "wait"])
 
     def test_render_resume_receipt_binds_inputs_source_and_output_bytes(self) -> None:
         args = SimpleNamespace(
@@ -644,6 +763,7 @@ class DeliveryContractTest(unittest.TestCase):
             ):
                 OFFLINE.write_segment_receipt(dest, args, 0, 30, capture=capture)
                 receipt = json.loads(OFFLINE.segment_receipt_path(dest).read_text())
+                self.assertEqual(receipt["file_bytes"], dest.stat().st_size)
                 self.assertEqual(receipt["decoded_video"], decoded)
                 self.assertEqual(
                     receipt["capture"],
@@ -665,6 +785,17 @@ class DeliveryContractTest(unittest.TestCase):
                     json.loads((ROOT / "music/score.json").read_text())["identity"]["contract_sha256"],
                 )
                 self.assertTrue(OFFLINE.complete(dest, 30, expected))
+                for invalid_bytes in (None, False, 0, receipt["file_bytes"] + 1):
+                    with self.subTest(segment_file_bytes=invalid_bytes):
+                        stale_bytes = copy.deepcopy(receipt)
+                        if invalid_bytes is None:
+                            stale_bytes.pop("file_bytes")
+                        else:
+                            stale_bytes["file_bytes"] = invalid_bytes
+                        OFFLINE.segment_receipt_path(dest).write_text(
+                            json.dumps(stale_bytes, indent=2) + "\n"
+                        )
+                        self.assertFalse(OFFLINE.complete(dest, 30, expected))
                 receipt_without_capture = copy.deepcopy(receipt)
                 receipt_without_capture.pop("capture")
                 OFFLINE.segment_receipt_path(dest).write_text(
@@ -757,9 +888,14 @@ class DeliveryContractTest(unittest.TestCase):
                 self.assertNotIn("seg-002", listing)
                 receipt_path = OFFLINE.concat_receipt_path(stem.with_suffix(".mov"))
                 receipt = json.loads(receipt_path.read_text())
+                self.assertEqual(receipt["file_bytes"], stem.with_suffix(".mov").stat().st_size)
                 self.assertEqual([item["name"] for item in receipt["segments"]], [part.name for part in parts])
                 self.assertEqual(receipt["decoded_video"], {**decoded, "fps": 30})
                 self.assertTrue(OFFLINE.concat_complete(stem, args, parts))
+                receipt["file_bytes"] = False
+                receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+                self.assertFalse(OFFLINE.concat_complete(stem, args, parts))
+                receipt["file_bytes"] = stem.with_suffix(".mov").stat().st_size
                 receipt["decoded_video"]["sha256"] = "c" * 64
                 receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
                 self.assertFalse(OFFLINE.concat_complete(stem, args, parts))

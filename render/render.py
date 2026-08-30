@@ -37,7 +37,9 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -67,6 +69,7 @@ CODECS = {
     "preview": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p"],
 }
 SUFFIX = {"prores": ".mov", "h264": ".mp4", "preview": ".mp4"}
+ENCODER_DIAGNOSTIC_MAX_BYTES = 64 << 10
 
 
 def file_sha256(path: Path) -> str:
@@ -427,6 +430,7 @@ def write_segment_receipt(
 
     payload = segment_identity(args, segment, frames)
     payload["file_sha256"] = file_sha256(dest)
+    payload["file_bytes"] = dest.stat().st_size
     try:
         stream = video_stream_info(dest)
         if capture is not None:
@@ -511,16 +515,127 @@ CAPTURE_JS = """
 """
 
 
-def ffmpeg_for(path: Path, width: int, height: int, fps: float, codec: str) -> subprocess.Popen:
+def ffmpeg_for(
+    path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    codec: str,
+    *,
+    stderr,
+) -> subprocess.Popen:
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
         "-vf", "vflip",
         *CODECS[codec],
         str(path),
     ]  # fmt: skip
     path.parent.mkdir(parents=True, exist_ok=True)
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=stderr)
+
+
+def _encoder_diagnostic(stderr) -> str:
+    """Read a bounded encoder diagnostic after the process has exited."""
+    stderr.flush()
+    stderr.seek(0)
+    payload = stderr.read(ENCODER_DIAGNOSTIC_MAX_BYTES + 1)
+    truncated = len(payload) > ENCODER_DIAGNOSTIC_MAX_BYTES
+    payload = payload[:ENCODER_DIAGNOSTIC_MAX_BYTES]
+    message = payload.decode(errors="replace")
+    if truncated:
+        message += "\n[ffmpeg stderr truncated]"
+    return message
+
+
+def _close_encoder_stdin(process: subprocess.Popen) -> OSError | None:
+    stdin = process.stdin
+    if stdin is None or stdin.closed:
+        return None
+    try:
+        stdin.close()
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _kill_and_wait_encoder(process: subprocess.Popen) -> BaseException | None:
+    """Terminate a possibly-live encoder and confirm that it was reaped."""
+    try:
+        running = process.poll() is None
+    except BaseException:
+        running = True
+    if running:
+        try:
+            process.kill()
+        except BaseException:
+            pass
+    try:
+        process.wait()
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _abort_encoder(process: subprocess.Popen) -> None:
+    """Best-effort termination which never masks the capture-side exception."""
+    try:
+        running = process.poll() is None
+    except BaseException:
+        running = True
+    if running:
+        try:
+            process.kill()
+        except BaseException:
+            pass
+    try:
+        _close_encoder_stdin(process)
+    except BaseException:
+        pass
+    try:
+        process.wait()
+    except BaseException:
+        pass
+
+
+@contextmanager
+def encoder_for_segment(
+    path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    codec: str,
+    segment: int,
+):
+    """Own ffmpeg from launch through a bounded, deadlock-free exit."""
+    with tempfile.TemporaryFile() as stderr:
+        process = ffmpeg_for(path, width, height, fps, codec, stderr=stderr)
+        try:
+            yield process
+        except BaseException:
+            _abort_encoder(process)
+            raise
+
+        close_error = _close_encoder_stdin(process)
+        if close_error is not None:
+            termination_error = _kill_and_wait_encoder(process)
+            detail = f"ffmpeg stdin close failed: {close_error}"
+            if termination_error is not None:
+                detail += f"\nffmpeg termination failed: {termination_error}"
+            else:
+                diagnostic = _encoder_diagnostic(stderr)
+                if diagnostic:
+                    detail += f"\n{diagnostic}"
+            raise SystemExit(f"ffmpeg failed on segment {segment}:\n{detail}")
+        try:
+            returncode = process.wait()
+        except BaseException:
+            _abort_encoder(process)
+            raise
+        diagnostic = _encoder_diagnostic(stderr)
+        if returncode != 0:
+            detail = diagnostic or "no diagnostic"
+            raise SystemExit(f"ffmpeg failed on segment {segment}:\n{detail}")
 
 
 class _Slot:
@@ -568,52 +683,56 @@ def render_segment(args, segment: int, dest: Path) -> dict:
                 return {"frames": 0, "skipped": True}
             count = min(args.segment_frames, total - start)
 
-            enc = ffmpeg_for(dest, film["w"], film["h"], fps, args.codec)
-            digest = hashlib.sha256()
-            written = [0]
+            with encoder_for_segment(
+                dest,
+                film["w"],
+                film["h"],
+                fps,
+                args.codec,
+                segment,
+            ) as enc:
+                digest = hashlib.sha256()
+                written = [0]
 
-            def sink(_path: str, body: bytes) -> None:
-                digest.update(body)
-                enc.stdin.write(body)
-                written[0] += 1
+                def sink(_path: str, body: bytes) -> None:
+                    digest.update(body)
+                    enc.stdin.write(body)
+                    written[0] += 1
 
-            slot.fn = sink
-            page.evaluate(CAPTURE_JS)
-            began = time.time()
-            missing = 0
-            for i in range(count):
-                t = film["t0"] + (start + i) / fps
-                r = page.evaluate("(t) => window.danseFilm.renderAt(t)", t)
-                if timing_score_identity(args) and (
-                    r.get("passage") != film["passage"]
-                    or r.get("passageSeed") != film["passageSeed"]
-                    or r.get("passageT0") != film["passageT0"]
-                    or r.get("passageSeconds") != film["passageSeconds"]
-                    or r.get("hasMusic") is not False
-                    or r.get("hasChoreography") is not False
-                ):
-                    raise SystemExit(
-                        "timing-only control left its selected score-free passage or admitted score motion"
-                    )
-                missing += r["missing"]
-                page.evaluate("(u) => window.danseCapture(u)", f"{base}/frame")
-                if args.progress and (i % 30 == 0 or i == count - 1):
-                    done = i + 1
-                    rate = done / max(1e-6, time.time() - began)
-                    left = (count - done) / max(1e-6, rate)
-                    print(
-                        f"\r  seg {segment:>3} · {done}/{count} · {rate:.1f} fps · "
-                        f"{r['movement']:<9} · {left / 60:4.1f} min left    ",
-                        end="",
-                        flush=True,
-                    )
-            if args.progress:
-                print()
+                slot.fn = sink
+                page.evaluate(CAPTURE_JS)
+                began = time.time()
+                missing = 0
+                for i in range(count):
+                    t = film["t0"] + (start + i) / fps
+                    r = page.evaluate("(t) => window.danseFilm.renderAt(t)", t)
+                    if timing_score_identity(args) and (
+                        r.get("passage") != film["passage"]
+                        or r.get("passageSeed") != film["passageSeed"]
+                        or r.get("passageT0") != film["passageT0"]
+                        or r.get("passageSeconds") != film["passageSeconds"]
+                        or r.get("hasMusic") is not False
+                        or r.get("hasChoreography") is not False
+                    ):
+                        raise SystemExit(
+                            "timing-only control left its selected score-free passage or admitted score motion"
+                        )
+                    missing += r["missing"]
+                    page.evaluate("(u) => window.danseCapture(u)", f"{base}/frame")
+                    if args.progress and (i % 30 == 0 or i == count - 1):
+                        done = i + 1
+                        rate = done / max(1e-6, time.time() - began)
+                        left = (count - done) / max(1e-6, rate)
+                        print(
+                            f"\r  seg {segment:>3} · {done}/{count} · {rate:.1f} fps · "
+                            f"{r['movement']:<9} · {left / 60:4.1f} min left    ",
+                            end="",
+                            flush=True,
+                        )
+                if args.progress:
+                    print()
 
-            enc.stdin.close()
-            err = enc.stderr.read().decode(errors="replace")
-            if enc.wait() != 0:
-                raise SystemExit(f"ffmpeg failed on segment {segment}:\n{err}")
+            slot.fn = None
             if written[0] != count:
                 raise SystemExit(f"segment {segment}: sank {written[0]} frames, rendered {count}")
 
@@ -659,6 +778,12 @@ def complete(dest: Path, want: int, expected: dict) -> bool:
     if receipt.get("schema") != expected["schema"] or receipt.get("segment") != expected["segment"]:
         return False
     if receipt.get("frames") != want or receipt.get("inputs") != expected["inputs"]:
+        return False
+    if (
+        type(receipt.get("file_bytes")) is not int
+        or receipt["file_bytes"] < 1
+        or receipt["file_bytes"] != dest.stat().st_size
+    ):
         return False
     if receipt.get("file_sha256") != file_sha256(dest):
         return False
@@ -786,6 +911,9 @@ def concat_complete(stem: Path, args, parts: list[Path]) -> bool:
         return False
     basic = (
         {key: receipt.get(key) for key in expected} == expected
+        and type(receipt.get("file_bytes")) is int
+        and receipt["file_bytes"] > 0
+        and receipt["file_bytes"] == dest.stat().st_size
         and receipt.get("file_sha256") == file_sha256(dest)
     )
     if not basic:
@@ -821,6 +949,7 @@ def concat(stem: Path, args, parts: list[Path]) -> Path:
     )  # fmt: skip
     receipt = concat_identity(args, parts)
     receipt["file_sha256"] = file_sha256(dest)
+    receipt["file_bytes"] = dest.stat().st_size
     try:
         receipt["decoded_video"] = concat_decoded_video_identity(dest, parts)
     except (MediaIdentityError, TypeError, ValueError) as exc:

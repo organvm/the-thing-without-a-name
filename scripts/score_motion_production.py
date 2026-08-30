@@ -22,9 +22,12 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import wave
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -68,6 +71,21 @@ PRODUCTION_HEIGHT = 1080
 PRODUCTION_FPS = 30
 PRODUCTION_PASSAGE_SEED = 2943173797
 REVIEW_ANCHOR_PSNR_FLOOR = 30.0
+REVIEW_ANCHOR_MAX_COUNT = 256
+PRODUCER_CONCAT_RECEIPT_MAX_BYTES = 2 << 20
+PRODUCER_SEGMENT_RECEIPT_MAX_BYTES = 512 << 10
+PRODUCER_SEGMENT_RECEIPT_TOTAL_MAX_BYTES = 16 << 20
+PRODUCER_SEGMENT_MAX_COUNT = 256
+# Production evidence is limited to 256 canonical ten-second (600-frame)
+# renderer segments.  Besides bounding decoder work, this keeps hostile JSON
+# durations from reaching float multiplication or round() as unbounded counts.
+PRODUCER_SEGMENT_FRAME_MAX = 600
+PRODUCTION_FRAME_MAX = PRODUCER_SEGMENT_MAX_COUNT * PRODUCER_SEGMENT_FRAME_MAX
+PRODUCER_MEDIA_MAX_BYTES_PER_FRAME = 8 << 20
+FRAME_IMAGE_MAX_BYTES = 64 << 20
+PRODUCTION_RECEIPT_MAX_BYTES = 4 << 20
+SAMPLE_RECEIPT_MAX_BYTES = 16 << 20
+FRAME_RECEIPT_MAX_BYTES = 16 << 20
 CAPTURE_TOOL = ROOT / "scripts/score_motion_production.py"
 BROWSER_CONTRACT = ROOT / "render/browser.py"
 
@@ -76,7 +94,12 @@ sys.path.insert(0, str(ROOT / "pipeline"))
 sys.path.insert(0, str(ROOT / "render"))
 from choreography import load_choreography  # noqa: E402
 from corpus_contract import authorize_render_tier  # noqa: E402
-from media_identity import MediaIdentityError, decoded_video_identity  # noqa: E402
+from media_identity import (  # noqa: E402
+    MediaIdentityError,
+    decoded_video_chain_identities,
+    decoded_video_identity,
+    video_stream_info,
+)
 from music_score import load_score  # noqa: E402
 
 
@@ -92,6 +115,44 @@ def finite_receipt_number(value: object) -> bool:
     )
 
 
+def production_frame_count(duration: object, label: str = "production duration") -> int:
+    """Return the one bounded 30 fps frame count admitted by the evidence gate."""
+
+    if not finite_receipt_number(duration) or duration <= 0:
+        raise EvidenceError(f"{label} must be a finite positive JSON number")
+    frame_value = float(duration) * PRODUCTION_FPS
+    if not math.isfinite(frame_value):
+        raise EvidenceError(f"{label} does not yield a finite production frame count")
+    if frame_value > PRODUCTION_FRAME_MAX:
+        raise EvidenceError(
+            f"{label} exceeds the {PRODUCTION_FRAME_MAX}-frame production limit"
+        )
+    frames = round(frame_value)
+    if frames < 1:
+        raise EvidenceError(f"{label} does not contain one complete production frame")
+    return frames
+
+
+def production_audio_frame_count(
+    duration: object,
+    sample_rate: object,
+    label: str = "production audio duration",
+) -> int:
+    """Return a bounded PCM count for the same maximum production span."""
+
+    production_frame_count(duration, label)
+    if type(sample_rate) is not int or sample_rate < 1:
+        raise EvidenceError("production audio sample rate must be a positive integer")
+    sample_value = float(duration) * sample_rate
+    maximum_samples = PRODUCTION_FRAME_MAX * sample_rate / PRODUCTION_FPS
+    if not math.isfinite(sample_value) or sample_value > maximum_samples:
+        raise EvidenceError(f"{label} has an unreasonable production audio frame count")
+    samples = round(sample_value)
+    if samples < 1:
+        raise EvidenceError(f"{label} does not contain one complete production audio frame")
+    return samples
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -104,6 +165,143 @@ def regular_file(path: Path, label: str) -> Path:
     if path.is_symlink() or not path.is_file():
         raise EvidenceError(f"{label} is missing or is not a regular file: {path}")
     return path.resolve(strict=True)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _verify_pinned_file(
+    path: Path,
+    directory_fd: int,
+    file_fd: int,
+    directory_identity: tuple[int, ...],
+    file_identity: tuple[int, ...],
+    label: str,
+) -> None:
+    try:
+        current_directory = os.fstat(directory_fd)
+        named_directory = os.stat(path.parent, follow_symlinks=False)
+        current_file = os.fstat(file_fd)
+        named_file = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise EvidenceError(f"{label} changed during authentication") from exc
+    if (
+        not stat.S_ISDIR(current_directory.st_mode)
+        or not stat.S_ISDIR(named_directory.st_mode)
+        or not stat.S_ISREG(current_file.st_mode)
+        or not stat.S_ISREG(named_file.st_mode)
+        or _stat_identity(current_directory) != directory_identity
+        or _stat_identity(named_directory) != directory_identity
+        or _stat_identity(current_file) != file_identity
+        or _stat_identity(named_file) != file_identity
+    ):
+        raise EvidenceError(f"{label} changed during authentication")
+
+
+@contextmanager
+def _pinned_regular_file(path: Path, label: str):
+    """Pin one no-follow file and its named parent for a complete measurement."""
+
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required) or not hasattr(os, "pread"):
+        raise EvidenceError(f"{label} cannot be descriptor-pinned on this platform")
+    directory_fd = None
+    file_fd = None
+    try:
+        path = path.absolute()
+        directory_fd = os.open(
+            os.sep,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        for part in path.parent.parts[1:]:
+            next_directory_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_directory_fd
+        file_fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        directory_info = os.fstat(directory_fd)
+        file_info = os.fstat(file_fd)
+        directory_identity = _stat_identity(directory_info)
+        file_identity = _stat_identity(file_info)
+        _verify_pinned_file(
+            path,
+            directory_fd,
+            file_fd,
+            directory_identity,
+            file_identity,
+            label,
+        )
+        try:
+            yield file_fd, file_info
+        except BaseException:
+            raise
+        else:
+            _verify_pinned_file(
+                path,
+                directory_fd,
+                file_fd,
+                directory_identity,
+                file_identity,
+                label,
+            )
+    except EvidenceError:
+        raise
+    except OSError as exc:
+        raise EvidenceError(f"{label} is missing, unsafe, or cannot be pinned") from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _fd_sha256(file_fd: int, label: str) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    try:
+        while True:
+            chunk = os.pread(file_fd, 1 << 20, offset)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+    except OSError as exc:
+        raise EvidenceError(f"cannot read {label} for its encoded digest") from exc
+    return digest.hexdigest()
+
+
+def _read_pinned_bytes(file_fd: int, *, maximum: int, label: str) -> bytes:
+    chunks = []
+    offset = 0
+    try:
+        while offset <= maximum:
+            chunk = os.pread(file_fd, min(1 << 20, maximum + 1 - offset), offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+    except OSError as exc:
+        raise EvidenceError(f"cannot read {label}") from exc
+    payload = b"".join(chunks)
+    if len(payload) > maximum:
+        raise EvidenceError(f"{label} exceeds its {maximum}-byte limit")
+    return payload
 
 
 def _safe_relative(relative: object, label: str) -> PurePosixPath:
@@ -143,11 +341,104 @@ def local_artifact(receipt_path: Path, reference: object, label: str) -> Path:
     return _bounded_file(receipt_path.parent, reference.get("path"), label)
 
 
-def read_json(path: Path, label: str) -> dict[str, Any]:
-    regular_file(path, label)
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON number {value}")
+
+
+def _json_object_from_payload(payload: bytes, label: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise EvidenceError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise EvidenceError(f"{label} must be a JSON object")
+    return value
+
+
+@contextmanager
+def _pinned_json_snapshot(path: Path, label: str, *, max_bytes: int):
+    """Hold a JSON file pinned while consumers validate its parsed snapshot."""
+
+    with _pinned_regular_file(path, label) as (file_fd, info):
+        if info.st_size > max_bytes:
+            raise EvidenceError(f"{label} exceeds its {max_bytes}-byte limit")
+        payload = _read_pinned_bytes(file_fd, maximum=max_bytes, label=label)
+        if len(payload) != info.st_size:
+            raise EvidenceError(f"{label} changed during authentication")
+        yield _json_object_from_payload(payload, label), payload
+
+
+@contextmanager
+def _pinned_artifact_json_snapshot(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    max_bytes: int,
+):
+    """Hold a referenced JSON artifact pinned across its complete validation."""
+
+    try:
+        path = local_artifact(receipt_path, reference, label)
+    except EvidenceError as exc:
+        yield [str(exc)], None, None, None
+        return
+    assert isinstance(reference, dict)
+    with _pinned_json_snapshot(path, label, max_bytes=max_bytes) as (value, payload):
+        errors = []
+        if reference.get("sha256") != hashlib.sha256(payload).hexdigest():
+            errors.append(f"{label} digest is stale")
+        if reference.get("bytes") != len(payload):
+            errors.append(f"{label} byte count is stale")
+        yield errors, path, value, payload
+
+
+def _bounded_json_snapshot(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> tuple[dict[str, Any], bytes]:
+    with _pinned_json_snapshot(path, label, max_bytes=max_bytes) as snapshot:
+        return snapshot
+
+
+def _bounded_binary_snapshot(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read one bounded regular file through a stable no-follow descriptor."""
+
+    with _pinned_regular_file(path, label) as (file_fd, info):
+        if info.st_size > max_bytes:
+            raise EvidenceError(f"{label} exceeds its {max_bytes}-byte limit")
+        payload = _read_pinned_bytes(file_fd, maximum=max_bytes, label=label)
+        if len(payload) != info.st_size:
+            raise EvidenceError(f"{label} changed during authentication")
+    return payload
+
+
+def read_json(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> dict[str, Any]:
+    path = regular_file(path, label)
+    if max_bytes is not None:
+        value, _ = _bounded_json_snapshot(path, label, max_bytes=max_bytes)
+        return value
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise EvidenceError(f"cannot read {label}: {exc}") from exc
     if not isinstance(value, dict):
         raise EvidenceError(f"{label} must be a JSON object")
@@ -233,7 +524,12 @@ def capture_contract_identity(root: Path = ROOT) -> dict[str, Any]:
 
 
 def _production_review_position(second: float) -> tuple[int, float]:
-    index = int(math.floor(float(second) * PRODUCTION_FPS + 0.5))
+    if not finite_receipt_number(second) or second < 0:
+        raise EvidenceError("production review second must be a finite nonnegative JSON number")
+    frame_value = float(second) * PRODUCTION_FPS
+    if not math.isfinite(frame_value) or frame_value > PRODUCTION_FRAME_MAX:
+        raise EvidenceError("production review second exceeds the bounded production frame span")
+    index = int(math.floor(frame_value + 0.5))
     return index, index / PRODUCTION_FPS
 
 
@@ -365,7 +661,11 @@ def current_context(
     if master.get("sha256") != sha256(master_path):
         raise EvidenceError("competition audio master digest is stale")
     pcm = wav_pcm_identity(master_path)
-    expected_frames = round(duration * pcm["sample_rate"])
+    expected_frames = production_audio_frame_count(
+        duration,
+        pcm["sample_rate"],
+        "production score duration",
+    )
     if master.get("frames") != expected_frames or pcm["frames"] != expected_frames:
         raise EvidenceError("competition audio master frame count does not match the exact score span")
     for field in ("sample_rate", "channels"):
@@ -438,33 +738,153 @@ def _artifact_errors(
     return errors, path
 
 
-def media_pcm_identity(path: Path, *, sample_rate: int = 48000, channels: int = 2) -> dict[str, Any]:
+def _artifact_json_snapshot(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    max_bytes: int,
+) -> tuple[list[str], Path | None, dict[str, Any] | None]:
+    """Authenticate and parse one bounded artifact from the same pinned bytes."""
+
+    try:
+        path = local_artifact(receipt_path, reference, label)
+        value, payload = _bounded_json_snapshot(path, label, max_bytes=max_bytes)
+    except EvidenceError as exc:
+        return [str(exc)], None, None
+    assert isinstance(reference, dict)
+    errors = []
+    digest = hashlib.sha256(payload).hexdigest()
+    if reference.get("sha256") != digest:
+        errors.append(f"{label} digest is stale")
+    if reference.get("bytes") != len(payload):
+        errors.append(f"{label} byte count is stale")
+    return errors, path, value
+
+
+def _artifact_binary_snapshot(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    max_bytes: int,
+) -> tuple[list[str], Path | None, bytes | None]:
+    """Authenticate one bounded artifact and return its exact pinned bytes."""
+
+    try:
+        path = local_artifact(receipt_path, reference, label)
+        payload = _bounded_binary_snapshot(path, label, max_bytes=max_bytes)
+    except EvidenceError as exc:
+        return [str(exc)], None, None
+    assert isinstance(reference, dict)
+    errors = []
+    if reference.get("sha256") != hashlib.sha256(payload).hexdigest():
+        errors.append(f"{label} digest is stale")
+    if reference.get("bytes") != len(payload):
+        errors.append(f"{label} byte count is stale")
+    return errors, path, payload
+
+
+def _cached_review_artifact_errors(
+    receipt_path: Path,
+    reference: object,
+    label: str,
+    *,
+    expected_frames: int,
+) -> tuple[list[str], Path | None]:
+    """Recheck a cached review measurement against one stable encoded snapshot."""
+
+    try:
+        path = local_artifact(receipt_path, reference, label)
+        with _pinned_regular_file(path, label) as (file_fd, info):
+            maximum = expected_frames * PRODUCER_MEDIA_MAX_BYTES_PER_FRAME
+            if info.st_size > maximum:
+                raise EvidenceError(f"{label} exceeds its {maximum}-byte media limit")
+            digest = _fd_sha256(file_fd, label)
+    except EvidenceError as exc:
+        return [str(exc)], None
+    assert isinstance(reference, dict)
+    errors = []
+    if reference.get("sha256") != digest:
+        errors.append(f"{label} digest is stale")
+    if reference.get("bytes") != info.st_size:
+        errors.append(f"{label} byte count is stale")
+    return errors, path
+
+
+def media_pcm_identity(
+    path: Path,
+    *,
+    sample_rate: int = 48000,
+    channels: int = 2,
+    expected_frames: int | None = None,
+    source_fd: int | None = None,
+) -> dict[str, Any]:
     """Hash the decoded PCM, rather than pretending a movie equals a WAV file."""
-    path = regular_file(path, "A/B review media")
+    if source_fd is None:
+        source = str(regular_file(path, "A/B review media"))
+        pass_fds: tuple[int, ...] = ()
+    else:
+        try:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+        except OSError as exc:
+            raise EvidenceError("A/B review media descriptor cannot be rewound") from exc
+        source = f"/dev/fd/{source_fd}"
+        pass_fds = (source_fd,)
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise EvidenceError("ffmpeg is required to authenticate review-media audio")
+    if expected_frames is not None and (type(expected_frames) is not int or expected_frames < 1):
+        raise EvidenceError("expected review-media audio frame count must be a positive integer")
     command = [
-        ffmpeg, "-v", "error", "-i", str(path), "-map", "0:a:0", "-vn",
+        ffmpeg, "-nostdin", "-v", "error", "-i", source, "-map", "0:a:0", "-vn",
         "-ac", str(channels), "-ar", str(sample_rate), "-c:a", "pcm_s16le", "-f", "s16le", "-",
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert process.stdout is not None and process.stderr is not None
     digest = hashlib.sha256()
     byte_count = 0
-    while True:
-        chunk = process.stdout.read(1 << 20)
-        if not chunk:
-            break
-        digest.update(chunk)
-        byte_count += len(chunk)
-    stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
-    returncode = process.wait()
-    if returncode:
-        raise EvidenceError(f"ffmpeg cannot decode review-media audio: {stderr}")
     frame_bytes = channels * 2
+    maximum_bytes = expected_frames * frame_bytes if expected_frames is not None else None
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            pass_fds=pass_fds,
+        )
+        assert process.stdout is not None
+        try:
+            while True:
+                read_size = 1 << 20
+                if maximum_bytes is not None:
+                    read_size = min(read_size, maximum_bytes + frame_bytes - byte_count)
+                chunk = process.stdout.read(read_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+                if maximum_bytes is not None and byte_count > maximum_bytes:
+                    raise EvidenceError(
+                        f"review-media audio has more than the expected {expected_frames} PCM frames"
+                    )
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+        returncode = process.wait()
+        if returncode:
+            errors.seek(0)
+            detail = errors.read(64 << 10).decode("utf-8", errors="replace").strip()
+            raise EvidenceError(f"ffmpeg cannot decode review-media audio: {detail}")
     if byte_count < frame_bytes or byte_count % frame_bytes:
         raise EvidenceError("review-media audio does not decode to complete stereo PCM frames")
+    if expected_frames is not None and byte_count != maximum_bytes:
+        raise EvidenceError(
+            f"review-media audio has {byte_count // frame_bytes} PCM frames; "
+            f"expected exactly {expected_frames}"
+        )
     return {
         "audio_pcm_sha256": digest.hexdigest(),
         "audio_frames": byte_count // frame_bytes,
@@ -473,11 +893,23 @@ def media_pcm_identity(path: Path, *, sample_rate: int = 48000, channels: int = 
     }
 
 
-def media_video_identity(path: Path, *, width: int, height: int) -> dict[str, Any]:
+def media_video_identity(
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    expected_frames: int | None = None,
+    source_fd: int | None = None,
+) -> dict[str, Any]:
     """Hash the canonical RGB pixels of every decoded frame in exact order."""
-    path = regular_file(path, "A/B review media")
     try:
-        identity = decoded_video_identity(path, width=width, height=height)
+        identity = decoded_video_identity(
+            path,
+            width=width,
+            height=height,
+            expected_frames=expected_frames,
+            source_fd=source_fd,
+        )
     except MediaIdentityError as exc:
         raise EvidenceError(str(exc)) from exc
     return {
@@ -490,20 +922,54 @@ def media_video_identity(path: Path, *, width: int, height: int) -> dict[str, An
     }
 
 
-def ffprobe_media(path: Path) -> dict[str, Any]:
-    path = regular_file(path, "A/B review media")
+def ffprobe_media(
+    path: Path,
+    *,
+    expected_video_frames: int | None = None,
+    expected_audio_frames: int | None = None,
+    source_fd: int | None = None,
+) -> dict[str, Any]:
+    if source_fd is None:
+        path = regular_file(path, "A/B review media")
+        with _pinned_regular_file(path, "A/B review media") as (file_fd, _info):
+            return ffprobe_media(
+                path,
+                expected_video_frames=expected_video_frames,
+                expected_audio_frames=expected_audio_frames,
+                source_fd=file_fd,
+            )
+    try:
+        info = os.fstat(source_fd)
+    except OSError as exc:
+        raise EvidenceError("A/B review media descriptor is unavailable") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise EvidenceError("A/B review media descriptor is not a regular file")
+    if expected_video_frames is not None and (
+        type(expected_video_frames) is not int or expected_video_frames < 1
+    ):
+        raise EvidenceError("expected review-media frame count must be a positive integer")
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
         raise EvidenceError("ffprobe is required to authenticate A/B review media")
+    if expected_video_frames is not None:
+        maximum = expected_video_frames * PRODUCER_MEDIA_MAX_BYTES_PER_FRAME
+        if info.st_size > maximum:
+            raise EvidenceError(f"A/B review media exceeds its {maximum}-byte media limit")
+    source = f"/dev/fd/{source_fd}"
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise EvidenceError("A/B review media descriptor cannot be rewound") from exc
     done = subprocess.run(
         [
-            ffprobe, "-v", "error", "-count_packets",
-            "-show_entries", "format=duration:stream=codec_type,avg_frame_rate,nb_read_packets,width,height",
-            "-of", "json", str(path),
+            ffprobe, "-v", "error",
+            "-show_entries", "format=duration:stream=codec_type,avg_frame_rate,width,height",
+            "-of", "json", source,
         ],
         capture_output=True,
         text=True,
         check=False,
+        pass_fds=(source_fd,),
     )
     if done.returncode:
         raise EvidenceError(f"ffprobe cannot inspect {path}: {done.stderr.strip()}")
@@ -514,29 +980,40 @@ def ffprobe_media(path: Path) -> dict[str, Any]:
         raise EvidenceError(f"ffprobe returned no finite duration for {path}") from exc
     if not math.isfinite(duration) or duration <= 0:
         raise EvidenceError(f"ffprobe returned an invalid duration for {path}")
-    streams = probe.get("streams") or []
+    streams = probe.get("streams")
+    if not isinstance(streams, list) or not all(isinstance(row, dict) for row in streams):
+        raise EvidenceError("ffprobe returned no exact A/B stream inventory")
     video = [row for row in streams if row.get("codec_type") == "video"]
     audio = [row for row in streams if row.get("codec_type") == "audio"]
-    if len(video) != 1 or len(audio) != 1:
+    if len(streams) != 2 or len(video) != 1 or len(audio) != 1:
         raise EvidenceError("each A/B review movie must contain exactly one video and one audio stream")
     rate = str(video[0].get("avg_frame_rate", ""))
     try:
         numerator, denominator = rate.split("/", 1)
         fps = float(numerator) / float(denominator)
-        video_frames = int(video[0]["nb_read_packets"])
-        width = int(video[0]["width"])
-        height = int(video[0]["height"])
+        width = video[0]["width"]
+        height = video[0]["height"]
+        if type(width) is not int or width < 1 or type(height) is not int or height < 1:
+            raise ValueError("non-integer review movie dimensions")
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
         raise EvidenceError(f"review movie has no exact numeric frame identity: {rate}") from exc
-    if abs(fps - PRODUCTION_FPS) > 1e-9 or video_frames < 1:
+    if not math.isfinite(fps) or fps <= 0 or abs(fps - PRODUCTION_FPS) > 1e-9:
         raise EvidenceError(f"review movie must be a non-empty 30 fps stream, got {fps}")
     if width != PRODUCTION_WIDTH or height != PRODUCTION_HEIGHT:
         raise EvidenceError(
             f"review movie must be {PRODUCTION_WIDTH}x{PRODUCTION_HEIGHT}, got {width}x{height}"
         )
+    video_identity = media_video_identity(
+        path,
+        width=width,
+        height=height,
+        expected_frames=expected_video_frames,
+        source_fd=source_fd,
+    )
+    video_frames = video_identity["decoded_video_frames"]
     return {
-        "sha256": sha256(path),
-        "bytes": path.stat().st_size,
+        "sha256": _fd_sha256(source_fd, "A/B review media"),
+        "bytes": info.st_size,
         "duration_seconds": duration,
         "fps": PRODUCTION_FPS,
         "width": width,
@@ -544,8 +1021,12 @@ def ffprobe_media(path: Path) -> dict[str, Any]:
         "video_frames": video_frames,
         "video_streams": 1,
         "audio_streams": 1,
-        **media_pcm_identity(path),
-        **media_video_identity(path, width=width, height=height),
+        **media_pcm_identity(
+            path,
+            expected_frames=expected_audio_frames,
+            source_fd=source_fd,
+        ),
+        **video_identity,
     }
 
 
@@ -707,11 +1188,15 @@ def _load_sample_receipt(
     expected: dict[str, Any],
     schema_root: Path = ROOT,
     recompute_rows: bool = False,
+    snapshot: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    try:
-        sample = read_json(sample_path, "production score-to-motion sample receipt")
-    except EvidenceError as exc:
-        return {}, [str(exc)]
+    if snapshot is None:
+        try:
+            sample = read_json(sample_path, "production score-to-motion sample receipt")
+        except EvidenceError as exc:
+            return {}, [str(exc)]
+    else:
+        sample = snapshot
     schema_error = _schema_error(
         sample,
         schema_root / "docs/evidence/score-to-motion-samples-production.schema.json",
@@ -749,20 +1234,22 @@ def _load_sample_receipt(
     return sample, errors
 
 
-def _image_psnr(first: Path, second: Path, width: int, height: int) -> float:
+def _image_psnr(first: Path | bytes, second: Path | bytes, width: int, height: int) -> float:
     try:
         from PIL import Image, ImageChops, ImageStat
     except ImportError as exc:
         raise EvidenceError("Pillow is required to authenticate production boundary frames") from exc
     try:
-        with Image.open(first) as left_source, Image.open(second) as right_source:
+        left_input = BytesIO(first) if isinstance(first, bytes) else first
+        right_input = BytesIO(second) if isinstance(second, bytes) else second
+        with Image.open(left_input) as left_source, Image.open(right_input) as right_source:
+            if left_source.size != (width, height) or right_source.size != (width, height):
+                raise EvidenceError("production boundary frame dimensions are stale")
             left = left_source.convert("RGB")
             right = right_source.convert("RGB")
-            if left.size != (width, height) or right.size != (width, height):
-                raise EvidenceError("production boundary frame dimensions are stale")
             difference = ImageChops.difference(left, right)
             squared = sum(ImageStat.Stat(difference).sum2)
-    except OSError as exc:
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise EvidenceError(f"cannot decode production boundary frames: {exc}") from exc
     if squared == 0:
         raise EvidenceError("production A/B boundary frames are pixel-identical")
@@ -770,7 +1257,7 @@ def _image_psnr(first: Path, second: Path, width: int, height: int) -> float:
     return 10 * math.log10((255 * 255) / mse)
 
 
-def _raw_frame_psnr(source: Path, payload: bytes, width: int, height: int) -> float:
+def _raw_frame_psnr(source: Path | bytes, payload: bytes, width: int, height: int) -> float:
     try:
         from PIL import Image, ImageChops, ImageStat
     except ImportError as exc:
@@ -778,13 +1265,14 @@ def _raw_frame_psnr(source: Path, payload: bytes, width: int, height: int) -> fl
     if len(payload) != width * height * 3:
         raise EvidenceError("review anchor does not contain one complete RGB frame")
     try:
-        with Image.open(source) as image:
-            expected = image.convert("RGB")
-            if expected.size != (width, height):
+        source_input = BytesIO(source) if isinstance(source, bytes) else source
+        with Image.open(source_input) as image:
+            if image.size != (width, height):
                 raise EvidenceError("review anchor source frame dimensions are stale")
+            expected = image.convert("RGB")
             actual = Image.frombytes("RGB", (width, height), payload)
             squared = sum(ImageStat.Stat(ImageChops.difference(expected, actual)).sum2)
-    except OSError as exc:
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise EvidenceError(f"cannot decode review anchor source frame: {exc}") from exc
     if squared == 0:
         return 120.0
@@ -810,73 +1298,135 @@ def review_frame_anchors(
     frame_path: Path,
     frame: dict[str, Any],
     mode: str,
+    expected_frames: int | None = None,
+    source_fd: int | None = None,
 ) -> list[dict[str, Any]]:
     """Match each movie's 30 fps boundary frame to the Metal capture for its mode."""
+    if source_fd is None:
+        media_path = regular_file(media_path, "A/B review media")
+        with _pinned_regular_file(media_path, "A/B review media") as (file_fd, _info):
+            return review_frame_anchors(
+                media_path,
+                frame_path=frame_path,
+                frame=frame,
+                mode=mode,
+                expected_frames=expected_frames,
+                source_fd=file_fd,
+            )
+    try:
+        info = os.fstat(source_fd)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise EvidenceError("A/B review media descriptor cannot be read for frame anchors") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise EvidenceError("A/B review media descriptor is not a regular file")
     if mode not in {"with_score", "control"}:
         raise EvidenceError(f"unknown A/B review mode: {mode}")
-    capture = frame.get("capture") or {}
-    width = int(capture.get("width", 0))
-    height = int(capture.get("height", 0))
-    rows = frame.get("rows") or []
+    if expected_frames is None:
+        span = frame.get("span") if isinstance(frame.get("span"), dict) else {}
+        duration = span.get("duration_seconds")
+        expected_frames = production_frame_count(
+            duration,
+            "frame receipt review-media duration",
+        )
+    if type(expected_frames) is not int or expected_frames < 1:
+        raise EvidenceError("review-media frame span must be a positive integer")
+    capture = frame.get("capture")
+    rows = frame.get("rows")
+    if (
+        not isinstance(capture, dict)
+        or type(capture.get("width")) is not int
+        or capture["width"] != PRODUCTION_WIDTH
+        or type(capture.get("height")) is not int
+        or capture["height"] != PRODUCTION_HEIGHT
+        or not isinstance(rows, list)
+        or not rows
+        or len(rows) > REVIEW_ANCHOR_MAX_COUNT
+        or not all(isinstance(row, dict) for row in rows)
+    ):
+        raise EvidenceError("frame receipt has no exact bounded anchor shape or row plan")
+    width = capture["width"]
+    height = capture["height"]
     indexes = [row.get("review_frame_index") for row in rows if isinstance(row, dict)]
     if (
         len(indexes) != len(rows)
         or not indexes
-        or any(type(index) is not int or index < 0 for index in indexes)
+        or any(type(index) is not int or not 0 <= index < expected_frames for index in indexes)
+        or indexes != sorted(indexes)
     ):
         raise EvidenceError("frame receipt has no complete review-frame index chain")
     unique_indexes = sorted(set(indexes))
+    rows_by_index: dict[int, list[dict[str, Any]]] = {}
+    for row, index in zip(rows, indexes, strict=True):
+        rows_by_index.setdefault(index, []).append(row)
     expression = "+".join(f"eq(n\\,{index})" for index in unique_indexes)
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise EvidenceError("ffmpeg is required to bind review movies to GPU captures")
-    process = subprocess.Popen(
-        [
-            ffmpeg, "-v", "error", "-i", str(regular_file(media_path, "A/B review media")),
-            "-map", "0:v:0", "-vf", f"select={expression}", "-fps_mode", "passthrough",
-            "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None and process.stderr is not None
-    frame_bytes = width * height * 3
-    decoded: dict[int, bytes] = {}
-    for index in unique_indexes:
-        payload = _read_exact(process.stdout, frame_bytes)
-        if len(payload) != frame_bytes:
-            process.kill()
-            process.wait()
-            raise EvidenceError(f"review movie is missing boundary frame {index}")
-        decoded[index] = payload
-    if process.stdout.read(1):
-        process.kill()
-        process.wait()
-        raise EvidenceError("review movie emitted surplus selected boundary frames")
-    stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
-    if process.wait():
-        raise EvidenceError(f"ffmpeg cannot extract review boundary frames: {stderr}")
-
-    anchors = []
-    for row in rows:
-        index = row["review_frame_index"]
-        source = local_artifact(frame_path, row.get(mode), f"{row.get('sample_id')} {mode} frame")
-        payload = decoded[index]
-        measured = _raw_frame_psnr(source, payload, width, height)
-        if measured < REVIEW_ANCHOR_PSNR_FLOOR:
-            raise EvidenceError(
-                f"{mode} review frame {index} is only {measured:.2f} dB from its Metal capture"
+    with tempfile.TemporaryFile() as errors:
+        try:
+            process = subprocess.Popen(
+                [
+                    ffmpeg, "-nostdin", "-v", "error", "-i", f"/dev/fd/{source_fd}",
+                    "-map", "0:v:0", "-vf", f"select={expression}", "-fps_mode", "passthrough",
+                    "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                pass_fds=(source_fd,),
             )
-        anchors.append(
-            {
-                "sample_id": row["sample_id"],
-                "frame_index": index,
-                "review_second": row["review_second"],
-                "source_frame_sha256": sha256(source),
-                "decoded_rgb_sha256": hashlib.sha256(payload).hexdigest(),
-                "psnr_db": round(measured, 9),
-            }
-        )
+        except OSError as exc:
+            raise EvidenceError(f"cannot launch review boundary-frame decoder: {exc}") from exc
+        assert process.stdout is not None
+        frame_bytes = width * height * 3
+        anchors = []
+        try:
+            for index in unique_indexes:
+                payload = _read_exact(process.stdout, frame_bytes)
+                if len(payload) != frame_bytes:
+                    raise EvidenceError(f"review movie is missing boundary frame {index}")
+                for row in rows_by_index[index]:
+                    source_errors, source, source_payload = _artifact_binary_snapshot(
+                        frame_path,
+                        row.get(mode),
+                        f"{row.get('sample_id')} {mode} frame anchor",
+                        max_bytes=FRAME_IMAGE_MAX_BYTES,
+                    )
+                    if source_errors or source is None or source_payload is None:
+                        raise EvidenceError(
+                            "; ".join(
+                                source_errors or ["review anchor source frame is absent"]
+                            )
+                        )
+                    measured = _raw_frame_psnr(source_payload, payload, width, height)
+                    if measured < REVIEW_ANCHOR_PSNR_FLOOR:
+                        raise EvidenceError(
+                            f"{mode} review frame {index} is only {measured:.2f} dB "
+                            "from its Metal capture"
+                        )
+                    anchors.append(
+                        {
+                            "sample_id": row["sample_id"],
+                            "frame_index": index,
+                            "review_second": row["review_second"],
+                            "source_frame_sha256": hashlib.sha256(source_payload).hexdigest(),
+                            "decoded_rgb_sha256": hashlib.sha256(payload).hexdigest(),
+                            "psnr_db": round(measured, 9),
+                        }
+                    )
+            if process.stdout.read(1):
+                raise EvidenceError("review movie emitted surplus selected boundary frames")
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+        if process.wait():
+            errors.seek(0)
+            detail = errors.read(64 << 10).decode("utf-8", errors="replace").strip()
+            raise EvidenceError(f"ffmpeg cannot extract review boundary frames: {detail}")
     return anchors
 
 
@@ -887,11 +1437,16 @@ def _load_frame_receipt(
     sample: dict[str, Any],
     expected: dict[str, Any],
     schema_root: Path = ROOT,
+    snapshot: dict[str, Any] | None = None,
+    sample_payload: bytes | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    try:
-        frame = read_json(frame_path, "production score-to-motion frame receipt")
-    except EvidenceError as exc:
-        return {}, [str(exc)]
+    if snapshot is None:
+        try:
+            frame = read_json(frame_path, "production score-to-motion frame receipt")
+        except EvidenceError as exc:
+            return {}, [str(exc)]
+    else:
+        frame = snapshot
     schema_error = _schema_error(
         frame,
         schema_root / "docs/evidence/score-to-motion-frames-production.schema.json",
@@ -900,21 +1455,53 @@ def _load_frame_receipt(
     if schema_error:
         return frame, [schema_error]
     errors = _context_errors(frame, expected, "frame receipt")
-    sample_errors, referenced_sample = _artifact_errors(frame_path, frame.get("sample_receipt"), "frame sample receipt")
+    if sample_payload is None:
+        sample_errors, referenced_sample = _artifact_errors(
+            frame_path,
+            frame.get("sample_receipt"),
+            "frame sample receipt",
+        )
+    else:
+        try:
+            referenced_sample = local_artifact(
+                frame_path,
+                frame.get("sample_receipt"),
+                "frame sample receipt",
+            )
+        except EvidenceError as exc:
+            sample_errors = [str(exc)]
+            referenced_sample = None
+        else:
+            sample_reference = frame.get("sample_receipt")
+            assert isinstance(sample_reference, dict)
+            sample_errors = []
+            if sample_reference.get("sha256") != hashlib.sha256(sample_payload).hexdigest():
+                sample_errors.append("frame sample receipt digest is stale")
+            if sample_reference.get("bytes") != len(sample_payload):
+                sample_errors.append("frame sample receipt byte count is stale")
     errors.extend(sample_errors)
     if referenced_sample is not None and referenced_sample != sample_path.resolve(strict=True):
         errors.append("frame receipt names a different production sample receipt")
 
-    sheet_errors, sheet_path = _artifact_errors(frame_path, frame.get("contact_sheet"), "contact sheet")
+    sheet_errors, sheet_path, sheet_payload = _artifact_binary_snapshot(
+        frame_path,
+        frame.get("contact_sheet"),
+        "contact sheet",
+        max_bytes=FRAME_IMAGE_MAX_BYTES,
+    )
     errors.extend(sheet_errors)
-    if sheet_path is not None:
+    if sheet_path is not None and sheet_payload is not None:
         try:
             from PIL import Image
-            with Image.open(sheet_path) as sheet:
-                if sheet.width < 1 or sheet.height < 1:
-                    errors.append("contact sheet is empty")
-        except (ImportError, OSError) as exc:
+        except ImportError as exc:
             errors.append(f"contact sheet cannot be decoded: {exc}")
+        else:
+            try:
+                with Image.open(BytesIO(sheet_payload)) as sheet:
+                    if sheet.width < 1 or sheet.height < 1:
+                        errors.append("contact sheet is empty")
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                errors.append(f"contact sheet cannot be decoded: {exc}")
 
     capture = frame.get("capture") or {}
     width = int(capture.get("width", 0))
@@ -954,15 +1541,30 @@ def _load_frame_receipt(
     resolved_rows: list[tuple[Path, Path]] = []
     for row in frame.get("rows") or []:
         sample_id = row.get("sample_id", "unknown")
-        with_errors, with_path = _artifact_errors(frame_path, row.get("with_score"), f"{sample_id} with-score frame")
-        control_errors, control_path = _artifact_errors(frame_path, row.get("control"), f"{sample_id} control frame")
+        with_errors, with_path, with_payload = _artifact_binary_snapshot(
+            frame_path,
+            row.get("with_score"),
+            f"{sample_id} with-score frame",
+            max_bytes=FRAME_IMAGE_MAX_BYTES,
+        )
+        control_errors, control_path, control_payload = _artifact_binary_snapshot(
+            frame_path,
+            row.get("control"),
+            f"{sample_id} control frame",
+            max_bytes=FRAME_IMAGE_MAX_BYTES,
+        )
         errors.extend(with_errors)
         errors.extend(control_errors)
-        if with_path is None or control_path is None:
+        if (
+            with_path is None
+            or with_payload is None
+            or control_path is None
+            or control_payload is None
+        ):
             continue
         resolved_rows.append((with_path, control_path))
         try:
-            measured = _image_psnr(with_path, control_path, width, height)
+            measured = _image_psnr(with_payload, control_payload, width, height)
         except EvidenceError as exc:
             errors.append(f"{sample_id}: {exc}")
         else:
@@ -972,12 +1574,27 @@ def _load_frame_receipt(
                 errors.append(f"{sample_id} has no observable pixel difference")
 
     determinism = frame.get("determinism") or {}
-    first_errors, first = _artifact_errors(frame_path, determinism.get("first"), "determinism first frame")
-    repeat_errors, repeat = _artifact_errors(frame_path, determinism.get("repeat"), "determinism repeat frame")
+    first_errors, first, first_payload = _artifact_binary_snapshot(
+        frame_path,
+        determinism.get("first"),
+        "determinism first frame",
+        max_bytes=FRAME_IMAGE_MAX_BYTES,
+    )
+    repeat_errors, repeat, repeat_payload = _artifact_binary_snapshot(
+        frame_path,
+        determinism.get("repeat"),
+        "determinism repeat frame",
+        max_bytes=FRAME_IMAGE_MAX_BYTES,
+    )
     errors.extend(first_errors)
     errors.extend(repeat_errors)
-    if first is not None and repeat is not None:
-        if first.read_bytes() != repeat.read_bytes():
+    if (
+        first is not None
+        and first_payload is not None
+        and repeat is not None
+        and repeat_payload is not None
+    ):
+        if first_payload != repeat_payload:
             errors.append("production boundary-frame renderer is not deterministic")
         if resolved_rows and first != resolved_rows[0][0]:
             errors.append("determinism first frame is not the first with-score boundary frame")
@@ -986,28 +1603,255 @@ def _load_frame_receipt(
     return frame, errors
 
 
-def _producer_segment_receipts(concat_path: Path) -> list[Path]:
-    """Resolve the exact ordered renderer receipt chain owned by one concat."""
-    concat = read_json(concat_path, "review-media render concat receipt")
+def _producer_media_for_receipt(receipt_path: Path, label: str) -> Path:
+    """Resolve the sibling media named by a renderer ``*.receipt.json`` file."""
+
+    suffix = ".receipt.json"
+    if not receipt_path.name.endswith(suffix) or receipt_path.name == suffix:
+        raise EvidenceError(f"{label} receipt has no exact media name")
+    return _bounded_file(receipt_path.parent, receipt_path.name[: -len(suffix)], label)
+
+
+def _producer_segment_chain(
+    concat_path: Path,
+    *,
+    concat: dict[str, Any] | None = None,
+    maximum_segments: int | None = None,
+) -> list[tuple[Path, Path, dict[str, Any]]]:
+    """Resolve the exact ordered renderer media/receipt chain owned by one concat."""
+
+    concat_receipt_suffix = ".mov.receipt.json"
+    if not concat_path.name.endswith(concat_receipt_suffix):
+        raise EvidenceError("review-media render concat receipt has no exact .mov sidecar name")
+    concat_stem = concat_path.name[: -len(concat_receipt_suffix)]
+    if concat is None:
+        concat = read_json(
+            concat_path,
+            "review-media render concat receipt",
+            max_bytes=PRODUCER_CONCAT_RECEIPT_MAX_BYTES,
+        )
     rows = concat.get("segments")
     if not isinstance(rows, list) or not rows:
         raise EvidenceError("review-media render concat receipt has no segment chain")
-    receipts = []
+    if len(rows) > PRODUCER_SEGMENT_MAX_COUNT:
+        raise EvidenceError("review-media render concat receipt exceeds its segment-count limit")
+    if maximum_segments is not None and len(rows) > maximum_segments:
+        raise EvidenceError(
+            "review-media render concat receipt has more segments than decoded frames"
+        )
+    chain = []
+    names: set[str] = set()
+    receipt_bytes = 0
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or set(row) != {"name", "receipt_sha256"}:
             raise EvidenceError(f"review-media render segment {index} has no exact reference")
         name = row.get("name")
         if not isinstance(name, str) or PurePosixPath(name).name != name:
             raise EvidenceError(f"review-media render segment {index} has an unsafe name")
-        path = _bounded_file(
+        if name in names:
+            raise EvidenceError(f"review-media render segment {index} reuses media {name}")
+        expected_name = f"{concat_stem}-seg-{index:03d}.mov"
+        if name != expected_name:
+            raise EvidenceError(
+                f"review-media render segment {index} is not the canonical {expected_name}"
+            )
+        names.add(name)
+        media_path = _bounded_file(
+            concat_path.parent,
+            name,
+            f"review-media render segment {index} media",
+        )
+        receipt_path = _bounded_file(
             concat_path.parent,
             f"{name}.receipt.json",
             f"review-media render segment {index} receipt",
         )
-        if row.get("receipt_sha256") != sha256(path):
+        segment, payload = _bounded_json_snapshot(
+            receipt_path,
+            f"review-media render segment {index} receipt",
+            max_bytes=PRODUCER_SEGMENT_RECEIPT_MAX_BYTES,
+        )
+        receipt_bytes += len(payload)
+        if receipt_bytes > PRODUCER_SEGMENT_RECEIPT_TOTAL_MAX_BYTES:
+            raise EvidenceError(
+                "review-media render segment receipts exceed their aggregate byte limit"
+            )
+        if row.get("receipt_sha256") != hashlib.sha256(payload).hexdigest():
             raise EvidenceError(f"review-media render segment {index} receipt digest is stale")
-        receipts.append(path)
-    return receipts
+        chain.append((media_path, receipt_path, segment))
+    return chain
+
+
+def _producer_stream_info(
+    path: Path,
+    label: str,
+    *,
+    source_fd: int | None = None,
+) -> dict[str, object]:
+    """Enforce the exact video-only ProRes production encoding contract."""
+
+    try:
+        stream = video_stream_info(path, source_fd=source_fd)
+        if (
+            stream.get("width") != PRODUCTION_WIDTH
+            or stream.get("height") != PRODUCTION_HEIGHT
+            or not finite_receipt_number(stream.get("fps"))
+            or abs(float(stream["fps"]) - PRODUCTION_FPS) > 1e-9
+            or stream.get("codec_name") != "prores"
+            or stream.get("profile") != "HQ"
+            or stream.get("pix_fmt") != "yuv422p10le"
+            or stream.get("stream_count") != 1
+            or stream.get("video_streams") != 1
+            or stream.get("audio_streams") != 0
+            or stream.get("subtitle_streams") != 0
+            or stream.get("data_streams") != 0
+        ):
+            raise MediaIdentityError(
+                f"producer video must be video-only ProRes HQ yuv422p10le at "
+                f"{PRODUCTION_WIDTH}x{PRODUCTION_HEIGHT} and {PRODUCTION_FPS} fps"
+            )
+    except (MediaIdentityError, OSError, TypeError, ValueError) as exc:
+        raise EvidenceError(f"{label} media cannot be authenticated: {exc}") from exc
+    return stream
+
+
+def _producer_decoded_video_identity(
+    path: Path,
+    *,
+    expected_frames: int,
+    include_fps: bool,
+    label: str,
+    source_fd: int | None = None,
+    aggregate_digest: Any | None = None,
+) -> dict[str, object]:
+    """Decode one producer movie and enforce its exact production stream shape."""
+
+    _producer_stream_info(path, label, source_fd=source_fd)
+    try:
+        identity = decoded_video_identity(
+            path,
+            width=PRODUCTION_WIDTH,
+            height=PRODUCTION_HEIGHT,
+            expected_frames=expected_frames,
+            source_fd=source_fd,
+            _aggregate_digest=aggregate_digest,
+        )
+    except (MediaIdentityError, OSError, TypeError, ValueError) as exc:
+        raise EvidenceError(f"{label} media cannot be authenticated: {exc}") from exc
+    if include_fps:
+        identity["fps"] = PRODUCTION_FPS
+    return identity
+
+
+def _producer_media_identity_errors(
+    path: Path,
+    receipt: dict[str, Any],
+    *,
+    expected_frames: int | None,
+    include_fps: bool,
+    label: str,
+) -> tuple[list[str], dict[str, object] | None]:
+    """Recompute encoded and decoded identities from actual renderer media."""
+
+    errors: list[str] = []
+    try:
+        with _pinned_regular_file(path, label) as (file_fd, info):
+            if expected_frames is not None:
+                maximum = expected_frames * PRODUCER_MEDIA_MAX_BYTES_PER_FRAME
+                if info.st_size > maximum:
+                    raise EvidenceError(f"{label} exceeds its {maximum}-byte media limit")
+            file_bytes = receipt.get("file_bytes")
+            if type(file_bytes) is not int or file_bytes < 1:
+                errors.append(f"{label} has no exact encoded output byte count")
+            elif file_bytes != info.st_size:
+                errors.append(f"{label} encoded output byte count is stale")
+            file_digest = receipt.get("file_sha256")
+            if not isinstance(file_digest, str) or not HEX64.fullmatch(file_digest):
+                errors.append(f"{label} has no encoded output digest")
+            elif file_digest != _fd_sha256(file_fd, label):
+                errors.append(f"{label} encoded output digest is stale")
+            if expected_frames is None:
+                return errors, None
+            decoded = _producer_decoded_video_identity(
+                path,
+                expected_frames=expected_frames,
+                include_fps=include_fps,
+                label=label,
+                source_fd=file_fd,
+            )
+    except EvidenceError as exc:
+        errors.append(str(exc))
+        return errors, None
+    if receipt.get("decoded_video") != decoded:
+        errors.append(f"{label} decoded video identity is stale")
+    return errors, decoded
+
+
+def _producer_segment_media_identity_errors(
+    paths: list[Path],
+    receipts: list[dict[str, Any]],
+    *,
+    expected_frames: list[int],
+    maximum_frames: int,
+    label: str,
+) -> tuple[list[str], dict[str, object] | None]:
+    """Authenticate every encoded segment and its continuous RGB chain once."""
+
+    errors: list[str] = []
+    if (
+        not paths
+        or len(paths) != len(receipts)
+        or len(paths) != len(expected_frames)
+        or type(maximum_frames) is not int
+        or maximum_frames < 1
+        or any(type(value) is not int or value < 1 for value in expected_frames)
+        or sum(expected_frames) != maximum_frames
+    ):
+        return [f"{label} has no exact bounded frame plan"], None
+    try:
+        chain_digest = hashlib.sha256()
+        actual_segments = []
+        for index, (path, receipt, frames) in enumerate(
+            zip(paths, receipts, expected_frames, strict=True)
+        ):
+            with _pinned_regular_file(path, f"{label} {index}") as (file_fd, info):
+                maximum = frames * PRODUCER_MEDIA_MAX_BYTES_PER_FRAME
+                if info.st_size > maximum:
+                    raise EvidenceError(
+                        f"{label} {index} exceeds its {maximum}-byte media limit"
+                    )
+                file_bytes = receipt.get("file_bytes")
+                if type(file_bytes) is not int or file_bytes < 1:
+                    errors.append(f"{label} {index} has no exact encoded output byte count")
+                elif file_bytes != info.st_size:
+                    errors.append(f"{label} {index} encoded output byte count is stale")
+                file_digest = receipt.get("file_sha256")
+                if not isinstance(file_digest, str) or not HEX64.fullmatch(file_digest):
+                    errors.append(f"{label} {index} has no encoded output digest")
+                elif file_digest != _fd_sha256(file_fd, f"{label} {index}"):
+                    errors.append(f"{label} {index} encoded output digest is stale")
+                actual = _producer_decoded_video_identity(
+                    path,
+                    expected_frames=frames,
+                    include_fps=False,
+                    label=f"{label} {index}",
+                    source_fd=file_fd,
+                    aggregate_digest=chain_digest,
+                )
+                actual_segments.append(actual)
+                if receipt.get("decoded_video") != actual:
+                    errors.append(f"{label} {index} decoded video identity is stale")
+        chain_decoded = {
+            "algorithm": "rgb24-stream-sha256-v1",
+            "sha256": chain_digest.hexdigest(),
+            "frames": maximum_frames,
+            "width": PRODUCTION_WIDTH,
+            "height": PRODUCTION_HEIGHT,
+        }
+    except EvidenceError as exc:
+        errors.append(str(exc))
+        return errors, None
+    return errors, chain_decoded
 
 
 def _producer_receipt_errors(
@@ -1020,27 +1864,28 @@ def _producer_receipt_errors(
     root: Path,
 ) -> tuple[list[str], Path | None]:
     """Bind every review frame to one exact canonical renderer receipt chain."""
-    errors, concat_path = _artifact_errors(
+    errors, concat_path, concat = _artifact_json_snapshot(
         receipt_path,
         reference,
         f"{mode} review-media producer receipt",
+        max_bytes=PRODUCER_CONCAT_RECEIPT_MAX_BYTES,
     )
-    if concat_path is None:
+    if concat_path is None or concat is None:
         return errors, None
-    try:
-        concat = read_json(concat_path, f"{mode} review-media producer receipt")
-    except EvidenceError as exc:
-        return [*errors, str(exc)], concat_path
     if concat.get("schema") != "danse.render.concat.v1":
         errors.append(f"{mode} review-media producer has the wrong schema")
     if concat.get("codec") != "prores":
         errors.append(f"{mode} review-media producer is not the lossless-evidence codec")
-    if not isinstance(concat.get("file_sha256"), str) or not HEX64.fullmatch(
-        concat.get("file_sha256", "")
-    ):
-        errors.append(f"{mode} review-media producer has no encoded output digest")
     decoded = concat.get("decoded_video") if isinstance(concat.get("decoded_video"), dict) else {}
-    expected_frames = round(float(expected["span"]["duration_seconds"]) * PRODUCTION_FPS)
+    span = expected.get("span") if isinstance(expected.get("span"), dict) else {}
+    try:
+        expected_frames = production_frame_count(
+            span.get("duration_seconds"),
+            "expected production duration",
+        )
+    except EvidenceError as exc:
+        errors.append(str(exc))
+        return errors, concat_path
     expected_decoded = {
         "algorithm": "rgb24-stream-sha256-v1",
         "sha256": review_identity.get("decoded_rgb_sha256"),
@@ -1055,45 +1900,75 @@ def _producer_receipt_errors(
         errors.append(f"{mode} review-media producer does not cover the exact frame span")
 
     try:
-        segment_paths = _producer_segment_receipts(concat_path)
+        segment_chain = _producer_segment_chain(
+            concat_path,
+            concat=concat,
+            maximum_segments=expected_frames,
+        )
     except EvidenceError as exc:
         errors.append(str(exc))
         return errors, concat_path
+
+    try:
+        concat_media = _producer_media_for_receipt(
+            concat_path,
+            f"{mode} render concat media",
+        )
+    except EvidenceError as exc:
+        errors.append(str(exc))
+        concat_decoded = None
+    else:
+        concat_media_errors, concat_decoded = _producer_media_identity_errors(
+            concat_media,
+            concat,
+            expected_frames=expected_frames,
+            include_fps=True,
+            label=f"{mode} render concat",
+        )
+        errors.extend(concat_media_errors)
     segment_frames = None
     total_frames = 0
+    segment_media_plan: list[Path] = []
+    segment_receipt_plan: list[dict[str, Any]] = []
+    segment_frame_plan: list[int] = []
+    frame_plan_valid = True
     control_source = None
     if mode == "control":
         try:
             control_source = renderer_source_tree(PRODUCTION_TIER, root, with_score=False)
         except EvidenceError as exc:
             errors.append(str(exc))
-    for ordinal, segment_path in enumerate(segment_paths):
-        try:
-            segment = read_json(segment_path, f"{mode} render segment {ordinal} receipt")
-        except EvidenceError as exc:
-            errors.append(str(exc))
-            continue
+    for ordinal, (segment_media, _segment_path, segment) in enumerate(segment_chain):
         if segment.get("schema") != "danse.render.segment.v1":
             errors.append(f"{mode} render segment {ordinal} has the wrong schema")
-        if segment.get("segment") != ordinal:
+            frame_plan_valid = False
+        if type(segment.get("segment")) is not int or segment.get("segment") != ordinal:
             errors.append(f"{mode} render segment chain is not ordered and contiguous at {ordinal}")
+            frame_plan_valid = False
         frames = segment.get("frames")
         if type(frames) is not int or frames < 1:
             errors.append(f"{mode} render segment {ordinal} has no exact frame count")
+            frame_plan_valid = False
             continue
+        segment_media_plan.append(segment_media)
+        segment_receipt_plan.append(segment)
+        segment_frame_plan.append(frames)
         inputs = segment.get("inputs") if isinstance(segment.get("inputs"), dict) else {}
         current_segment_frames = inputs.get("segment_frames")
         if type(current_segment_frames) is not int or current_segment_frames < 1:
             errors.append(f"{mode} render segment {ordinal} has no segment-span identity")
+            frame_plan_valid = False
         elif segment_frames is None:
             segment_frames = current_segment_frames
         elif current_segment_frames != segment_frames:
             errors.append(f"{mode} render segments do not share one segment span")
+            frame_plan_valid = False
         if segment_frames is not None:
             remaining = expected_frames - ordinal * segment_frames
             wanted = min(segment_frames, max(remaining, 0))
             if frames != wanted:
                 errors.append(f"{mode} render segment {ordinal} does not own its exact frame range")
+                frame_plan_valid = False
         total_frames += frames
         common = {
             "window": "passage",
@@ -1107,7 +1982,15 @@ def _producer_receipt_errors(
             "fps": PRODUCTION_FPS,
         }
         for field, value in common.items():
-            if inputs.get(field) != value:
+            actual = inputs.get(field)
+            wrong_type = (
+                (field in {"start", "fps"} and not finite_receipt_number(actual))
+                or (
+                    field in {"seed", "stream", "width", "height"}
+                    and type(actual) is not int
+                )
+            )
+            if wrong_type or actual != value:
                 errors.append(f"{mode} render segment {ordinal} has stale {field}")
         if mode == "with_score":
             if any(field in inputs for field in ("duration_seconds", "timing_score", "passage_timing")):
@@ -1150,7 +2033,7 @@ def _producer_receipt_errors(
         renderer = str(capture.get("renderer", "")).lower()
         if "apple" not in renderer or "metal" not in renderer:
             errors.append(f"{mode} render segment {ordinal} is not authenticated as Apple Metal")
-        if capture.get("missing") != 0:
+        if type(capture.get("missing")) is not int or capture.get("missing") != 0:
             errors.append(f"{mode} render segment {ordinal} has missing photographic plates")
         if not isinstance(capture.get("raw_rgba_sha256"), str) or not HEX64.fullmatch(
             capture.get("raw_rgba_sha256", "")
@@ -1177,8 +2060,11 @@ def _producer_receipt_errors(
         )
         if (
             segment_decoded.get("algorithm") != "rgb24-stream-sha256-v1"
+            or type(segment_decoded.get("frames")) is not int
             or segment_decoded.get("frames") != frames
+            or type(segment_decoded.get("width")) is not int
             or segment_decoded.get("width") != PRODUCTION_WIDTH
+            or type(segment_decoded.get("height")) is not int
             or segment_decoded.get("height") != PRODUCTION_HEIGHT
             or not isinstance(segment_decoded.get("sha256"), str)
             or not HEX64.fullmatch(segment_decoded.get("sha256", ""))
@@ -1186,6 +2072,24 @@ def _producer_receipt_errors(
             errors.append(f"{mode} render segment {ordinal} has no full decoded-frame identity")
     if total_frames != expected_frames:
         errors.append(f"{mode} render producer segment chain has {total_frames}, expected {expected_frames} frames")
+        frame_plan_valid = False
+    if frame_plan_valid and len(segment_media_plan) == len(segment_chain):
+        media_errors, chain_decoded = _producer_segment_media_identity_errors(
+            segment_media_plan,
+            segment_receipt_plan,
+            expected_frames=segment_frame_plan,
+            maximum_frames=expected_frames,
+            label=f"{mode} render segment",
+        )
+        errors.extend(media_errors)
+        if chain_decoded is not None and concat_decoded is not None:
+            actual_concat_frames = {
+                key: value for key, value in concat_decoded.items() if key != "fps"
+            }
+            if chain_decoded != actual_concat_frames:
+                errors.append(
+                    f"{mode} render segment decoded chain differs from its actual concat"
+                )
     return errors, concat_path
 
 
@@ -1197,28 +2101,87 @@ def _media_errors(
     frame_path: Path | None,
     frame: dict[str, Any],
     root: Path,
+    review_probe_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     errors = []
-    duration = float(expected["span"]["duration_seconds"])
-    expected_video_frames = round(duration * 30)
+    span = expected.get("span") if isinstance(expected.get("span"), dict) else {}
+    try:
+        expected_video_frames = production_frame_count(
+            span.get("duration_seconds"),
+            "expected production duration",
+        )
+    except EvidenceError as exc:
+        return [str(exc)]
+    duration = float(span["duration_seconds"])
     master = expected["audio_master"]
     identities: dict[str, tuple[dict[str, Any], Path]] = {}
     for name in ("with_score", "control"):
         reference = (receipt.get("review_media") or {}).get(name)
-        artifact_errors, path = _artifact_errors(receipt_path, reference, f"{name} review media")
+        cached_measurement = (review_probe_cache or {}).get(name)
+        cached_probe = (
+            cached_measurement.get("probe")
+            if isinstance(cached_measurement, dict)
+            else None
+        )
+        cached_anchors = (
+            cached_measurement.get("anchors")
+            if isinstance(cached_measurement, dict)
+            else None
+        )
+        if isinstance(cached_probe, dict) and isinstance(cached_anchors, list):
+            artifact_errors, path = _cached_review_artifact_errors(
+                receipt_path,
+                reference,
+                f"{name} review media",
+                expected_frames=expected_video_frames,
+            )
+        else:
+            try:
+                path = local_artifact(receipt_path, reference, f"{name} review media")
+            except EvidenceError as exc:
+                errors.append(str(exc))
+                continue
+            artifact_errors = []
         errors.extend(artifact_errors)
         if path is None or not isinstance(reference, dict):
             continue
-        try:
-            probed = ffprobe_media(path)
-        except EvidenceError as exc:
-            errors.append(str(exc))
-            continue
+        measured_anchors: list[dict[str, Any]] | None = None
+        if isinstance(cached_probe, dict) and isinstance(cached_anchors, list):
+            probed = cached_probe
+            measured_anchors = cached_anchors
+        else:
+            try:
+                with _pinned_regular_file(path, f"{name} review media") as (file_fd, _info):
+                    probed = ffprobe_media(
+                        path,
+                        expected_video_frames=expected_video_frames,
+                        expected_audio_frames=master["frames"],
+                        source_fd=file_fd,
+                    )
+                    if frame_path is not None and frame:
+                        try:
+                            measured_anchors = review_frame_anchors(
+                                path,
+                            frame_path=frame_path,
+                            frame=frame,
+                            mode=name,
+                            expected_frames=expected_video_frames,
+                            source_fd=file_fd,
+                            )
+                        except EvidenceError as exc:
+                            errors.append(str(exc))
+            except EvidenceError as exc:
+                errors.append(str(exc))
+                continue
+            if reference.get("sha256") != probed.get("sha256"):
+                errors.append(f"{name} review media digest is stale")
+            if reference.get("bytes") != probed.get("bytes"):
+                errors.append(f"{name} review media byte count is stale")
         for field in (
             "sha256", "bytes", "duration_seconds", "fps", "width", "height", "video_frames",
             "video_streams", "audio_streams", "audio_pcm_sha256", "audio_frames",
             "audio_sample_rate", "audio_channels", "video_framehash_sha256",
-            "decoded_video_frames",
+            "decoded_rgb_sha256", "decoded_video_frames",
         ):
             if reference.get(field) != probed.get(field):
                 errors.append(f"{name} review media has stale {field}")
@@ -1236,14 +2199,8 @@ def _media_errors(
             errors.append(f"{name} review media has the wrong A/B mode")
         if frame_path is None or not frame:
             errors.append(f"{name} review media has no authenticated Metal frame receipt")
-        else:
-            try:
-                anchors = review_frame_anchors(path, frame_path=frame_path, frame=frame, mode=name)
-            except EvidenceError as exc:
-                errors.append(str(exc))
-            else:
-                if reference.get("anchors") != anchors:
-                    errors.append(f"{name} review-media frame anchors are stale")
+        elif measured_anchors is not None and reference.get("anchors") != measured_anchors:
+            errors.append(f"{name} review-media frame anchors are stale")
         producer_errors, _ = _producer_receipt_errors(
             receipt_path,
             reference.get("producer_receipt"),
@@ -1283,75 +2240,118 @@ def production_receipt_errors(
     root: Path = ROOT,
     require_clean: bool = True,
     recompute_samples: bool = True,
+    _review_probe_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     """Return every reason a receipt cannot satisfy the production machine gate."""
     if receipt_path.is_symlink() or not receipt_path.is_file():
         return [f"production A/B receipt is absent: {receipt_path}"]
     try:
-        receipt = read_json(receipt_path, "production A/B receipt")
+        with _pinned_json_snapshot(
+            receipt_path,
+            "production A/B receipt",
+            max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+        ) as (receipt, _receipt_payload):
+            if _historical_fixture(receipt):
+                return ["historical fixture evidence cannot satisfy the production A/B gate"]
+            schema_error = _schema_error(
+                receipt,
+                root / "docs/evidence/score-to-motion-production.schema.json",
+                "production A/B receipt",
+            )
+            if schema_error:
+                return [schema_error]
+
+            with _pinned_artifact_json_snapshot(
+                receipt_path,
+                receipt.get("frame_receipt"),
+                "frame receipt",
+                max_bytes=FRAME_RECEIPT_MAX_BYTES,
+            ) as (frame_ref_errors, frame_path, frame_document, _frame_payload), \
+                 _pinned_artifact_json_snapshot(
+                     receipt_path,
+                     receipt.get("sample_receipt"),
+                     "sample receipt",
+                     max_bytes=SAMPLE_RECEIPT_MAX_BYTES,
+                 ) as (sample_ref_errors, sample_path, sample_document, sample_payload):
+                errors: list[str] = [*frame_ref_errors, *sample_ref_errors]
+                if expected is None:
+                    tier = PRODUCTION_TIER
+                    if isinstance(frame_document, dict):
+                        capture = frame_document.get("capture")
+                        if isinstance(capture, dict):
+                            tier = capture.get("tier", tier)
+                    try:
+                        audio_path = repository_file(
+                            root,
+                            receipt["audio_render_receipt"]["path"],
+                            "audio-render receipt",
+                        )
+                        expected = current_context(
+                            audio_path,
+                            tier=tier,
+                            root=root,
+                            require_clean=require_clean,
+                        )
+                    except (EvidenceError, KeyError, TypeError) as exc:
+                        return [*errors, str(exc)]
+                expected_span = (
+                    expected.get("span") if isinstance(expected.get("span"), dict) else {}
+                )
+                try:
+                    production_frame_count(
+                        expected_span.get("duration_seconds"),
+                        "expected production duration",
+                    )
+                except EvidenceError as exc:
+                    return [*errors, str(exc)]
+                errors.extend(_context_errors(receipt, expected, "production A/B receipt"))
+
+                sample: dict[str, Any] = {}
+                if sample_path is not None and sample_document is not None:
+                    sample, sample_errors = _load_sample_receipt(
+                        sample_path,
+                        expected=expected,
+                        schema_root=root,
+                        recompute_rows=recompute_samples,
+                        snapshot=sample_document,
+                    )
+                    errors.extend(sample_errors)
+                frame: dict[str, Any] = {}
+                if (
+                    frame_path is not None
+                    and frame_document is not None
+                    and sample_path is not None
+                    and sample_payload is not None
+                    and sample
+                ):
+                    loaded_frame, frame_errors = _load_frame_receipt(
+                        frame_path,
+                        sample_path=sample_path,
+                        sample=sample,
+                        expected=expected,
+                        schema_root=root,
+                        snapshot=frame_document,
+                        sample_payload=sample_payload,
+                    )
+                    errors.extend(frame_errors)
+                    if not frame_errors:
+                        frame = loaded_frame
+                errors.extend(
+                    _media_errors(
+                        receipt_path,
+                        receipt,
+                        expected=expected,
+                        frame_path=frame_path,
+                        frame=frame,
+                        root=root,
+                        review_probe_cache=_review_probe_cache,
+                    )
+                )
+                if receipt.get("human_review") != {"status": "not-attested"}:
+                    errors.append("machine evidence must not claim human artistic acceptance")
+                return errors
     except EvidenceError as exc:
         return [str(exc)]
-    if _historical_fixture(receipt):
-        return ["historical fixture evidence cannot satisfy the production A/B gate"]
-    schema_error = _schema_error(
-        receipt,
-        root / "docs/evidence/score-to-motion-production.schema.json",
-        "production A/B receipt",
-    )
-    if schema_error:
-        return [schema_error]
-
-    errors: list[str] = []
-    frame_ref_errors, frame_path = _artifact_errors(receipt_path, receipt.get("frame_receipt"), "frame receipt")
-    errors.extend(frame_ref_errors)
-    sample_ref_errors, sample_path = _artifact_errors(receipt_path, receipt.get("sample_receipt"), "sample receipt")
-    errors.extend(sample_ref_errors)
-    if expected is None:
-        tier = PRODUCTION_TIER
-        if frame_path is not None:
-            try:
-                tier = read_json(frame_path, "production frame receipt").get("capture", {}).get("tier", tier)
-            except EvidenceError as exc:
-                errors.append(str(exc))
-        try:
-            audio_path = repository_file(root, receipt["audio_render_receipt"]["path"], "audio-render receipt")
-            expected = current_context(audio_path, tier=tier, root=root, require_clean=require_clean)
-        except (EvidenceError, KeyError, TypeError) as exc:
-            return [*errors, str(exc)]
-    errors.extend(_context_errors(receipt, expected, "production A/B receipt"))
-
-    sample: dict[str, Any] = {}
-    if sample_path is not None:
-        sample, sample_errors = _load_sample_receipt(
-            sample_path,
-            expected=expected,
-            schema_root=root,
-            recompute_rows=recompute_samples,
-        )
-        errors.extend(sample_errors)
-    frame: dict[str, Any] = {}
-    if frame_path is not None and sample_path is not None and sample:
-        frame, frame_errors = _load_frame_receipt(
-            frame_path,
-            sample_path=sample_path,
-            sample=sample,
-            expected=expected,
-            schema_root=root,
-        )
-        errors.extend(frame_errors)
-    errors.extend(
-        _media_errors(
-            receipt_path,
-            receipt,
-            expected=expected,
-            frame_path=frame_path,
-            frame=frame,
-            root=root,
-        )
-    )
-    if receipt.get("human_review") != {"status": "not-attested"}:
-        errors.append("machine evidence must not claim human artistic acceptance")
-    return errors
 
 
 def evidence_artifact_paths(receipt_path: Path) -> list[Path]:
@@ -1376,13 +2376,28 @@ def evidence_artifact_paths(receipt_path: Path) -> list[Path]:
     for name in ("with_score", "control"):
         media = receipt["review_media"][name]
         paths.add(local_artifact(receipt_path, media, f"{name} review media"))
-        producer = local_artifact(
+        producer_errors, producer, concat = _artifact_json_snapshot(
             receipt_path,
             media.get("producer_receipt"),
             f"{name} review-media producer receipt",
+            max_bytes=PRODUCER_CONCAT_RECEIPT_MAX_BYTES,
         )
+        if producer_errors:
+            raise EvidenceError("; ".join(producer_errors))
+        if producer is None or concat is None:
+            raise EvidenceError(f"{name} review-media producer receipt is absent")
         paths.add(producer)
-        paths.update(_producer_segment_receipts(producer))
+        paths.add(_producer_media_for_receipt(producer, f"{name} render concat media"))
+        decoded = concat.get("decoded_video") if isinstance(concat.get("decoded_video"), dict) else {}
+        maximum_segments = decoded.get("frames")
+        if type(maximum_segments) is not int or maximum_segments < 1:
+            raise EvidenceError(f"{name} review-media producer has no exact decoded frame count")
+        for segment_media, segment_receipt, _ in _producer_segment_chain(
+            producer,
+            concat=concat,
+            maximum_segments=maximum_segments,
+        ):
+            paths.update({segment_media, segment_receipt})
     return sorted(paths)
 
 
@@ -1885,6 +2900,12 @@ def write_receipt(
     """Finalize only already-measured machine artifacts; never mint acceptance."""
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise EvidenceError("production A/B receipt destination is unsafe")
+    span = context.get("span") if isinstance(context.get("span"), dict) else {}
+    expected_video_frames = production_frame_count(
+        span.get("duration_seconds"),
+        "production receipt duration",
+    )
+    duration = float(span["duration_seconds"])
     destination.parent.mkdir(parents=True, exist_ok=True)
     base = destination.parent.resolve(strict=True)
     for path in (
@@ -1918,15 +2939,29 @@ def write_receipt(
     if frame_errors:
         raise EvidenceError("; ".join(frame_errors))
 
-    duration = float(context["span"]["duration_seconds"])
-    expected_video_frames = round(duration * 30)
     media = {}
+    review_probe_cache: dict[str, dict[str, Any]] = {}
     producer_paths = {
         "with_score": with_score_producer,
         "control": control_producer,
     }
     for name, path in (("with_score", with_score), ("control", control)):
-        probe = ffprobe_media(path)
+        path = regular_file(path, f"{name} review media")
+        with _pinned_regular_file(path, f"{name} review media") as (file_fd, _info):
+            probe = ffprobe_media(
+                path,
+                expected_video_frames=expected_video_frames,
+                expected_audio_frames=context["audio_master"]["frames"],
+                source_fd=file_fd,
+            )
+            anchors = review_frame_anchors(
+                path,
+                frame_path=frame_path,
+                frame=frame,
+                mode=name,
+                expected_frames=expected_video_frames,
+                source_fd=file_fd,
+            )
         if probe["video_frames"] != expected_video_frames:
             raise EvidenceError(f"{name} review movie does not contain the exact rounded production frame span")
         if abs(float(probe["duration_seconds"]) - duration) > 0.5 / 30:
@@ -1937,27 +2972,13 @@ def write_receipt(
             raise EvidenceError(f"{name} review movie has a stale audio frame count")
         if probe["decoded_video_frames"] != expected_video_frames:
             raise EvidenceError(f"{name} review movie has a stale decoded frame count")
-        producer_errors, _ = _producer_receipt_errors(
-            destination,
-            artifact_reference(producer_paths[name], base),
-            mode=name,
-            expected=context,
-            review_identity=probe,
-            root=root,
-        )
-        if producer_errors:
-            raise EvidenceError("; ".join(producer_errors))
+        review_probe_cache[name] = {"probe": probe, "anchors": anchors}
         media[name] = {
             "path": path.relative_to(base).as_posix(),
             "mode": name,
             **probe,
             "producer_receipt": artifact_reference(producer_paths[name], base),
-            "anchors": review_frame_anchors(
-                path,
-                frame_path=frame_path,
-                frame=frame,
-                mode=name,
-            ),
+            "anchors": anchors,
         }
     if media["with_score"]["sha256"] == media["control"]["sha256"]:
         raise EvidenceError("with-score and control review movies are byte-identical")
@@ -1986,6 +3007,7 @@ def write_receipt(
         root=root,
         require_clean=False,
         recompute_samples=True,
+        _review_probe_cache=review_probe_cache,
     )
     if errors:
         raise EvidenceError("; ".join(errors))

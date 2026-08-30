@@ -6,10 +6,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -229,6 +231,15 @@ class EvidenceFixture:
             }
             for path in (self.with_movie, self.control_movie)
         }
+        self.producer_rgb_by_payload = {}
+        self.producer_rgb_by_mode = {
+            mode: f"{mode} canonical decoded RGB frames".encode()
+            for mode in ("with_score", "control")
+        }
+        for mode, movie in (("with_score", self.with_movie), ("control", self.control_movie)):
+            decoded_sha256 = hashlib.sha256(self.producer_rgb_by_mode[mode]).hexdigest()
+            self.media[movie]["video_framehash_sha256"] = decoded_sha256
+            self.media[movie]["decoded_rgb_sha256"] = decoded_sha256
         self.anchors = {
             mode: [
                 {
@@ -246,6 +257,8 @@ class EvidenceFixture:
             for mode in ("with_score", "control")
         }
         self.producer_paths = {}
+        self.producer_media_paths = {}
+        self.producer_decoded_by_payload = {}
         control_source_tree = AB.renderer_source_tree(
             AB.PRODUCTION_TIER,
             ROOT,
@@ -256,6 +269,9 @@ class EvidenceFixture:
             producer_root = self.base / "producer-receipts" / mode
             producer_root.mkdir(parents=True)
             segment_name = f"{mode}-seg-000.mov"
+            segment_media = producer_root / segment_name
+            segment_payload = f"{mode} canonical segment media".encode()
+            segment_media.write_bytes(segment_payload)
             segment_receipt = producer_root / f"{segment_name}.receipt.json"
             inputs = {
                 "window": "passage",
@@ -318,12 +334,16 @@ class EvidenceFixture:
                             "width": AB.PRODUCTION_WIDTH,
                             "height": AB.PRODUCTION_HEIGHT,
                         },
-                        "file_sha256": "6" * 64,
+                        "file_sha256": digest(segment_media),
+                        "file_bytes": segment_media.stat().st_size,
                     },
                     indent=2,
                 )
                 + "\n"
             )
+            concat_media = producer_root / f"{mode}.mov"
+            concat_payload = f"{mode} canonical concat media".encode()
+            concat_media.write_bytes(concat_payload)
             concat_receipt = producer_root / f"{mode}.mov.receipt.json"
             concat_receipt.write_text(
                 json.dumps(
@@ -336,7 +356,8 @@ class EvidenceFixture:
                                 "receipt_sha256": digest(segment_receipt),
                             }
                         ],
-                        "file_sha256": "7" * 64,
+                        "file_sha256": digest(concat_media),
+                        "file_bytes": concat_media.stat().st_size,
                         "decoded_video": {
                             "algorithm": "rgb24-stream-sha256-v1",
                             "sha256": self.media[movie]["decoded_rgb_sha256"],
@@ -350,7 +371,22 @@ class EvidenceFixture:
                 )
                 + "\n"
             )
+            decoded = {
+                "algorithm": "rgb24-stream-sha256-v1",
+                "sha256": self.media[movie]["decoded_rgb_sha256"],
+                "frames": 30,
+                "width": AB.PRODUCTION_WIDTH,
+                "height": AB.PRODUCTION_HEIGHT,
+            }
+            self.producer_decoded_by_payload[segment_payload] = decoded
+            self.producer_decoded_by_payload[concat_payload] = decoded
+            self.producer_rgb_by_payload[segment_payload] = self.producer_rgb_by_mode[mode]
+            self.producer_rgb_by_payload[concat_payload] = self.producer_rgb_by_mode[mode]
             self.producer_paths[mode] = concat_receipt
+            self.producer_media_paths[mode] = {
+                "concat": concat_media,
+                "segments": [segment_media],
+            }
         self.receipt = self.base / "score-to-motion-production.json"
         self.write_receipt()
         self.score_master = score_master
@@ -388,11 +424,70 @@ class EvidenceFixture:
             transform(document)
         self.receipt.write_text(json.dumps(document, indent=2) + "\n")
 
-    def probe(self, path: Path) -> dict:
+    def probe(self, path: Path, **_kwargs) -> dict:
         return copy.deepcopy(self.media[path])
 
-    def anchor_probe(self, path: Path, *, frame_path: Path, frame: dict, mode: str) -> list[dict]:
+    def anchor_probe(
+        self,
+        path: Path,
+        *,
+        frame_path: Path,
+        frame: dict,
+        mode: str,
+        expected_frames: int | None = None,
+        source_fd: int | None = None,
+    ) -> list[dict]:
         return copy.deepcopy(self.anchors[mode])
+
+    def producer_probe(
+        self,
+        path: Path,
+        *,
+        expected_frames: int,
+        include_fps: bool,
+        label: str,
+        source_fd: int | None = None,
+        aggregate_digest=None,
+    ) -> dict:
+        try:
+            payload = (
+                path.read_bytes()
+                if source_fd is None
+                else AB.os.pread(source_fd, AB.os.fstat(source_fd).st_size, 0)
+            )
+            identity = copy.deepcopy(self.producer_decoded_by_payload[payload])
+        except (KeyError, OSError) as exc:
+            raise AB.EvidenceError(f"{label} media cannot be authenticated") from exc
+        if identity["frames"] != expected_frames:
+            raise AB.EvidenceError(
+                f"{label} media cannot be authenticated: decoded frame count is stale"
+            )
+        if include_fps:
+            identity["fps"] = AB.PRODUCTION_FPS
+        if aggregate_digest is not None:
+            aggregate_digest.update(self.producer_rgb_by_payload[payload])
+        return identity
+
+    @contextmanager
+    def producer_patch(self):
+        with mock.patch.object(
+            AB,
+            "_producer_decoded_video_identity",
+            side_effect=self.producer_probe,
+        ):
+            yield
+
+    def production_errors(self) -> list[str]:
+        with (
+            mock.patch.object(AB, "ffprobe_media", side_effect=self.probe),
+            mock.patch.object(AB, "review_frame_anchors", side_effect=self.anchor_probe),
+            self.producer_patch(),
+        ):
+            return AB.production_receipt_errors(
+                self.receipt,
+                expected=self.context,
+                recompute_samples=False,
+            )
 
     def package_manifest(self) -> dict:
         producer = self.root / "provenance/producer-receipts/render.json"
@@ -544,7 +639,10 @@ class ProductionScoreMotionTest(unittest.TestCase):
             fixture = EvidenceFixture(Path(temporary))
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
-                mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ),
+                fixture.producer_patch(),
             ):
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
@@ -556,10 +654,21 @@ class ProductionScoreMotionTest(unittest.TestCase):
             self.assertEqual(document["human_review"], {"status": "not-attested"})
             self.assertNotIn("accepted", fixture.receipt.read_text())
 
+            fixture.write_receipt(
+                lambda value: value["review_media"]["with_score"].__setitem__(
+                    "decoded_rgb_sha256", "0" * 64
+                )
+            )
+            errors = fixture.production_errors()
+            self.assertIn("with_score review media has stale decoded_rgb_sha256", errors)
+
             fixture.write_receipt(lambda value: value.__setitem__("repository_head", "9" * 40))
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
-                mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ),
+                fixture.producer_patch(),
             ):
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
@@ -569,12 +678,65 @@ class ProductionScoreMotionTest(unittest.TestCase):
             self.assertIn("production A/B receipt has stale repository_head", errors)
 
             fixture.write_receipt(lambda value: value.__setitem__("human_review", {"status": "accepted"}))
-            errors = AB.production_receipt_errors(
-                fixture.receipt,
-                expected=fixture.context,
-                recompute_samples=False,
-            )
+            with fixture.producer_patch(), mock.patch.object(
+                AB, "ffprobe_media", side_effect=fixture.probe
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
             self.assertIn("production A/B receipt schema failed", errors[0])
+
+    def test_write_receipt_decodes_each_full_media_graph_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            with (
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe) as review_probe,
+                mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ) as anchor_probe,
+                mock.patch.object(
+                    AB,
+                    "_producer_decoded_video_identity",
+                    side_effect=fixture.producer_probe,
+                ) as producer_probe,
+                mock.patch.object(AB, "generate_sample_rows", return_value=fixture.rows),
+            ):
+                document = AB.write_receipt(
+                    destination=fixture.receipt,
+                    context=fixture.context,
+                    sample_path=fixture.sample,
+                    frame_path=fixture.frame,
+                    with_score=fixture.with_movie,
+                    control=fixture.control_movie,
+                    with_score_producer=fixture.producer_paths["with_score"],
+                    control_producer=fixture.producer_paths["control"],
+                    root=ROOT,
+                )
+            self.assertEqual(document["human_review"], {"status": "not-attested"})
+            self.assertEqual(review_probe.call_count, 2)
+            self.assertEqual(anchor_probe.call_count, 2)
+            self.assertEqual(producer_probe.call_count, 4)
+            for probe_call, anchor_call in zip(
+                review_probe.call_args_list,
+                anchor_probe.call_args_list,
+                strict=True,
+            ):
+                self.assertEqual(
+                    probe_call.kwargs["source_fd"],
+                    anchor_call.kwargs["source_fd"],
+                )
+            labels = [call.kwargs["label"] for call in producer_probe.call_args_list]
+            self.assertEqual(
+                labels,
+                [
+                    "with_score render concat",
+                    "with_score render segment 0",
+                    "control render concat",
+                    "control render segment 0",
+                ],
+            )
 
     def test_non_anchor_splice_fails_full_frame_producer_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -590,6 +752,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
             ):
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
@@ -676,6 +839,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 with (
                     mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                     mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                    fixture.producer_patch(),
                 ):
                     errors = AB.production_receipt_errors(
                         fixture.receipt,
@@ -710,18 +874,1001 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 }[case]
                 self.assertIn(expected_error, errors)
 
-    def test_evidence_graph_owns_every_render_producer_receipt(self) -> None:
+    def test_producer_media_files_and_encoded_identities_fail_closed(self) -> None:
+        cases = (
+            "missing-concat",
+            "missing-segment",
+            "missing-segment-receipt",
+            "stale-segment-receipt",
+            "symlink-segment",
+            "stale-concat-bytes",
+            "stale-segment-digest",
+            "boolean-concat-byte-count",
+            "zero-segment-byte-count",
+            "duplicate-segment",
+            "out-of-order-segment-name",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                mode = "with_score"
+                concat_path = fixture.producer_paths[mode]
+                concat_media = fixture.producer_media_paths[mode]["concat"]
+                segment_media = fixture.producer_media_paths[mode]["segments"][0]
+                concat = json.loads(concat_path.read_text())
+                segment_path = segment_media.with_name(segment_media.name + ".receipt.json")
+                segment = json.loads(segment_path.read_text())
+                rewrite_concat = False
+                rewrite_segment = False
+                if case == "missing-concat":
+                    concat_media.unlink()
+                elif case == "missing-segment":
+                    segment_media.unlink()
+                elif case == "missing-segment-receipt":
+                    segment_path.unlink()
+                elif case == "stale-segment-receipt":
+                    segment_path.write_text(segment_path.read_text() + "\n")
+                elif case == "symlink-segment":
+                    segment_media.unlink()
+                    segment_media.symlink_to(fixture.producer_media_paths["control"]["segments"][0])
+                elif case == "stale-concat-bytes":
+                    concat_media.write_bytes(b"changed concat bytes")
+                elif case == "stale-segment-digest":
+                    segment_media.write_bytes(b"changed segment bytes")
+                elif case == "boolean-concat-byte-count":
+                    concat["file_bytes"] = False
+                    rewrite_concat = True
+                elif case == "zero-segment-byte-count":
+                    segment["file_bytes"] = 0
+                    rewrite_segment = True
+                elif case == "duplicate-segment":
+                    concat["segments"].append(copy.deepcopy(concat["segments"][0]))
+                    rewrite_concat = True
+                elif case == "out-of-order-segment-name":
+                    concat["segments"][0]["name"] = "with_score-seg-001.mov"
+                    rewrite_concat = True
+
+                if rewrite_segment:
+                    segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+                    concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+                    rewrite_concat = True
+                if rewrite_concat:
+                    concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+                    fixture.write_receipt()
+                errors = fixture.production_errors()
+                expected = {
+                    "missing-concat": "with_score render concat media is missing",
+                    "missing-segment": "review-media render segment 0 media is missing",
+                    "missing-segment-receipt": "review-media render segment 0 receipt is missing",
+                    "stale-segment-receipt": "render segment 0 receipt digest is stale",
+                    "symlink-segment": "review-media render segment 0 media traverses a symlink",
+                    "stale-concat-bytes": "with_score render concat encoded output",
+                    "stale-segment-digest": "with_score render segment 0 encoded output",
+                    "boolean-concat-byte-count": (
+                        "with_score render concat has no exact encoded output byte count"
+                    ),
+                    "zero-segment-byte-count": (
+                        "with_score render segment 0 has no exact encoded output byte count"
+                    ),
+                    "duplicate-segment": "review-media render segment 1 reuses media",
+                    "out-of-order-segment-name": "is not the canonical with_score-seg-000.mov",
+                }[case]
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_rehashed_swapped_producer_media_still_fails_decoded_binding(self) -> None:
+        for target in ("concat", "segment"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                left = fixture.producer_media_paths["with_score"]
+                right = fixture.producer_media_paths["control"]
+                left_path = left["concat"] if target == "concat" else left["segments"][0]
+                right_path = right["concat"] if target == "concat" else right["segments"][0]
+                left_bytes, right_bytes = left_path.read_bytes(), right_path.read_bytes()
+                left_path.write_bytes(right_bytes)
+                right_path.write_bytes(left_bytes)
+                for mode, media_path in (("with_score", left_path), ("control", right_path)):
+                    concat_path = fixture.producer_paths[mode]
+                    concat = json.loads(concat_path.read_text())
+                    receipt_path = (
+                        concat_path
+                        if target == "concat"
+                        else media_path.with_name(media_path.name + ".receipt.json")
+                    )
+                    receipt = json.loads(receipt_path.read_text())
+                    receipt["file_sha256"] = digest(media_path)
+                    receipt["file_bytes"] = media_path.stat().st_size
+                    receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+                    if target == "segment":
+                        concat["segments"][0]["receipt_sha256"] = digest(receipt_path)
+                        concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+                fixture.write_receipt()
+                errors = fixture.production_errors()
+                if target == "concat":
+                    self.assertTrue(
+                        any("render concat decoded video identity is stale" in error for error in errors),
+                        errors,
+                    )
+                else:
+                    self.assertTrue(
+                        any("render segment 0 decoded video identity is stale" in error for error in errors),
+                        errors,
+                    )
+                self.assertTrue(
+                    any("segment decoded chain differs from its actual concat" in error for error in errors),
+                    errors,
+                )
+
+    def test_segment_chain_aggregate_must_equal_the_actual_concat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            mode = "with_score"
+            concat_path = fixture.producer_paths[mode]
+            concat = json.loads(concat_path.read_text())
+            first_media = fixture.producer_media_paths[mode]["segments"][0]
+            first_receipt_path = first_media.with_name(first_media.name + ".receipt.json")
+            first = json.loads(first_receipt_path.read_text())
+            first["frames"] = 15
+            first["inputs"]["segment_frames"] = 15
+            first["decoded_video"]["frames"] = 15
+            first["decoded_video"]["sha256"] = "1" * 64
+            first_receipt_path.write_text(json.dumps(first, indent=2) + "\n")
+
+            second_media = concat_path.parent / "with_score-seg-001.mov"
+            second_media.write_bytes(b"with_score second canonical segment")
+            second = copy.deepcopy(first)
+            second["segment"] = 1
+            second["file_sha256"] = digest(second_media)
+            second["file_bytes"] = second_media.stat().st_size
+            second["decoded_video"]["sha256"] = "2" * 64
+            second_receipt_path = second_media.with_name(second_media.name + ".receipt.json")
+            second_receipt_path.write_text(json.dumps(second, indent=2) + "\n")
+            concat["segments"] = [
+                {"name": first_media.name, "receipt_sha256": digest(first_receipt_path)},
+                {"name": second_media.name, "receipt_sha256": digest(second_receipt_path)},
+            ]
+            concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+            fixture.write_receipt()
+
+            individual = [first["decoded_video"], second["decoded_video"]]
+
+            def producer_probe(path, *, expected_frames, include_fps, label, source_fd=None,
+                               aggregate_digest=None):
+                if label.startswith("with_score render segment"):
+                    ordinal = int(label.rsplit(" ", 1)[1])
+                    identity = copy.deepcopy(individual[ordinal])
+                    self.assertEqual(identity["frames"], expected_frames)
+                    if aggregate_digest is not None:
+                        aggregate_digest.update(f"different decoded segment {ordinal}".encode())
+                    return identity
+                return fixture.producer_probe(
+                    path,
+                    expected_frames=expected_frames,
+                    include_fps=include_fps,
+                    label=label,
+                    source_fd=source_fd,
+                    aggregate_digest=aggregate_digest,
+                )
+
+            with (
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                mock.patch.object(
+                    AB,
+                    "_producer_decoded_video_identity",
+                    side_effect=producer_probe,
+                ),
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertIn(
+                "with_score render segment decoded chain differs from its actual concat",
+                errors,
+            )
+
+    def test_producer_stream_contract_rejects_wrong_encoding_or_extra_streams(self) -> None:
+        exact = {
+            "width": AB.PRODUCTION_WIDTH,
+            "height": AB.PRODUCTION_HEIGHT,
+            "fps": AB.PRODUCTION_FPS,
+            "codec_name": "prores",
+            "profile": "HQ",
+            "pix_fmt": "yuv422p10le",
+            "stream_count": 1,
+            "video_streams": 1,
+            "audio_streams": 0,
+            "subtitle_streams": 0,
+            "data_streams": 0,
+        }
+        cases = {
+            "shape": {"width": 1280},
+            "fps": {"fps": 24},
+            "codec": {"codec_name": "h264"},
+            "profile": {"profile": "Standard"},
+            "pixel-format": {"pix_fmt": "yuv422p"},
+            "audio": {"stream_count": 2, "audio_streams": 1},
+            "attachment": {"stream_count": 2},
+        }
+        for case, changes in cases.items():
+            with self.subTest(case=case), mock.patch.object(
+                AB,
+                "video_stream_info",
+                return_value={**exact, **changes},
+            ):
+                with self.assertRaisesRegex(AB.EvidenceError, "video-only ProRes HQ"):
+                    AB._producer_stream_info(Path("unused.mov"), "producer")
+
+    def test_boolean_producer_receipt_numbers_fail_closed(self) -> None:
+        cases = {
+            "ordinal": (lambda row: row.__setitem__("segment", False), "not ordered and contiguous"),
+            "missing": (
+                lambda row: row["capture"].__setitem__("missing", False),
+                "missing photographic plates",
+            ),
+            "stream": (
+                lambda row: row["inputs"].__setitem__("stream", False),
+                "has stale stream",
+            ),
+            "start": (
+                lambda row: row["inputs"].__setitem__("start", False),
+                "has stale start",
+            ),
+            "decoded-frames": (
+                lambda row: row["decoded_video"].__setitem__("frames", True),
+                "has no full decoded-frame identity",
+            ),
+        }
+        for case, (mutate, expected) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                concat_path = fixture.producer_paths["control"]
+                concat = json.loads(concat_path.read_text())
+                segment_media = fixture.producer_media_paths["control"]["segments"][0]
+                segment_path = segment_media.with_name(segment_media.name + ".receipt.json")
+                segment = json.loads(segment_path.read_text())
+                mutate(segment)
+                segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+                concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+                concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+                fixture.write_receipt()
+                errors = fixture.production_errors()
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_producer_receipt_byte_and_segment_count_caps_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "oversized.json"
+            path.write_bytes(b" " * 9)
+            with self.assertRaisesRegex(AB.EvidenceError, "8-byte limit"):
+                AB.read_json(path, "producer receipt", max_bytes=8)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            concat_path = fixture.producer_paths["with_score"]
+            concat = json.loads(concat_path.read_text())
+            concat["segments"].append(copy.deepcopy(concat["segments"][0]))
+            concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+            fixture.write_receipt()
+            with mock.patch.object(AB, "PRODUCER_SEGMENT_MAX_COUNT", 1):
+                errors = fixture.production_errors()
+            self.assertTrue(
+                any("exceeds its segment-count limit" in error for error in errors),
+                errors,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            segment_receipts = [
+                paths["segments"][0].with_name(paths["segments"][0].name + ".receipt.json")
+                for paths in fixture.producer_media_paths.values()
+            ]
+            with (
+                mock.patch.object(
+                    AB,
+                    "PRODUCER_SEGMENT_RECEIPT_TOTAL_MAX_BYTES",
+                    min(path.stat().st_size for path in segment_receipts) - 1,
+                ),
+                mock.patch.object(
+                    AB,
+                    "_producer_decoded_video_identity",
+                    side_effect=AssertionError("receipt cap must precede every producer decoder"),
+                ),
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ),
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(any("aggregate byte limit" in error for error in errors), errors)
+
+    def test_pinned_media_and_receipt_snapshots_reject_path_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            target = fixture.producer_media_paths["with_score"]["concat"]
+            replacement = fixture.producer_media_paths["control"]["concat"].read_bytes()
+            original_probe = fixture.producer_probe
+            swapped = False
+
+            def swapping_probe(path, **kwargs):
+                nonlocal swapped
+                identity = original_probe(path, **kwargs)
+                if not swapped and kwargs["label"] == "with_score render concat":
+                    swapped = True
+                    target.rename(target.with_name(target.name + ".pinned-original"))
+                    target.write_bytes(replacement)
+                return identity
+
+            with mock.patch.object(
+                AB,
+                "_producer_decoded_video_identity",
+                side_effect=swapping_probe,
+            ), mock.patch.object(
+                AB, "ffprobe_media", side_effect=fixture.probe
+            ), mock.patch.object(
+                AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(
+                any("with_score render concat changed during authentication" in error for error in errors),
+                errors,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "producer.mov.receipt.json"
+            path.write_text('{"schema":"danse.render.concat.v1"}\n')
+            original_reader = AB._read_pinned_bytes
+            swapped = False
+
+            def swapping_reader(file_fd, *, maximum, label):
+                nonlocal swapped
+                payload = original_reader(file_fd, maximum=maximum, label=label)
+                if not swapped:
+                    swapped = True
+                    path.rename(path.with_name(path.name + ".pinned-original"))
+                    path.write_bytes(payload)
+                return payload
+
+            with mock.patch.object(AB, "_read_pinned_bytes", side_effect=swapping_reader):
+                with self.assertRaisesRegex(AB.EvidenceError, "changed during authentication"):
+                    AB._bounded_json_snapshot(path, "producer receipt", max_bytes=1024)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            original_loader = AB._load_frame_receipt
+            swapped = False
+
+            def swapping_frame_loader(*args, **kwargs):
+                nonlocal swapped
+                result = original_loader(*args, **kwargs)
+                if not swapped:
+                    swapped = True
+                    payload = fixture.frame.read_bytes()
+                    fixture.frame.rename(
+                        fixture.frame.with_name(fixture.frame.name + ".pinned-original")
+                    )
+                    fixture.frame.write_bytes(payload)
+                return result
+
+            with mock.patch.object(
+                AB, "_load_frame_receipt", side_effect=swapping_frame_loader
+            ), mock.patch.object(
+                AB, "ffprobe_media", side_effect=fixture.probe
+            ), mock.patch.object(
+                AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+            ), fixture.producer_patch():
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(any("changed during authentication" in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = root / "frame-receipt.json"
+            receipt.write_text("{}\n")
+            image = root / "frame.png"
+            image.write_bytes(b"one exact image snapshot")
+            image_reference = reference(image, root)
+            original_reader = AB._read_pinned_bytes
+            swapped = False
+
+            def swapping_image_reader(file_fd, *, maximum, label):
+                nonlocal swapped
+                payload = original_reader(file_fd, maximum=maximum, label=label)
+                if not swapped:
+                    swapped = True
+                    image.rename(image.with_name(image.name + ".pinned-original"))
+                    image.write_bytes(payload)
+                return payload
+
+            with mock.patch.object(AB, "_read_pinned_bytes", side_effect=swapping_image_reader):
+                errors, path, payload = AB._artifact_binary_snapshot(
+                    receipt,
+                    image_reference,
+                    "anchor frame",
+                    max_bytes=1024,
+                )
+            self.assertIsNone(path)
+            self.assertIsNone(payload)
+            self.assertTrue(any("changed during authentication" in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            target = fixture.with_movie
+            replacement = fixture.control_movie.read_bytes()
+            source_fds: list[int] = []
+            swapped = False
+
+            def review_probe(path, **kwargs):
+                source_fds.append(kwargs["source_fd"])
+                return fixture.probe(path, **kwargs)
+
+            def swapping_anchor(path, **kwargs):
+                nonlocal swapped
+                source_fds.append(kwargs["source_fd"])
+                if path == target and not swapped:
+                    swapped = True
+                    target.rename(target.with_name(target.name + ".pinned-original"))
+                    target.write_bytes(replacement)
+                return fixture.anchor_probe(path, **kwargs)
+
+            with mock.patch.object(
+                AB, "ffprobe_media", side_effect=review_probe
+            ), mock.patch.object(
+                AB, "review_frame_anchors", side_effect=swapping_anchor
+            ), fixture.producer_patch():
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(any("changed during authentication" in error for error in errors), errors)
+            self.assertEqual(source_fds[0], source_fds[1])
+
+    def test_caps_and_malformed_large_integers_fail_before_expensive_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            oversized_json = root / "oversized.json"
+            oversized_json.write_bytes(b" " * 9)
+            reference_value = {"path": oversized_json.name, "sha256": "0" * 64, "bytes": 9}
+            receipt = root / "receipt.json"
+            receipt.write_text("{}\n")
+            with mock.patch.object(AB.hashlib, "sha256", side_effect=AssertionError) as sha:
+                errors, path, document = AB._artifact_json_snapshot(
+                    receipt,
+                    reference_value,
+                    "producer receipt",
+                    max_bytes=8,
+                )
+            self.assertIsNone(path)
+            self.assertIsNone(document)
+            self.assertTrue(any("8-byte limit" in error for error in errors), errors)
+            sha.assert_not_called()
+
+            oversized_media = root / "producer.mov"
+            with oversized_media.open("wb") as handle:
+                handle.truncate(AB.PRODUCER_MEDIA_MAX_BYTES_PER_FRAME + 1)
+            with mock.patch.object(AB, "_fd_sha256", side_effect=AssertionError) as digest_probe, \
+                 mock.patch.object(
+                     AB, "_producer_decoded_video_identity", side_effect=AssertionError
+                 ) as decoded_probe:
+                errors, decoded = AB._producer_media_identity_errors(
+                    oversized_media,
+                    {"file_bytes": 1, "file_sha256": "0" * 64},
+                    expected_frames=1,
+                    include_fps=False,
+                    label="producer",
+                )
+            self.assertIsNone(decoded)
+            self.assertTrue(any("media limit" in error for error in errors), errors)
+            digest_probe.assert_not_called()
+            decoded_probe.assert_not_called()
+
+            long_integer = root / "long-integer.json"
+            long_integer.write_bytes(b'{"value":' + (b"1" * 5000) + b"}\n")
+            with self.assertRaisesRegex(AB.EvidenceError, "cannot read producer receipt"):
+                AB.read_json(long_integer, "producer receipt", max_bytes=6000)
+
+            self.assertEqual(
+                AB.production_frame_count(AB.PRODUCTION_FRAME_MAX / AB.PRODUCTION_FPS),
+                AB.PRODUCTION_FRAME_MAX,
+            )
+            invalid_durations = {
+                "bool": True,
+                "string": "1",
+                "zero": 0,
+                "negative": -1,
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "overflowing-product": 1e308,
+                "over-production-limit": (
+                    AB.PRODUCTION_FRAME_MAX + 1
+                ) / AB.PRODUCTION_FPS,
+            }
+            fixture = EvidenceFixture(root / "duration-fixture")
+            for case, duration in invalid_durations.items():
+                with self.subTest(duration=case), self.assertRaises(AB.EvidenceError):
+                    AB.production_frame_count(duration)
+
+                expected = copy.deepcopy(fixture.context)
+                expected["span"]["duration_seconds"] = duration
+                with mock.patch.object(
+                    AB,
+                    "ffprobe_media",
+                    side_effect=AssertionError("invalid duration must precede media probes"),
+                ):
+                    errors = AB.production_receipt_errors(
+                        fixture.receipt,
+                        expected=expected,
+                        recompute_samples=False,
+                    )
+                self.assertTrue(
+                    any("expected production duration" in error for error in errors),
+                    errors,
+                )
+
+                with mock.patch.object(
+                    AB,
+                    "_load_sample_receipt",
+                    side_effect=AssertionError("invalid duration must precede receipt loads"),
+                ), mock.patch.object(
+                    AB,
+                    "ffprobe_media",
+                    side_effect=AssertionError("invalid duration must precede media probes"),
+                ), self.assertRaisesRegex(AB.EvidenceError, "production receipt duration"):
+                    AB.write_receipt(
+                        destination=fixture.base / f"invalid-duration-{case}.json",
+                        context=expected,
+                        sample_path=fixture.sample,
+                        frame_path=fixture.frame,
+                        with_score=fixture.with_movie,
+                        control=fixture.control_movie,
+                        with_score_producer=fixture.producer_paths["with_score"],
+                        control_producer=fixture.producer_paths["control"],
+                    )
+
+            self.assertEqual(AB._production_review_position(0), (0, 0.0))
+            self.assertEqual(AB.production_audio_frame_count(1.0, 48000), 48000)
+            for case, value in {
+                "bool": True,
+                "negative": -1,
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "overflowing-product": 1e308,
+                "over-production-limit": (
+                    AB.PRODUCTION_FRAME_MAX + 1
+                ) / AB.PRODUCTION_FPS,
+            }.items():
+                with self.subTest(review_second=case), self.assertRaises(AB.EvidenceError):
+                    AB._production_review_position(value)
+                with self.subTest(audio_duration=case), self.assertRaises(AB.EvidenceError):
+                    AB.production_audio_frame_count(value, 48000)
+
+    def test_invalid_absurd_segment_plan_never_launches_segment_decoder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            concat_path = fixture.producer_paths["with_score"]
+            concat = json.loads(concat_path.read_text())
+            segment_path = concat_path.parent / f"{concat['segments'][0]['name']}.receipt.json"
+            segment = json.loads(segment_path.read_text())
+            segment["frames"] = 10**18
+            segment["inputs"]["segment_frames"] = 10**18
+            segment["decoded_video"]["frames"] = 10**18
+            segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+            concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+            concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+            fixture.write_receipt()
+
+            def bounded_probe(path, **kwargs):
+                if kwargs["label"].startswith("with_score render segment"):
+                    raise AssertionError("invalid segment frame plans must not launch a decoder")
+                return fixture.producer_probe(path, **kwargs)
+
+            with mock.patch.object(
+                AB, "_producer_decoded_video_identity", side_effect=bounded_probe
+            ), mock.patch.object(
+                AB, "ffprobe_media", side_effect=fixture.probe
+            ), mock.patch.object(
+                AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(any("does not own its exact frame range" in error for error in errors), errors)
+
+    def test_media_decoder_lifecycle_is_bounded_and_pcm_stderr_is_file_backed(self) -> None:
+        media_subprocess = AB.decoded_video_identity.__globals__["subprocess"]
+
+        class FakeVideoProcess:
+            def __init__(self, payload: bytes, returncode: int = 0) -> None:
+                self.stdout = io.BytesIO(payload)
+                self.returncode = returncode
+                self.killed = False
+                self.waited = 0
+
+            def poll(self):
+                return None if not self.killed else self.returncode
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self):
+                self.waited += 1
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temporary:
+            movie = Path(temporary) / "video.mov"
+            movie.write_bytes(b"container")
+            for name, payload in (("surplus", b"abcdef"), ("partial", b"abcd")):
+                with self.subTest(case=name):
+                    process = FakeVideoProcess(payload)
+                    with mock.patch.object(media_subprocess, "Popen", return_value=process):
+                        with self.assertRaises(AB.MediaIdentityError):
+                            AB.decoded_video_identity(
+                                movie,
+                                width=1,
+                                height=1,
+                                expected_frames=1,
+                                ffmpeg="ffmpeg",
+                            )
+                    self.assertTrue(process.killed)
+                    self.assertGreaterEqual(process.waited, 1)
+
+            failed = FakeVideoProcess(b"abc", returncode=9)
+            with mock.patch.object(media_subprocess, "Popen", return_value=failed):
+                with self.assertRaisesRegex(AB.MediaIdentityError, "cannot decode renderer video"):
+                    AB.decoded_video_identity(
+                        movie,
+                        width=1,
+                        height=1,
+                        expected_frames=1,
+                        ffmpeg="ffmpeg",
+                    )
+            self.assertEqual(failed.waited, 1)
+
+            class FakeAudioProcess:
+                def __init__(self, _command, *, stdout, stderr, **_kwargs) -> None:
+                    self.stdout = io.BytesIO(b"\x00\x00\x00\x00")
+                    stderr.write(b"x" * (2 << 20))
+
+                def poll(self):
+                    return 0
+
+                def kill(self):
+                    return None
+
+                def wait(self):
+                    return 0
+
+            with mock.patch.object(AB.shutil, "which", return_value="ffmpeg"), mock.patch.object(
+                AB.subprocess, "Popen", side_effect=FakeAudioProcess
+            ) as popen:
+                identity = AB.media_pcm_identity(movie)
+            self.assertEqual(identity["audio_frames"], 1)
+            self.assertIsNot(popen.call_args.kwargs["stderr"], AB.subprocess.PIPE)
+
+            surplus_audio = FakeVideoProcess(b"\x00" * 8)
+            with mock.patch.object(AB.shutil, "which", return_value="ffmpeg"), mock.patch.object(
+                AB.subprocess, "Popen", return_value=surplus_audio
+            ):
+                with self.assertRaisesRegex(AB.EvidenceError, "more than the expected 1 PCM frames"):
+                    AB.media_pcm_identity(movie, expected_frames=1)
+            self.assertTrue(surplus_audio.killed)
+            self.assertGreaterEqual(surplus_audio.waited, 1)
+
+    def test_descriptor_walk_and_pread_faults_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real = root / "real"
+            real.mkdir()
+            artifact = real / "artifact.json"
+            artifact.write_text("{}\n")
+            linked = root / "linked"
+            linked.symlink_to(real, target_is_directory=True)
+            with self.assertRaisesRegex(AB.EvidenceError, "unsafe|cannot be pinned"):
+                with AB._pinned_regular_file(linked / artifact.name, "artifact"):
+                    self.fail("an ancestor symlink must not be descriptor-walked")
+
+            file_fd = AB.os.open(artifact, AB.os.O_RDONLY)
+            try:
+                with mock.patch.object(AB.os, "pread", side_effect=OSError("read fault")):
+                    with self.assertRaisesRegex(AB.EvidenceError, "encoded digest"):
+                        AB._fd_sha256(file_fd, "artifact")
+                    with self.assertRaisesRegex(AB.EvidenceError, "cannot read artifact"):
+                        AB._read_pinned_bytes(file_fd, maximum=16, label="artifact")
+            finally:
+                AB.os.close(file_fd)
+
+    def test_malformed_frame_images_and_capture_shapes_report_gate_errors(self) -> None:
+        import struct
+        import zlib
+        from PIL import Image as PillowImage
+
+        ihdr = struct.pack(">IIBBBBB", 100_000, 100_000, 8, 2, 0, 0, 0)
+        chunk = b"IHDR" + ihdr
+        bomb = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", len(ihdr))
+            + chunk
+            + struct.pack(">I", zlib.crc32(chunk) & 0xFFFFFFFF)
+        )
+        with self.assertRaisesRegex(AB.EvidenceError, "cannot decode review anchor"):
+            AB._raw_frame_psnr(bomb, b"\x00\x00\x00", 1, 1)
+        with self.assertRaisesRegex(AB.EvidenceError, "cannot decode production boundary"):
+            AB._image_psnr(bomb, bomb, 1, 1)
+
+        stale_image = io.BytesIO()
+        PillowImage.new("RGB", (2, 2), "black").save(stale_image, format="PNG")
+        with mock.patch.object(
+            PillowImage.Image,
+            "convert",
+            side_effect=AssertionError("stale dimensions must be rejected before conversion"),
+        ):
+            with self.assertRaisesRegex(AB.EvidenceError, "dimensions are stale"):
+                AB._raw_frame_psnr(stale_image.getvalue(), b"\x00\x00\x00", 1, 1)
+            with self.assertRaisesRegex(AB.EvidenceError, "dimensions are stale"):
+                AB._image_psnr(stale_image.getvalue(), stale_image.getvalue(), 1, 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = EvidenceFixture(Path(temporary))
+            frame = json.loads(fixture.frame.read_text())
+            frame["capture"]["width"] = "not-an-integer"
+            fixture.frame.write_text(json.dumps(frame, indent=2) + "\n")
+            fixture.write_receipt()
+            with (
+                mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
+                mock.patch.object(
+                    AB,
+                    "review_frame_anchors",
+                    side_effect=AssertionError("invalid frame receipts must not launch anchor decoding"),
+                ),
+                fixture.producer_patch(),
+            ):
+                errors = AB.production_receipt_errors(
+                    fixture.receipt,
+                    expected=fixture.context,
+                    recompute_samples=False,
+                )
+            self.assertTrue(any("frame receipt schema failed" in error for error in errors), errors)
+            self.assertTrue(any("no authenticated Metal frame receipt" in error for error in errors), errors)
+
+    def test_review_anchor_decoder_uses_pinned_media_and_file_backed_stderr(self) -> None:
+        class AnchorProcess:
+            def __init__(self, payload: bytes, *, stderr, running: bool = False) -> None:
+                self.stdout = io.BytesIO(payload)
+                self.running = running
+                self.killed = False
+                self.waited = 0
+                stderr.write(b"diagnostic" * (1 << 18))
+
+            def poll(self):
+                return None if self.running and not self.killed else 0
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self):
+                self.waited += 1
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            movie = root / "review.mov"
+            movie.write_bytes(b"review container")
+            source = root / "source.png"
+            source.write_bytes(b"source frame")
+            frame_path = root / "frames.json"
+            frame = {
+                "capture": {"width": 1, "height": 1},
+                "rows": [
+                    {
+                        "sample_id": "sample-000",
+                        "review_frame_index": 0,
+                        "review_second": 0,
+                        "with_score": reference(source, root),
+                    }
+                ],
+            }
+            process = None
+
+            def popen(_command, *, stdout, stderr, **_kwargs):
+                nonlocal process
+                process = AnchorProcess(b"abc", stderr=stderr)
+                return process
+
+            with mock.patch.object(AB.shutil, "which", return_value="ffmpeg"), mock.patch.object(
+                AB.subprocess, "Popen", side_effect=popen
+            ) as launched, mock.patch.object(
+                AB, "_raw_frame_psnr", return_value=120.0
+            ), mock.patch.object(
+                AB, "PRODUCTION_WIDTH", 1
+            ), mock.patch.object(
+                AB, "PRODUCTION_HEIGHT", 1
+            ):
+                anchors = AB.review_frame_anchors(
+                    movie,
+                    frame_path=frame_path,
+                    frame=frame,
+                    mode="with_score",
+                    expected_frames=1,
+                )
+            self.assertEqual(len(anchors), 1)
+            command = launched.call_args.args[0]
+            self.assertIn("-nostdin", command)
+            self.assertIn("/dev/fd/", command[command.index("-i") + 1])
+            self.assertIsNot(launched.call_args.kwargs["stderr"], AB.subprocess.PIPE)
+            self.assertIsNotNone(process)
+            self.assertEqual(process.waited, 1)
+
+            short = None
+
+            def short_popen(_command, *, stdout, stderr, **_kwargs):
+                nonlocal short
+                short = AnchorProcess(b"", stderr=stderr, running=True)
+                return short
+
+            with mock.patch.object(AB.shutil, "which", return_value="ffmpeg"), mock.patch.object(
+                AB.subprocess, "Popen", side_effect=short_popen
+            ), mock.patch.object(AB, "PRODUCTION_WIDTH", 1), mock.patch.object(
+                AB, "PRODUCTION_HEIGHT", 1
+            ):
+                with self.assertRaisesRegex(AB.EvidenceError, "missing boundary frame"):
+                    AB.review_frame_anchors(
+                        movie,
+                        frame_path=frame_path,
+                        frame=frame,
+                        mode="with_score",
+                        expected_frames=1,
+                    )
+            self.assertIsNotNone(short)
+            self.assertTrue(short.killed)
+            self.assertGreaterEqual(short.waited, 1)
+
+    def test_review_probe_counts_decoded_frames_not_packets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            movie = Path(temporary) / "review.mov"
+            movie.write_bytes(b"review")
+            document = {
+                "format": {"duration": "1.0"},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "avg_frame_rate": "30/1",
+                        "nb_read_frames": "not authoritative",
+                        "nb_read_packets": "999",
+                        "width": AB.PRODUCTION_WIDTH,
+                        "height": AB.PRODUCTION_HEIGHT,
+                    },
+                    {"codec_type": "audio"},
+                ],
+            }
+            result = mock.Mock(returncode=0, stdout=json.dumps(document), stderr="")
+            with (
+                mock.patch.object(AB.shutil, "which", return_value="ffprobe"),
+                mock.patch.object(AB.subprocess, "run", return_value=result) as run,
+                mock.patch.object(
+                    AB,
+                    "media_pcm_identity",
+                    return_value={
+                        "audio_pcm_sha256": "1" * 64,
+                        "audio_frames": 48_000,
+                        "audio_sample_rate": 48_000,
+                        "audio_channels": 2,
+                    },
+                ),
+                mock.patch.object(
+                    AB,
+                    "media_video_identity",
+                    return_value={
+                        "video_framehash_sha256": "2" * 64,
+                        "decoded_rgb_sha256": "2" * 64,
+                        "decoded_video_frames": 30,
+                    },
+                ) as video_identity,
+            ):
+                identity = AB.ffprobe_media(movie, expected_video_frames=30)
+            self.assertEqual(identity["video_frames"], 30)
+            command = run.call_args.args[0]
+            self.assertNotIn("-count_frames", command)
+            self.assertNotIn("nb_read_frames", command[command.index("-show_entries") + 1])
+            self.assertNotIn("-count_packets", command)
+            video_call = video_identity.call_args
+            self.assertEqual(video_call.kwargs["expected_frames"], 30)
+
+    def test_decoded_segment_chain_hash_is_ordered_rgb_bytes(self) -> None:
+        class FakeProcess:
+            def __init__(self, payload: bytes) -> None:
+                self.stdout = io.BytesIO(payload)
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                return None
+
+            def wait(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.mov"
+            second = Path(temporary) / "second.mov"
+            first.write_bytes(b"first container")
+            second.write_bytes(b"second container")
+            frames = {first: b"\x01\x02\x03", second: b"\x04\x05\x06"}
+
+            def popen(command, **_kwargs):
+                source = Path(command[command.index("-i") + 1])
+                return FakeProcess(frames[source])
+
+            media_subprocess = AB.decoded_video_chain_identities.__globals__["subprocess"]
+            with mock.patch.object(media_subprocess, "Popen", side_effect=popen):
+                individual, chain = AB.decoded_video_chain_identities(
+                    [first, second],
+                    width=1,
+                    height=1,
+                    expected_frames=[1, 1],
+                    ffmpeg="ffmpeg",
+                )
+                _, reversed_chain = AB.decoded_video_chain_identities(
+                    [second, first],
+                    width=1,
+                    height=1,
+                    expected_frames=[1, 1],
+                    ffmpeg="ffmpeg",
+                )
+            self.assertEqual(individual[0]["sha256"], hashlib.sha256(frames[first]).hexdigest())
+            self.assertEqual(
+                chain["sha256"],
+                hashlib.sha256(frames[first] + frames[second]).hexdigest(),
+            )
+            self.assertEqual(
+                reversed_chain["sha256"],
+                hashlib.sha256(frames[second] + frames[first]).hexdigest(),
+            )
+            self.assertNotEqual(chain["sha256"], reversed_chain["sha256"])
+
+    def test_evidence_graph_owns_every_render_producer_receipt_and_movie(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = EvidenceFixture(Path(temporary))
             owned = set(AB.evidence_artifact_paths(fixture.receipt))
-            for producer in fixture.producer_paths.values():
+            for mode, producer in fixture.producer_paths.items():
                 self.assertIn(producer.resolve(), owned)
+                self.assertIn(
+                    fixture.producer_media_paths[mode]["concat"].resolve(),
+                    owned,
+                )
                 concat = json.loads(producer.read_text())
-                for row in concat["segments"]:
+                for index, row in enumerate(concat["segments"]):
                     self.assertIn(
                         (producer.parent / f"{row['name']}.receipt.json").resolve(),
                         owned,
                     )
+                    self.assertIn(
+                        fixture.producer_media_paths[mode]["segments"][index].resolve(),
+                        owned,
+                    )
+            surplus_media = fixture.producer_paths["with_score"].parent / "with_score-seg-999.mov"
+            surplus_receipt = surplus_media.with_name(surplus_media.name + ".receipt.json")
+            surplus_media.write_bytes(b"unowned prior render")
+            surplus_receipt.write_text("{}\n")
+            owned_with_surplus = set(AB.evidence_artifact_paths(fixture.receipt))
+            self.assertNotIn(surplus_media.resolve(), owned_with_surplus)
+            self.assertNotIn(surplus_receipt.resolve(), owned_with_surplus)
+            fixture.producer_media_paths["control"]["segments"][0].unlink()
+            with self.assertRaisesRegex(AB.EvidenceError, "segment 0 media is missing"):
+                AB.evidence_artifact_paths(fixture.receipt)
 
     def test_pcm_or_frame_substitution_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -731,10 +1878,12 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with mock.patch.object(
                 AB,
                 "ffprobe_media",
-                side_effect=lambda path: changed if path == fixture.control_movie else fixture.probe(path),
+                side_effect=lambda path, **kwargs: (
+                    changed if path == fixture.control_movie else fixture.probe(path, **kwargs)
+                ),
             ), mock.patch.object(
                 AB, "review_frame_anchors", side_effect=fixture.anchor_probe
-            ):
+            ), fixture.producer_patch():
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
                     expected=fixture.context,
@@ -748,6 +1897,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
             ):
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
@@ -763,6 +1913,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
                     AB,
@@ -779,12 +1930,48 @@ class ProductionScoreMotionTest(unittest.TestCase):
                 errors = AB.packaged_receipt_errors(fixture.root, manifest)
             self.assertEqual(errors, [])
 
+            for case, duration in {
+                "bool": True,
+                "zero": 0,
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "overflowing-product": 1e308,
+            }.items():
+                invalid_duration = copy.deepcopy(manifest)
+                invalid_duration["duration"] = duration
+                invalid_duration["t1"] = duration
+                with self.subTest(package_duration=case), (
+                    mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe)
+                ), mock.patch.object(
+                    AB, "review_frame_anchors", side_effect=fixture.anchor_probe
+                ), fixture.producer_patch(), mock.patch.object(
+                    AB, "git_identity", return_value=fixture.context["repository_head"]
+                ), mock.patch.object(
+                    AB,
+                    "renderer_source_tree",
+                    side_effect=lambda *_args, with_score=True, **_kwargs: (
+                        fixture.context["source_tree_sha256"]
+                        if with_score
+                        else fixture.control_source_tree
+                    ),
+                ), mock.patch.object(
+                    AB, "generate_sample_rows", return_value=fixture.rows
+                ), mock.patch.object(
+                    AB, "require_production_tier", return_value=None
+                ):
+                    errors = AB.packaged_receipt_errors(fixture.root, invalid_duration)
+                self.assertTrue(
+                    any("expected production duration" in error for error in errors),
+                    errors,
+                )
+
             stale = copy.deepcopy(manifest)
             stale["t1"] = 0.9
             stale["duration"] = 0.9
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
                     AB,
@@ -806,6 +1993,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
                     AB,
@@ -836,6 +2024,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", side_effect=fixture.probe),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
                 mock.patch.object(AB, "git_identity", return_value=fixture.context["repository_head"]),
                 mock.patch.object(
                     AB,
@@ -877,6 +2066,7 @@ class ProductionScoreMotionTest(unittest.TestCase):
             with (
                 mock.patch.object(AB, "ffprobe_media", return_value=identical),
                 mock.patch.object(AB, "review_frame_anchors", side_effect=fixture.anchor_probe),
+                fixture.producer_patch(),
             ):
                 errors = AB.production_receipt_errors(
                     fixture.receipt,
