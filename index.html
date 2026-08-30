@@ -207,7 +207,7 @@
     </div>
   </fieldset>
 </section>
-<nav id="danse-dock" aria-label="Danse control categories">
+<nav id="danse-dock" hidden aria-hidden="true" aria-label="Danse control categories">
   <button type="button" data-category="hold" aria-pressed="false" aria-label="Hold motion" aria-keyshortcuts="Space">Hold</button>
   <button type="button" data-category="river" aria-pressed="false" aria-controls="surface-tray">River</button>
   <button type="button" data-category="score" aria-pressed="false" aria-controls="surface-tray">Score</button>
@@ -220,7 +220,7 @@
   <div class="tray-content" data-tray="presence"><div class="tray-heading"><div><h2>Presence</h2><p>Optional local influence. Sliders never activate Presence.</p></div></div><div class="tray-actions"><button class="danse-action" type="button" id="presence-off" aria-pressed="true">Off</button><button class="danse-action" type="button" id="presence-camera" aria-pressed="false">Camera</button><button class="danse-action" type="button" id="presence-touch" aria-pressed="false">Keyboard-touch</button><button class="danse-action" type="button" id="presence-replay" aria-pressed="false">Replay</button></div><p class="tray-status" id="presence-receipt" role="status" aria-live="polite">Interaction is off.</p><button class="danse-action" type="button" id="presence-details">Presence details and receipts</button></div>
 </section>
 <dialog id="project-map" aria-labelledby="project-map-title"><div class="map-shell"><h2 id="project-map-title">Danse project map</h2><p id="project-map-status" role="status">Loading the public project map.</p><ul id="project-map-list"><li><a href="./">Live artwork</a></li><li><a aria-disabled="true">Study <small>(unavailable until public admission)</small></a></li></ul><button class="danse-action" type="button" id="map-close">Close map</button></div></dialog>
-<button id="hud-toggle" type="button" aria-controls="hud" aria-expanded="false" aria-label="Show Danse controls" aria-keyshortcuts="H">
+<button id="hud-toggle" type="button" hidden aria-hidden="true" aria-controls="hud" aria-expanded="false" aria-label="Show Danse controls" aria-keyshortcuts="H">
   <span aria-hidden="true">H</span><span class="wide-label"> &middot; Controls</span>
 </button>
 <div id="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
@@ -759,6 +759,12 @@ function toggleControls() {
   else controlBus.actions.close();
 }
 
+function openTray(category, trigger) {
+  if (!hud.hidden) setHudVisible(false);
+  surfaceTrigger = trigger;
+  controlBus.actions.openTray(category);
+}
+
 async function openMap(trigger) {
   surfaceTrigger = trigger;
   controlBus.actions.openMap();
@@ -811,7 +817,7 @@ controlBus.subscribe((state) => {
 reducedMotion.addEventListener("change", reducedMotionChanged);
 hudToggle.addEventListener("click", toggleControls);
 dock.querySelector('[data-category="hold"]').addEventListener("click", () => { void controlBus.actions.hold(); });
-for (const category of ["river", "score", "presence"]) dock.querySelector(`[data-category="${category}"]`).addEventListener("click", (event) => { surfaceTrigger = event.currentTarget; controlBus.actions.openTray(category); });
+for (const category of ["river", "score", "presence"]) dock.querySelector(`[data-category="${category}"]`).addEventListener("click", (event) => openTray(category, event.currentTarget));
 dock.querySelector('[data-category="map"]').addEventListener("click", (event) => { void openMap(event.currentTarget); });
 el("river-new").addEventListener("click", () => { void controlBus.actions.newRiver(); });
 el("river-undo").addEventListener("click", () => { void controlBus.actions.undoRiver(); });
@@ -840,6 +846,11 @@ addEventListener("keydown", (event) => {
   else if (command.name === "movement") void controlBus.actions.movement(command.value);
   else void controlBus.actions[command.name]();
 });
+
+dock.hidden = false;
+dock.removeAttribute("aria-hidden");
+hudToggle.hidden = false;
+hudToggle.removeAttribute("aria-hidden");
 
 addEventListener("pagehide", () => interaction.stop(at()));
 

@@ -96,9 +96,34 @@ await test("keyboard compatibility yields named actions and respects editable/na
   assert.deepEqual(shortcutAction(event("7")), { name: "movement", value: 7 });
   assert.deepEqual(shortcutAction(event("m")), { name: "toggleCutout" });
   assert.deepEqual(shortcutAction(event("Escape", "INPUT")), { name: "close" });
-  assert.equal(shortcutAction(event("h", "INPUT")), null);
-  assert.equal(shortcutAction(event(" ", "BUTTON")), null);
+  for (const tag of ["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA"]) {
+    for (const key of [" ", "n", "s", "f", "m", "1", "7"]) assert.equal(shortcutAction(event(key, tag)), null);
+    assert.deepEqual(shortcutAction(event("h", tag)), { name: "toggleControls" });
+    assert.deepEqual(shortcutAction(event("Escape", tag)), { name: "close" });
+  }
+  assert.equal(shortcutAction({ ...event("n"), target: { tagName: "DIV", isContentEditable: true } }), null);
+  assert.deepEqual(shortcutAction({ ...event("h"), target: { tagName: "DIV", isContentEditable: true } }), { name: "toggleControls" });
   assert.equal(shortcutAction(event("8")), null);
+});
+
+await test("rapid program toggles derive from pending intent and settle on the latest choice", async () => {
+  const calls = [];
+  let finishScore;
+  const bus = createControlActions({
+    setProgram: (value) => {
+      calls.push(value);
+      if (value === "free") return true;
+      return new Promise((resolve) => { finishScore = resolve; });
+    },
+  });
+  bus.actions.sync({ type: ACTIONS.SET_PROGRAM, value: "free" });
+  const score = bus.actions.toggleProgram();
+  const free = bus.actions.toggleProgram();
+  await free;
+  finishScore(true);
+  await score;
+  assert.deepEqual(calls, ["score-led", "free"]);
+  assert.equal(bus.getState().program, "free");
 });
 
 await test("button and shortcut callers share one action bus", async () => {

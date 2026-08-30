@@ -114,16 +114,23 @@ export function isEditableTarget(target) {
   return ["input", "select", "textarea"].includes(tag) || Boolean(target.isContentEditable);
 }
 
+function isControlTarget(target) {
+  if (isEditableTarget(target)) return true;
+  if (typeof target?.closest === "function") {
+    return Boolean(target.closest("button, input, select, textarea, a, [contenteditable]"));
+  }
+  const tag = String(target?.tagName ?? "").toLowerCase();
+  return tag === "button" || tag === "a";
+}
+
 /** Translate compatibility keys to the same named actions used by buttons. */
 export function shortcutAction(event) {
   if (!event || event.repeat || ((event.altKey || event.ctrlKey || event.metaKey) && event.key !== "Escape")) return null;
   const key = String(event.key ?? "");
   const lower = key.toLowerCase();
-  const editable = isEditableTarget(event.target);
-  const button = String(event.target?.tagName ?? "").toLowerCase() === "button";
   if (key === "Escape") return { name: "close" };
-  if (editable || (key === " " && button)) return null;
   if (lower === "h") return { name: "toggleControls" };
+  if (isControlTarget(event.target)) return null;
   if (key === " ") return { name: "hold" };
   if (lower === "n") return { name: "newRiver" };
   if (lower === "s") return { name: "share" };

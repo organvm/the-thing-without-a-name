@@ -705,18 +705,22 @@ class InterfaceContractTest(unittest.TestCase):
         tag, toggle = self.markup.by_id["hud-toggle"]
         self.assertEqual(tag, "button")
         self.assertEqual(toggle["type"], "button")
+        self.assertIn("hidden", toggle)
+        self.assertEqual(toggle["aria-hidden"], "true")
         self.assertEqual(toggle["aria-controls"], "hud")
         self.assertEqual(toggle["aria-expanded"], "false")
         self.assertEqual(toggle["aria-label"], "Show Danse controls")
         tag, dock = self.markup.by_id["danse-dock"]
         self.assertEqual((tag, dock["aria-label"]), ("nav", "Danse control categories"))
+        self.assertIn("hidden", dock)
+        self.assertEqual(dock["aria-hidden"], "true")
         categories = [
             attrs["data-category"]
             for tag, attrs in self.markup.tags
             if tag == "button" and attrs.get("data-category")
         ]
         self.assertEqual(categories, ["hold", "river", "score", "presence", "map"])
-        self.assertIn('#surface-tray[hidden],#hud[hidden] { display:none; }', self.styles)
+        self.assertIn('#danse-dock[hidden],#surface-tray[hidden],#hud[hidden],#hud-toggle[hidden] { display:none; }', self.styles)
         self.assertIn("min-width: 48px; min-height: 48px", self.html)
 
     def test_keyboard_buttons_and_browser_probe_share_named_actions(self) -> None:
@@ -733,10 +737,22 @@ class InterfaceContractTest(unittest.TestCase):
     def test_controls_initialize_before_listening_and_replace_the_map_atomically(self) -> None:
         bus = self.script.index("controlBus = createControlActions({")
         listener = self.script.index('hudToggle.addEventListener("click", toggleControls)')
+        reveal = self.script.index("dock.hidden = false;")
         self.assertLess(bus, listener)
+        self.assertLess(listener, reveal)
+        self.assertLess(self.script.index("projectMap.addEventListener(\"cancel\""), reveal)
+        self.assertLess(self.script.index('addEventListener("keydown"'), reveal)
+        self.assertIn('dock.removeAttribute("aria-hidden")', self.script[reveal:])
+        self.assertIn("hudToggle.hidden = false;", self.script[reveal:])
+        self.assertIn('hudToggle.removeAttribute("aria-hidden")', self.script[reveal:])
         toggle = self.script.split("function toggleControls() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("if (!controlBus) return;", toggle)
         self.assertIn("if (projectMap.open) controlBus.actions.close();", toggle)
+
+    def test_opening_a_tray_closes_the_visual_details_sheet_first(self) -> None:
+        helper = self.script.split("function openTray(category, trigger) {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openTray(category)"))
+        self.assertIn("surfaceTrigger = trigger;", helper)
 
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
         handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]

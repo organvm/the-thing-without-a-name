@@ -21,7 +21,7 @@
   overflow-y:auto; overscroll-behavior:contain; padding:14px max(14px,env(safe-area-inset-right)) 14px max(14px,env(safe-area-inset-left));
   border-top:1px solid var(--danse-line); background:var(--danse-bg);
 }
-#surface-tray[hidden],#hud[hidden] { display:none; }
+#danse-dock[hidden],#surface-tray[hidden],#hud[hidden],#hud-toggle[hidden] { display:none; }
 #surface-tray .tray-content { display:none; max-width:64rem; margin:0 auto; }
 #surface-tray[data-open="river"] [data-tray="river"],#surface-tray[data-open="score"] [data-tray="score"],#surface-tray[data-open="presence"] [data-tray="presence"] { display:block; }
 .tray-heading { display:flex; align-items:start; justify-content:space-between; gap:12px; }
