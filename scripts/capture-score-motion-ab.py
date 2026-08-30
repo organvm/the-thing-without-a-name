@@ -122,6 +122,9 @@ def emit(seed: int, stream: int, passage_index: int) -> dict:
         });
       }
       const payload = {
+        schema: 'danse.evidence.score-to-motion-ab.fixture.v1',
+        evidence_scope: 'historical-fixture-only',
+        score_role: 'affine-regression-fixture-not-production',
         contract: score.identity.contract_sha256,
         seed: `0x${seed.toString(16)}`,
         stream,
@@ -142,6 +145,9 @@ def emit(seed: int, stream: int, passage_index: int) -> dict:
 def markdown(payload: dict) -> str:
     lines = [
         "# Score → motion A/B capture evidence (2026-08-05)",
+        "",
+        "**Historical fixture evidence only.** This affine synthetic-score regression",
+        "cannot satisfy the native-tempo production A/B or final-cut gates.",
         "",
         "For one fixed (seed, stream, passage) the same absolute time is sampled with and",
         "without the score clock. `score_delta` is exactly the choreography the score",

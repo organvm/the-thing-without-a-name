@@ -780,12 +780,28 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
         self.assertIn("if (generation !== programGeneration) return false", self.script)
         self.assertIn('value: program ? "score-led" : "free"', self.script)
+        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        self.assertIn("if (programIntent === programGeneration) {", handler)
+        self.assertLess(
+            handler.index("if (programIntent === programGeneration) {", handler.index("river = nextRiver;")),
+            handler.index('controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM'),
+        )
         self.assertIn("describeProgram();", self.script)
+
+    def test_music_toggle_and_advanced_receipt_follow_authoritative_state(self) -> None:
+        music = self.script.split("async function toggleMusic(intent) {", 1)[1].split("\n}", 1)[0]
+        subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
+        self.assertIn('if (intent === "stopped")', music)
+        self.assertIn("await scoreAudio.start(scoreSecondAt(at()))", music)
+        self.assertIn("scoreAudio.stop();", music.split("catch (error)", 1)[1])
+        self.assertIn("renderMusicReceipt(state);", subscription)
 
     def test_shared_river_uses_only_allowlisted_presentation_state(self) -> None:
         share = self.script.split("async function shareRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const sharedRiver = river;", share)
+        self.assertIn("if (river !== sharedRiver) return false;", share)
         self.assertIn("sharePresentationState(controlBus.getState())", share)
-        self.assertIn("sharePresentationUrl(Arrival.href(river), presentation)", share)
+        self.assertIn("sharePresentationUrl(Arrival.href(sharedRiver), presentation)", share)
         self.assertNotIn("location.href", share)
 
     def test_slow_replay_receipt_cannot_replace_a_later_presence_choice(self) -> None:
@@ -798,7 +814,9 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("if (generation !== presenceOperationGeneration) return controlBus.getState().presence;", presence)
 
     def test_presence_status_clear_renders_the_authoritative_interaction_message(self) -> None:
+        interaction = self.script.split("function renderInteraction(snapshot) {", 1)[1].split("\n}", 1)[0]
         subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
+        self.assertIn('controlBus?.getState().status.presence || message', interaction)
         self.assertIn('el("presence-receipt").textContent = state.status.presence || presenceMessage();', subscription)
 
     def test_pre_activation_fallback_values_are_applied_when_presence_starts(self) -> None:
@@ -835,7 +853,7 @@ class InterfaceContractTest(unittest.TestCase):
             self.script,
         )
         film = (ROOT / "film.html").read_text(encoding="utf-8")
-        self.assertIn("scoreUrl ? await MusicalScore.load(scoreUrl) : null", film)
+        self.assertIn("scoreUrl !== null ? await MusicalScore.load(scoreUrl) : null", film)
         self.assertNotIn("MusicalScore.loadOptional", film)
 
     def test_canvas_has_a_text_description_and_canonical_metadata(self) -> None:

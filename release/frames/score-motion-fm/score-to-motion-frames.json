@@ -1,5 +1,6 @@
 {
   "schema": "danse.evidence.score-to-motion-frames.v1",
+  "evidence_scope": "historical-fixture-only",
   "contract": "0979888d8b4aac050a8cabc6c9c5b358209694e2be2555d041887ccb5c78fe7d",
   "seed": "0x12345678",
   "stream": 7,

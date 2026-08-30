@@ -1,5 +1,8 @@
 # Score → motion A/B — observable frames (2026-08-05)
 
+**Historical fixture evidence only.** These GPU frames use the affine
+synthetic score and cannot satisfy the production A/B or final-cut gates.
+
 The numeric A/B receipt proves the score moves the image in state
 arithmetic. This renders the actual frame at each declared boundary,
 WITH the score and WITHOUT it, at the same absolute time, and measures

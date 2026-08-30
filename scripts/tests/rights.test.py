@@ -660,7 +660,12 @@ class RightsContractTest(unittest.TestCase):
             asset for asset in self.document["assets"] if asset["id"] == "room-source-recordings"
         )
         self.assertEqual(room["uses"][0]["required_for"], [])
-        for rule_id in ("moving-image", "score-source", "audio-render-receipt"):
+        for rule_id in (
+            "moving-image",
+            "score-source",
+            "audio-render-receipt",
+            "score-motion-evidence",
+        ):
             rule = next(rule for rule in self.document["package_rules"] if rule["id"] == rule_id)
             requirements = [(row["asset"], row["use"]) for row in rule["requirements"]]
             self.assertNotIn(RIGHTS.HYBRID_AUDIO_REQUIREMENT, requirements)
@@ -802,6 +807,8 @@ class RightsContractTest(unittest.TestCase):
             "submitted-via-submittable",
             "accepted-film-no-withdrawal",
             "publicity-stills-free-of-rights",
+            "submission-rights-warranty",
+            "festival-scheduling-discretion",
             "archive-library-choice",
             "regulations-accepted",
         ):

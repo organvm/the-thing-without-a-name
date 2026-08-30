@@ -1,0 +1,1244 @@
+{
+  "schema": "danse.opportunities.v1",
+  "snapshot_id": "omega-20260829",
+  "frozen_at": "2026-08-29T22:12:19Z",
+  "owner_issue": 15,
+  "successor_issue": 22,
+  "policy": {
+    "immutable": true,
+    "fact_statuses": [
+      "verified",
+      "unstated",
+      "not-applicable",
+      "conflicted"
+    ],
+    "dispositions": [
+      "active",
+      "closed",
+      "watch",
+      "conflicted",
+      "blocked",
+      "historical"
+    ],
+    "external_actions": "human-gated"
+  },
+  "source_evidence": {
+    "path": "opportunities/source-evidence-20260826.json",
+    "sha256": "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c026693258cd6c974bc8",
+    "bytes": 8488
+  },
+  "operational_queue": {
+    "basis": "frozen_at",
+    "expires_at": "2026-08-31T22:00:00-04:00",
+    "successor_issue": 22
+  },
+  "release_consumers": [
+    {
+      "issue": 2,
+      "role": "ScreenDance filing register",
+      "status": "bound"
+    },
+    {
+      "issue": 12,
+      "role": "canonical Omega release manifest",
+      "status": "pending"
+    }
+  ],
+  "ranked_actions": [
+    {
+      "rank": 1,
+      "opportunity_id": "screendance-miami-2027",
+      "action": "Finish issues 8 through 10 and 16, then validate and file only the artist-approved score-driven package through issue 2."
+    },
+    {
+      "rank": 2,
+      "opportunity_id": "cinedans-fest-2027-installation",
+      "action": "Finish the issue 14 room evidence and submit the installation through the portal, with supplemental material sent only by the account owner."
+    },
+    {
+      "rank": 3,
+      "opportunity_id": "times-square-midnight-moment",
+      "action": "After the final cut exists, build the required silent 170-second horizontal derivative and release-manifest stills."
+    },
+    {
+      "rank": 4,
+      "opportunity_id": "cinedans-2028-international-short",
+      "action": "Preserve this longer-run film target for the accepted final cut and confirm the selected-master deadline typo before any filing."
+    },
+    {
+      "rank": 5,
+      "opportunity_id": "mignolo-screendance-2026",
+      "action": "Ask Mignolo to reconcile its official New Jersey page with the published Brussels 2026 call, deadline, venue, fee, and current FilmFreeway terms."
+    },
+    {
+      "rank": 6,
+      "opportunity_id": "miami-dade-tdc-2026-q2",
+      "action": "Identify an eligible Miami-Dade nonprofit applicant and attend or schedule the mandatory pre-application contact before treating this as a grant route."
+    }
+  ],
+  "opportunities": [
+    {
+      "id": "bakehouse-studio-residency-2026",
+      "name": "Studio Artist Residency Program 2026–2028",
+      "organization": "Bakehouse Art Complex",
+      "disposition": "closed",
+      "fit": "residency",
+      "owner_issue": 15,
+      "deadline_at": "2026-05-01T23:45:00-05:00",
+      "sources": [
+        {
+          "url": "https://www.bacfl.org/air-programs",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Applications closed; the official page states 1 May 2026 at 11:45 p.m. EST, not the 1 August short-term deadline in the predecessor plan.",
+          "source": "https://www.bacfl.org/air-programs"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Affordable two-year studio residency for Miami-based artists; residency term 1 November 2026 through 31 October 2028.",
+          "source": "https://www.bacfl.org/air-programs"
+        },
+        {
+          "id": "fee",
+          "status": "verified",
+          "value": "Studio costs are capped at approximately 50% of market rate; the separate Associate Artist Program costs $550 per year.",
+          "source": "https://www.bacfl.org/air-programs"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "The current page explicitly says applications are closed and routes questions to Residency Program Coordinator Christine Cortes.",
+          "source": "https://www.bacfl.org/air-programs"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "No action in this frozen release; issue 22 may watch for a later cycle."
+    },
+    {
+      "id": "cinedans-2028-international-short",
+      "name": "International Short Film Competition 2028",
+      "organization": "Cinedans",
+      "disposition": "active",
+      "fit": "film",
+      "owner_issue": 2,
+      "deadline_at": "2027-06-30T00:00:00+02:00",
+      "sources": [
+        {
+          "url": "https://cinedans.nl/p/welcome_entries",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        },
+        {
+          "url": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1",
+          "kind": "terms",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "30 June 2027; the source does not publish a cutoff time, so the fail-closed internal boundary is the start of that date in Europe/Amsterdam.",
+          "source": "https://cinedans.nl/p/welcome_entries"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "International professional fiction or experimental dance films, 1–25 minutes, under three years old, not submitted to prior Cinedans editions; maximum three submissions per filmmaker.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "fee",
+          "status": "verified",
+          "value": "€20 entry fee.",
+          "source": "https://cinedans.nl/p/welcome_entries"
+        },
+        {
+          "id": "runtime",
+          "status": "verified",
+          "value": "Between 1 and 25 minutes.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "container",
+          "status": "conflicted",
+          "value": "Selected films require DCP and ProRes, but the official terms say the master is due before the end of January 2026, an impossible date for this 2028 competition.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1",
+          "resolve": "Ask entry@cinedans.nl for the corrected master deadline and current DCP/ProRes specifications before filing."
+        },
+        {
+          "id": "aspect",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask entry@cinedans.nl or use the selected-film technical specification when issued."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask entry@cinedans.nl whether English captions or subtitles are mandatory for non-dialogue, dialogue, and accessibility tracks."
+        },
+        {
+          "id": "credits",
+          "status": "verified",
+          "value": "Entry-form film information is used for festival publications; catalogue writing remains at festival discretion.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "installation",
+          "status": "not-applicable",
+          "value": "This entry is the international short-film competition; the installation route is recorded separately."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Up to three festival screenings without screening fees; promotional use of submitted film, stills, posters and trailers, including an excerpt up to 10% or three minutes; submitter warrants all rights; travel and lodging are not covered.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 10,
+          "status": "pending",
+          "detail": "A new artist-approved score-driven final cut does not yet exist."
+        },
+        {
+          "issue": 16,
+          "status": "pending",
+          "detail": "The exact final package rights manifest and attestations remain pending."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "fee-and-submit",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve the final work, pay the €20 fee, accept terms, and send through the account-owned portal."
+        }
+      ],
+      "next_action": "Hold for the final cut, then resolve the official date typo before an account-owned filing."
+    },
+    {
+      "id": "cinedans-fest-2027-installation",
+      "name": "FEST '27 Out of Competition — installation/project proposal",
+      "organization": "Cinedans",
+      "disposition": "active",
+      "fit": "installation",
+      "owner_issue": 14,
+      "deadline_at": "2026-09-15T00:00:00+02:00",
+      "sources": [
+        {
+          "url": "https://cinedans.nl/p/welcome_entries",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        },
+        {
+          "url": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1",
+          "kind": "terms",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "15 September 2026; no cutoff time is published, so the fail-closed internal boundary is the start of that date in Europe/Amsterdam.",
+          "source": "https://cinedans.nl/p/welcome_entries"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Out of Competition accepts installation, stereoscopic, VR, professional and student feature/documentary work, and other project proposals under three years old and not submitted to prior Cinedans editions; maximum two submissions.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "fee",
+          "status": "verified",
+          "value": "No entry fee.",
+          "source": "https://cinedans.nl/p/welcome_entries"
+        },
+        {
+          "id": "runtime",
+          "status": "not-applicable",
+          "value": "The target is an installation/project proposal rather than the short-film competition."
+        },
+        {
+          "id": "container",
+          "status": "verified",
+          "value": "The project must enter through the Filmchief portal; installation and other proposal materials may additionally be sent to entry@cinedans.nl.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "aspect",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask entry@cinedans.nl for display geometry and project-proposal preview requirements."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask entry@cinedans.nl which captions, transcript, and accessibility files should accompany the installation proposal."
+        },
+        {
+          "id": "credits",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask entry@cinedans.nl for installation credit and catalogue fields; provide the release-manifest credits as evidence, not as an inferred festival format."
+        },
+        {
+          "id": "installation",
+          "status": "verified",
+          "value": "Installation work and other project proposals are explicitly accepted; portal entry is mandatory and supplemental materials may be emailed.",
+          "source": "https://filmchief.com/festivals/cinedans/download/2027/Terms%20and%20Conditions%20Cinedans%202027.pdf?v=1"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "The portal and terms apply on submission; the March 2027 edition is at Eye Filmmuseum, Amsterdam, while installation technical, travel, insurance, and presentation details require confirmation.",
+          "source": "https://cinedans.nl/p/welcome_entries"
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 14,
+          "status": "pending",
+          "detail": "The digital twin, venue specification, calibration, recovery, and wall-plug evidence are not terminal."
+        },
+        {
+          "issue": 17,
+          "status": "pending",
+          "detail": "The pitch, accessibility package, press kit, and release media are not yet generated from a release manifest."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "proposal-approval",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve the installation proposal and account-owned portal/email sends."
+        },
+        {
+          "id": "venue-terms",
+          "owner": "external",
+          "status": "required",
+          "action": "Cinedans must confirm installation technical, travel, insurance, and presentation terms."
+        }
+      ],
+      "next_action": "Complete issue 14 evidence and issue 17 proposal assets, then obtain human approval for the portal and supplemental send."
+    },
+    {
+      "id": "eyebeam-2026-residency",
+      "name": "Speculating on Plurality 2026 residency",
+      "organization": "Eyebeam",
+      "disposition": "historical",
+      "fit": "residency",
+      "owner_issue": 15,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://eyebeam.org/2026-residents/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "The already-selected cohort comprises six New York City-based emerging artists in the first decade of their careers.",
+          "source": "https://eyebeam.org/2026-residents/"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "The concluded selection provided a 12-week residency and $4,000 stipend; it is not a current call.",
+          "source": "https://eyebeam.org/2026-residents/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "No current action; issue 22 may evaluate a future call on its then-current rules."
+    },
+    {
+      "id": "ica-miami-unsolicited-proposal",
+      "name": "Unsolicited artwork or portfolio proposal",
+      "organization": "Institute of Contemporary Art, Miami",
+      "disposition": "historical",
+      "fit": "relationship",
+      "owner_issue": 15,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://icamiami.org/about/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "eligibility",
+          "status": "not-applicable",
+          "value": "There is no unsolicited proposal route."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "ICA Miami does not review or accept unsolicited artworks or portfolios by email, mail, or in person and will not return received material.",
+          "source": "https://icamiami.org/about/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "Do not send unsolicited material; only a future invited or relationship-owned route may reopen this target."
+    },
+    {
+      "id": "knight-arts-challenge-miami",
+      "name": "Knight Arts Challenge Miami",
+      "organization": "Knight Foundation",
+      "disposition": "historical",
+      "fit": "grant",
+      "owner_issue": 15,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://knightfoundation.org/knight-arts-challenge/kacm/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Issue 22 must locate a new official call before assigning any current deadline."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "The plan's target resolves to legacy program material rather than a current open call.",
+          "source": "https://knightfoundation.org/knight-arts-challenge/kacm/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "Do not build or file against legacy rules; issue 22 may record a genuinely new Knight call."
+    },
+    {
+      "id": "locust-projects-main-gallery",
+      "name": "Main Gallery Open Call",
+      "organization": "Locust Projects",
+      "disposition": "watch",
+      "fit": "installation",
+      "owner_issue": 22,
+      "deadline_at": "2025-11-16T23:59:00-05:00",
+      "sources": [
+        {
+          "url": "https://www.locustprojects.org/for-artists/submissions/exhibition-open-call.html",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "The official page is titled 2025 Main Gallery Open Call — Closed and states a 16 November 2025 deadline; no 2026 call is published despite stale 'now open' text lower on the same page.",
+          "source": "https://www.locustprojects.org/for-artists/submissions/exhibition-open-call.html"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "The historical call sought ambitious new installation work designed specifically for the approximately 2,500-square-foot Main Gallery, not existing work.",
+          "source": "https://www.locustprojects.org/for-artists/submissions/exhibition-open-call.html"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Historical support was a $10,000 project budget, $5,000 artist fee, limited per diem/travel, accommodations, infrastructure and installation assistance.",
+          "source": "https://www.locustprojects.org/for-artists/submissions/exhibition-open-call.html"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "Issue 22 watches the official page or eNews for a newly dated call; the closed 2025 rules cannot become current work."
+    },
+    {
+      "id": "miami-dade-tdc-2026-q2",
+      "name": "Tourist Development Council Grants Program — second quarter",
+      "organization": "Miami-Dade County Department of Cultural Affairs",
+      "disposition": "blocked",
+      "fit": "grant",
+      "owner_issue": 15,
+      "deadline_at": "2026-10-13T23:59:00-04:00",
+      "sources": [
+        {
+          "url": "https://www.miamidadearts.org/node/16041",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        },
+        {
+          "url": "https://www.miamidadearts.org/artist-access-art-grants-program",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Workshop 9 September 2026 at 11:00 a.m.; courtesy review 5 October; application deadline 13 October 2026 at 11:59 p.m.",
+          "source": "https://www.miamidadearts.org/node/16041"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "The fall-cycle announcement is for Miami-Dade County-based nonprofit cultural groups; TDC supports significant cultural or special events and film/television origination that stimulate tourism and significant county media impact.",
+          "source": "https://www.miamidadearts.org/node/16041"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm all application and fiscal-sponsor costs with TDC administrator Nikenna Smart before an organization commits."
+        },
+        {
+          "id": "runtime",
+          "status": "not-applicable",
+          "value": "This is an organization grant, not a film call."
+        },
+        {
+          "id": "container",
+          "status": "not-applicable",
+          "value": "Application materials are submitted through SurveyMonkey Apply, not as a film master."
+        },
+        {
+          "id": "aspect",
+          "status": "not-applicable",
+          "value": "No film aspect requirement is stated for this organization grant."
+        },
+        {
+          "id": "captions",
+          "status": "not-applicable",
+          "value": "No media caption specification is stated in the fall-cycle announcement."
+        },
+        {
+          "id": "credits",
+          "status": "unstated",
+          "value": null,
+          "resolve": "An eligible organization must obtain current TDC guidelines and confirm acknowledgement requirements with Nikenna Smart."
+        },
+        {
+          "id": "installation",
+          "status": "not-applicable",
+          "value": "The announcement does not define venue installation specifications."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Applicants must attend a mandatory workshop or schedule a pre-application consultation, be registered in SurveyMonkey Apply, and understand funding is contingent on the county budget.",
+          "source": "https://www.miamidadearts.org/node/16041"
+        },
+        {
+          "id": "predecessor-plan-correction",
+          "status": "verified",
+          "value": "The individual Artist Access program is a different, maximum-$2,000 professional-development grant; its 2025–2026 cycles ended by 1 June 2026, presentation and installation costs are ineligible, and administrator consultation is not required. The predecessor plan's $7,500/$15,000 ART claim and 13 October date therefore cannot be used.",
+          "source": "https://www.miamidadearts.org/artist-access-art-grants-program"
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 14,
+          "status": "pending",
+          "detail": "A credible installation/presentation scope and budget depend on issue 14."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "eligible-organization",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Choose or authorize an eligible Miami-Dade nonprofit applicant or fiscal relationship."
+        },
+        {
+          "id": "grant-consultation",
+          "owner": "external",
+          "status": "required",
+          "action": "The eligible organization must attend the workshop or schedule the required administrator consultation."
+        }
+      ],
+      "next_action": "Resolve the organizational vehicle and mandatory consultation; this is TDC, not the individual ART grant claimed by the predecessor plan."
+    },
+    {
+      "id": "mignolo-screendance-2026",
+      "name": "Mignolo International Screendance Festival 2026",
+      "organization": "Mignolo Arts",
+      "disposition": "conflicted",
+      "fit": "film",
+      "owner_issue": 15,
+      "deadline_at": "2026-10-13T23:59:00-05:00",
+      "sources": [
+        {
+          "url": "https://www.mignolo.art/screendance",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        },
+        {
+          "url": "https://www.newjerseystage.com/articles2/2026/04/20/mignolo-international-screendance-festival-is-accepting-submissions/",
+          "kind": "published-partner",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "conflicted",
+          "value": "A published 2026 announcement states 13 October 2026 at 11:59 p.m. EST; Mignolo's official festival page publishes no current deadline.",
+          "source": "https://www.newjerseystage.com/articles2/2026/04/20/mignolo-international-screendance-festival-is-accepting-submissions/",
+          "resolve": "Ask info@mignolo.art to confirm the live deadline and time-zone semantics against the current FilmFreeway listing."
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Worldwide screendance makers; original work made for film/video with a movement focus; filmed performances and installations are excluded.",
+          "source": "https://www.mignolo.art/screendance"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm the exact current fee and category in FilmFreeway with info@mignolo.art before any account action."
+        },
+        {
+          "id": "runtime",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm the current runtime cap in FilmFreeway with info@mignolo.art."
+        },
+        {
+          "id": "container",
+          "status": "verified",
+          "value": "Final format must be MOV or MP4.",
+          "source": "https://www.mignolo.art/screendance"
+        },
+        {
+          "id": "aspect",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask info@mignolo.art for projection aspect and raster requirements."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask info@mignolo.art whether captions or subtitles are required."
+        },
+        {
+          "id": "credits",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask info@mignolo.art for on-screen and catalogue credit rules."
+        },
+        {
+          "id": "installation",
+          "status": "verified",
+          "value": "Filmed performances and installations are not accepted.",
+          "source": "https://www.mignolo.art/screendance"
+        },
+        {
+          "id": "terms",
+          "status": "conflicted",
+          "value": "Applicants grant promotional use of photographs and films, but the official page still names an in-person Metuchen, New Jersey screening while the 2026 published announcement names WEi Studio in Brussels plus a virtual festival.",
+          "source": "https://www.newjerseystage.com/articles2/2026/04/20/mignolo-international-screendance-festival-is-accepting-submissions/",
+          "resolve": "Ask info@mignolo.art to reconcile venue, dates, awards, promotional license, and current FilmFreeway terms in writing."
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 10,
+          "status": "pending",
+          "detail": "Only the future score-driven final cut may be considered."
+        },
+        {
+          "issue": 16,
+          "status": "pending",
+          "detail": "Exact final-film and promotional-use rights clearance remains pending."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "terms-reconciliation",
+          "owner": "external",
+          "status": "required",
+          "action": "Mignolo must reconcile the official page, 2026 announcement, and portal terms."
+        },
+        {
+          "id": "account-submit",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve the exact film, fee, license, and account-owned send after reconciliation."
+        }
+      ],
+      "next_action": "Do not file until Mignolo provides a coherent current call."
+    },
+    {
+      "id": "miami-light-project-here-now-2027",
+      "name": "Here & Now 2027",
+      "organization": "Miami Light Project",
+      "disposition": "closed",
+      "fit": "installation",
+      "owner_issue": 15,
+      "deadline_at": "2026-06-20T23:00:00-04:00",
+      "sources": [
+        {
+          "url": "https://miamilightproject.com/news/here-now-2027-submissions-open/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Closed 20 June 2026 at 11:00 p.m.",
+          "source": "https://miamilightproject.com/news/here-now-2027-submissions-open/"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Short-form work by Miami-based performing and multimedia artists across dance, music, theater and spoken word.",
+          "source": "https://miamilightproject.com/news/here-now-2027-submissions-open/"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Selected artists receive a commission fee, rehearsal space, technical assistance and professional development.",
+          "source": "https://miamilightproject.com/news/here-now-2027-submissions-open/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "No current action; issue 22 may verify a later cycle from a newly published call."
+    },
+    {
+      "id": "oolite-ellies-creator-2027",
+      "name": "The Ellies Creator Award 2027",
+      "organization": "Oolite Arts",
+      "disposition": "closed",
+      "fit": "grant",
+      "owner_issue": 15,
+      "deadline_at": "2026-08-03T23:59:00-04:00",
+      "sources": [
+        {
+          "url": "https://oolitearts.org/ellies-open-calls/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Deadline extended to 3 August 2026 at 11:59 p.m. ET; the page also retains its original 31 July text.",
+          "source": "https://oolitearts.org/ellies-open-calls/"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Individual South Florida artists age 21+, resident in Miami-Dade, Broward, Palm Beach or Monroe County, not enrolled in 2027, with matching Florida ID and secondary residence proof; recent Oolite winners/residents and conflicts are excluded.",
+          "source": "https://oolitearts.org/ellies-open-calls/"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm any application fee in Oolite's Submittable form before the account owner sends."
+        },
+        {
+          "id": "runtime",
+          "status": "not-applicable",
+          "value": "This is an unrestricted career award, not a film submission."
+        },
+        {
+          "id": "container",
+          "status": "not-applicable",
+          "value": "The application accepts review links rather than a delivery master."
+        },
+        {
+          "id": "aspect",
+          "status": "not-applicable",
+          "value": "No film aspect specification applies to the career award."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Inspect the live Submittable work-sample fields for accessibility requirements before sending."
+        },
+        {
+          "id": "credits",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Inspect the live application and award agreement; no credit rule is published on the call page."
+        },
+        {
+          "id": "installation",
+          "status": "not-applicable",
+          "value": "No installation proposal is required."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Thirty-five individual artists receive $10,000 unrestricted awards; multiple Oolite applications require a consistent preference ranking and a person can receive only one opportunity.",
+          "source": "https://oolitearts.org/ellies-open-calls/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [
+        {
+          "id": "residency-proof",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Establish whether the South Florida residency, ID, enrollment, and prior-participation rules are met."
+        },
+        {
+          "id": "application-send",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve application claims, account actions, terms, and the public send before the extended deadline."
+        }
+      ],
+      "next_action": "Immediate human eligibility and filing decision before 3 August 2026 at 11:59 p.m. ET; no agent may infer eligibility or send."
+    },
+    {
+      "id": "oolite-studio-residency-2027",
+      "name": "Studio Residency Program 2027",
+      "organization": "Oolite Arts",
+      "disposition": "closed",
+      "fit": "residency",
+      "owner_issue": 15,
+      "deadline_at": "2026-08-03T23:59:00-04:00",
+      "sources": [
+        {
+          "url": "https://oolitearts.org/studio-residency/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Deadline extended to 3 August 2026 at 11:59 p.m. ET; the page also retains the original 31 July call dates.",
+          "source": "https://oolitearts.org/studio-residency/"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "South Florida residents age 21+, not enrolled in a degree program in 2027, with matching Florida ID and secondary proof; recent Oolite winners/residents and conflicts are excluded.",
+          "source": "https://oolitearts.org/studio-residency/"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm any application fee in the live Oolite Submittable form."
+        },
+        {
+          "id": "runtime",
+          "status": "not-applicable",
+          "value": "This is a studio residency, not a film call."
+        },
+        {
+          "id": "container",
+          "status": "not-applicable",
+          "value": "No delivery master specification applies."
+        },
+        {
+          "id": "aspect",
+          "status": "not-applicable",
+          "value": "No film aspect specification applies."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Inspect the live work-sample fields for accessibility requirements before sending."
+        },
+        {
+          "id": "credits",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Inspect the live application and residency agreement for acknowledgement requirements."
+        },
+        {
+          "id": "installation",
+          "status": "verified",
+          "value": "Free Miami Beach studio with 24-hour access and fabrication/digital facilities; residents must use the studio at least 15 hours weekly and participate in programs.",
+          "source": "https://oolitearts.org/studio-residency/"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Residency runs 16 February 2027 through 14 January 2028; eligible long-term South Florida residents receive $12,000 Knight housing support plus $3,000 Oolite support; travel and visa costs are excluded; absences over 30 days are barred.",
+          "source": "https://oolitearts.org/studio-residency/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [
+        {
+          "id": "residency-proof",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Establish South Florida eligibility and ability to meet the physical studio commitments."
+        },
+        {
+          "id": "preference-and-send",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Rank dual Oolite applications consistently, approve claims and terms, and send from the account before the extended deadline."
+        }
+      ],
+      "next_action": "Immediate human eligibility, preference, and filing decision before 3 August 2026 at 11:59 p.m. ET."
+    },
+    {
+      "id": "screendance-miami-2027",
+      "name": "ScreenDance Miami Festival 2027",
+      "organization": "Miami Light Project",
+      "disposition": "active",
+      "fit": "film",
+      "owner_issue": 2,
+      "deadline_at": "2026-08-31T22:00:00-04:00",
+      "consumer_contract": {
+        "path": "submission/screendance-2027.yaml",
+        "excluded_fields": [
+          "opportunity_snapshot"
+        ],
+        "schema": "danse.submission.v2",
+        "canonical_sha256": "0c99bad6604b7061b3a404a02980e81df66422147ee51ac768dbe5fc2f3d0a14"
+      },
+      "sources": [
+        {
+          "url": "https://miamilightproject.submittable.com/submit",
+          "kind": "portal",
+          "checked_at": "2026-08-26T14:16:20-04:00"
+        },
+        {
+          "url": "https://miamilightproject.com/program/screen-dance-2027/",
+          "kind": "official",
+          "checked_at": "2026-08-26T14:16:20-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "conflicted",
+          "value": "Submittable states Monday, 31 August 2026 at 11:00 p.m. EST; the official program page states 11:59 p.m. The release uses 10:00 p.m. America/New_York as a conservative internal filing buffer, not as a timezone conversion.",
+          "source": "https://miamilightproject.submittable.com/submit",
+          "resolve": "Treat the 10:00 p.m. local wall as controlling internally and ask Miami Light Project to reconcile the two published times if operationally necessary."
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Worldwide dancers, choreographers, movers, and filmmakers submitting a final dance film; works in progress are rejected.",
+          "source": "https://miamilightproject.submittable.com/submit"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm the charge, if any, at the account-owned Submittable payment step."
+        },
+        {
+          "id": "runtime",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Call Miami Light Project at 305-576-4350 for the maximum accepted runtime; the build conservatively caps a passage at 480 seconds."
+        },
+        {
+          "id": "container",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask Miami Light Project for selected-film master and codec requirements; the project preserves ProRes HQ and H.264 derivatives meanwhile."
+        },
+        {
+          "id": "aspect",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask Miami Light Project whether 16:9 and any SoundScape wall version have distinct delivery requirements."
+        },
+        {
+          "id": "captions",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Ask Miami Light Project for caption and subtitle requirements; issue 17 still produces captions and transcript for the release."
+        },
+        {
+          "id": "credits",
+          "status": "verified",
+          "value": "By submitting, the applicant declares that they hold all rights to share every aspect of the film and have cleared rights with composers, musicians, dancers, and all other collaborators; selected publicity stills must be supplied free of rights for unrestricted festival promotion.",
+          "source": "https://miamilightproject.submittable.com/submit"
+        },
+        {
+          "id": "installation",
+          "status": "not-applicable",
+          "value": "This portal entry is the film filing; any lobby or wall installation is a later venue relationship, not a published call entitlement."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Password-protected downloadable link; accepted work cannot be withdrawn; selected stills carry promotional permission without time/place limits; general scheduling and screening timetables are at festival discretion; archive-library include/opt-out choice; filing unconditionally accepts regulations and festival-management final decisions.",
+          "source": "https://miamilightproject.submittable.com/submit"
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 10,
+          "status": "pending",
+          "detail": "The previous 5:13 package is provisional; the score-driven final cut and new package do not exist."
+        },
+        {
+          "issue": 16,
+          "status": "pending",
+          "detail": "Final package rights, biography, dancer, music and promotional-still attestations remain human-gated."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "artistic-and-rights-approval",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve the actual score-driven final cut, biography, rights and promotional stills."
+        },
+        {
+          "id": "upload-and-submit",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Perform Vimeo/account acts, choose archive participation, accept terms, and file through Submittable."
+        }
+      ],
+      "next_action": "Complete issues 8–10 and 16; do not upload or file the provisional package."
+    },
+    {
+      "id": "superblue-artist-route",
+      "name": "Artist presentation relationship",
+      "organization": "Superblue",
+      "disposition": "historical",
+      "fit": "relationship",
+      "owner_issue": 15,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://www.superblue.com/artists",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        },
+        {
+          "url": "https://www.superblue.com/faq",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Issue 22 must identify a published artist call or an authorized relationship before assigning a deadline."
+        },
+        {
+          "id": "terms",
+          "status": "unstated",
+          "value": null,
+          "resolve": "The official artist and visitor pages do not publish a submission contract for unsolicited proposals."
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "No unsolicited send; only an authorized relationship or a newly published call can reactivate this target."
+    },
+    {
+      "id": "the-bass-unsolicited-proposal",
+      "name": "Unsolicited artwork or proposal",
+      "organization": "The Bass",
+      "disposition": "historical",
+      "fit": "relationship",
+      "owner_issue": 15,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://thebass.org/about/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "eligibility",
+          "status": "not-applicable",
+          "value": "There is no unsolicited proposal route."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "The Bass does not accept unsolicited artworks or proposals and offers no return or response guarantee for anything sent.",
+          "source": "https://thebass.org/about/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "Do not send unsolicited material; only a future invitation or relationship-owned route may reopen this target."
+    },
+    {
+      "id": "times-square-midnight-moment",
+      "name": "Midnight Moment",
+      "organization": "Times Square Arts",
+      "disposition": "active",
+      "fit": "public-screen",
+      "owner_issue": 17,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "verified",
+          "value": "Rolling Slideroom submissions; no fixed deadline is published.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "Completed original moving-image art suitable for a diverse public space, without nudity, sex, drugs, violence, religious iconography, overt political messages, expletives, advertising or logos; artist owns and licenses all material.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        },
+        {
+          "id": "fee",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm any current Slideroom application charge at the account-owned filing step."
+        },
+        {
+          "id": "runtime",
+          "status": "verified",
+          "value": "Mandatory 170-second edit; selected works also require 150- and 170-second accurate edits.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        },
+        {
+          "id": "container",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Confirm current Slideroom container and codec fields; the official page specifies raster and duration but not a codec/container."
+        },
+        {
+          "id": "aspect",
+          "status": "verified",
+          "value": "Mandatory horizontal 1920×1080 or larger; ideal selected-work vertical version 1176×1464; work must tolerate crops and many screen ratios.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        },
+        {
+          "id": "captions",
+          "status": "not-applicable",
+          "value": "The mandatory billboard work is silent and must succeed with no audio; no dialogue-dependent content is planned."
+        },
+        {
+          "id": "credits",
+          "status": "verified",
+          "value": "Submission video contains no title, artist name or credits; Times Square Arts creates an unalterable selected-work credit slide with artist, title, year and optional partner.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        },
+        {
+          "id": "installation",
+          "status": "not-applicable",
+          "value": "Midnight Moment is delivered to the billboard network; Times Square Arts handles per-screen formatting after selection."
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "No audio; no credits/logos; 1–3 18×24-inch 300-dpi JPG/TIFF stills without text/logos; single-channel recommended; synchronization is not guaranteed and individual billboard operators may decline display.",
+          "source": "https://www.timessquarenyc.org/arts/submit-an-arts-proposal"
+        }
+      ],
+      "dependencies": [
+        {
+          "issue": 10,
+          "status": "pending",
+          "detail": "The score-driven final passage and derivative render do not yet exist."
+        },
+        {
+          "issue": 17,
+          "status": "pending",
+          "detail": "The release manifest, public-safe stills, credits and public presentation materials remain pending."
+        }
+      ],
+      "human_gates": [
+        {
+          "id": "public-content-approval",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve the silent public-space edit and stills against content restrictions."
+        },
+        {
+          "id": "slideroom-send",
+          "owner": "Anthony",
+          "status": "required",
+          "action": "Approve any fee and perform the account-owned Slideroom send."
+        }
+      ],
+      "next_action": "Generate the silent 170-second derivative only after the final cut and release manifest are accepted."
+    },
+    {
+      "id": "wavemaker-grants-2027-watch",
+      "name": "WaveMaker Grants",
+      "organization": "Locust Projects",
+      "disposition": "watch",
+      "fit": "grant",
+      "owner_issue": 22,
+      "deadline_at": null,
+      "sources": [
+        {
+          "url": "https://www.wavemakergrants.org/",
+          "kind": "official",
+          "checked_at": "2026-08-03T21:43:00-04:00"
+        }
+      ],
+      "facts": [
+        {
+          "id": "deadline",
+          "status": "unstated",
+          "value": null,
+          "resolve": "Issue 22 must wait for a newly published application cycle; the current page only says 2026 grantees will be announced in August."
+        },
+        {
+          "id": "eligibility",
+          "status": "verified",
+          "value": "The program supports Miami artists creating innovative artist-driven public work in unconventional spaces.",
+          "source": "https://www.wavemakergrants.org/"
+        },
+        {
+          "id": "terms",
+          "status": "verified",
+          "value": "Historical/current program description offers up to $6,000 in New Work, Long-Haul, and Research & Development + Implementation categories; no new application is open on the checked page.",
+          "source": "https://www.wavemakergrants.org/"
+        }
+      ],
+      "dependencies": [],
+      "human_gates": [],
+      "next_action": "Issue 22 watches for a new official cycle; no speculative February–April 2027 deadline is allowed in the frozen release."
+    }
+  ]
+}

@@ -29,19 +29,25 @@ the film that contains it.
     render/deliver.py --only stills
     render/deliver.py --force reel    # re-make one that already exists
     render/deliver.py --out <scratch-render-root> --package <package-root>
-    render/deliver.py --preflight      # same dependency plan, no writes or rendering
+    render/deliver.py --preflight      # same plan, no persistent output or rendering
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
+import errno
 import functools
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +56,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path, PurePosixPath
 
 import yaml
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    fcntl = None
 
 HERE = Path(__file__).resolve().parent
 DANSE = HERE.parent
@@ -71,6 +82,13 @@ AUDIO_USES = DANSE / "sound" / "audio-uses.json"
 AUDIO_RENDER_SCHEMA = DANSE / "music" / "audio-render.schema.json"
 AUDIO_RENDER_RECEIPT = DANSE / ".work" / "music" / "competition" / "audio-render.json"
 AUDIO_MASTER = DANSE / ".work" / "music" / "competition" / "delibes-master.wav"
+SCORE_MOTION_EVIDENCE = (
+    DANSE
+    / ".work"
+    / "evidence"
+    / "score-to-motion-production"
+    / "score-to-motion-production.json"
+)
 MUSIC_CREDIT = (
     "Music by Léo Delibes. Source arrangements by Paul De Bra, adapted and "
     "re-orchestrated for Danse under CC BY 4.0. Changes include instrumentation, "
@@ -111,6 +129,14 @@ SCORE_SOURCE_ITEM = "provenance/passage-score.wav"
 AUDIO_RENDER_SOURCE_ITEM = "provenance/audio-render.json"
 PRODUCTION_RECEIPT = "provenance/production.json"
 PRODUCER_RECEIPTS = "provenance/producer-receipts"
+SCORE_MOTION_EVIDENCE_DIR = "provenance/score-to-motion"
+SCORE_MOTION_EVIDENCE_ITEM = f"{SCORE_MOTION_EVIDENCE_DIR}/score-to-motion-production.json"
+SCORE_MOTION_RECEIPT_MAX_BYTES = 4 << 20
+PACKAGE_MANIFEST_MAX_BYTES = 4 << 20
+PRODUCER_RECEIPT_MAX_BYTES = 4 << 20
+PRODUCER_RECEIPT_TOTAL_MAX_BYTES = 16 << 20
+PRODUCER_CONCAT_SEGMENT_MAX_COUNT = 256
+PRODUCTION_RECEIPT_MAX_BYTES = 4 << 20
 PASSAGE_SELECTORS = {"master", "derived", "reel", "stills"}
 FIXED_WINDOW_ITEMS = {"midnight-moment.mov", "trailer.mp4", REEL_ITEM}
 
@@ -173,6 +199,449 @@ def digest(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _bounded_regular_bytes(
+    target: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    description: str,
+    dir_fd: int | None = None,
+) -> tuple[bytes, str]:
+    """Read one stable regular-file snapshot from a path or pinned directory."""
+    label = Path(target).name
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(target, flags, dir_fd=dir_fd)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("not a regular file")
+        if before.st_size > max_bytes:
+            raise SystemExit(f"{description} exceeds its safe byte limit: {label}")
+        chunks = []
+        copied = 0
+        while copied <= max_bytes:
+            block = os.read(descriptor, min(1 << 20, max_bytes + 1 - copied))
+            if not block:
+                break
+            chunks.append(block)
+            copied += len(block)
+        if copied > max_bytes:
+            raise SystemExit(f"{description} exceeds its safe byte limit: {label}")
+        after = os.fstat(descriptor)
+        named = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+    except SystemExit:
+        raise
+    except OSError as exc:
+        raise SystemExit(f"{description} is missing or unsafe: {label}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields) or (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+    ) != (named.st_dev, named.st_ino, named.st_mode, named.st_size):
+        raise SystemExit(f"{description} changed while being read: {label}")
+    payload = b"".join(chunks)
+    if len(payload) != after.st_size:
+        raise SystemExit(f"{description} changed while being read: {label}")
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def bounded_regular_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    description: str,
+) -> tuple[bytes, str]:
+    """Read one stable regular-file snapshot without following its final link."""
+    return _bounded_regular_bytes(path, max_bytes=max_bytes, description=description)
+
+
+def bounded_regular_bytes_at(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+    description: str,
+) -> tuple[bytes, str]:
+    """Read one stable regular-file snapshot relative to a pinned directory."""
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise SystemExit(f"{description} has an unsafe descriptor-relative name")
+    return _bounded_regular_bytes(
+        name,
+        max_bytes=max_bytes,
+        description=description,
+        dir_fd=directory_fd,
+    )
+
+
+def require_atomic_rename_host():
+    """Return the supported no-replace rename primitive or fail before publication."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+        requirement = "Linux kernel 3.15+ with glibc 2.28+ exporting renameat2"
+    elif sys.platform == "darwin":  # pragma: no cover - exercised on capture hosts
+        rename = getattr(libc, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+        requirement = "macOS 10.12.3+ exporting renameatx_np"
+    else:  # pragma: no cover - fail closed on unsupported POSIX variants
+        rename = None
+        flag = 0
+        requirement = "Linux or macOS with a kernel atomic no-replace rename"
+    if rename is None:
+        raise OSError(
+            errno.ENOTSUP,
+            f"package publication requires {requirement}",
+        )
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    # Resolve the libc entry point *and* prove that the running kernel accepts
+    # the primitive.  An exported glibc ``renameat2`` wrapper can outlive the
+    # kernel support it needs (or be blocked by the host), so symbol discovery
+    # alone can make ``--preflight`` report a false READY.  Relative names with
+    # deliberately invalid directory descriptors cannot mutate the filesystem;
+    # EBADF proves the request reached a kernel implementation that parsed the
+    # no-replace operation.  Every other result fails closed before staging.
+    ctypes.set_errno(0)
+    probe_result = rename(
+        -1,
+        b".danse-atomic-rename-probe-source",
+        -1,
+        b".danse-atomic-rename-probe-destination",
+        flag,
+    )
+    probe_errno = ctypes.get_errno()
+    if probe_result == 0 or probe_errno != errno.EBADF:
+        code = probe_errno or errno.ENOTSUP
+        raise OSError(
+            code,
+            f"package publication requires {requirement}; "
+            f"atomic no-replace capability probe failed: {os.strerror(code)}",
+        )
+    return rename, flag, requirement
+
+
+def atomic_rename_noreplace(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    src_dir_fd: int | None = None,
+    dst_dir_fd: int | None = None,
+) -> None:
+    """Atomically rename one entry while refusing to replace a winner.
+
+    The package transaction cannot safely emulate this with a stat followed by
+    ``os.replace``: another publisher can win between those two syscalls.  The
+    delivery rail already requires POSIX locking, and its supported production
+    hosts expose the corresponding kernel no-replace rename primitive.
+    """
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    # POSIX leaves AT_FDCWD implementation-defined: Linux uses -100 while
+    # Darwin uses -2.  Python does not expose it on every supported version.
+    current_directory = -2 if sys.platform == "darwin" else -100
+    source_directory = current_directory if src_dir_fd is None else src_dir_fd
+    destination_directory = current_directory if dst_dir_fd is None else dst_dir_fd
+    rename, flag, _ = require_atomic_rename_host()
+    if rename(
+        source_directory,
+        source_bytes,
+        destination_directory,
+        destination_bytes,
+        flag,
+    ) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), os.fspath(destination))
+
+
+def write_new_regular_bytes_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    mode: int = 0o644,
+) -> str:
+    """Create one descriptor-relative staging file without replacing an entry."""
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise OSError(errno.EINVAL, "unsafe descriptor-relative staging name", name)
+    if not isinstance(payload, bytes):
+        raise TypeError("staged payload must be bytes")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, mode, dir_fd=directory_fd)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written < 1:
+                raise OSError(errno.EIO, "short write while staging package receipt")
+            offset += written
+        os.fchmod(descriptor, mode)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size != len(payload)
+            or stat.S_IMODE(info.st_mode) != mode
+        ):
+            raise OSError(errno.EIO, "unsafe staged package receipt")
+    finally:
+        os.close(descriptor)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def create_atomic_probe_entry_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+) -> tuple[int, tuple[int, int, int]]:
+    """Create and pin one private probe entry until its rename is verified."""
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise OSError(errno.EINVAL, "unsafe atomic probe name", name)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written < 1:
+                raise OSError(errno.EIO, "short write while creating atomic probe")
+            offset += written
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_mode)
+        named_identity = (named.st_dev, named.st_ino, named.st_mode)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != len(payload)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or named_identity != opened_identity
+        ):
+            raise OSError(errno.ESTALE, "atomic probe entry changed after creation")
+        return descriptor, opened_identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def require_atomic_rename_filesystem(target: Path) -> str:
+    """Prove no-replace publication semantics on the target filesystem.
+
+    Kernel support does not imply that the filesystem mounted at the package
+    boundary implements the rename flag.  Exercise both the absent-destination
+    success path and the existing-destination refusal before rendering.  Probe
+    Entries are descriptor-relative, independently unpredictable, and tracked
+    from their still-open O_EXCL descriptors.  Cleanup removes only an exact
+    recorded inode; an unowned winner is preserved and reported.
+    """
+    _, _, requirement = require_atomic_rename_host()
+    probe_root = target if target.exists() else target.parent
+    while not probe_root.exists() and probe_root.parent != probe_root:
+        probe_root = probe_root.parent
+    if probe_root.is_symlink() or not probe_root.is_dir():
+        raise OSError(
+            errno.ENOTDIR,
+            f"package filesystem probe has no safe existing directory: {probe_root}",
+        )
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(probe_root, directory_flags)
+    source = f".danse-atomic-source-{os.getpid()}-{secrets.token_hex(16)}"
+    destination = f".danse-atomic-destination-{os.getpid()}-{secrets.token_hex(16)}"
+    contender = f".danse-atomic-contender-{os.getpid()}-{secrets.token_hex(16)}"
+    names = (source, destination, contender)
+    root_identity: tuple[int, int, int] | None = None
+    owned_entries: dict[str, tuple[int, int, int]] = {}
+    probe_descriptors: list[int] = []
+    primary_error: BaseException | None = None
+    cleanup_errors: list[str] = []
+
+    def identity(value: os.stat_result) -> tuple[int, int, int]:
+        return value.st_dev, value.st_ino, value.st_mode
+
+    def named_entry(name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def create_owned(name: str, payload: bytes) -> tuple[int, int, int]:
+        descriptor, created_identity = create_atomic_probe_entry_at(
+            directory_fd,
+            name,
+            payload,
+        )
+        probe_descriptors.append(descriptor)
+        owned_entries[name] = created_identity
+        return created_identity
+
+    try:
+        opened_root = os.fstat(directory_fd)
+        named_root = os.stat(probe_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or identity(opened_root) != identity(named_root)
+        ):
+            raise OSError(errno.ESTALE, "package filesystem probe root changed")
+        root_identity = identity(opened_root)
+
+        source_identity = create_owned(source, b"probe")
+        atomic_rename_noreplace(
+            source,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        source_info = named_entry(source)
+        destination_info = named_entry(destination)
+        if (
+            source_info is not None
+            or destination_info is None
+            or identity(destination_info) != source_identity
+            or destination_info.st_size != 5
+        ):
+            raise OSError(errno.EIO, "atomic package filesystem probe lost its source")
+        owned_entries.pop(source, None)
+        owned_entries[destination] = source_identity
+
+        contender_identity = create_owned(contender, b"other")
+        try:
+            atomic_rename_noreplace(
+                contender,
+                destination,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+            destination_info = named_entry(destination)
+            contender_info = named_entry(contender)
+            if (
+                destination_info is None
+                or identity(destination_info) != source_identity
+                or contender_info is None
+                or identity(contender_info) != contender_identity
+            ):
+                raise OSError(
+                    errno.EIO,
+                    "atomic package filesystem probe changed an entry on collision",
+                )
+        else:
+            destination_info = named_entry(destination)
+            contender_info = named_entry(contender)
+            if (
+                destination_info is not None
+                and identity(destination_info) == contender_identity
+                and contender_info is None
+            ):
+                owned_entries[destination] = contender_identity
+                owned_entries.pop(contender, None)
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic package filesystem probe replaced an existing destination",
+            )
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        for name, owned_identity in tuple(owned_entries.items()):
+            try:
+                current = named_entry(name)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot inspect {name}: {exc}")
+                continue
+            if current is None:
+                continue
+            if identity(current) != owned_identity:
+                cleanup_errors.append(f"{name} is no longer probe-owned")
+                continue
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+
+        for name in names:
+            try:
+                current = named_entry(name)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot census {name}: {exc}")
+                continue
+            if current is not None:
+                cleanup_errors.append(f"unowned probe entry retained: {name}")
+
+        for descriptor in probe_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot close probe entry: {exc}")
+
+        if root_identity is not None:
+            try:
+                current_root = os.stat(probe_root, follow_symlinks=False)
+            except OSError as exc:
+                cleanup_errors.append(f"cannot revalidate package filesystem root: {exc}")
+            else:
+                if identity(current_root) != root_identity:
+                    cleanup_errors.append("package filesystem root changed during probe")
+        try:
+            os.close(directory_fd)
+        except OSError as exc:
+            cleanup_errors.append(f"cannot close package filesystem root: {exc}")
+
+    if cleanup_errors:
+        detail = "; ".join(cleanup_errors)
+        if primary_error is not None:
+            raise OSError(
+                errno.EIO,
+                f"atomic package filesystem probe failed ({primary_error}) and cleanup "
+                f"did not complete safely: {detail}",
+            ) from primary_error
+        raise OSError(
+            errno.EIO,
+            f"atomic package filesystem probe cleanup did not complete safely: {detail}",
+        )
+    if primary_error is not None:
+        if isinstance(primary_error, OSError):
+            code = primary_error.errno or errno.ENOTSUP
+            raise OSError(
+                code,
+                f"package publication requires atomic no-replace support on the "
+                f"filesystem at {probe_root}: {primary_error}",
+            ) from primary_error
+        raise primary_error
+    return f"{requirement}; verified on {probe_root}"
 
 
 def repository_state() -> dict:
@@ -827,18 +1296,42 @@ def _passage_identity(manifest: dict) -> dict:
     return {key: manifest[key] for key in keys}
 
 
-def _prior_production_matches(package: Path, manifest: dict, previous: dict) -> dict | None:
+def _prior_production_matches(
+    package: Path,
+    manifest: dict,
+    previous: dict,
+    *,
+    provenance_fd: int | None = None,
+) -> dict | None:
     reference = previous.get("production")
     if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
         return None
     if reference.get("path") != PRODUCTION_RECEIPT:
         return None
-    path = package / PRODUCTION_RECEIPT
-    if path.is_symlink() or not path.is_file() or digest(path) != reference.get("sha256"):
+    try:
+        if provenance_fd is None:
+            path = package / PRODUCTION_RECEIPT
+            if path.is_symlink() or not path.is_file():
+                return None
+            document, production_sha = bounded_regular_bytes(
+                path,
+                max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                description="package production receipt",
+            )
+        else:
+            document, production_sha = bounded_regular_bytes_at(
+                provenance_fd,
+                Path(PRODUCTION_RECEIPT).name,
+                max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                description="package production receipt",
+            )
+    except SystemExit:
         return None
     try:
-        production = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        production = json.loads(document)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if production_sha != reference.get("sha256"):
         return None
     if not isinstance(production, dict):
         return None
@@ -867,16 +1360,36 @@ def _prior_production_matches(package: Path, manifest: dict, previous: dict) -> 
     return reference
 
 
-def _read_producer_receipt(path: Path, expected_schema: str) -> tuple[dict, str]:
-    if path.is_symlink() or not path.is_file():
-        raise SystemExit(f"producer receipt is missing or unsafe: {path.name}")
+def _read_producer_receipt(
+    path: Path,
+    expected_schema: str,
+    *,
+    max_bytes: int = PRODUCER_RECEIPT_MAX_BYTES,
+) -> tuple[dict, str, int]:
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise SystemExit("producer receipt graph exceeds its aggregate byte limit")
     try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        document, receipt_sha = bounded_regular_bytes(
+            path,
+            max_bytes=min(max_bytes, PRODUCER_RECEIPT_MAX_BYTES),
+            description="producer receipt",
+        )
+    except SystemExit as exc:
+        if (
+            max_bytes < PRODUCER_RECEIPT_MAX_BYTES
+            and "exceeds its safe byte limit" in str(exc)
+        ):
+            raise SystemExit(
+                "producer receipt graph exceeds its aggregate byte limit"
+            ) from exc
+        raise
+    try:
+        value = json.loads(document)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise SystemExit(f"producer receipt is invalid: {path.name}") from exc
     if not isinstance(value, dict) or value.get("schema") != expected_schema:
         raise SystemExit(f"producer receipt has the wrong schema: {path.name}")
-    return value, digest(path)
+    return value, receipt_sha, len(document)
 
 
 def write_production_receipt(
@@ -884,152 +1397,1343 @@ def write_production_receipt(
     render_root: Path,
     manifest: dict,
     previous: dict,
+    *,
+    publish_manifest: bool = False,
+    previous_manifest_sha256: str | None = None,
 ) -> dict | None:
-    """Bind package bytes to the render/score receipts that produced their inputs."""
+    """Bind package bytes to their producers and optionally commit the manifest.
+
+    Direct callers retain the historical graph-only behavior. Delivery uses
+    ``publish_manifest`` so the manifest rename is the final commit point for
+    the graph it references.
+    """
     targets = _production_targets(manifest)
-    if not targets:
+    if not targets and not publish_manifest:
         return None
-    passage = _passage_identity(manifest)
-    repository_head = manifest.get("repository_head")
-    if not isinstance(repository_head, str) or not re.fullmatch(
-        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", repository_head
+    if previous_manifest_sha256 is not None and (
+        not isinstance(previous_manifest_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", previous_manifest_sha256)
     ):
-        raise SystemExit("rendered package has no exact repository-head identity")
-    source_tree = manifest.get("source_tree_sha256")
-    if not isinstance(source_tree, str) or not re.fullmatch(r"[0-9a-f]{64}", source_tree):
-        raise SystemExit("rendered package has no complete source-tree identity")
-    path = package / PRODUCTION_RECEIPT
-    if path.parent.is_symlink() or (
-        path.parent.exists() and not path.parent.is_dir()
-    ):
-        raise SystemExit("package production receipt parent is not a regular directory")
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise SystemExit("package production receipt destination is not a regular file")
-    prior = _prior_production_matches(package, manifest, previous)
-    if prior is not None:
-        return prior
+        raise SystemExit("prior package manifest has no exact byte identity")
 
+    passage = None
+    repository_head = None
+    source_tree = None
+    if targets:
+        passage = _passage_identity(manifest)
+        repository_head = manifest.get("repository_head")
+        if not isinstance(repository_head, str) or not re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", repository_head
+        ):
+            raise SystemExit("rendered package has no exact repository-head identity")
+        source_tree = manifest.get("source_tree_sha256")
+        if not isinstance(source_tree, str) or not re.fullmatch(r"[0-9a-f]{64}", source_tree):
+            raise SystemExit("rendered package has no complete source-tree identity")
+
+    package = package.absolute()
+    if package.is_symlink() or (package.exists() and not package.is_dir()):
+        raise SystemExit("package root is not a regular directory")
+    package.mkdir(parents=True, exist_ok=True)
+    if package.is_symlink() or not package.is_dir():
+        raise SystemExit("package root is not a regular directory")
+
+    manifest_name = "manifest.json"
+    provenance_name = Path(PRODUCTION_RECEIPT).parts[0]
+    production_name = Path(PRODUCTION_RECEIPT).name
     receipt_root = package / PRODUCER_RECEIPTS
-    if receipt_root.is_symlink() or (receipt_root.exists() and not receipt_root.is_dir()):
-        raise SystemExit("package producer-receipt boundary is not a regular directory")
-    receipt_root.mkdir(parents=True, exist_ok=True)
-    for old in receipt_root.iterdir():
-        if old.is_symlink() or not old.is_file():
-            raise SystemExit("package producer-receipt boundary contains an unsafe entry")
-        old.unlink()
+    receipt_root_name = Path(PRODUCER_RECEIPTS).name
+    common_flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+    with contextlib.ExitStack() as stack:
+        if fcntl is None:
+            raise SystemExit(
+                "package producer receipt publication requires POSIX advisory locking"
+            )
+        try:
+            if not package.name:
+                raise OSError("package root cannot be a filesystem root")
+            stage_parent_fd = os.open(package.parent, directory_flags)
+            stack.callback(os.close, stage_parent_fd)
+            opened_stage_parent = os.fstat(stage_parent_fd)
+            named_stage_parent = os.stat(package.parent, follow_symlinks=False)
+            directory_fd = os.open(package.name, directory_flags, dir_fd=stage_parent_fd)
+            stack.callback(os.close, directory_fd)
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            stack.callback(fcntl.flock, directory_fd, fcntl.LOCK_UN)
+            opened_package = os.fstat(directory_fd)
+            named_package = os.stat(
+                package.name,
+                dir_fd=stage_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise SystemExit("package root cannot be locked for receipt publication") from exc
+        if (
+            not stat.S_ISDIR(opened_stage_parent.st_mode)
+            or (
+                opened_stage_parent.st_dev,
+                opened_stage_parent.st_ino,
+                opened_stage_parent.st_mode,
+            )
+            != (
+                named_stage_parent.st_dev,
+                named_stage_parent.st_ino,
+                named_stage_parent.st_mode,
+            )
+            or not stat.S_ISDIR(opened_package.st_mode)
+            or (opened_package.st_dev, opened_package.st_ino, opened_package.st_mode)
+            != (named_package.st_dev, named_package.st_ino, named_package.st_mode)
+        ):
+            raise SystemExit("package root changed while being locked")
 
-    producers: dict[str, dict] = {}
+        def entry_stat(directory: int, name: str) -> os.stat_result | None:
+            try:
+                return os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
 
-    def add_receipt(path: Path, kind: str) -> str:
-        schema = {
-            "render-segment": "danse.render.segment.v1",
-            "render-concat": "danse.render.concat.v1",
-            "score": "danse.score.receipt.v2",
-        }[kind]
-        value, receipt_sha = _read_producer_receipt(path, schema)
-        if kind == "render-segment":
-            inputs = value.get("inputs") if isinstance(value.get("inputs"), dict) else {}
+        def edge_identity(value: os.stat_result) -> tuple[int, int, int]:
+            return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+        package_identity = edge_identity(opened_package)
+        stage_parent_identity = edge_identity(opened_stage_parent)
+
+        def require_stage_parent_edge() -> None:
+            try:
+                named = os.stat(package.parent, follow_symlinks=False)
+            except OSError as exc:
+                raise OSError("package parent changed during receipt publication") from exc
+            if not stat.S_ISDIR(named.st_mode) or edge_identity(named) != stage_parent_identity:
+                raise OSError("package parent changed during receipt publication")
+
+        def require_package_edge() -> None:
+            require_stage_parent_edge()
+            try:
+                named = os.stat(
+                    package.name,
+                    dir_fd=stage_parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise OSError("package root changed during receipt publication") from exc
+            if not stat.S_ISDIR(named.st_mode) or edge_identity(named) != package_identity:
+                raise OSError("package root changed during receipt publication")
+
+        if publish_manifest:
+            manifest_info = entry_stat(directory_fd, manifest_name)
+            if manifest_info is not None and not stat.S_ISREG(manifest_info.st_mode):
+                raise SystemExit("package manifest destination is not a regular file")
+            live_manifest_sha = (
+                bounded_regular_bytes_at(
+                    directory_fd,
+                    manifest_name,
+                    max_bytes=PACKAGE_MANIFEST_MAX_BYTES,
+                    description="package manifest",
+                )[1]
+                if manifest_info is not None
+                else None
+            )
+            if live_manifest_sha != previous_manifest_sha256:
+                raise SystemExit("package manifest changed after it was read")
+
+        provenance_fd = None
+        provenance_identity = None
+        if targets:
+            provenance_info = entry_stat(directory_fd, provenance_name)
+            if provenance_info is None:
+                try:
+                    os.mkdir(provenance_name, mode=0o755, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise SystemExit(
+                        "package production receipt parent cannot be created safely"
+                    ) from exc
+                provenance_info = entry_stat(directory_fd, provenance_name)
+            if provenance_info is None or not stat.S_ISDIR(provenance_info.st_mode):
+                raise SystemExit("package production receipt parent is not a regular directory")
+            try:
+                provenance_fd = os.open(
+                    provenance_name,
+                    directory_flags,
+                    dir_fd=directory_fd,
+                )
+                stack.callback(os.close, provenance_fd)
+                opened_provenance = os.fstat(provenance_fd)
+                named_provenance = os.stat(
+                    provenance_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise SystemExit(
+                    "package production receipt parent cannot be descriptor-pinned"
+                ) from exc
             if (
-                inputs.get("source_tree_sha256")
-                != renderer_source_sha256(manifest["corpus_tier"])
-                or inputs.get("tier") != manifest["corpus_tier"]
+                not stat.S_ISDIR(opened_provenance.st_mode)
+                or edge_identity(opened_provenance) != edge_identity(named_provenance)
             ):
-                raise SystemExit(f"render segment receipt source identity is stale: {path.name}")
-        producer_id = f"{kind}-{receipt_sha[:20]}"
-        if producer_id in producers:
-            return producer_id
-        components: list[str] = []
-        if kind == "render-concat":
-            segments = value.get("segments")
-            if not isinstance(segments, list) or not segments:
-                raise SystemExit(f"render concat receipt has no segment chain: {path.name}")
-            for segment in segments:
-                name = segment.get("name") if isinstance(segment, dict) else None
-                if not isinstance(name, str) or Path(name).name != name:
-                    raise SystemExit(f"render concat receipt has an unsafe segment: {path.name}")
-                segment_path = path.parent / f"{name}.receipt.json"
-                component = add_receipt(segment_path, "render-segment")
-                if producers[component]["receipt"]["sha256"] != segment.get("receipt_sha256"):
-                    raise SystemExit(f"render concat receipt segment digest is stale: {path.name}")
-                components.append(component)
-        output_sha = value.get("sha256") if kind == "score" else value.get("file_sha256")
-        if not isinstance(output_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", output_sha):
-            raise SystemExit(f"producer receipt has no output digest: {path.name}")
-        destination = receipt_root / f"{producer_id}.json"
-        shutil.copy2(path, destination)
-        if digest(destination) != receipt_sha:
-            raise SystemExit(f"producer receipt copy changed bytes: {path.name}")
-        producers[producer_id] = {
-            "id": producer_id,
-            "kind": kind,
-            "receipt": {
-                "path": destination.relative_to(package).as_posix(),
-                "sha256": receipt_sha,
-            },
-            "output_sha256": output_sha,
-            "components": components,
-        }
-        return producer_id
+                raise SystemExit("package production receipt parent changed while being opened")
+            provenance_identity = edge_identity(opened_provenance)
 
-    score_id = None
-    if SCORE_SOURCE_ITEM in targets or any(name in AUDIO_ITEMS for name in targets):
-        score_id = add_receipt(score_receipt_path(render_root / "passage-score.wav"), "score")
-    picture_id = None
-    if any(name in AUDIO_ITEMS - {REEL_ITEM} for name in targets):
-        picture_id = add_receipt(
-            render_root / "passage-default.mov.receipt.json",
-            "render-concat",
-        )
-    reel_id = None
-    if REEL_ITEM in targets:
-        reel_id = add_receipt(
-            render_root / "reel-provenance/reel-default.mp4.receipt.json",
-            "render-concat",
-        )
+            def require_provenance_edge() -> None:
+                assert provenance_fd is not None and provenance_identity is not None
+                require_package_edge()
+                try:
+                    named = os.stat(
+                        provenance_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise OSError(
+                        "package provenance boundary changed during receipt publication"
+                    ) from exc
+                if not stat.S_ISDIR(named.st_mode) or edge_identity(named) != provenance_identity:
+                    raise OSError(
+                        "package provenance boundary changed during receipt publication"
+                    )
 
-    outputs = []
-    for name, item in sorted(targets.items()):
-        if name == SCORE_SOURCE_ITEM:
-            producer_ids = [score_id]
-        elif name == REEL_ITEM:
-            producer_ids = [reel_id, score_id]
-        elif name in AUDIO_ITEMS:
-            producer_ids = [picture_id, score_id]
-        else:
-            seed = int(Path(name).stem.removeprefix("seed-"), 0)
-            matches = sorted(render_root.glob(f"passage-{seed}-seg-*.mov.receipt.json"))
-            if len(matches) != 1:
-                raise SystemExit(f"generated still has no unique render receipt: {name}")
-            producer_ids = [add_receipt(matches[0], "render-segment")]
-        if any(value is None for value in producer_ids):
-            raise SystemExit(f"rendered package output has incomplete producer evidence: {name}")
-        outputs.append(
-            {
-                "name": name,
-                "bytes": item["bytes"],
-                "sha256": item["sha256"],
-                "producers": producer_ids,
+            production_info = entry_stat(provenance_fd, production_name)
+            if production_info is not None and not stat.S_ISREG(production_info.st_mode):
+                raise SystemExit("package production receipt destination is not a regular file")
+
+        prior = None
+        if targets:
+            assert provenance_fd is not None
+            receipt_info = entry_stat(provenance_fd, receipt_root_name)
+            if receipt_info is not None and not stat.S_ISDIR(receipt_info.st_mode):
+                raise SystemExit("package producer-receipt boundary is not a regular directory")
+            if receipt_info is not None:
+                try:
+                    receipt_fd = os.open(
+                        receipt_root_name,
+                        directory_flags,
+                        dir_fd=provenance_fd,
+                    )
+                except OSError as exc:
+                    raise SystemExit(
+                        "package producer-receipt boundary cannot be descriptor-pinned"
+                    ) from exc
+                try:
+                    for old_name in os.listdir(receipt_fd):
+                        old_info = entry_stat(receipt_fd, old_name)
+                        if old_info is None or not stat.S_ISREG(old_info.st_mode):
+                            raise SystemExit(
+                                "package producer-receipt boundary contains an unsafe entry"
+                            )
+                finally:
+                    os.close(receipt_fd)
+
+            previous_reference = previous.get("production")
+            valid_previous_reference = (
+                isinstance(previous_reference, dict)
+                and set(previous_reference) == {"path", "sha256"}
+                and previous_reference.get("path") == PRODUCTION_RECEIPT
+                and isinstance(previous_reference.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", previous_reference["sha256"])
+            )
+            if valid_previous_reference and production_info is not None:
+                live_production_sha = bounded_regular_bytes_at(
+                    provenance_fd,
+                    production_name,
+                    max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                    description="package production receipt",
+                )[1]
+                if live_production_sha != previous_reference["sha256"]:
+                    raise SystemExit("package production receipt changed after its manifest was read")
+            elif not valid_previous_reference and production_info is not None:
+                raise SystemExit("package production receipt has no stable prior manifest reference")
+            prior = _prior_production_matches(
+                package,
+                manifest,
+                previous,
+                provenance_fd=provenance_fd,
+            )
+            if prior is not None and not publish_manifest:
+                return prior
+
+        if package_identity == stage_parent_identity:
+            raise SystemExit("package transaction boundary must be outside the package surface")
+        stage_name = ""
+        for _ in range(128):
+            candidate = f".danse-package-transaction-{secrets.token_hex(12)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=stage_parent_fd)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise SystemExit(
+                    "package transaction boundary cannot be created safely"
+                ) from exc
+            stage_name = candidate
+            break
+        if not stage_name:
+            raise SystemExit("package transaction boundary name could not be allocated")
+        stage_root = package.parent / stage_name
+        try:
+            stage_fd = os.open(stage_name, directory_flags, dir_fd=stage_parent_fd)
+            stack.callback(os.close, stage_fd)
+            opened_stage = os.fstat(stage_fd)
+            named_stage = os.stat(
+                stage_name,
+                dir_fd=stage_parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            try:
+                os.rmdir(stage_name, dir_fd=stage_parent_fd)
+            except OSError:
+                pass
+            raise SystemExit("package transaction boundary cannot be descriptor-pinned") from exc
+        if (
+            not stat.S_ISDIR(opened_stage.st_mode)
+            or edge_identity(opened_stage) != edge_identity(named_stage)
+            or opened_stage.st_dev != opened_package.st_dev
+        ):
+            if (
+                stat.S_ISDIR(named_stage.st_mode)
+                and edge_identity(opened_stage) == edge_identity(named_stage)
+            ):
+                try:
+                    os.rmdir(stage_name, dir_fd=stage_parent_fd)
+                except OSError:
+                    pass
+            raise SystemExit("package transaction boundary changed while being opened")
+        stage_identity = edge_identity(opened_stage)
+
+        moves: list[dict[str, object]] = []
+
+        def inode_at(directory: int, name: str) -> tuple[int, int, int] | None:
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            return edge_identity(info)
+
+        def move(
+            source_directory: int,
+            source: str,
+            destination_directory: int,
+            destination: str,
+            rollback_directory: int,
+            rollback: str,
+            label: str,
+        ) -> None:
+            identity = inode_at(source_directory, source)
+            if identity is None:
+                raise OSError(f"{label} source disappeared before publication")
+            record = {
+                "source_directory": source_directory,
+                "source": source,
+                "destination_directory": destination_directory,
+                "destination": destination,
+                "rollback_directory": rollback_directory,
+                "rollback": rollback,
+                "identity": identity,
+                "label": label,
             }
-        )
+            moves.append(record)
+            try:
+                atomic_rename_noreplace(
+                    source,
+                    destination,
+                    src_dir_fd=source_directory,
+                    dst_dir_fd=destination_directory,
+                )
+            finally:
+                # State is derived from the inode after the syscall, so an
+                # interrupt delivered after rename cannot hide a completed move.
+                record["moved"] = (
+                    inode_at(destination_directory, destination) == identity
+                    and inode_at(source_directory, source) != identity
+                )
 
-    production = {
-        "schema": "danse.delivery.production.v1",
-        "repository_head": repository_head,
-        "source_tree_sha256": source_tree,
-        "passage": passage,
-        "sound": manifest.get("sound"),
-        "producers": [producers[key] for key in sorted(producers)],
-        "outputs": outputs,
+        def stage_edge_is_original() -> bool:
+            info = entry_stat(stage_parent_fd, stage_name)
+            return (
+                info is not None
+                and stat.S_ISDIR(info.st_mode)
+                and edge_identity(info) == stage_identity
+            )
+
+        def recovery_notice() -> str:
+            if stage_edge_is_original():
+                return f"recovery preserved at {stage_root}"
+            return (
+                "recovery preserved in displaced originally opened "
+                f"stage inode {opened_stage.st_dev}:{opened_stage.st_ino}; "
+                f"unrelated named entry preserved at {stage_root}"
+            )
+
+        def clear_directory(directory: int) -> None:
+            for name in os.listdir(directory):
+                if not stage_edge_is_original():
+                    raise OSError("transaction boundary changed during cleanup")
+                info = entry_stat(directory, name)
+                if info is None:
+                    raise OSError("transaction entry disappeared during cleanup")
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, directory_flags, dir_fd=directory)
+                    try:
+                        opened_child = os.fstat(child)
+                        if edge_identity(opened_child) != edge_identity(info):
+                            raise OSError("transaction directory changed during cleanup")
+                        clear_directory(child)
+                    finally:
+                        os.close(child)
+                    current = entry_stat(directory, name)
+                    if current is None or edge_identity(current) != edge_identity(info):
+                        raise OSError("transaction directory changed during cleanup")
+                    if not stage_edge_is_original():
+                        raise OSError("transaction boundary changed during cleanup")
+                    os.rmdir(name, dir_fd=directory)
+                else:
+                    current = entry_stat(directory, name)
+                    if current is None or edge_identity(current) != edge_identity(info):
+                        raise OSError("transaction entry changed during cleanup")
+                    if not stage_edge_is_original():
+                        raise OSError("transaction boundary changed during cleanup")
+                    os.unlink(name, dir_fd=directory)
+
+        def cleanup_transaction(context: str) -> None:
+            if not stage_edge_is_original():
+                raise SystemExit(f"{context}; {recovery_notice()}")
+            try:
+                clear_directory(stage_fd)
+                if not stage_edge_is_original():
+                    raise OSError("transaction boundary changed during cleanup")
+                os.rmdir(stage_name, dir_fd=stage_parent_fd)
+            except BaseException as cleanup_exc:
+                raise SystemExit(f"{context}; {recovery_notice()}") from cleanup_exc
+
+        reference: dict | None = prior
+        try:
+            staged_receipt_root_name = "producer-receipts.new"
+            staged_production_name = "production.new.json"
+            staged_manifest_name = "manifest.new.json"
+            expected_receipts: dict[str, str] = {}
+            expected_production_sha = None
+            staged_receipt_fd = None
+
+            if targets and prior is None:
+                # Authenticate and stage the complete replacement graph before
+                # touching the currently receipted producer set.
+                os.mkdir(staged_receipt_root_name, mode=0o755, dir_fd=stage_fd)
+                staged_receipt_fd = os.open(
+                    staged_receipt_root_name,
+                    directory_flags,
+                    dir_fd=stage_fd,
+                )
+                stack.callback(os.close, staged_receipt_fd)
+                opened_staged_receipts = os.fstat(staged_receipt_fd)
+                named_staged_receipts = os.stat(
+                    staged_receipt_root_name,
+                    dir_fd=stage_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(opened_staged_receipts.st_mode)
+                    or edge_identity(opened_staged_receipts)
+                    != edge_identity(named_staged_receipts)
+                    or stat.S_IMODE(opened_staged_receipts.st_mode) != 0o755
+                ):
+                    raise OSError("staged producer receipt boundary is unsafe")
+                producers: dict[str, dict] = {}
+                producer_receipt_bytes = 0
+
+                def add_receipt(receipt_path: Path, kind: str) -> str:
+                    nonlocal producer_receipt_bytes
+                    schema = {
+                        "render-segment": "danse.render.segment.v1",
+                        "render-concat": "danse.render.concat.v1",
+                        "score": "danse.score.receipt.v2",
+                    }[kind]
+                    remaining_receipt_bytes = (
+                        PRODUCER_RECEIPT_TOTAL_MAX_BYTES - producer_receipt_bytes
+                    )
+                    value, receipt_sha, receipt_bytes = _read_producer_receipt(
+                        receipt_path,
+                        schema,
+                        max_bytes=remaining_receipt_bytes,
+                    )
+                    producer_receipt_bytes += receipt_bytes
+                    if kind == "render-segment":
+                        inputs = (
+                            value.get("inputs")
+                            if isinstance(value.get("inputs"), dict)
+                            else {}
+                        )
+                        if (
+                            inputs.get("source_tree_sha256")
+                            != renderer_source_sha256(manifest["corpus_tier"])
+                            or inputs.get("tier") != manifest["corpus_tier"]
+                        ):
+                            raise SystemExit(
+                                "render segment receipt source identity is stale: "
+                                f"{receipt_path.name}"
+                            )
+                    producer_id = f"{kind}-{receipt_sha[:20]}"
+                    if producer_id in producers:
+                        if producers[producer_id]["receipt"]["sha256"] != receipt_sha:
+                            raise SystemExit("producer receipt identity prefix collision")
+                        return producer_id
+                    components: list[str] = []
+                    if kind == "render-concat":
+                        segments = value.get("segments")
+                        if not isinstance(segments, list) or not segments:
+                            raise SystemExit(
+                                "render concat receipt has no segment chain: "
+                                f"{receipt_path.name}"
+                            )
+                        if len(segments) > PRODUCER_CONCAT_SEGMENT_MAX_COUNT:
+                            raise SystemExit(
+                                "render concat receipt exceeds its segment-count limit: "
+                                f"{receipt_path.name}"
+                            )
+                        segment_names = []
+                        for segment in segments:
+                            name = segment.get("name") if isinstance(segment, dict) else None
+                            if not isinstance(name, str) or Path(name).name != name:
+                                raise SystemExit(
+                                    "render concat receipt has an unsafe segment: "
+                                    f"{receipt_path.name}"
+                                )
+                            segment_names.append(name)
+                        if len(set(segment_names)) != len(segment_names):
+                            raise SystemExit(
+                                "render concat receipt repeats a segment: "
+                                f"{receipt_path.name}"
+                            )
+                        for segment, name in zip(segments, segment_names, strict=True):
+                            segment_path = receipt_path.parent / f"{name}.receipt.json"
+                            component = add_receipt(segment_path, "render-segment")
+                            if producers[component]["receipt"]["sha256"] != segment.get(
+                                "receipt_sha256"
+                            ):
+                                raise SystemExit(
+                                    "render concat receipt segment digest is stale: "
+                                    f"{receipt_path.name}"
+                                )
+                            components.append(component)
+                    output_sha = (
+                        value.get("sha256")
+                        if kind == "score"
+                        else value.get("file_sha256")
+                    )
+                    if not isinstance(output_sha, str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", output_sha
+                    ):
+                        raise SystemExit(
+                            f"producer receipt has no output digest: {receipt_path.name}"
+                        )
+                    canonical_destination = receipt_root / f"{producer_id}.json"
+                    document, copied_sha = bounded_regular_bytes(
+                        receipt_path,
+                        max_bytes=min(
+                            receipt_bytes,
+                            PRODUCER_RECEIPT_MAX_BYTES,
+                        ),
+                        description="producer receipt",
+                    )
+                    if copied_sha != receipt_sha or len(document) != receipt_bytes:
+                        raise SystemExit(
+                            f"producer receipt copy changed bytes: {receipt_path.name}"
+                        )
+                    assert staged_receipt_fd is not None
+                    staged_sha = write_new_regular_bytes_at(
+                        staged_receipt_fd,
+                        canonical_destination.name,
+                        document,
+                    )
+                    if staged_sha != receipt_sha:
+                        raise SystemExit(
+                            f"producer receipt copy changed bytes: {receipt_path.name}"
+                        )
+                    expected_receipts[canonical_destination.name] = receipt_sha
+                    producers[producer_id] = {
+                        "id": producer_id,
+                        "kind": kind,
+                        "receipt": {
+                            "path": canonical_destination.relative_to(package).as_posix(),
+                            "sha256": receipt_sha,
+                        },
+                        "output_sha256": output_sha,
+                        "components": components,
+                    }
+                    return producer_id
+
+                score_id = None
+                if SCORE_SOURCE_ITEM in targets or any(
+                    name in AUDIO_ITEMS for name in targets
+                ):
+                    score_id = add_receipt(
+                        score_receipt_path(render_root / "passage-score.wav"),
+                        "score",
+                    )
+                picture_id = None
+                if any(name in AUDIO_ITEMS - {REEL_ITEM} for name in targets):
+                    picture_id = add_receipt(
+                        render_root / "passage-default.mov.receipt.json",
+                        "render-concat",
+                    )
+                reel_id = None
+                if REEL_ITEM in targets:
+                    reel_id = add_receipt(
+                        render_root / "reel-provenance/reel-default.mp4.receipt.json",
+                        "render-concat",
+                    )
+
+                outputs = []
+                for name, item in sorted(targets.items()):
+                    if name == SCORE_SOURCE_ITEM:
+                        producer_ids = [score_id]
+                    elif name == REEL_ITEM:
+                        producer_ids = [reel_id, score_id]
+                    elif name in AUDIO_ITEMS:
+                        producer_ids = [picture_id, score_id]
+                    else:
+                        seed = int(Path(name).stem.removeprefix("seed-"), 0)
+                        matches = sorted(
+                            render_root.glob(f"passage-{seed}-seg-*.mov.receipt.json")
+                        )
+                        if len(matches) != 1:
+                            raise SystemExit(
+                                f"generated still has no unique render receipt: {name}"
+                            )
+                        producer_ids = [add_receipt(matches[0], "render-segment")]
+                    if any(value is None for value in producer_ids):
+                        raise SystemExit(
+                            f"rendered package output has incomplete producer evidence: {name}"
+                        )
+                    outputs.append(
+                        {
+                            "name": name,
+                            "bytes": item["bytes"],
+                            "sha256": item["sha256"],
+                            "producers": producer_ids,
+                        }
+                    )
+
+                production = {
+                    "schema": "danse.delivery.production.v1",
+                    "repository_head": repository_head,
+                    "source_tree_sha256": source_tree,
+                    "passage": passage,
+                    "sound": manifest.get("sound"),
+                    "producers": [producers[key] for key in sorted(producers)],
+                    "outputs": outputs,
+                }
+                production_bytes = (json.dumps(production, indent=2) + "\n").encode()
+                if len(production_bytes) > PRODUCTION_RECEIPT_MAX_BYTES:
+                    raise SystemExit("package production receipt exceeds its safe byte limit")
+                expected_production_sha = write_new_regular_bytes_at(
+                    stage_fd,
+                    staged_production_name,
+                    production_bytes,
+                )
+                reference = {
+                    "path": PRODUCTION_RECEIPT,
+                    "sha256": expected_production_sha,
+                }
+            elif targets and prior is not None:
+                assert provenance_fd is not None
+                production_bytes, expected_production_sha = bounded_regular_bytes_at(
+                    provenance_fd,
+                    production_name,
+                    max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                    description="reused package production receipt",
+                )
+                if expected_production_sha != prior["sha256"]:
+                    raise OSError("reused production receipt changed while being staged")
+                staged_sha = write_new_regular_bytes_at(
+                    stage_fd,
+                    staged_production_name,
+                    production_bytes,
+                )
+                if staged_sha != expected_production_sha:
+                    raise OSError("reused production receipt changed while being staged")
+
+            expected_manifest_sha = None
+            if publish_manifest:
+                if reference is not None:
+                    manifest["production"] = reference
+                else:
+                    manifest.pop("production", None)
+                manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
+                if len(manifest_bytes) > PACKAGE_MANIFEST_MAX_BYTES:
+                    raise SystemExit("package manifest exceeds its safe byte limit")
+                expected_manifest_sha = write_new_regular_bytes_at(
+                    stage_fd,
+                    staged_manifest_name,
+                    manifest_bytes,
+                )
+
+            old_manifest = "manifest.old.json"
+            old_production = "production.old.json"
+            old_receipts = "producer-receipts.old"
+            failed_manifest = "manifest.failed.json"
+            failed_production = "production.failed.json"
+            failed_receipts = "producer-receipts.failed"
+
+            def validate_published_production_graph() -> None:
+                assert provenance_fd is not None
+                require_provenance_edge()
+                production_info = entry_stat(provenance_fd, production_name)
+                if (
+                    production_info is None
+                    or not stat.S_ISREG(production_info.st_mode)
+                    or stat.S_IMODE(production_info.st_mode) != 0o644
+                    or bounded_regular_bytes_at(
+                        provenance_fd,
+                        production_name,
+                        max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                        description="published package production receipt",
+                    )[1]
+                    != expected_production_sha
+                ):
+                    raise OSError("published package production receipt changed bytes")
+                if prior is not None:
+                    return
+                receipt_info = entry_stat(provenance_fd, receipt_root_name)
+                if receipt_info is None or not stat.S_ISDIR(receipt_info.st_mode):
+                    raise OSError("published package producer receipt boundary is unsafe")
+                try:
+                    receipt_fd = os.open(
+                        receipt_root_name,
+                        directory_flags,
+                        dir_fd=provenance_fd,
+                    )
+                except OSError as receipt_exc:
+                    raise OSError(
+                        "published package producer receipt boundary is unsafe"
+                    ) from receipt_exc
+                try:
+                    opened_receipts = os.fstat(receipt_fd)
+                    if (
+                        edge_identity(opened_receipts) != edge_identity(receipt_info)
+                        or stat.S_IMODE(opened_receipts.st_mode) != 0o755
+                    ):
+                        raise OSError(
+                            "published package producer receipt boundary is unsafe"
+                        )
+                    published_receipts = {}
+                    for candidate_name in os.listdir(receipt_fd):
+                        candidate_info = entry_stat(receipt_fd, candidate_name)
+                        if (
+                            candidate_info is None
+                            or not stat.S_ISREG(candidate_info.st_mode)
+                            or stat.S_IMODE(candidate_info.st_mode) != 0o644
+                        ):
+                            raise OSError(
+                                "published package producer receipt graph is unsafe"
+                            )
+                        published_receipts[candidate_name] = bounded_regular_bytes_at(
+                            receipt_fd,
+                            candidate_name,
+                            max_bytes=PRODUCER_RECEIPT_MAX_BYTES,
+                            description="published package producer receipt",
+                        )[1]
+                finally:
+                    os.close(receipt_fd)
+                if published_receipts != expected_receipts:
+                    raise OSError("published package producer receipt graph changed bytes")
+
+            require_package_edge()
+            if targets:
+                require_provenance_edge()
+            if publish_manifest:
+                manifest_info = entry_stat(directory_fd, manifest_name)
+                live_manifest_sha = (
+                    bounded_regular_bytes_at(
+                        directory_fd,
+                        manifest_name,
+                        max_bytes=PACKAGE_MANIFEST_MAX_BYTES,
+                        description="package manifest",
+                    )[1]
+                    if manifest_info is not None and stat.S_ISREG(manifest_info.st_mode)
+                    else None
+                )
+                if live_manifest_sha != previous_manifest_sha256:
+                    raise OSError("package manifest changed before publication")
+            if targets and prior is not None:
+                assert provenance_fd is not None
+                live_production_sha = bounded_regular_bytes_at(
+                    provenance_fd,
+                    production_name,
+                    max_bytes=PRODUCTION_RECEIPT_MAX_BYTES,
+                    description="package production receipt",
+                )[1]
+                if live_production_sha != prior["sha256"]:
+                    raise OSError("reused production receipt changed before manifest commit")
+            if publish_manifest and entry_stat(directory_fd, manifest_name) is not None:
+                move(
+                    directory_fd,
+                    manifest_name,
+                    stage_fd,
+                    old_manifest,
+                    directory_fd,
+                    manifest_name,
+                    "prior package manifest",
+                )
+            if targets:
+                assert provenance_fd is not None
+                if entry_stat(provenance_fd, production_name) is not None:
+                    move(
+                        provenance_fd,
+                        production_name,
+                        stage_fd,
+                        old_production,
+                        provenance_fd,
+                        production_name,
+                        "prior production receipt",
+                    )
+                if prior is None and entry_stat(provenance_fd, receipt_root_name) is not None:
+                    move(
+                        provenance_fd,
+                        receipt_root_name,
+                        stage_fd,
+                        old_receipts,
+                        provenance_fd,
+                        receipt_root_name,
+                        "prior producer receipts",
+                    )
+                if prior is None:
+                    move(
+                        stage_fd,
+                        staged_receipt_root_name,
+                        provenance_fd,
+                        receipt_root_name,
+                        stage_fd,
+                        failed_receipts,
+                        "new producer receipts",
+                    )
+                move(
+                    stage_fd,
+                    staged_production_name,
+                    provenance_fd,
+                    production_name,
+                    stage_fd,
+                    failed_production,
+                    "new production receipt",
+                )
+                # Authenticate the graph after every publication rename and
+                # before its manifest is allowed to become the commit point.
+                validate_published_production_graph()
+            if publish_manifest:
+                # The named provenance edge is part of the graph the manifest
+                # is about to publish.  A rename through the pinned descriptor
+                # may be safe while a concurrent path swap would make the
+                # manifest point somewhere else, so reject that split view.
+                require_package_edge()
+                if targets:
+                    require_provenance_edge()
+                move(
+                    stage_fd,
+                    staged_manifest_name,
+                    directory_fd,
+                    manifest_name,
+                    stage_fd,
+                    failed_manifest,
+                    "new package manifest",
+                )
+            require_package_edge()
+            if targets:
+                # Revalidate after the final manifest publication as well.  A
+                # mutation in this interval rolls the manifest and graph back
+                # through their transaction-owned inodes.
+                validate_published_production_graph()
+            if publish_manifest:
+                manifest_info = entry_stat(directory_fd, manifest_name)
+                if (
+                    manifest_info is None
+                    or not stat.S_ISREG(manifest_info.st_mode)
+                    or stat.S_IMODE(manifest_info.st_mode) != 0o644
+                    or bounded_regular_bytes_at(
+                        directory_fd,
+                        manifest_name,
+                        max_bytes=PACKAGE_MANIFEST_MAX_BYTES,
+                        description="published package manifest",
+                    )[1]
+                    != expected_manifest_sha
+                ):
+                    raise OSError("published package manifest changed bytes")
+        except BaseException as exc:
+            rollback_errors = []
+            for record in reversed(moves):
+                source_directory = record["source_directory"]
+                source = record["source"]
+                destination_directory = record["destination_directory"]
+                destination = record["destination"]
+                rollback_directory = record["rollback_directory"]
+                rollback = record["rollback"]
+                identity = record["identity"]
+                label = record["label"]
+                source_identity = inode_at(source_directory, source)
+                destination_identity = inode_at(destination_directory, destination)
+                if source_identity == identity and destination_identity != identity:
+                    continue
+                if destination_identity != identity or source_identity == identity:
+                    rollback_errors.append(f"{label}: publication state is ambiguous")
+                    continue
+                restored = False
+                try:
+                    try:
+                        atomic_rename_noreplace(
+                            destination,
+                            rollback,
+                            src_dir_fd=destination_directory,
+                            dst_dir_fd=rollback_directory,
+                        )
+                    finally:
+                        restored = (
+                            inode_at(rollback_directory, rollback) == identity
+                            and inode_at(destination_directory, destination) != identity
+                        )
+                except BaseException as rollback_exc:
+                    if not restored:
+                        rollback_errors.append(f"{label}: {rollback_exc}")
+                else:
+                    if not restored:
+                        rollback_errors.append(f"{label}: rollback did not restore its inode")
+            if rollback_errors:
+                detail = "; ".join(rollback_errors)
+                raise SystemExit(
+                    "package receipt transaction failed; rollback failed: "
+                    f"{detail}; {recovery_notice()}"
+                ) from exc
+            cleanup_transaction("package receipt transaction failed after rollback")
+            if isinstance(exc, OSError):
+                raise SystemExit("package producer receipt replacement failed") from exc
+            raise
+        else:
+            cleanup_transaction("package receipt transaction committed")
+            return reference
+
+
+@functools.lru_cache(maxsize=1)
+def score_motion_contract():
+    """Load the portable A/B authenticator without making delivery import scripts."""
+    path = DANSE / "scripts" / "score_motion_production.py"
+    spec = importlib.util.spec_from_file_location("danse_delivery_score_motion_contract", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit("cannot load the production score-to-motion evidence contract")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def safe_score_motion_directory(package: Path, directory: Path) -> Path:
+    """Create one evidence directory without traversing a package symlink."""
+    package = package.absolute()
+    directory = directory.absolute()
+    if package.is_symlink() or not package.is_dir():
+        raise SystemExit("package score-to-motion evidence root is not a regular directory")
+    try:
+        relative = directory.relative_to(package)
+    except ValueError as exc:
+        raise SystemExit("package score-to-motion evidence destination escapes the package") from exc
+    current = package
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        current.mkdir(exist_ok=True)
+    return current
+
+
+def prior_score_motion_evidence(
+    package: Path,
+    previous: dict,
+    items: dict[str, dict],
+) -> dict | None:
+    """Retain one prior evidence reference only from stable in-package bytes."""
+    reference = previous.get("score_motion_evidence")
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"path", "sha256"}
+        or reference.get("path") != SCORE_MOTION_EVIDENCE_ITEM
+        or not isinstance(reference.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])
+    ):
+        return None
+    item = items.get(SCORE_MOTION_EVIDENCE_ITEM)
+    if not isinstance(item, dict):
+        return None
+
+    common_flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+    descriptors: list[int] = []
+    directory_edges: list[tuple[int, str, os.stat_result]] = []
+    try:
+        root_fd = os.open(package, directory_flags)
+        descriptors.append(root_fd)
+        root_info = os.fstat(root_fd)
+        named_root = os.stat(package, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or (root_info.st_dev, root_info.st_ino) != (named_root.st_dev, named_root.st_ino)
+        ):
+            return None
+
+        parent_fd = root_fd
+        parts = PurePosixPath(SCORE_MOTION_EVIDENCE_ITEM).parts
+        for part in parts[:-1]:
+            child_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            descriptors.append(child_fd)
+            child_info = os.fstat(child_fd)
+            if not stat.S_ISDIR(child_info.st_mode):
+                return None
+            directory_edges.append((parent_fd, part, child_info))
+            parent_fd = child_fd
+
+        receipt_fd = os.open(parts[-1], os.O_RDONLY | common_flags, dir_fd=parent_fd)
+        descriptors.append(receipt_fd)
+        before = os.fstat(receipt_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > SCORE_MOTION_RECEIPT_MAX_BYTES
+        ):
+            return None
+        receipt_digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(
+                receipt_fd,
+                min(1 << 20, SCORE_MOTION_RECEIPT_MAX_BYTES + 1 - copied),
+            )
+            if not block:
+                break
+            receipt_digest.update(block)
+            copied += len(block)
+            if copied > SCORE_MOTION_RECEIPT_MAX_BYTES:
+                return None
+        after = os.fstat(receipt_fd)
+
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+        if identity(before) != identity(after) or copied != after.st_size:
+            return None
+        named_receipt = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if identity(after) != identity(named_receipt):
+            return None
+        for ancestor_fd, name, opened in directory_edges:
+            named = os.stat(name, dir_fd=ancestor_fd, follow_symlinks=False)
+            if (opened.st_dev, opened.st_ino, opened.st_mode) != (
+                named.st_dev,
+                named.st_ino,
+                named.st_mode,
+            ):
+                return None
+        digest_value = receipt_digest.hexdigest()
+        if (
+            digest_value != reference["sha256"]
+            or item.get("sha256") != digest_value
+            or item.get("bytes") != copied
+        ):
+            return None
+        return dict(reference)
+    except OSError:
+        return None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def prune_score_motion_evidence(destination_root: Path, expected: set[str]) -> None:
+    """Make the owned evidence subtree equal the current graph, never a union."""
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(production, indent=2) + "\n")
-    return {"path": PRODUCTION_RECEIPT, "sha256": digest(path)}
+    try:
+        surface = sorted(
+            destination_root.rglob("*"),
+            key=lambda candidate: (len(candidate.parts), candidate.as_posix()),
+            reverse=True,
+        )
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence boundary cannot be inventoried") from exc
+    for candidate in surface:
+        relative = candidate.relative_to(destination_root).as_posix()
+        if candidate.is_symlink():
+            raise SystemExit("package score-to-motion evidence boundary contains a symlink")
+        if candidate.is_file():
+            if relative not in expected:
+                candidate.unlink()
+        elif candidate.is_dir():
+            if relative not in expected_directories:
+                try:
+                    candidate.rmdir()
+                except OSError as exc:
+                    raise SystemExit(
+                        "package score-to-motion evidence boundary contains an unsafe entry"
+                    ) from exc
+        else:
+            raise SystemExit("package score-to-motion evidence boundary contains an unsafe entry")
+
+
+def require_score_motion_evidence_census(destination_root: Path, expected: set[str]) -> None:
+    """Authenticate the final owned subtree after every atomic replacement."""
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in PurePosixPath(relative).parents
+        if parent != PurePosixPath(".")
+    }
+    files: set[str] = set()
+    directories: set[str] = set()
+    try:
+        surface = destination_root.rglob("*")
+        for candidate in surface:
+            relative = candidate.relative_to(destination_root).as_posix()
+            if candidate.is_symlink():
+                raise SystemExit("package score-to-motion evidence boundary contains a symlink")
+            if candidate.is_file():
+                files.add(relative)
+            elif candidate.is_dir():
+                directories.add(relative)
+            else:
+                raise SystemExit("package score-to-motion evidence boundary contains an unsafe entry")
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence boundary cannot be inventoried") from exc
+    if files != expected or directories != expected_directories:
+        raise SystemExit("package score-to-motion evidence census is not exact")
+
+
+def atomic_stage_score_motion_file(package: Path, source: Path, destination: Path) -> None:
+    """Replace one evidence path without following links or rewriting a shared inode."""
+    safe_score_motion_directory(package, destination.parent)
+    if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+        raise SystemExit("package score-to-motion evidence destination is unsafe")
+
+    common_flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = source_fd = temporary_fd = result_fd = None
+    temporary_name: str | None = None
+    replaced = False
+    try:
+        directory_fd = os.open(destination.parent, directory_flags)
+        opened_directory = os.fstat(directory_fd)
+        safe_score_motion_directory(package, destination.parent)
+        named_directory = os.stat(destination.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or (opened_directory.st_dev, opened_directory.st_ino)
+            != (named_directory.st_dev, named_directory.st_ino)
+        ):
+            raise SystemExit("package score-to-motion evidence destination changed during staging")
+
+        source_fd = os.open(source, os.O_RDONLY | common_flags)
+        source_before = os.fstat(source_fd)
+        if not stat.S_ISREG(source_before.st_mode):
+            raise SystemExit("score-to-motion evidence source is not a regular file")
+        for _ in range(16):
+            candidate = f".{destination.name}.stage-{os.getpid()}-{os.urandom(8).hex()}"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | common_flags,
+                    (stat.S_IMODE(source_before.st_mode) & 0o777) | 0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise SystemExit("cannot reserve a score-to-motion evidence staging file")
+
+        source_digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(source_fd, 1 << 20)
+            if not block:
+                break
+            source_digest.update(block)
+            copied += len(block)
+            remaining = memoryview(block)
+            while remaining:
+                written = os.write(temporary_fd, remaining)
+                if written <= 0:
+                    raise OSError("short score-to-motion evidence write")
+                remaining = remaining[written:]
+        source_after = os.fstat(source_fd)
+        source_before_identity = (
+            source_before.st_dev,
+            source_before.st_ino,
+            source_before.st_mode,
+            source_before.st_size,
+            source_before.st_mtime_ns,
+            source_before.st_ctime_ns,
+        )
+        source_after_identity = (
+            source_after.st_dev,
+            source_after.st_ino,
+            source_after.st_mode,
+            source_after.st_size,
+            source_after.st_mtime_ns,
+            source_after.st_ctime_ns,
+        )
+        if (
+            source_before_identity != source_after_identity
+            or copied != source_after.st_size
+        ):
+            raise SystemExit("score-to-motion evidence source changed during staging")
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        replaced = True
+
+        result_fd = os.open(destination.name, os.O_RDONLY | common_flags, dir_fd=directory_fd)
+        result_info = os.fstat(result_fd)
+        if not stat.S_ISREG(result_info.st_mode):
+            raise SystemExit("package score-to-motion evidence destination is unsafe")
+        result_digest = hashlib.sha256()
+        result_bytes = 0
+        while True:
+            block = os.read(result_fd, 1 << 20)
+            if not block:
+                break
+            result_digest.update(block)
+            result_bytes += len(block)
+        if result_bytes != copied or result_digest.digest() != source_digest.digest():
+            raise SystemExit("package score-to-motion evidence copy changed bytes")
+
+        safe_score_motion_directory(package, destination.parent)
+        named_directory = os.stat(destination.parent, follow_symlinks=False)
+        named_result = os.stat(destination.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (opened_directory.st_dev, opened_directory.st_ino)
+            != (named_directory.st_dev, named_directory.st_ino)
+            or (result_info.st_dev, result_info.st_ino)
+            != (named_result.st_dev, named_result.st_ino)
+        ):
+            raise SystemExit("package score-to-motion evidence destination changed during staging")
+    except OSError as exc:
+        raise SystemExit("package score-to-motion evidence could not be copied safely") from exc
+    finally:
+        for descriptor in (result_fd, temporary_fd, source_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        if directory_fd is not None:
+            if temporary_name is not None and not replaced:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(directory_fd)
+
+
+def stage_score_motion_evidence(
+    package: Path,
+    span: dict,
+    repository_head: str,
+) -> tuple[dict | None, list[Path]]:
+    """Copy only a complete, current evidence graph; absence stays a later gate."""
+    destination_root = safe_score_motion_directory(
+        package,
+        package / SCORE_MOTION_EVIDENCE_DIR,
+    )
+    if not SCORE_MOTION_EVIDENCE.is_file():
+        prune_score_motion_evidence(destination_root, set())
+        try:
+            destination_root.rmdir()
+        except OSError as exc:
+            raise SystemExit(
+                "package score-to-motion evidence boundary could not be removed"
+            ) from exc
+        return None, []
+    contract = score_motion_contract()
+    errors = contract.production_receipt_errors(SCORE_MOTION_EVIDENCE)
+    if errors:
+        raise SystemExit("production score-to-motion evidence is stale: " + "; ".join(errors[:6]))
+    receipt = json.loads(SCORE_MOTION_EVIDENCE.read_text(encoding="utf-8"))
+    expected_span = {
+        "river_seed": 20170620,
+        "stream": 0,
+        "passage": span["passage"],
+        "t0": span["t0"],
+        "t1": span["t1"],
+        "duration_seconds": span["duration"],
+    }
+    receipt_span = receipt.get("span")
+    comparable_span = isinstance(receipt_span, dict) and set(receipt_span) == set(expected_span)
+    if comparable_span:
+        comparable_span = all(
+            receipt_span[key] == expected_span[key]
+            for key in expected_span
+            if key != "duration_seconds"
+        )
+    receipt_duration = receipt_span.get("duration_seconds") if isinstance(receipt_span, dict) else None
+    if (
+        not isinstance(receipt_duration, (int, float))
+        or isinstance(receipt_duration, bool)
+        or not math.isfinite(receipt_duration)
+        or abs(receipt_duration - expected_span["duration_seconds"]) > 1e-6
+    ):
+        comparable_span = False
+    if receipt.get("repository_head") != repository_head or not comparable_span:
+        raise SystemExit("production score-to-motion evidence belongs to a different package span or Git HEAD")
+    source_root = SCORE_MOTION_EVIDENCE.parent.resolve(strict=True)
+    sources = contract.evidence_artifact_paths(SCORE_MOTION_EVIDENCE)
+    expected = {source.relative_to(source_root).as_posix() for source in sources}
+    prune_score_motion_evidence(destination_root, expected)
+    staged = []
+    for source in sources:
+        relative = source.relative_to(source_root)
+        destination = destination_root / relative
+        atomic_stage_score_motion_file(package, source, destination)
+        staged.append(destination)
+    prune_score_motion_evidence(destination_root, expected)
+    require_score_motion_evidence_census(destination_root, expected)
+    receipt_copy = package / SCORE_MOTION_EVIDENCE_ITEM
+    staged_errors = contract.production_receipt_errors(receipt_copy)
+    if staged_errors:
+        raise SystemExit(
+            "staged production score-to-motion evidence is inconsistent: "
+            + "; ".join(staged_errors[:6])
+        )
+    return {"path": SCORE_MOTION_EVIDENCE_ITEM, "sha256": digest(receipt_copy)}, staged
 
 
 def capture_root(root: Path, span: dict, start: float) -> Path:
     """Keep restartable intermediates for different absolute spans disjoint."""
     offset = f"{start:.3f}".rstrip("0").rstrip(".").replace("-", "m").replace(".", "p") or "0"
     return root / f"passage-{span['seed']:08X}-from-{offset}"
+
+
+def retained_capture_root(root: Path, manifest: dict) -> Path:
+    """Recover the restart root for passage media retained by a partial update."""
+    passage_seed = manifest.get("passage_seed")
+    t0 = manifest.get("t0")
+    if not isinstance(passage_seed, str) or not re.fullmatch(
+        r"0x[0-9A-Fa-f]{1,8}",
+        passage_seed,
+    ):
+        raise SystemExit("retained package has no valid passage-seed capture identity")
+    if (
+        not isinstance(t0, (int, float))
+        or isinstance(t0, bool)
+        or not math.isfinite(t0)
+        or t0 < 0
+    ):
+        raise SystemExit("retained package has no valid capture start identity")
+    return capture_root(root, {"seed": int(passage_seed, 16)}, float(t0))
 
 
 def is_forced(force: set[str], name: str, group: str | None = None) -> bool:
@@ -1169,7 +2873,7 @@ def preflight(
     span_error: str | None = None,
     passage_requested: bool = True,
 ) -> int:
-    """Validate a delivery invocation without creating a directory or rendering."""
+    """Validate a delivery invocation without persistent output or rendering."""
     rows: list[tuple[bool, str, str]] = []
 
     def add(ok: bool, name: str, detail: str) -> None:
@@ -1193,6 +2897,12 @@ def preflight(
         "exact repository head",
         repository_detail,
     )
+    try:
+        rename_requirement = require_atomic_rename_filesystem(package)
+    except OSError as exc:
+        add(False, "atomic package publication", str(exc))
+    else:
+        add(True, "atomic package publication", rename_requirement)
     add(program.get("schema") == "danse.program.v2", "program", str(program.get("schema")))
     add(
         not passage_requested or program.get("seed") == 20170620,
@@ -1585,7 +3295,7 @@ def deliver_reel(program: dict, sound: Path, tier: str, force: bool, start: floa
                 raise SystemExit("reel provenance boundary contains an unsafe entry")
             old.unlink()
         concat_receipt = picture.with_name(picture.name + ".receipt.json")
-        concat_value, _ = _read_producer_receipt(
+        concat_value, _, _ = _read_producer_receipt(
             concat_receipt,
             "danse.render.concat.v1",
         )
@@ -1816,7 +3526,11 @@ def main() -> int:
     ap.add_argument("--force", action="append", choices=FORCE_ITEMS, default=[], help="re-make an existing item")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="root for restartable render intermediates")
     ap.add_argument("--package", type=Path, help="staged package root (default: <out>/package)")
-    ap.add_argument("--preflight", action="store_true", help="validate this invocation without rendering or writing")
+    ap.add_argument(
+        "--preflight",
+        action="store_true",
+        help="validate without rendering or retaining output",
+    )
     args = ap.parse_args()
     if args.start < 0:
         ap.error("--start must be non-negative")
@@ -1867,6 +3581,10 @@ def main() -> int:
         repository["head"],
     ):
         raise SystemExit(f"{package}/manifest.json belongs to a different passage; choose a fresh --package root")
+    try:
+        require_atomic_rename_filesystem(package)
+    except OSError as exc:
+        raise SystemExit(str(exc)) from exc
 
     work = pending(program, only, force, package)
     selected_fixed_windows = {
@@ -1961,7 +3679,33 @@ def main() -> int:
 
     print()
     manifest_path = PACKAGE / "manifest.json"
-    previous = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    if manifest_path.is_symlink() or (
+        manifest_path.exists() and not manifest_path.is_file()
+    ):
+        raise SystemExit("package manifest must be a regular non-symlink file")
+    previous_manifest_sha256 = None
+    if manifest_path.is_file():
+        try:
+            previous_manifest_bytes, previous_manifest_sha256 = bounded_regular_bytes(
+                manifest_path,
+                max_bytes=PACKAGE_MANIFEST_MAX_BYTES,
+                description="package manifest",
+            )
+            previous = json.loads(previous_manifest_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise SystemExit("package manifest is invalid or unreadable") from exc
+        if not isinstance(previous, dict):
+            raise SystemExit("package manifest is not a JSON object")
+    else:
+        previous = {}
+    score_motion_evidence = None
+    if span is not None:
+        score_motion_evidence, evidence_files = stage_score_motion_evidence(
+            PACKAGE,
+            span,
+            repository["head"],
+        )
+        made.extend(evidence_files)
     previous_items = {
         item["name"]: item
         for item in previous.get("items", [])
@@ -2034,10 +3778,25 @@ def main() -> int:
         manifest["sound"] = master_sound
     elif previous_sound:
         manifest["sound"] = previous_sound
-    production = write_production_receipt(PACKAGE, OUT, manifest, previous)
-    if production is not None:
-        manifest["production"] = production
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    if span is None:
+        score_motion_evidence = prior_score_motion_evidence(
+            PACKAGE,
+            previous,
+            previous_items,
+        )
+    if score_motion_evidence is not None:
+        manifest["score_motion_evidence"] = score_motion_evidence
+    producer_root = OUT
+    if span is None and _production_targets(manifest):
+        producer_root = retained_capture_root(args.out, manifest)
+    write_production_receipt(
+        PACKAGE,
+        producer_root,
+        manifest,
+        previous,
+        publish_manifest=True,
+        previous_manifest_sha256=previous_manifest_sha256,
+    )
     total = sum(i["bytes"] for i in manifest["items"])
     print(f"\n  {len(manifest['items'])} items · {total / 1e9:.2f} GB · {PACKAGE}")
     if shutil.which("python3"):

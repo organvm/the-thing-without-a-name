@@ -435,7 +435,9 @@ addEventListener("hashchange", async () => {
   el("river-receipt").textContent = `River ${hex(river.seed)} arrived from this link. Undo is unavailable.`;
   shifted = nextRiver.shifted;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
-  controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM, value: program ? "score-led" : "free" });
+  if (programIntent === programGeneration) {
+    controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM, value: program ? "score-led" : "free" });
+  }
   controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: reducedMotion.matches });
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   describeProgram();
@@ -477,7 +479,7 @@ function renderInteraction(snapshot) {
   el("camera-retry").hidden = !snapshot.retryable;
   el("interaction-stop").disabled = snapshot.mode === "off";
   el("receipt-save").disabled = !(snapshot.session?.samples > 0);
-  el("presence-receipt").textContent = message;
+  el("presence-receipt").textContent = controlBus?.getState().status.presence || message;
   const presence = snapshot.mode === "fallback" ? "keyboard-touch" : ["camera", "replay"].includes(snapshot.mode) ? snapshot.mode : "off";
   if (controlBus && controlBus.getState().presence !== presence) controlBus.actions.sync({ type: ACTIONS.SET_PRESENCE, value: presence });
 }
@@ -539,21 +541,34 @@ if (scoreLoadFailure) flash("Musical score unavailable · continuing with the de
 
 const musicButton = el("music-toggle");
 const musicStatus = el("music-status");
-async function toggleMusic() {
+let musicErrorMessage = "";
+function renderMusicReceipt(state) {
+  const active = state.music === "playing" || state.music === "suspended-by-hold";
+  musicButton.disabled = state.music === "unavailable";
+  musicButton.textContent = active ? "Stop music" : "Start music";
+  if (state.music !== "error") musicErrorMessage = "";
+  musicStatus.textContent = state.music === "unavailable"
+    ? "Music score unavailable."
+    : state.music === "stopped"
+      ? "Music stopped."
+      : state.music === "playing"
+        ? "Music follows the score-led choreography."
+        : state.music === "suspended-by-hold"
+          ? "Music is suspended while this frame is held."
+          : musicErrorMessage || "Music could not start.";
+}
+async function toggleMusic(intent) {
   if (!scoreAudio) return "unavailable";
   try {
-    if (scoreAudio.playing) {
+    if (intent === "stopped") {
       scoreAudio.stop();
-      musicButton.textContent = "Start music";
-      musicStatus.textContent = "Music stopped.";
       return "stopped";
     }
     await scoreAudio.start(scoreSecondAt(at()));
-    musicButton.textContent = "Stop music";
-    musicStatus.textContent = heldAt === null ? "Music follows the score-led choreography." : "Music is suspended while this frame is held.";
     return heldAt === null ? "playing" : "suspended-by-hold";
   } catch (error) {
-    musicStatus.textContent = `Music could not start: ${error.message}`;
+    scoreAudio.stop();
+    musicErrorMessage = `Music could not start: ${error.message}`;
     return "error";
   }
 }
@@ -623,9 +638,6 @@ let surfaceTrigger = null;
 function toggleHold() {
   heldAt = heldAt === null ? at() : null;
   if (scoreAudio?.playing) scoreAudio.sync(scoreSecondAt(at()), heldAt !== null);
-  musicStatus.textContent = scoreAudio?.playing && heldAt !== null
-    ? "Music is suspended while this frame is held."
-    : scoreAudio?.playing ? "Music follows the score-led choreography." : musicStatus.textContent;
   renderInteraction(interaction.snapshot());
 }
 
@@ -663,29 +675,34 @@ function undoRiver() {
 }
 
 async function shareRiver() {
+  const sharedRiver = river;
   const presentation = sharePresentationState(controlBus.getState());
-  const link = sharePresentationUrl(Arrival.href(river), presentation);
+  const link = sharePresentationUrl(Arrival.href(sharedRiver), presentation);
+  const receipt = (message) => {
+    if (river !== sharedRiver) return false;
+    el("river-receipt").textContent = message;
+    return true;
+  };
   try {
     if (navigator.share) {
       await navigator.share({ title: "Danse", text: "Join this Danse river.", url: link });
-      el("river-receipt").textContent = "River link handed to the device share sheet.";
+      receipt("River link handed to the device share sheet.");
       return "share-sheet";
     }
     await navigator.clipboard.writeText(link);
-    el("river-receipt").textContent = "River link copied to the clipboard.";
+    receipt("River link copied to the clipboard.");
     return "clipboard";
   } catch (error) {
     if (error?.name === "AbortError") {
-      el("river-receipt").textContent = "Sharing canceled; the river is unchanged.";
+      receipt("Sharing canceled; the river is unchanged.");
       return "canceled";
     }
     try {
       await navigator.clipboard.writeText(link);
-      el("river-receipt").textContent = "Share sheet unavailable; river link copied instead.";
+      receipt("Share sheet unavailable; river link copied instead.");
       return "clipboard-fallback";
     } catch {
-      el("river-receipt").textContent = `Copy unavailable. River link: ${link}`;
-      flash(link, 6000);
+      if (receipt(`Copy unavailable. River link: ${link}`)) flash(link, 6000);
       return "visible-link";
     }
   }
@@ -824,6 +841,7 @@ const conductorActive = conductor.model !== "native" || conductor.meter !== null
 controlBus.actions.sync({ type: ACTIONS.SET_CONDUCTOR, active: conductorActive, ready: !conductorActive });
 controlBus.subscribe((state) => {
   renderControlSurface(dock, state);
+  renderMusicReceipt(state);
   const trayOpen = state.surface.startsWith("tray:");
   tray.hidden = !trayOpen;
   tray.setAttribute("aria-hidden", String(!trayOpen));

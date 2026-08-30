@@ -41,13 +41,29 @@ import { requireTier } from "./engine/tier.js";
 
 const q = new URLSearchParams(location.search);
 const program = await Program.load(q.get("program") ?? "render/program.json");
-const scoreUrl = q.get("score");
-const musicalScore = scoreUrl ? await MusicalScore.load(scoreUrl) : null;
-const choreographyUrl = q.get("choreography");
-if (musicalScore?.release_status !== "fixture-only" && musicalScore && !choreographyUrl) {
+if (q.has("duration")) {
+  throw new Error("obsolete duration override is forbidden; use a receipt-bound timing score");
+}
+const scoreUrl = q.has("score") ? q.get("score") : null;
+const musicalScore = scoreUrl !== null ? await MusicalScore.load(scoreUrl) : null;
+const choreographyUrl = q.has("choreography") ? q.get("choreography") : null;
+if (
+  musicalScore?.release_status !== "fixture-only"
+  && musicalScore !== null
+  && choreographyUrl === null
+) {
   throw new Error("a production music score requires ?choreography=<contract>");
 }
+const passageTiming = q.has("passage-seconds")
+  ? Program.fixedPassageTiming(numericParam(q, "passage-seconds", 0, { min: Number.EPSILON }))
+  : null;
+if (passageTiming && (musicalScore !== null || choreographyUrl !== null)) {
+  throw new Error("timing-only capture cannot load score motion or choreography");
+}
 const cap = Program.captureOf(program, q.get("capture") ?? q.get("window") ?? "passage");
+if (passageTiming && cap.passages !== 1) {
+  throw new Error("timing-only capture must record exactly one passage");
+}
 const seed = numericParam(q, "s", program.seed, { integer: true, min: 0, max: 0xFFFFFFFF });
 const stream = numericParam(q, "u", 0, { integer: true, min: 0, max: 0xFFFFFFFF });
 const tier = q.get("tier") ?? "screen";
@@ -65,15 +81,10 @@ const height = numericParam(q, "height", cap.h, { integer: true, min: 1 });
 const from = numericParam(q, "from", 0, { min: 0 });
 const span = (() => {
   const fps = numericParam(q, "fps", cap.fps, { min: Number.EPSILON });
-  if (cap.seconds > 0) return { t0: from, t1: from + cap.seconds, fps };
-  let at = Program.passageAt(program, seed, from, stream, musicalScore);
-  const t0 = at.t0;
-  let t1 = at.t0;
-  for (let k = 0; k < cap.passages; k++) {
-    at = Program.passageAt(program, seed, t1 + 1e-6, stream, musicalScore);
-    t1 = at.t0 + at.seconds;
-  }
-  return { t0, t1, fps };
+  return {
+    ...Program.captureSpan(program, seed, from, cap, stream, musicalScore, passageTiming),
+    fps,
+  };
 })();
 
 const canvas = document.getElementById("stage");
@@ -81,7 +92,7 @@ canvas.style.width = `${width}px`;
 canvas.style.height = `${height}px`;
 
 const corpus = await Corpus.load("corpus/", { local: true });
-const choreography = choreographyUrl
+const choreography = choreographyUrl !== null
   ? await Choreography.load(choreographyUrl, { score: musicalScore, corpus })
   : null;
 if (!corpus.manifest.tiers[tier]) {
@@ -102,7 +113,12 @@ let missing = 0;
 async function renderAt(t) {
   // What this frame will ask for — fetched and decoded BEFORE anything is drawn,
   // so the frame does not depend on what happened to be cached.
-  const { cast } = step(corpus, seed, t, program, { stream, score: musicalScore, choreography });
+  const { cast } = step(corpus, seed, t, program, {
+    stream,
+    score: musicalScore,
+    choreography,
+    timing: passageTiming,
+  });
   const ids = cast.flatMap((c) => c.layers.map((l) => l.frame)).filter(Boolean);
   if (ids.length) await requireTier(corpus, tier, ids);
 
@@ -112,6 +128,7 @@ async function renderAt(t) {
     stream,
     score: musicalScore,
     choreography,
+    timing: passageTiming,
     quantise: 0,
     tier,
     pixelRatio: 1,
@@ -120,18 +137,31 @@ async function renderAt(t) {
   renderer.gl.finish();
   drawn++;
   missing += r.missing;
-  return { t, movement: r.state.movement, cut: r.state.cut, planes: r.planes, missing: r.missing };
+  return {
+    t,
+    movement: r.state.movement,
+    cut: r.state.cut,
+    passage: r.state.passage,
+    passageSeed: r.state.passageSeed,
+    passageT0: r.state.passageT0,
+    passageSeconds: r.state.passageSeconds,
+    hasMusic: Object.hasOwn(r.state, "music"),
+    hasChoreography: Object.hasOwn(r.state, "choreography"),
+    planes: r.planes,
+    missing: r.missing,
+  };
 }
 
 // What this recording caught. The river has no name; a PASSAGE of it does, and
 // that is what a capture is named by — so a file on disk can be traced back to
 // the exact stretch of the piece it recorded and to nothing else.
-const opening = Program.passageAt(program, seed, span.t0, stream, musicalScore);
+const opening = Program.passageAt(program, seed, span.t0, stream, musicalScore, passageTiming);
 
 window.danseFilm = {
   program,
   score: musicalScore,
   choreography,
+  timing: passageTiming,
   capture: cap.name,
   window: span,
   seed,
@@ -139,6 +169,8 @@ window.danseFilm = {
   seedHex: hex(seed),
   passage: opening.index,
   passageSeed: opening.seed,
+  passageT0: opening.t0,
+  passageSeconds: opening.seconds,
   passageHex: hex(opening.seed),
   signature: signature(program, {
     riverSeed: seed,

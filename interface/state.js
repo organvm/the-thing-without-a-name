@@ -57,6 +57,7 @@ export function reduceControlState(state, action) {
       break;
     case ACTIONS.RESET_RIVER:
       next.playback = action.reducedMotion ? "held-reduced" : "running";
+      next.movement = 1;
       if (next.playback === "running" && state.music === "suspended-by-hold") next.music = "playing";
       else if (next.playback !== "running" && state.music === "playing") next.music = "suspended-by-hold";
       break;

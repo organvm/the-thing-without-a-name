@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:danse:submission-receipt:v1",
+  "title": "Danse ScreenDance phase and local-validation receipts",
+  "oneOf": [
+    { "$ref": "#/$defs/packageReceipt" },
+    { "$ref": "#/$defs/uploadedReceipt" },
+    { "$ref": "#/$defs/submittedReceipt" },
+    { "$ref": "#/$defs/validationReceipt" }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitOid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "typedId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{5,127}$"
+    },
+    "destinationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+    },
+    "signer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "role"],
+      "properties": {
+        "name": { "const": "Anthony J. Padavano" },
+        "role": {
+          "enum": [
+            "package-approver",
+            "upload-account-owner",
+            "submission-account-owner"
+          ]
+        }
+      }
+    },
+    "packageSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "package-approver" } } }
+      ]
+    },
+    "uploadedSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "upload-account-owner" } } }
+      ]
+    },
+    "submittedSigner": {
+      "allOf": [
+        { "$ref": "#/$defs/signer" },
+        { "properties": { "role": { "const": "submission-account-owner" } } }
+      ]
+    },
+    "packageBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "manifest_sha256", "repository_head"],
+      "properties": {
+        "manifest": { "const": "manifest.json" },
+        "manifest_sha256": { "$ref": "#/$defs/digest" },
+        "repository_head": { "$ref": "#/$defs/gitOid" }
+      }
+    },
+    "opportunityBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "sha256"],
+      "properties": {
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "deadlineBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timezone", "upload_target", "hard_wall"],
+      "properties": {
+        "timezone": { "type": "string", "minLength": 1 },
+        "upload_target": { "type": "string", "minLength": 1 },
+        "hard_wall": { "type": "string", "minLength": 1 }
+      }
+    },
+    "attestationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "canonical_sha256", "document"],
+      "properties": {
+        "path": { "const": "attest.yaml" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "canonical_sha256": { "$ref": "#/$defs/digest" },
+        "document": { "type": "string", "minLength": 1, "maxLength": 262144 }
+      }
+    },
+    "assertionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "values"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/digest" },
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "boolean" },
+              { "type": "string", "minLength": 1 }
+            ]
+          }
+        }
+      }
+    },
+    "packageReceiptRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "package" },
+        "path": { "const": "receipts/package.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "uploadedReceiptRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "uploaded" },
+        "path": { "const": "receipts/uploaded.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "upload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "asset_id",
+        "url",
+        "uploaded_at",
+        "manifest_item",
+        "sha256"
+      ],
+      "properties": {
+        "provider": { "$ref": "#/$defs/destinationId" },
+        "asset_id": { "$ref": "#/$defs/destinationId" },
+        "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "uploaded_at": { "$ref": "#/$defs/utcTimestamp" },
+        "manifest_item": { "type": "string", "pattern": "^screener\\.(?:mp4|mov|mxf|m4v)$" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "submission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["portal", "confirmation_id", "submitted_at"],
+      "properties": {
+        "portal": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "confirmation_id": { "$ref": "#/$defs/destinationId" },
+        "submitted_at": { "$ref": "#/$defs/utcTimestamp" }
+      }
+    },
+    "packageReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "receipt_id",
+        "recorded_at",
+        "signer",
+        "package",
+        "opportunity",
+        "deadline",
+        "attestation",
+        "assertions"
+      ],
+      "properties": {
+        "schema": { "const": "danse.submission.package.v1" },
+        "receipt_id": { "$ref": "#/$defs/typedId" },
+        "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
+        "signer": { "$ref": "#/$defs/packageSigner" },
+        "package": { "$ref": "#/$defs/packageBinding" },
+        "opportunity": { "$ref": "#/$defs/opportunityBinding" },
+        "deadline": { "$ref": "#/$defs/deadlineBinding" },
+        "attestation": { "$ref": "#/$defs/attestationBinding" },
+        "assertions": { "$ref": "#/$defs/assertionBinding" }
+      }
+    },
+    "uploadedReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "receipt_id",
+        "recorded_at",
+        "signer",
+        "package",
+        "opportunity",
+        "deadline",
+        "attestation",
+        "assertions",
+        "prior_receipt",
+        "upload"
+      ],
+      "properties": {
+        "schema": { "const": "danse.submission.uploaded.v1" },
+        "receipt_id": { "$ref": "#/$defs/typedId" },
+        "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
+        "signer": { "$ref": "#/$defs/uploadedSigner" },
+        "package": { "$ref": "#/$defs/packageBinding" },
+        "opportunity": { "$ref": "#/$defs/opportunityBinding" },
+        "deadline": { "$ref": "#/$defs/deadlineBinding" },
+        "attestation": { "$ref": "#/$defs/attestationBinding" },
+        "assertions": { "$ref": "#/$defs/assertionBinding" },
+        "prior_receipt": { "$ref": "#/$defs/packageReceiptRow" },
+        "upload": { "$ref": "#/$defs/upload" }
+      }
+    },
+    "submittedReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "receipt_id",
+        "recorded_at",
+        "signer",
+        "package",
+        "opportunity",
+        "deadline",
+        "attestation",
+        "assertions",
+        "prior_receipt",
+        "submission"
+      ],
+      "properties": {
+        "schema": { "const": "danse.submission.submitted.v1" },
+        "receipt_id": { "$ref": "#/$defs/typedId" },
+        "recorded_at": { "$ref": "#/$defs/utcTimestamp" },
+        "signer": { "$ref": "#/$defs/submittedSigner" },
+        "package": { "$ref": "#/$defs/packageBinding" },
+        "opportunity": { "$ref": "#/$defs/opportunityBinding" },
+        "deadline": { "$ref": "#/$defs/deadlineBinding" },
+        "attestation": { "$ref": "#/$defs/attestationBinding" },
+        "assertions": { "$ref": "#/$defs/assertionBinding" },
+        "prior_receipt": { "$ref": "#/$defs/uploadedReceiptRow" },
+        "submission": { "$ref": "#/$defs/submission" }
+      }
+    },
+    "submittedReceiptRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "path", "sha256", "receipt_id"],
+      "properties": {
+        "phase": { "const": "submitted" },
+        "path": { "const": "receipts/submitted.json" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "receipt_id": { "$ref": "#/$defs/typedId" }
+      }
+    },
+    "phaseReceiptRow": {
+      "oneOf": [
+        { "$ref": "#/$defs/packageReceiptRow" },
+        { "$ref": "#/$defs/uploadedReceiptRow" },
+        { "$ref": "#/$defs/submittedReceiptRow" }
+      ]
+    },
+    "validationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "scope",
+        "phase",
+        "validated_at",
+        "repository_head",
+        "package",
+        "phase_receipts",
+        "predicates"
+      ],
+      "properties": {
+        "schema": { "const": "danse.submission.validation.v1" },
+        "scope": { "const": "submission-phase-validation" },
+        "phase": { "enum": ["package", "uploaded", "submitted"] },
+        "validated_at": { "$ref": "#/$defs/utcTimestamp" },
+        "repository_head": { "$ref": "#/$defs/gitOid" },
+        "package": { "$ref": "#/$defs/packageBinding" },
+        "phase_receipts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/phaseReceiptRow" }
+        },
+        "predicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "phase": { "const": "package" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [{ "$ref": "#/$defs/packageReceiptRow" }],
+                "items": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "uploaded" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  { "$ref": "#/$defs/packageReceiptRow" },
+                  { "$ref": "#/$defs/uploadedReceiptRow" }
+                ],
+                "items": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "submitted" } }, "required": ["phase"] },
+          "then": {
+            "properties": {
+              "phase_receipts": {
+                "minItems": 3,
+                "maxItems": 3,
+                "prefixItems": [
+                  { "$ref": "#/$defs/packageReceiptRow" },
+                  { "$ref": "#/$defs/uploadedReceiptRow" },
+                  { "$ref": "#/$defs/submittedReceiptRow" }
+                ],
+                "items": false
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

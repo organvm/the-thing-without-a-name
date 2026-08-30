@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { createControlActions } from "../../interface/actions.js";
 import { renderControlSurface } from "../../interface/render.js";
+import { ScoreAudio } from "../../sound/browser-midi.js";
 import {
   ACTIONS,
   initialControlState,
@@ -40,10 +41,11 @@ await test("state contracts cover hold, program, cutout, music, surfaces, auditi
 await test("river and reduced-motion transitions keep playback and music synchronized", () => {
   let state = initialControlState();
   state = reduceControlState(state, { type: ACTIONS.SET_MUSIC, value: "playing" });
+  state = reduceControlState(state, { type: ACTIONS.SET_MOVEMENT, value: 4 });
   state = reduceControlState(state, { type: ACTIONS.TOGGLE_HOLD, allowMotion: true });
-  assert.deepEqual([state.playback, state.music], ["held-user", "suspended-by-hold"]);
+  assert.deepEqual([state.playback, state.music, state.movement], ["held-user", "suspended-by-hold", 4]);
   state = reduceControlState(state, { type: ACTIONS.RESET_RIVER, reducedMotion: false });
-  assert.deepEqual([state.playback, state.music], ["running", "playing"]);
+  assert.deepEqual([state.playback, state.music, state.movement], ["running", "playing", 1]);
   state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: true });
   assert.deepEqual([state.playback, state.music], ["held-reduced", "suspended-by-hold"]);
   state = reduceControlState(state, { type: ACTIONS.SET_REDUCED_MOTION, value: false });
@@ -135,6 +137,56 @@ await test("rapid program toggles derive from pending intent and settle on the l
   await score;
   assert.deepEqual(calls, ["score-led", "free"]);
   assert.equal(bus.getState().program, "free");
+});
+
+await test("rapid music toggles serialize pending intent and settle stopped", async () => {
+  const calls = [];
+  let finishStart;
+  const bus = createControlActions({
+    music: (intent) => {
+      calls.push(intent);
+      if (intent === "stopped") return "stopped";
+      return new Promise((resolve) => { finishStart = resolve; });
+    },
+  });
+  const start = bus.actions.music();
+  const stop = bus.actions.music();
+  await Promise.resolve();
+  assert.deepEqual(calls, ["playing"]);
+  finishStart("playing");
+  await Promise.all([start, stop]);
+  assert.deepEqual(calls, ["playing", "stopped"]);
+  assert.equal(bus.getState().music, "stopped");
+});
+
+await test("music startup fails closed when Web Audio scheduling throws", async () => {
+  const originalWindow = globalThis.window;
+  class FailingAudioContext {
+    constructor() {
+      this.currentTime = 0;
+      this.destination = {};
+    }
+    createGain() {
+      return { gain: { value: 0 }, connect() {} };
+    }
+    async resume() {}
+    createOscillator() {
+      throw new Error("fixture scheduling failure");
+    }
+  }
+  globalThis.window = { AudioContext: FailingAudioContext };
+  try {
+    const audio = new ScoreAudio({
+      time: { duration_seconds: 4 },
+      notes: [{ start_second: 0, end_second: 1, stem: "violin-1", pitch: 60, velocity: 64 }],
+    });
+    await assert.rejects(audio.start(0), /fixture scheduling failure/);
+    assert.equal(audio.playing, false);
+    assert.equal(audio.nodes.size, 0);
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
 });
 
 await test("stale Presence completions cannot replace newer modes or status", async () => {

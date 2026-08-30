@@ -1,10 +1,13 @@
-import { ACTIONS, PRESENCE, initialControlState, reduceControlState } from "./state.js";
+import { ACTIONS, MUSIC, PRESENCE, initialControlState, reduceControlState } from "./state.js";
 
 /** Buttons, shortcuts, and browser probes all call this one named action API. */
 export function createControlActions(adapter, options = {}) {
   let state = initialControlState(options);
   let programIntent = state.program;
   let programIntentRevision = 0;
+  let musicIntent = state.music;
+  let musicIntentRevision = 0;
+  let musicOperation = Promise.resolve();
   let presenceIntent = state.presence;
   let presenceRevision = 0;
   const listeners = new Set();
@@ -52,6 +55,21 @@ export function createControlActions(adapter, options = {}) {
       if (revision === presenceRevision) presenceIntent = state.presence;
     });
   };
+  const toggleMusic = () => {
+    if (musicIntent === "unavailable") return Promise.resolve("unavailable");
+    const intent = ["playing", "suspended-by-hold"].includes(musicIntent) ? "stopped" : "playing";
+    const revision = ++musicIntentRevision;
+    musicIntent = intent;
+    const operation = musicOperation.then(() => adapter.music(intent));
+    musicOperation = operation.catch(() => undefined);
+    return run(
+      "music",
+      () => operation,
+      (value) => revision === musicIntentRevision ? { type: ACTIONS.SET_MUSIC, value } : null,
+    ).finally(() => {
+      if (revision === musicIntentRevision) musicIntent = state.music;
+    });
+  };
   const sync = (action) => {
     if (action?.type === ACTIONS.SET_PROGRAM) {
       programIntentRevision += 1;
@@ -60,6 +78,10 @@ export function createControlActions(adapter, options = {}) {
     if (action?.type === ACTIONS.SET_PRESENCE && PRESENCE.includes(action.value)) {
       if (action.value !== presenceIntent) presenceRevision += 1;
       presenceIntent = action.value;
+    }
+    if (action?.type === ACTIONS.SET_MUSIC && MUSIC.includes(action.value)) {
+      musicIntentRevision += 1;
+      musicIntent = action.value;
     }
     return dispatch(action);
   };
@@ -81,7 +103,7 @@ export function createControlActions(adapter, options = {}) {
     setProgram,
     toggleProgram: () => setProgram(programIntent === "score-led" ? "free" : "score-led"),
     toggleCutout: () => run("figure-cutout", adapter.toggleCutout, { type: ACTIONS.TOGGLE_CUTOUT }),
-    music: () => run("music", adapter.music, (value) => ({ type: ACTIONS.SET_MUSIC, value })),
+    music: toggleMusic,
     conductor: (value) => run("conductor", () => adapter.conductor(value), (result) => ({ type: ACTIONS.SET_CONDUCTOR, ...result })),
     presence: setPresence,
     openTray: (category) => dispatch({ type: ACTIONS.OPEN_TRAY, category }),

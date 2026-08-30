@@ -59,17 +59,26 @@ function dwell(phase, rest = 0.16) {
  * still a pure function of (seed, t), so an offline renderer can seek anywhere,
  * render segments out of order, and get bit-identical frames.
  */
-export function state(seed, t, program = null, stream = 0, score = null, pose = null) {
-  return program ? programState(seed, t, program, stream, score, pose) : freeState(seed, t, score, pose);
+export function state(seed, t, program = null, stream = 0, score = null, pose = null, timing = null) {
+  const hasScore = score !== null && score !== undefined;
+  const hasPose = pose !== null && pose !== undefined;
+  const hasTiming = timing !== null && timing !== undefined;
+  if (hasScore && hasTiming) throw new Error("score and timing-only clocks are mutually exclusive");
+  if (hasTiming && hasPose) throw new Error("timing-only clocks cannot admit choreography poses");
+  if (hasPose && !hasScore) throw new Error("choreography poses require a music score");
+  if (hasTiming && !program) throw new Error("timing-only clocks require a bounded program");
+  return program
+    ? programState(seed, t, program, stream, score, pose, timing)
+    : freeState(seed, t, score, pose);
 }
 
 /** Under a program, every channel is interpolated across its movement, and the
  *  MATERIAL seed changes at declared reseed points — which is how the closing
  *  movement restarts the engine with entirely different photographs while the
  *  structural moves stay the same. */
-function programState(seed, t, program, stream, score, pose) {
+function programState(seed, t, program, stream, score, pose, timing) {
   let movement, index, u, passage, music;
-  if (score) {
+  if (score !== null && score !== undefined) {
     passage = passageAt(program, seed, t, stream, score);
     music = {
       ...scoreAt(score, t, { t0: passage.t0, seconds: passage.seconds }),
@@ -92,7 +101,7 @@ function programState(seed, t, program, stream, score, pose) {
       u = music.movement.u;
     }
   } else {
-    ({ movement, index, u, passage } = movementAt(program, seed, t, stream));
+    ({ movement, index, u, passage } = movementAt(program, seed, t, stream, null, timing));
   }
   const epoch = pose ? 0 : epochAt(movement, u);
   const arrivingMovement = pose?.transition.kind === "topology"
@@ -232,7 +241,7 @@ function freeState(seed, t, score = null, pose = null) {
     passageSeconds: PERIOD,
     passageT0: Math.floor(t / PERIOD) * PERIOD,
   };
-  if (score) {
+  if (score !== null && score !== undefined) {
     result.music = {
       ...scoreAt(score, t),
       note_field: noteFieldAt(score, t),

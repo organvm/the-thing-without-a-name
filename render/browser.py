@@ -387,6 +387,28 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     }""")
     want("#s=" in shared["hash"], "clipboard fallback did not receive a river link")
     want(shared["search"] == "", "shared River retained the debug score query")
+    stale_share = page.evaluate("""async () => {
+      let finishShare;
+      Object.defineProperty(navigator, 'share', {
+        configurable:true,
+        value:() => new Promise((resolve) => { finishShare = resolve; }),
+      });
+      try {
+        const pending = danse.actions.share();
+        await danse.actions.newRiver();
+        const before = document.getElementById('river-receipt').textContent;
+        finishShare();
+        await pending;
+        return { before, after:document.getElementById('river-receipt').textContent };
+      } finally {
+        Object.defineProperty(navigator, 'share', { configurable:true, value:undefined });
+      }
+    }""")
+    want(
+        stale_share["after"] == stale_share["before"]
+        and "new river" in stale_share["after"].lower(),
+        "a stale Share completion overwrote the newer River receipt",
+    )
     shot("desktop-river-tray")
 
     page.click('[data-category="score"]')
@@ -472,13 +494,14 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
       delete window.__originalFileText;
       delete window.__finishReceiptText;
     }""")
-    page.click("#interaction-stop")
     page.set_input_files("#receipt-load", files=[{"name": "invalid.json", "mimeType": "application/json", "buffer": b"{}"}])
     page.wait_for_function(
         "() => (document.getElementById('presence-receipt')?.textContent || '').toLowerCase().includes('rejected')",
         timeout=10_000,
     )
+    page.wait_for_timeout(400)
     want("rejected" in page.locator("#presence-receipt").inner_text().lower(), "invalid receipt did not receive explicit rejection status")
+    want(page.evaluate("() => danse.controlState.presence") == "keyboard-touch", "invalid receipt replaced the active Presence mode")
     page.press("#fallback-x", "m")
     want(page.evaluate("() => danse.controlState.cutout") == "on", "letter shortcut fired while a slider held focus")
     page.press("#fallback-x", "Escape")

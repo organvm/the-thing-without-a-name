@@ -45,7 +45,12 @@ export class ScoreAudio {
     }
     await this.context.resume();
     this.playing = true;
-    this.seek(sourceSecond, true);
+    try {
+      this.seek(sourceSecond, true);
+    } catch (error) {
+      this.stop();
+      throw error;
+    }
   }
 
   stop() {
