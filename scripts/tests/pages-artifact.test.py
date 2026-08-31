@@ -604,6 +604,39 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 source_root=root,
             )
 
+    def test_forged_loose_runtime_object_under_claimed_hash_is_rejected(self) -> None:
+        root = self.base / "corrupt-object-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        object_id = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout.strip()
+        forged = (root / "arrival.js").read_bytes() + b"\n// forged payload\n"
+        RELEASE_SUPPORT.replace_loose_object_bytes(root, object_id, "blob", forged)
+        accepted_without_integrity_check = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout
+        self.assertEqual(accepted_without_integrity_check, forged)
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "failed raw Git object integrity verification",
+        ):
+            PAGES.build(
+                root,
+                self.base / "corrupt-object-pages",
+                commit,
+                require_git_source=True,
+            )
+
     def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
         root = self.base / "redirected-source"
         public_fixture(root)

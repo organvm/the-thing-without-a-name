@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
@@ -64,6 +65,21 @@ def load_release_builder():
 
 
 BUILD = load_release_builder()
+
+
+def replace_loose_object_bytes(
+    root: Path,
+    object_id: str,
+    kind: str,
+    payload: bytes,
+) -> None:
+    """Put forged bytes under an existing loose-object hash filename."""
+    loose = root / ".git" / "objects" / object_id[:2] / object_id[2:]
+    if not loose.is_file():
+        raise AssertionError(f"fixture object is not loose: {object_id}")
+    header = f"{kind} {len(payload)}\0".encode("ascii")
+    loose.chmod(0o600)
+    loose.write_bytes(zlib.compress(header + payload))
 
 
 def verify_fixture_artifact(
@@ -850,6 +866,50 @@ class ProductionCliSourceTest(unittest.TestCase):
                     tree,
                     source_root=root,
                 )
+
+    def test_forged_loose_object_under_claimed_hash_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            commit = initialize_git_fixture(root)
+            object_id = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "rev-parse",
+                    f"{commit}:release/manifest.json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=CONTRACT.provenance_git_env(),
+            ).stdout.strip()
+            forged = (root / "release/manifest.json").read_bytes().replace(
+                b'"version": "0.1.0-draft"',
+                b'"version": "0.1.1-draft"',
+                1,
+            )
+            replace_loose_object_bytes(root, object_id, "blob", forged)
+            accepted_without_integrity_check = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "show",
+                    f"{commit}:release/manifest.json",
+                ],
+                check=True,
+                capture_output=True,
+                env=CONTRACT.provenance_git_env(),
+            ).stdout
+            self.assertEqual(accepted_without_integrity_check, forged)
+
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "failed raw Git object integrity verification",
+            ):
+                BUILD.source_release_manifest(root, commit)
 
     def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

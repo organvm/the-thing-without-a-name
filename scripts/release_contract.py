@@ -729,6 +729,27 @@ def require_commit_object(root: Path, commit: str) -> str:
         raise ReleaseError(
             f"source object {commit} must resolve to a commit object: {detail}"
         )
+    integrity = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "fsck",
+            "--strict",
+            "--no-dangling",
+            "--no-reflogs",
+            commit,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if integrity.returncode != 0:
+        detail = integrity.stderr.strip() or integrity.stdout.strip() or "Git fsck failed"
+        raise ReleaseError(
+            f"source commit {commit} failed raw Git object integrity verification: {detail}"
+        )
     return commit
 
 
