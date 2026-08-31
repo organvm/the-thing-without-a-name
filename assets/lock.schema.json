@@ -31,7 +31,7 @@
         "kind": {"const": "https"},
         "url": {
           "type": "string",
-          "pattern": "^https://(?!localhost(?:[:/]|$))(?![^/?#@]*@)[^/?#@]+(?:/[^?#]*)?$"
+          "pattern": "^https://(?!localhost(?:[:/]|$))(?![^/?#@]*@)[A-Za-z0-9.-]+(?::443)?(?:/[^?#]*)?$"
         }
       }
     },
@@ -51,8 +51,8 @@
       "properties": {
         "kind": {"const": "github-release"},
         "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
-        "tag": {"type": "string", "minLength": 1},
-        "asset": {"type": "string", "pattern": "^[^/\\\\]+$"},
+        "tag": {"type": "string", "pattern": "^[^\\r\\n\\u0000]+$"},
+        "asset": {"type": "string", "pattern": "^[^/\\\\\\r\\n\\u0000]+$"},
         "token_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}
       }
     },

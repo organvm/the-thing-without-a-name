@@ -38,6 +38,10 @@ GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
 MEDIA_TYPE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
 RIGHTS_CLASSES = ("public", "restricted", "private")
 CHUNK = 1 << 20
@@ -116,7 +120,9 @@ def _https_url(value: object) -> str:
             raise AssetError("HTTPS source URL must use the default TLS port")
     except ValueError as exc:
         raise AssetError("HTTPS source URL has an invalid port") from exc
-    host = parsed.hostname.rstrip(".").lower()
+    host = parsed.hostname.lower()
+    if not HOSTNAME.fullmatch(host):
+        raise AssetError("HTTPS source URL must use a canonical DNS hostname")
     if host == "localhost" or host.endswith((".localhost", ".local")):
         raise AssetError("HTTPS source URL cannot target a local host")
     try:

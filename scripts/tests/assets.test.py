@@ -194,6 +194,8 @@ class AssetParityTest(unittest.TestCase):
             "https://user@example.com/a",
             "https://example.com/a?signature=secret",
             "https://example.com/a#x",
+            "https://example.com:444/a",
+            "https://example.com./a",
             "https://localhost/a",
             "https://127.0.0.1/a",
         ):
@@ -458,6 +460,7 @@ class AssetParityTest(unittest.TestCase):
             "https://user@example.com/private",
             "https://example.com/private?signature=secret",
             "https://example.com/private#fragment",
+            "https://example.com:444/private",
             "https://localhost/private",
         ):
             unsafe = copy.deepcopy(lock_value)
