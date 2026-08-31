@@ -39,7 +39,7 @@ Applicant attestation supplied 31 August 2026: permission from the dancer was gr
 ## What is required today
 
 1. Check out the exact submission commit on the Mac and ensure Chrome, Playwright, ffmpeg 9.0.1, FluidSynth 2.6.0, and the digest-bound MuseScore General SF3 are present.
-2. Run `submission/prepare-screendance-macos.sh /absolute/new/output-directory`. It renders the intended native-tempo 5:50.896 Delibes cut, muxes 320 kbps AAC, extracts three film stills, and rejects the result if the basic media identity is wrong.
+2. Run `bash submission/prepare-screendance-macos.sh /absolute/new/output-directory`. It renders the intended native-tempo 5:50.896 Delibes cut, muxes 320 kbps AAC, extracts three film stills, and rejects the result if the basic media identity is wrong.
 3. Watch the entire MP4 with sound. Confirm title/end credits, no black or corrupt frames except the intentional closing card, intelligible score, and acceptable choreography. This is the final-cut decision.
 4. Upload that MP4 to Vimeo. Set a password and enable downloads. Test both password playback and download while logged out or in a private window.
 5. Enter the applicant-only fields above, paste the synopsis, biography and music credit, upload one to three generated stills, choose the archive option, and accept the legal checkboxes only if true for the exact upload.
