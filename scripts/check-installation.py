@@ -15,6 +15,7 @@ from installation.contract import (  # noqa: E402
     ContractError,
     calibration_plan,
     frame_ticket,
+    installation_workbook,
     load_json,
     load_reference_contracts,
     runtime_plan,
@@ -31,7 +32,14 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--release-root", type=Path)
     value.add_argument(
         "--emit",
-        choices=("status", "calibration", "frame", "runtime-plan"),
+        choices=(
+            "status",
+            "calibration",
+            "frame",
+            "workbook",
+            "simulation",
+            "runtime-plan",
+        ),
         default="status",
     )
     value.add_argument("--seed", type=int, default=20170620)
@@ -59,6 +67,12 @@ def main(argv: list[str] | None = None) -> int:
             result = calibration_plan(spec)
         elif args.emit == "frame":
             result = frame_ticket(spec, args.seed, args.stream, args.frame)
+        elif args.emit == "workbook":
+            result = installation_workbook(spec, gates)
+        elif args.emit == "simulation":
+            from installation.simulation import run_portable_simulation
+
+            result = run_portable_simulation(spec)
         elif args.emit == "runtime-plan":
             if evidence is None or args.release_root is None:
                 raise ContractError(

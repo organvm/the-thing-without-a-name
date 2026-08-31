@@ -47,6 +47,17 @@
         "license_notice": {"$ref": "#/$defs/trackedSource"}
       }
     },
+    "hydratedRecordingSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "custody", "receipt"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "custody": {"const": "hydrated-derived"},
+        "receipt": {"$ref": "#/$defs/trackedSource"}
+      }
+    },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
@@ -75,7 +86,13 @@
           ]
         },
         "license": {"type": ["string", "null"]},
-        "source": {"anyOf": [{"$ref": "#/$defs/trackedSource"}, {"type": "null"}]},
+        "source": {
+          "anyOf": [
+            {"$ref": "#/$defs/trackedSource"},
+            {"$ref": "#/$defs/hydratedRecordingSource"},
+            {"type": "null"}
+          ]
+        },
         "sources": {
           "type": "array",
           "minItems": 1,

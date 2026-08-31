@@ -113,6 +113,8 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
+import types
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
@@ -125,33 +127,89 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-_release_scripts = str(Path(__file__).resolve().parent)
-sys.path.insert(0, _release_scripts)
-from release_contract import (
-    EXPECTED_OPPORTUNITY_FROZEN_AT,
-    EXPECTED_OPPORTUNITY_RECEIPT_SHA256,
-    EXPECTED_OPPORTUNITY_SHA256,
-    EXPECTED_SOURCE_EVIDENCE_SHA256,
-    GENERATED_PRODUCT_PATHS,
-    HEX64,
-    MANIFEST,
-    PHASES,
-    ROOT,
-    ReleaseError,
-    canonical_json,
-    load_json,
-    safe_relative,
-    sha256,
-    source_commit,
-    source_file,
-    validate_release,
-)
-if _release_scripts in sys.path:
-    sys.path.remove(_release_scripts)
-del _release_scripts
+def _load_release_contract():
+    """Load source bytes only from the contract beside this builder."""
+    path = Path(__file__).resolve().with_name("release_contract.py")
+    identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"danse_release_contract_{identity}"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = None
+    try:
+        source = path.read_bytes()
+        code = compile(source, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+        required = (
+            "EXPECTED_OPPORTUNITY_FROZEN_AT",
+            "EXPECTED_OPPORTUNITY_RECEIPT_SHA256",
+            "EXPECTED_OPPORTUNITY_SHA256",
+            "EXPECTED_SOURCE_EVIDENCE_SHA256",
+            "GENERATED_PRODUCT_PATHS",
+            "HEX64",
+            "MANIFEST",
+            "PHASES",
+            "PROGRESSIVE_CONTROLS_SCHEMA_PATH",
+            "ROOT",
+            "SCHEMA",
+            "ReleaseError",
+            "canonical_json",
+            "decode_json_object",
+            "load_json",
+            "phase_blockers",
+            "provenance_git_command",
+            "provenance_git_env",
+            "reject_git_rewrites",
+            "require_commit_object",
+            "safe_relative",
+            "sha256",
+            "source_commit",
+            "source_commit_blob",
+            "source_file",
+            "validate_release",
+            "validate_schema",
+        )
+        if any(not hasattr(module, name) for name in required):
+            raise AttributeError("release contract is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise RuntimeError("cannot load the sibling release contract") from exc
+    return module
+
+
+_RELEASE_CONTRACT = _load_release_contract()
+EXPECTED_OPPORTUNITY_FROZEN_AT = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_FROZEN_AT
+EXPECTED_OPPORTUNITY_RECEIPT_SHA256 = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_RECEIPT_SHA256
+EXPECTED_OPPORTUNITY_SHA256 = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_SHA256
+EXPECTED_SOURCE_EVIDENCE_SHA256 = _RELEASE_CONTRACT.EXPECTED_SOURCE_EVIDENCE_SHA256
+GENERATED_PRODUCT_PATHS = _RELEASE_CONTRACT.GENERATED_PRODUCT_PATHS
+HEX64 = _RELEASE_CONTRACT.HEX64
+MANIFEST = _RELEASE_CONTRACT.MANIFEST
+PHASES = _RELEASE_CONTRACT.PHASES
+PROGRESSIVE_CONTROLS_SCHEMA_PATH = _RELEASE_CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
+ROOT = _RELEASE_CONTRACT.ROOT
+SCHEMA = _RELEASE_CONTRACT.SCHEMA
+ReleaseError = _RELEASE_CONTRACT.ReleaseError
+canonical_json = _RELEASE_CONTRACT.canonical_json
+decode_json_object = _RELEASE_CONTRACT.decode_json_object
+load_json = _RELEASE_CONTRACT.load_json
+phase_blockers = _RELEASE_CONTRACT.phase_blockers
+provenance_git_command = _RELEASE_CONTRACT.provenance_git_command
+provenance_git_env = _RELEASE_CONTRACT.provenance_git_env
+reject_git_rewrites = _RELEASE_CONTRACT.reject_git_rewrites
+require_commit_object = _RELEASE_CONTRACT.require_commit_object
+safe_relative = _RELEASE_CONTRACT.safe_relative
+sha256 = _RELEASE_CONTRACT.sha256
+source_commit = _RELEASE_CONTRACT.source_commit
+source_commit_blob = _RELEASE_CONTRACT.source_commit_blob
+source_file = _RELEASE_CONTRACT.source_file
+validate_release = _RELEASE_CONTRACT.validate_release
+validate_schema = _RELEASE_CONTRACT.validate_schema
 
 ARTIFACT_SCHEMA = "danse.release-build.v1"
 ARTIFACT_MANIFEST = "release-build.json"
+PROJECT_PAGE_CONTRACT = "danse.project-page.v1"
+RELEASE_PAYLOAD_CONTRACT = "danse.release-payload.v1"
 REPOSITORY = "organvm/the-thing-without-a-name"
 PDF_NAME = "pitch/danse-installation-pitch.pdf"
 GENERATED_PATHS = (
@@ -165,6 +223,14 @@ GENERATED_PATHS = (
     "press/posting-calendar.json",
     "media/release-media.json",
 )
+PROJECT_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; "
+    "media-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; "
+    "script-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; "
+    "base-uri 'none'; form-action 'none'"
+)
+PROJECT_SITE_URL = "https://organvm.github.io/the-thing-without-a-name/"
+PROJECT_CANONICAL_URL = PROJECT_SITE_URL + "project/"
 PROJECT_RESOURCES = (
     ("pitch-pdf-copy", "Installation pitch (PDF)"),
     ("accessibility-copy", "Accessibility statement"),
@@ -173,6 +239,23 @@ PROJECT_RESOURCES = (
     ("press-kit-copy", "Press kit"),
     ("credits-copy", "Credits"),
 )
+HTML_VOID_ELEMENTS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
+PROJECT_HEAD_ELEMENTS = {"link", "meta", "style", "title"}
 
 
 class _ProjectMarkup(HTMLParser):
@@ -180,15 +263,180 @@ class _ProjectMarkup(HTMLParser):
         super().__init__()
         self.ids: set[str] = set()
         self.hrefs: list[str] = []
+        self.metas: list[dict[str, str | None]] = []
+        self.active_elements: set[str] = set()
+        self.event_handlers: set[str] = set()
+        self.duplicate_attributes: set[str] = set()
+        self.referrer_policy_overrides: set[str] = set()
+        self.link_elements: list[dict[str, str | None]] = []
+        self.doctypes = 0
+        self.html_starts = 0
+        self.html_ends = 0
+        self.html_attributes: list[dict[str, str | None]] = []
+        self.in_head = False
+        self.head_starts = 0
+        self.head_ends = 0
+        self.head_attributes: list[dict[str, str | None]] = []
+        self.head_stack: list[str] = []
+        self.in_body = False
+        self.body_starts = 0
+        self.body_ends = 0
+        self.structure_errors: set[str] = set()
+        self.head_elements: list[tuple[str, dict[str, str | None]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "html":
+            self.html_starts += 1
+            self.html_attributes.append(values)
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts
+                or self.body_starts
+            ):
+                self.structure_errors.add("misordered html start")
+        elif tag == "head":
+            self.head_starts += 1
+            self.head_attributes.append(values)
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts != 1
+                or self.head_ends
+                or self.body_starts
+                or self.in_body
+                or self.in_head
+            ):
+                self.structure_errors.add("misordered head start")
+            self.in_head = True
+        elif tag == "body":
+            self.body_starts += 1
+            if (
+                self.html_starts != 1
+                or self.html_ends
+                or self.head_starts != 1
+                or self.head_ends != 1
+                or self.in_head
+                or self.body_starts != 1
+                or self.body_ends
+                or self.in_body
+            ):
+                self.structure_errors.add("misordered body start")
+            self.in_body = True
+        elif self.in_head:
+            if not self.head_stack:
+                self.head_elements.append((tag, values))
+                if tag not in PROJECT_HEAD_ELEMENTS:
+                    self.structure_errors.add(f"prohibited head child {tag}")
+            if tag not in HTML_VOID_ELEMENTS:
+                self.head_stack.append(tag)
+        elif not self.in_body:
+            self.structure_errors.add(f"element outside head or body: {tag}")
         element_id = values.get("id")
         if element_id:
             self.ids.add(element_id)
         href = values.get("href")
         if tag == "a" and href:
             self.hrefs.append(href)
+        if tag == "meta":
+            self.metas.append(values)
+        if tag == "link":
+            self.link_elements.append(values)
+        if tag in {
+            "audio",
+            "base",
+            "embed",
+            "form",
+            "iframe",
+            "img",
+            "input",
+            "math",
+            "noscript",
+            "object",
+            "picture",
+            "script",
+            "source",
+            "svg",
+            "template",
+            "track",
+            "video",
+        }:
+            self.active_elements.add(tag)
+        self.event_handlers.update(
+            name for name, _value in attrs if name.lower().startswith("on")
+        )
+        self.referrer_policy_overrides.update(
+            value or "<empty>"
+            for name, value in attrs
+            if name.lower() == "referrerpolicy"
+            and (value or "").lower() != "no-referrer"
+        )
+        names = [name.lower() for name, _value in attrs]
+        self.duplicate_attributes.update(
+            name for name in names if names.count(name) > 1
+        )
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag not in HTML_VOID_ELEMENTS:
+            self.structure_errors.add(f"self-closing non-void element {tag}")
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "html":
+            self.html_ends += 1
+            if (
+                self.html_starts != 1
+                or self.html_ends != 1
+                or self.in_head
+                or self.in_body
+                or self.head_ends != 1
+                or self.body_ends != 1
+            ):
+                self.structure_errors.add("misordered html end")
+        elif tag == "head":
+            self.head_ends += 1
+            if not self.in_head:
+                self.structure_errors.add("unmatched head end")
+            if self.head_stack:
+                self.structure_errors.add("unclosed head descendant")
+                self.head_stack.clear()
+            self.in_head = False
+        elif tag == "body":
+            self.body_ends += 1
+            if not self.in_body or self.body_ends != 1:
+                self.structure_errors.add("misordered body end")
+            self.in_body = False
+        elif self.in_head and tag not in HTML_VOID_ELEMENTS:
+            if not self.head_stack or self.head_stack[-1] != tag:
+                self.structure_errors.add(f"mismatched head descendant {tag}")
+            else:
+                self.head_stack.pop()
+        elif not self.in_body:
+            self.structure_errors.add(f"element end outside head or body: {tag}")
+
+    def handle_data(self, data: str) -> None:
+        if self.in_head and not self.head_stack and data.strip():
+            self.structure_errors.add("non-whitespace head text")
+        elif not self.in_head and not self.in_body and data.strip():
+            self.structure_errors.add("text outside head or body")
+
+    def handle_decl(self, decl: str) -> None:
+        self.doctypes += 1
+        if (
+            decl.lower() != "doctype html"
+            or self.doctypes != 1
+            or self.html_starts
+            or self.head_starts
+            or self.body_starts
+        ):
+            self.structure_errors.add("invalid or misordered doctype")
+
+    def handle_pi(self, data: str) -> None:
+        self.structure_errors.add("processing instruction")
 
 
 def _h(value: object) -> str:
@@ -203,14 +451,57 @@ def _status(value: str) -> str:
     return f'<span class="status status-{_h(value)}">{_h(value.replace("-", " "))}</span>'
 
 
-def project_html(manifest: dict, phase: str, commit: str) -> bytes:
+def project_security_contract(manifest: dict, phase: str) -> dict:
+    """Bind project discovery metadata to the canonical site and cleared media."""
+    if phase not in PHASES:
+        raise ReleaseError(f"unknown project security phase: {phase}")
+    identity = manifest["identity"]
+    project_contract = manifest["artifact_contracts"]["project_page"]
+    if project_contract != PROJECT_PAGE_CONTRACT:
+        raise ReleaseError(f"unsupported project-page contract: {project_contract}")
+    canonical = identity["canonical_url"] + identity["project_path"]
+    if identity["canonical_url"] != PROJECT_SITE_URL or canonical != PROJECT_CANONICAL_URL:
+        raise ReleaseError("release manifest project URL drifted from the canonical site")
+    social_card = next(
+        (
+            medium
+            for medium in manifest["media"]
+            if medium["id"] == "project-social-card"
+            and phase in medium["required_for"]
+            and medium["status"] == "ready"
+            and medium["clearance"]["status"] == "cleared"
+            and medium["source"] is not None
+        ),
+        None,
+    )
+    social_image = None
+    if social_card is not None:
+        source = social_card["source"]
+        destination = safe_relative(
+            source["destination"], "project social-card destination"
+        )
+        social_image = {
+            "url": PROJECT_SITE_URL + destination,
+            "path": destination,
+            "bytes": source["bytes"],
+            "sha256": source["sha256"],
+        }
+    return {
+        "project_contract": project_contract,
+        "canonical_url": canonical,
+        "social_image": social_image,
+    }
+
+
+def _project_html_v1(manifest: dict, phase: str, commit: str) -> bytes:
     identity = manifest["identity"]
     copy = manifest["copy"]
     installation = manifest["installation"]
     accessibility = manifest["accessibility"]
     press = manifest["press"]
     draft = phase == "draft"
-    canonical = identity["canonical_url"] + identity["project_path"]
+    security_contract = project_security_contract(manifest, phase)
+    canonical = security_contract["canonical_url"]
     reference = installation["reference_contract"]
     twin_url = _repo_evidence_url(commit, reference["digital_twin"]["path"])
     gates_url = _repo_evidence_url(commit, reference["gate_ledger"]["path"])
@@ -320,18 +611,8 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
         else ""
     )
     robots = '<meta name="robots" content="noindex,nofollow">' if draft else '<meta name="robots" content="index,follow">'
-    social_card = next(
-        (
-            medium
-            for medium in manifest["media"]
-            if medium["id"] == "project-social-card"
-            and medium["status"] == "ready"
-            and medium["clearance"]["status"] == "cleared"
-            and medium["source"] is not None
-        ),
-        None,
-    )
-    social_image = identity["canonical_url"] + social_card["source"]["destination"] if social_card else None
+    social_image_record = security_contract["social_image"]
+    social_image = social_image_record["url"] if social_image_record else None
     social_meta = (
         f'<meta property="og:image" content="{_h(social_image)}">\n'
         f'  <meta name="twitter:card" content="summary_large_image">'
@@ -342,6 +623,8 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
     document = f"""<!doctype html>
 <html lang="en">
 <head>
+  <meta http-equiv="Content-Security-Policy" content="{PROJECT_CSP}">
+  <meta name="referrer" content="no-referrer">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   {robots}
@@ -428,6 +711,26 @@ def project_html(manifest: dict, phase: str, commit: str) -> bytes:
 </html>
 """
     return document.encode("utf-8")
+
+
+def project_html(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    *,
+    contract: str | None = None,
+) -> bytes:
+    """Render one explicitly versioned project-page byte contract."""
+    source_contract = manifest["artifact_contracts"]["project_page"]
+    if contract is None:
+        contract = source_contract
+    if contract != source_contract:
+        raise ReleaseError(
+            "project-page contract does not match the source manifest"
+        )
+    if contract == PROJECT_PAGE_CONTRACT:
+        return _project_html_v1(manifest, phase, commit)
+    raise ReleaseError(f"unsupported project-page contract: {contract}")
 
 
 def accessibility_markdown(manifest: dict, phase: str) -> bytes:
@@ -859,6 +1162,163 @@ def pitch_pdf(manifest: dict, phase: str, commit: str) -> bytes:
     return pdf.finish()
 
 
+def manifested_media_records(manifest: dict, phase: str) -> list[dict]:
+    """Derive every copied-media identity directly from the source manifest."""
+    if phase not in PHASES:
+        raise ReleaseError(f"unknown release payload phase: {phase}")
+    records: list[dict] = []
+    paths: set[str] = set()
+    ids: set[str] = set()
+    for medium in manifest["media"]:
+        source = medium["source"]
+        if (
+            phase not in medium["required_for"]
+            or medium["status"] != "ready"
+            or medium["clearance"]["status"] != "cleared"
+            or source is None
+        ):
+            continue
+        destination = safe_relative(
+            source["destination"],
+            f"media {medium['id']} destination",
+        )
+        if medium["id"] in ids or destination in paths:
+            raise ReleaseError("release media identities or destinations are duplicated")
+        ids.add(medium["id"])
+        paths.add(destination)
+        records.append(
+            {
+                "id": medium["id"],
+                "path": destination,
+                "bytes": source["bytes"],
+                "sha256": source["sha256"],
+            }
+        )
+    return records
+
+
+def _generated_release_files_v1(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    copied: list[dict],
+) -> dict[str, bytes]:
+    generated_files = {
+        "project/index.html": project_html(
+            manifest,
+            phase,
+            commit,
+            contract=manifest["artifact_contracts"]["project_page"],
+        ),
+        PDF_NAME: pitch_pdf(manifest, phase, commit),
+        "accessibility/accessibility.md": accessibility_markdown(manifest, phase),
+        "accessibility/captions.en.vtt": captions_vtt(manifest, phase),
+        "accessibility/transcript.txt": transcript_text(manifest, phase),
+        "press/press-kit.md": press_markdown(manifest, phase),
+        "press/credits.txt": credits_text(manifest, phase),
+        "press/posting-calendar.json": canonical_json(
+            {
+                "schema": "danse.release-posting-calendar.v1",
+                "release_id": manifest["release_id"],
+                "phase": phase,
+                "publishes_automatically": False,
+                "items": manifest["press"]["posting_calendar"],
+            }
+        ),
+    }
+    generated_products = []
+    for product in manifest["products"]:
+        relative = product["path"]
+        if (
+            GENERATED_PRODUCT_PATHS.get(product["id"]) != relative
+            or relative not in generated_files
+        ):
+            raise ReleaseError(
+                f"generated product {product['id']} has no canonical builder output"
+            )
+        data = generated_files[relative]
+        generated_products.append(
+            {
+                "id": product["id"],
+                "path": relative,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    generated_files["media/release-media.json"] = media_inventory(
+        manifest,
+        phase,
+        copied,
+        generated_products,
+    )
+    if set(generated_files) != set(GENERATED_PATHS):
+        raise ReleaseError("release builder's generated output contract drifted")
+    return generated_files
+
+
+def generated_release_files(
+    manifest: dict,
+    phase: str,
+    commit: str,
+    copied: list[dict],
+) -> dict[str, bytes]:
+    """Dispatch the source-bound, historically preserved payload renderer."""
+    contract = manifest["artifact_contracts"]["release_payload"]
+    if contract == RELEASE_PAYLOAD_CONTRACT:
+        return _generated_release_files_v1(manifest, phase, commit, copied)
+    raise ReleaseError(f"unsupported release-payload contract: {contract}")
+
+
+def release_payload_records(manifest: dict, phase: str, commit: str) -> dict[str, dict]:
+    """Return the complete source-bound identity of one release artifact."""
+    copied = manifested_media_records(manifest, phase)
+    generated = generated_release_files(manifest, phase, commit, copied)
+    records = {
+        record["path"]: {
+            "path": record["path"],
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
+        for record in copied
+    }
+    for relative, data in generated.items():
+        if relative in records:
+            raise ReleaseError(f"generated output collides with release media: {relative}")
+        records[relative] = {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    return records
+
+
+def selected_release_records(
+    manifest: dict,
+    phase: str,
+    commit: str,
+) -> dict[str, dict]:
+    """Select the exact generated/media records admitted to a composed surface."""
+    payload = release_payload_records(manifest, phase, commit)
+    selected = {
+        record["path"]: payload[record["path"]]
+        for record in manifested_media_records(manifest, phase)
+    }
+    for product in manifest["products"]:
+        if phase not in product["required_for"]:
+            continue
+        if product["status"] != "ready":
+            raise ReleaseError(
+                f"{phase} generated product {product['id']} is not admitted"
+            )
+        relative = product["path"]
+        if relative not in payload or relative in selected:
+            raise ReleaseError(
+                f"{phase} generated product {product['id']} has an invalid identity"
+            )
+        selected[relative] = payload[relative]
+    return selected
+
+
 def write_bytes(output: Path, relative: str, data: bytes) -> Path:
     relative = safe_relative(relative, "artifact output path")
     target = output / PurePosixPath(relative)
@@ -913,6 +1373,39 @@ def copy_manifested_media(
     }
 
 
+def write_committed_media(
+    data: bytes,
+    target: Path,
+    record: dict,
+    label: str,
+) -> dict:
+    """Materialize one authenticated source-commit blob without checkout filters."""
+    copied_bytes = len(data)
+    copied_sha256 = hashlib.sha256(data).hexdigest()
+    if copied_bytes != record["bytes"] or copied_sha256 != record["sha256"]:
+        raise ReleaseError(f"{label} does not match its source-manifest identity")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("xb") as target_handle:
+            target_handle.write(data)
+    except FileExistsError as exc:
+        raise ReleaseError(f"{label} destination appeared during the build") from exc
+    except OSError as exc:
+        if target.exists() and not target.is_symlink():
+            target.unlink()
+        raise ReleaseError(f"cannot materialize {label}: {exc}") from exc
+    if target.stat().st_size != copied_bytes or sha256(target) != copied_sha256:
+        target.unlink()
+        raise ReleaseError(f"{label} destination changed during the build")
+    target.chmod(0o644)
+    os.utime(target, (0, 0), follow_symlinks=False)
+    return {
+        "path": target,
+        "bytes": copied_bytes,
+        "sha256": copied_sha256,
+    }
+
+
 def artifact_inventory(root: Path) -> set[str]:
     if root.is_symlink() or not root.is_dir():
         raise ReleaseError(f"release artifact root must be a regular directory: {root}")
@@ -935,12 +1428,15 @@ def artifact_inventory(root: Path) -> set[str]:
 def validate_git_source(root: Path, expected_commit: str) -> None:
     """Bind a production CLI build to one clean, exact Git worktree."""
     root = root.absolute().resolve()
-    expected_commit = source_commit(root, expected_commit)
+    expected_commit = require_commit_object(root, expected_commit)
+    reject_git_rewrites(root)
+    git_env = provenance_git_env()
     identity = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+        provenance_git_command(root, "rev-parse", "--show-toplevel", "HEAD"),
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2:
@@ -954,18 +1450,17 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
             f"source commit {expected_commit} does not match checkout HEAD {actual_commit}"
         )
     status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
+        provenance_git_command(
+            root,
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-        ],
+        ),
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     if status.returncode != 0:
         raise ReleaseError(f"cannot inspect source checkout: {status.stderr.strip()}")
@@ -1014,6 +1509,221 @@ def verify_project_links(
             raise ReleaseError(f"project page names a missing fragment: #{parsed.fragment}")
 
 
+def verify_project_security_contract(
+    contract: object,
+    delivered_records: dict[str, dict],
+) -> tuple[str, str | None]:
+    """Validate the manifest-derived discovery URLs against receipted bytes."""
+    if not isinstance(contract, dict) or set(contract) != {
+        "project_contract",
+        "canonical_url",
+        "social_image",
+    }:
+        raise ReleaseError("project security binding has an unknown shape")
+    if contract["project_contract"] != PROJECT_PAGE_CONTRACT:
+        raise ReleaseError("project-page contract is unsupported")
+    canonical = contract["canonical_url"]
+    if canonical != PROJECT_CANONICAL_URL:
+        raise ReleaseError("project canonical URL is not manifest-bound")
+    social = contract["social_image"]
+    if social is None:
+        return canonical, None
+    if not isinstance(social, dict) or set(social) != {
+        "url",
+        "path",
+        "bytes",
+        "sha256",
+    }:
+        raise ReleaseError("project social-image binding has an unknown shape")
+    path = safe_relative(social["path"], "project social-image path")
+    if not path.startswith("media/assets/"):
+        raise ReleaseError("project social image is outside the released media boundary")
+    if social["url"] != PROJECT_SITE_URL + path:
+        raise ReleaseError("project social image URL is not manifest-bound")
+    identity = {
+        "path": path,
+        "bytes": social["bytes"],
+        "sha256": social["sha256"],
+    }
+    if delivered_records.get(path) != identity:
+        raise ReleaseError("project social image is not bound by the media receipt")
+    return canonical, social["url"]
+
+
+def verify_project_security(
+    project: str,
+    contract: object,
+    delivered_records: dict[str, dict],
+) -> None:
+    """Require the generated project page to remain passive and network-closed."""
+    canonical_url, social_image_url = verify_project_security_contract(
+        contract,
+        delivered_records,
+    )
+    parser = _ProjectMarkup()
+    parser.feed(project)
+    policies = [
+        meta.get("content")
+        for meta in parser.metas
+        if (meta.get("http-equiv") or "").lower() == "content-security-policy"
+    ]
+    if policies != [PROJECT_CSP]:
+        raise ReleaseError("project page lacks the exact fail-closed content security policy")
+    referrers = [
+        meta.get("content")
+        for meta in parser.metas
+        if (meta.get("name") or "").lower() == "referrer"
+    ]
+    if referrers != ["no-referrer"]:
+        raise ReleaseError("project page lacks the exact no-referrer policy")
+    if parser.html_attributes != [{"lang": "en"}] or parser.head_attributes != [{}]:
+        raise ReleaseError("project page opening document attributes are not exact")
+    if parser.active_elements:
+        raise ReleaseError(
+            "project page contains prohibited active elements: "
+            + ", ".join(sorted(parser.active_elements))
+        )
+    if (
+        parser.doctypes != 1
+        or parser.html_starts != 1
+        or parser.html_ends != 1
+        or parser.head_starts != 1
+        or parser.head_ends != 1
+        or parser.in_head
+        or parser.body_starts != 1
+        or parser.body_ends != 1
+        or parser.in_body
+        or parser.structure_errors
+    ):
+        details = ", ".join(sorted(parser.structure_errors)) or "head count"
+        raise ReleaseError(f"project page has malformed head structure: {details}")
+    exact_csp = {
+        "http-equiv": "Content-Security-Policy",
+        "content": PROJECT_CSP,
+    }
+    exact_referrer = {"name": "referrer", "content": "no-referrer"}
+    if (
+        len(parser.head_elements) < 2
+        or parser.head_elements[0] != ("meta", exact_csp)
+        or parser.head_elements[1] != ("meta", exact_referrer)
+    ):
+        raise ReleaseError(
+            "project security metadata must be exact and precede all head markup"
+        )
+    csp_head_positions = [0]
+    loading_positions = [
+        index
+        for index, (tag, _attrs) in enumerate(parser.head_elements)
+        if tag
+        in {
+            "audio",
+            "base",
+            "embed",
+            "form",
+            "iframe",
+            "img",
+            "link",
+            "object",
+            "script",
+            "source",
+            "style",
+            "track",
+            "video",
+        }
+    ]
+    if loading_positions and csp_head_positions[0] > min(loading_positions):
+        raise ReleaseError("project content security policy must precede load-bearing markup")
+    unexpected_http_equiv = sorted(
+        {
+            value
+            for meta in parser.metas
+            if (value := (meta.get("http-equiv") or "").lower())
+            and value != "content-security-policy"
+        }
+    )
+    if unexpected_http_equiv:
+        raise ReleaseError(
+            "project page contains prohibited HTTP-equivalent metadata: "
+            + ", ".join(unexpected_http_equiv)
+        )
+    canonical_links = [
+        link
+        for link in parser.link_elements
+        if set(link) == {"href", "rel"}
+        and (link.get("rel") or "").lower().split() == ["canonical"]
+        and link.get("href") == canonical_url
+    ]
+    if len(parser.link_elements) != 1 or len(canonical_links) != 1:
+        raise ReleaseError(
+            "project page must contain only its manifest-bound canonical link"
+        )
+    allowed_names = {
+        "viewport",
+        "referrer",
+        "robots",
+        "description",
+        "twitter:card",
+    }
+    allowed_properties = {"og:title", "og:description", "og:type", "og:url"}
+    if social_image_url is not None:
+        allowed_properties.add("og:image")
+    named: dict[str, list[str | None]] = {}
+    properties: dict[str, list[str | None]] = {}
+    charsets: list[str | None] = []
+    for meta in parser.metas:
+        if set(meta) == {"charset"}:
+            charsets.append(meta["charset"])
+            continue
+        if "http-equiv" in meta:
+            if meta != exact_csp:
+                raise ReleaseError("project page contains non-canonical HTTP metadata")
+            continue
+        if set(meta) == {"name", "content"}:
+            name = (meta.get("name") or "").lower()
+            if name not in allowed_names:
+                raise ReleaseError(f"project page contains prohibited named metadata: {name}")
+            named.setdefault(name, []).append(meta.get("content"))
+            continue
+        if set(meta) == {"property", "content"}:
+            prop = (meta.get("property") or "").lower()
+            if prop not in allowed_properties:
+                raise ReleaseError(f"project page contains prohibited property metadata: {prop}")
+            properties.setdefault(prop, []).append(meta.get("content"))
+            continue
+        raise ReleaseError("project page contains metadata outside the generated contract")
+    if charsets != ["utf-8"]:
+        raise ReleaseError("project page charset metadata drifted")
+    if set(named) != allowed_names or any(len(values) != 1 for values in named.values()):
+        raise ReleaseError("project page named metadata inventory drifted")
+    if named["twitter:card"] != [
+        "summary_large_image" if social_image_url is not None else "summary"
+    ]:
+        raise ReleaseError("project social-card metadata drifted")
+    if set(properties) != allowed_properties or any(
+        len(values) != 1 for values in properties.values()
+    ):
+        raise ReleaseError("project page property metadata inventory drifted")
+    if properties["og:type"] != ["website"] or properties["og:url"] != [canonical_url]:
+        raise ReleaseError("project Open Graph identity is not manifest-bound")
+    if social_image_url is not None and properties["og:image"] != [social_image_url]:
+        raise ReleaseError("project social image metadata is not receipt-bound")
+    if parser.event_handlers:
+        raise ReleaseError(
+            "project page contains prohibited inline event handlers: "
+            + ", ".join(sorted(parser.event_handlers))
+        )
+    if parser.referrer_policy_overrides:
+        raise ReleaseError(
+            "project page contains referrer-policy overrides: "
+            + ", ".join(sorted(parser.referrer_policy_overrides))
+        )
+    if parser.duplicate_attributes:
+        raise ReleaseError(
+            "project page contains duplicate attributes: "
+            + ", ".join(sorted(parser.duplicate_attributes))
+        )
+
+
 def _verify_pdf(path: Path, phase: str, title: str) -> None:
     try:
         reader = PdfReader(str(path))
@@ -1039,7 +1749,184 @@ def _read_utf8_artifact(output: Path, relative: str, label: str) -> str:
         raise ReleaseError(f"{label} is not readable UTF-8: {exc}") from exc
 
 
-def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
+def source_release_manifest(
+    root: Path,
+    commit: str,
+    *,
+    allow_worktree_fallback: bool = False,
+) -> tuple[dict, str]:
+    """Read the release manifest from the declared commit, or an explicit fixture."""
+    root = root.absolute().resolve()
+    if allow_worktree_fallback and not (root / ".git").exists():
+        path = source_file(root, MANIFEST.as_posix(), "release manifest")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"release manifest cannot be read: {exc}") from exc
+        manifest = decode_json_object(data, "source-commit release manifest")
+        return manifest, hashlib.sha256(data).hexdigest()
+    if not allow_worktree_fallback:
+        commit = require_commit_object(root, commit)
+    else:
+        reject_git_rewrites(root)
+    committed = subprocess.run(
+        provenance_git_command(root, "show", f"{commit}:{MANIFEST.as_posix()}"),
+        capture_output=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if committed.returncode == 0:
+        data = committed.stdout
+    elif allow_worktree_fallback:
+        path = source_file(root, MANIFEST.as_posix(), "release manifest")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"release manifest cannot be read: {exc}") from exc
+    else:
+        detail = committed.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(
+            f"cannot resolve release manifest at source commit {commit}: {detail}"
+        )
+    manifest = decode_json_object(data, "source-commit release manifest")
+    return manifest, hashlib.sha256(data).hexdigest()
+
+
+def active_toolchain() -> dict[str, str]:
+    """Return the exact dependency versions that determine generated bytes."""
+    return {
+        "python": platform.python_version(),
+        "pypdf": pypdf.__version__,
+        "reportlab": reportlab.Version,
+    }
+
+
+def release_phase_blockers(manifest: dict, phase: str) -> list[str]:
+    """Expose the trusted phase predicate after committed-data validation."""
+    return phase_blockers(manifest, phase)
+
+
+def _manifest_evidence_paths(manifest: dict) -> set[str]:
+    """Collect every manifest record that participates in phase admission."""
+    paths: set[str] = set()
+
+    def include(record: object, label: str) -> None:
+        if record is None:
+            return
+        if not isinstance(record, dict):
+            raise ReleaseError(f"{label} must be a record or null")
+        paths.add(safe_relative(record.get("path"), f"{label} path"))
+
+    for claim in manifest["claims"]:
+        include(claim["evidence"], f"claim {claim['id']} evidence")
+    for credit in manifest["credits"]:
+        include(credit["evidence"], f"credit {credit['id']} evidence")
+    for medium in manifest["media"]:
+        include(medium["source"], f"media {medium['id']} source")
+        include(
+            medium["clearance"]["evidence"],
+            f"media {medium['id']} clearance",
+        )
+    for gate in manifest["gates"]:
+        include(gate["evidence"], f"gate {gate['id']} evidence")
+
+    installation = manifest["installation"]["reference_contract"]
+    include(installation["digital_twin"], "installation digital twin")
+    include(installation["gate_ledger"], "installation gate ledger")
+    opportunity = manifest["opportunity_snapshot"]
+    paths.update(
+        {
+            safe_relative(opportunity["path"], "opportunity snapshot path"),
+            safe_relative(opportunity["receipt_path"], "opportunity receipt path"),
+            safe_relative(
+                opportunity["source_evidence_path"],
+                "opportunity source-evidence path",
+            ),
+        }
+    )
+    return paths
+
+
+def validate_source_commit_release(
+    root: Path,
+    commit: str,
+    manifest: dict,
+    phase: str,
+) -> dict:
+    """Validate phase eligibility entirely from regular blobs in ``commit``."""
+    root = root.absolute().resolve()
+    commit = require_commit_object(root, commit)
+    with tempfile.TemporaryDirectory(prefix="danse-source-release-") as temporary:
+        snapshot = Path(temporary)
+        listing = subprocess.run(
+            provenance_git_command(
+                root,
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                commit,
+            ),
+            capture_output=True,
+            check=False,
+            env=provenance_git_env(),
+        )
+        if listing.returncode != 0:
+            raise ReleaseError("cannot enumerate the declared source commit")
+        for row in (item for item in listing.stdout.split(b"\0") if item):
+            if b"\t" not in row:
+                raise ReleaseError("declared source commit has an invalid tree record")
+            identity, encoded_path = row.split(b"\t", 1)
+            try:
+                mode, kind, object_id = identity.decode("ascii").split()
+                relative = encoded_path.decode("utf-8")
+            except (UnicodeError, ValueError) as exc:
+                raise ReleaseError(
+                    "declared source commit has an invalid tree identity"
+                ) from exc
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                continue
+            relative = safe_relative(relative, "declared source path")
+            blob = subprocess.run(
+                provenance_git_command(root, "cat-file", "blob", object_id),
+                capture_output=True,
+                check=False,
+                env=provenance_git_env(),
+            )
+            if blob.returncode != 0:
+                raise ReleaseError(
+                    f"cannot read declared source file {relative}"
+                )
+            target = snapshot / PurePosixPath(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob.stdout)
+            target.chmod(0o755 if mode == "100755" else 0o644)
+
+        validate_schema(snapshot, manifest)
+
+        # The declared commit supplies data only. Executable validators always
+        # come from this verifier's trusted, versioned source tree.
+        validated = validate_release(
+            snapshot,
+            phase=phase,
+            checker_root=ROOT,
+            provenance_root=root,
+            provenance_commit=commit,
+        )
+        if validated != manifest:
+            raise ReleaseError(
+                "source-commit release validation returned different manifest bytes"
+            )
+        return validated
+
+
+def verify_artifact(
+    output: Path,
+    expected_commit: str | None = None,
+    *,
+    source_root: Path = ROOT,
+    allow_worktree_manifest: bool = False,
+) -> dict:
     output = output.absolute()
     if output.is_symlink() or not output.is_dir():
         raise ReleaseError(f"release artifact root must be a regular directory: {output}")
@@ -1063,11 +1950,19 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         raise ReleaseError("release artifact toolchain receipt is invalid")
     if not all(isinstance(value, str) and value for value in toolchain.values()):
         raise ReleaseError("release artifact toolchain versions must be non-empty strings")
+    expected_toolchain = active_toolchain()
+    if toolchain != expected_toolchain:
+        raise ReleaseError(
+            "release artifact requires its exact receipted generation toolchain; "
+            f"receipt={toolchain}, active={expected_toolchain}"
+        )
     release = receipt["release"]
     if set(release) != {
         "id",
         "version",
+        "payload_contract",
         "manifest",
+        "project_security",
         "installation_reference",
         "opportunity_snapshot",
         "opportunity_receipt",
@@ -1087,6 +1982,50 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         raise ReleaseError("release artifact opportunity_snapshot digest is invalid")
     if release["manifest"]["path"] != MANIFEST.as_posix():
         raise ReleaseError("release artifact points at a non-canonical release manifest")
+    source_manifest, source_manifest_sha256 = source_release_manifest(
+        source_root,
+        commit,
+        allow_worktree_fallback=allow_worktree_manifest,
+    )
+    if release["manifest"]["sha256"] != source_manifest_sha256:
+        raise ReleaseError("release artifact manifest digest does not match its source commit")
+    try:
+        if allow_worktree_manifest:
+            validated_source_manifest = validate_release(
+                source_root,
+                phase=receipt["phase"],
+            )
+        else:
+            validated_source_manifest = validate_source_commit_release(
+                source_root,
+                commit,
+                source_manifest,
+                receipt["phase"],
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReleaseError(
+            f"source-commit release manifest failed schema/evidence validation: {exc}"
+        ) from exc
+    if validated_source_manifest != source_manifest:
+        raise ReleaseError(
+            "validated source-commit release manifest drifted from committed bytes"
+        )
+    if (
+        release["id"] != source_manifest["release_id"]
+        or release["version"] != source_manifest["version"]
+        or release["payload_contract"]
+        != source_manifest["artifact_contracts"]["release_payload"]
+        or release["payload_contract"] != RELEASE_PAYLOAD_CONTRACT
+    ):
+        raise ReleaseError("release artifact identity drifted from its source manifest")
+    expected_project_security = project_security_contract(
+        source_manifest,
+        receipt["phase"],
+    )
+    if release["project_security"] != expected_project_security:
+        raise ReleaseError(
+            "release artifact project security binding drifted from its source manifest"
+        )
     installation_reference = release["installation_reference"]
     if not isinstance(installation_reference, dict) or set(installation_reference) != {
         "schema",
@@ -1125,6 +2064,10 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             or record["bytes"] < 0
         ):
             raise ReleaseError(f"release artifact installation {key} binding is invalid")
+    if installation_reference != source_manifest["installation"]["reference_contract"]:
+        raise ReleaseError(
+            "release artifact installation binding drifted from its source manifest"
+        )
     if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260829.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity snapshot")
     if release["opportunity_receipt"]["path"] != "opportunities/omega-20260829.receipt.json":
@@ -1143,6 +2086,7 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
     if not isinstance(records, list):
         raise ReleaseError("release artifact file inventory must be a list")
     paths: list[str] = []
+    delivered_records: dict[str, dict] = {}
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
             raise ReleaseError("release artifact contains a malformed file record")
@@ -1159,6 +2103,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
             raise ReleaseError(f"release artifact digest mismatch: {relative}")
         paths.append(relative)
+        delivered_records[relative] = {
+            "path": relative,
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ReleaseError("release artifact paths must be sorted and unique")
     inventory = artifact_inventory(output)
@@ -1175,6 +2124,21 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
 
     project = _read_utf8_artifact(output, "project/index.html", "project page")
     verify_project_links(output, set(paths))
+    verify_project_security(
+        project,
+        expected_project_security,
+        delivered_records,
+    )
+    expected_project = project_html(
+        source_manifest,
+        receipt["phase"],
+        commit,
+        contract=expected_project_security["project_contract"],
+    ).decode("utf-8")
+    if project != expected_project:
+        raise ReleaseError(
+            "project page does not reproduce the source-manifest public claims"
+        )
     draft = receipt["phase"] == "draft"
     if ('name="robots" content="noindex,nofollow"' in project) != draft:
         raise ReleaseError("project-page robot policy does not match artifact phase")
@@ -1195,6 +2159,23 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
     if not captions.startswith("WEBVTT\n"):
         raise ReleaseError("caption artifact is not WebVTT")
     _verify_pdf(output / PDF_NAME, receipt["phase"], project_title(project))
+    expected_payload = release_payload_records(
+        source_manifest,
+        receipt["phase"],
+        commit,
+    )
+    if delivered_records != expected_payload:
+        extra = sorted(set(delivered_records) - set(expected_payload))
+        missing = sorted(set(expected_payload) - set(delivered_records))
+        changed = sorted(
+            path
+            for path in set(delivered_records) & set(expected_payload)
+            if delivered_records[path] != expected_payload[path]
+        )
+        raise ReleaseError(
+            "release payload does not reproduce its source-manifest contract; "
+            f"extra={extra}, missing={missing}, changed={changed}"
+        )
     return receipt
 
 
@@ -1217,7 +2198,24 @@ def build(
     commit = source_commit(root, commit)
     if require_git_source:
         validate_git_source(root, commit)
-    manifest = validate_release(root, phase=phase)
+    source_manifest, source_manifest_sha256 = source_release_manifest(
+        root,
+        commit,
+        allow_worktree_fallback=not require_git_source,
+    )
+    if require_git_source:
+        manifest = validate_source_commit_release(
+            root,
+            commit,
+            source_manifest,
+            phase,
+        )
+    else:
+        manifest = validate_release(root, phase=phase)
+        if source_manifest != manifest:
+            raise ReleaseError(
+                "validated release manifest does not match the declared source commit"
+            )
     output = output.absolute()
     if output.is_symlink():
         raise ReleaseError(f"refusing symlinked release output: {output}")
@@ -1239,15 +2237,25 @@ def build(
             or source is None
         ):
             continue
-        source_path = source_file(root, source["path"], f"media {medium['id']} source")
+        label = f"media {medium['id']} source"
         destination = safe_relative(source["destination"], f"media {medium['id']} destination")
         target = output / PurePosixPath(destination)
-        copied_record = copy_manifested_media(
-            source_path,
-            target,
-            source,
-            f"media {medium['id']} source",
-        )
+        if require_git_source:
+            data, _executable = source_commit_blob(
+                root,
+                commit,
+                source["path"],
+                label,
+            )
+            copied_record = write_committed_media(data, target, source, label)
+        else:
+            source_path = source_file(root, source["path"], label)
+            copied_record = copy_manifested_media(
+                source_path,
+                target,
+                source,
+                label,
+            )
         copied.append(
             {
                 "id": medium["id"],
@@ -1257,46 +2265,10 @@ def build(
             }
         )
 
-    generated_files = {
-        "project/index.html": project_html(manifest, phase, commit),
-        PDF_NAME: pitch_pdf(manifest, phase, commit),
-        "accessibility/accessibility.md": accessibility_markdown(manifest, phase),
-        "accessibility/captions.en.vtt": captions_vtt(manifest, phase),
-        "accessibility/transcript.txt": transcript_text(manifest, phase),
-        "press/press-kit.md": press_markdown(manifest, phase),
-        "press/credits.txt": credits_text(manifest, phase),
-        "press/posting-calendar.json": canonical_json(
-            {
-                "schema": "danse.release-posting-calendar.v1",
-                "release_id": manifest["release_id"],
-                "phase": phase,
-                "publishes_automatically": False,
-                "items": manifest["press"]["posting_calendar"],
-            }
-        ),
-    }
-    generated_products = []
-    for product in manifest["products"]:
-        relative = product["path"]
-        if GENERATED_PRODUCT_PATHS.get(product["id"]) != relative or relative not in generated_files:
-            raise ReleaseError(f"generated product {product['id']} has no canonical builder output")
-        data = generated_files[relative]
-        generated_products.append(
-            {
-                "id": product["id"],
-                "path": relative,
-                "bytes": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
-        )
-    generated_files["media/release-media.json"] = media_inventory(
-        manifest,
-        phase,
-        copied,
-        generated_products,
-    )
-    if set(generated_files) != set(GENERATED_PATHS):
-        raise ReleaseError("release builder's generated output contract drifted")
+    expected_copied = manifested_media_records(manifest, phase)
+    if copied != expected_copied:
+        raise ReleaseError("copied media drifted from the source-manifest contract")
+    generated_files = generated_release_files(manifest, phase, commit, copied)
     for relative, data in generated_files.items():
         write_bytes(output, relative, data)
 
@@ -1304,21 +2276,21 @@ def build(
     for relative in sorted(artifact_inventory(output)):
         path = output / PurePosixPath(relative)
         files.append({"path": relative, "bytes": path.stat().st_size, "sha256": sha256(path)})
-    manifest_path = source_file(root, MANIFEST.as_posix(), "release manifest")
     installation_reference = manifest["installation"]["reference_contract"]
     receipt = {
         "schema": ARTIFACT_SCHEMA,
         "phase": phase,
         "source": {"repository": REPOSITORY, "commit": commit},
-        "toolchain": {
-            "python": platform.python_version(),
-            "pypdf": pypdf.__version__,
-            "reportlab": reportlab.Version,
-        },
+        "toolchain": active_toolchain(),
         "release": {
             "id": manifest["release_id"],
             "version": manifest["version"],
-            "manifest": {"path": MANIFEST.as_posix(), "sha256": sha256(manifest_path)},
+            "payload_contract": manifest["artifact_contracts"]["release_payload"],
+            "manifest": {
+                "path": MANIFEST.as_posix(),
+                "sha256": source_manifest_sha256,
+            },
+            "project_security": project_security_contract(manifest, phase),
             "installation_reference": {
                 "schema": installation_reference["schema"],
                 "status": installation_reference["status"],
@@ -1351,7 +2323,12 @@ def build(
     if require_git_source:
         validate_git_source(root, commit)
     write_bytes(output, ARTIFACT_MANIFEST, canonical_json(receipt))
-    return verify_artifact(output, commit)
+    return verify_artifact(
+        output,
+        commit,
+        source_root=root,
+        allow_worktree_manifest=not require_git_source,
+    )
 
 
 def main() -> int:
@@ -1373,7 +2350,12 @@ def main() -> int:
                 require_git_source=True,
             )
         else:
-            receipt = verify_artifact(args.verify, args.source_commit)
+            receipt = verify_artifact(
+                args.verify,
+                args.source_commit,
+                source_root=args.root,
+                allow_worktree_manifest=False,
+            )
             if receipt["phase"] != args.phase:
                 raise ReleaseError(
                     f"artifact phase {receipt['phase']} does not match expected {args.phase}"

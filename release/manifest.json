@@ -3,6 +3,10 @@
   "release_id": "danse-alpha-omega-20260804",
   "version": "0.1.0-draft",
   "status": "draft",
+  "artifact_contracts": {
+    "project_page": "danse.project-page.v1",
+    "release_payload": "danse.release-payload.v1"
+  },
   "opportunity_snapshot": {
     "path": "opportunities/omega-20260829.json",
     "snapshot_id": "omega-20260829",
@@ -33,15 +37,15 @@
       "schema": "danse.installation.reference-binding.v1",
       "status": "reference-only",
       "spec_id": "danse-reference-installation-20260804",
-      "spec_contract_sha256": "35cebf541a80788bce08586ada4299cbef77fffe1ebdbb4633f357214ecc9c66",
+      "spec_contract_sha256": "d069282efd9a7fc62caccffdcd0dc74ae716863a78fce955f9e8d8cc3d83f27f",
       "digital_twin": {
         "path": "installation/digital-twin.json",
-        "sha256": "1d41a80973022fe60e31cfdafd533a55629a1a8c463a2b545279ec4b2e541f7a",
+        "sha256": "d086f256354c5e21df3fedd3b8cefac8d23386da67f57acd0ade2ee7d20b3a09",
         "bytes": 5416
       },
       "gate_ledger": {
         "path": "installation/gates.json",
-        "sha256": "9a900295fe3bfefd4e637d5d221deb8b2931d2b1b4c8c144afce13aaacaf1762",
+        "sha256": "abdb7e56f90ee98150604dc0732a36d9dafd6677966a5b89cc4622aa1072166e",
         "bytes": 825
       },
       "physical_predicates_satisfied": false,

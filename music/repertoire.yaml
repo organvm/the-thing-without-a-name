@@ -90,7 +90,7 @@ works:
       source: null
       render_contract:
         path: music/audio-render.schema.json
-        sha256: e9b6098a19a9f7afaf120e0834c7f5bd49a456bd6a0cfaafce79ba38735e5956
+        sha256: a881fbe123c5998ad76430278bd518e8ff2bd4b48a2f76fa54316b102033a397
       evidence:
         - kind: deterministic-render-contract
           citation: The package must supply a matching danse.audio.render.v1 receipt; selection does not claim that ignored WAV bytes already exist.

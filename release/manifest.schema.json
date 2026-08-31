@@ -9,6 +9,7 @@
     "release_id",
     "version",
     "status",
+    "artifact_contracts",
     "opportunity_snapshot",
     "identity",
     "copy",
@@ -26,6 +27,15 @@
     "release_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]+$"},
     "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[a-z0-9.-]+)?$"},
     "status": {"enum": ["draft", "public-approved", "released"]},
+    "artifact_contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_page", "release_payload"],
+      "properties": {
+        "project_page": {"const": "danse.project-page.v1"},
+        "release_payload": {"const": "danse.release-payload.v1"}
+      }
+    },
     "opportunity_snapshot": {"$ref": "#/$defs/opportunitySnapshot"},
     "identity": {"$ref": "#/$defs/identity"},
     "copy": {"$ref": "#/$defs/copy"},

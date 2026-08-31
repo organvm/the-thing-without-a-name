@@ -70,6 +70,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import types
@@ -423,6 +424,8 @@ def _git_environment() -> dict[str, str]:
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
         "LC_ALL": "C",
     }
     # Git for Windows needs SYSTEMROOT; temporary-path variables are harmless
@@ -495,6 +498,20 @@ def _no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         if key in value:
             raise ReleaseError(f"JSON contains duplicate key {key!r}")
         value[key] = item
+    return value
+
+
+def decode_json_object(data: bytes, label: str) -> dict[str, Any]:
+    """Decode one UTF-8 JSON object while rejecting duplicate keys."""
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_no_duplicate_object,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"{label} is invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} must be a JSON object")
     return value
 
 
@@ -672,6 +689,22 @@ def _git_bytes(root: Path, *args: str) -> bytes:
     return result.stdout
 
 
+def _provenance_target(root: Path, explicit: str | None = None) -> str:
+    """Resolve one exact commit used as the descendant validation target."""
+
+    if explicit is None:
+        return _git_output(root, "rev-parse", "HEAD")
+    target = explicit.lower()
+    if not HEX40.fullmatch(target):
+        raise ReleaseError(
+            "release provenance target must be a full 40-character commit SHA"
+        )
+    resolved = _git_output(root, "rev-parse", "--verify", f"{target}^{{commit}}")
+    if resolved != target:
+        raise ReleaseError("release provenance target is not the declared commit")
+    return target
+
+
 UNSAFE_REPOSITORY_CONFIG = re.compile(
     r"\A(?:"
     r"core\.(?:worktree|fsmonitor|hookspath|attributesfile|excludesfile|"
@@ -728,7 +761,10 @@ def _reject_git_replace_refs(root: Path) -> None:
         root, "for-each-ref", "--format=%(refname)", "refs/replace"
     )
     if replacements:
-        raise ReleaseError("release validation rejects Git replacement refs")
+        raise ReleaseError(
+            "release validation rejects Git replacement refs; source repository "
+            "contains replacement object refs"
+        )
 
 
 def _reject_shallow_repository(root: Path) -> None:
@@ -898,7 +934,12 @@ def _parse_utc(value: object, label: str) -> datetime:
     return parsed
 
 
-def git_commit_identity(root: Path, oid: object) -> tuple[str, datetime]:
+def git_commit_identity(
+    root: Path,
+    oid: object,
+    *,
+    target_commit: str | None = None,
+) -> tuple[str, datetime]:
     """Resolve one real ancestor commit to its exact tree and committer time."""
 
     _reject_shallow_repository(root)
@@ -906,8 +947,8 @@ def git_commit_identity(root: Path, oid: object) -> tuple[str, datetime]:
         raise ReleaseError("release receipt has no exact 40-character repository head")
     _git_output(root, "cat-file", "-e", f"{oid}^{{commit}}")
     tree = _git_output(root, "rev-parse", f"{oid}^{{tree}}")
-    checkout_head = _git_output(root, "rev-parse", "HEAD")
-    _git_output(root, "merge-base", "--is-ancestor", oid, checkout_head)
+    target = _provenance_target(root, target_commit)
+    _git_output(root, "merge-base", "--is-ancestor", oid, target)
     committed = _git_output(root, "show", "-s", "--format=%cI", oid)
     try:
         committed_at = datetime.fromisoformat(committed).astimezone(timezone.utc)
@@ -919,7 +960,11 @@ def git_commit_identity(root: Path, oid: object) -> tuple[str, datetime]:
 
 
 def validate_evidence_only_descendant(
-    root: Path, oid: str, allowed_paths: set[str]
+    root: Path,
+    oid: str,
+    allowed_paths: set[str],
+    *,
+    target_commit: str | None = None,
 ) -> None:
     """Require checkout drift from a frozen source to be evidence-only.
 
@@ -930,6 +975,7 @@ def validate_evidence_only_descendant(
     media, and product drift all fail closed.
     """
 
+    target = _provenance_target(root, target_commit)
     try:
         source_diff = subprocess.run(
             _git_command(
@@ -941,7 +987,7 @@ def validate_evidence_only_descendant(
                 "--name-only",
                 "-z",
                 oid,
-                "HEAD",
+                target,
                 "--",
             ),
             capture_output=True,
@@ -1084,8 +1130,19 @@ def _current_rights_validation_date() -> date:
     ).date()
 
 
-def _tracked_paths(root: Path) -> set[str]:
-    payload = _git_output(root, "ls-files", "-z")
+def _tracked_paths(root: Path, *, target_commit: str | None = None) -> set[str]:
+    if target_commit is None:
+        payload = _git_output(root, "ls-files", "-z")
+    else:
+        target = _provenance_target(root, target_commit)
+        payload = _git_output(
+            root,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            target,
+        )
     return {item for item in payload.split("\0") if item}
 
 
@@ -1095,6 +1152,9 @@ def _validate_subject(
     manifest: dict[str, Any],
     contract: dict[str, Any],
     verified_git_objects: set[tuple[str, str]],
+    *,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
 ) -> tuple[dict[str, Any], datetime]:
     if not isinstance(subject, dict) or set(subject) != {
         "release_id",
@@ -1121,18 +1181,23 @@ def _validate_subject(
     source_head = subject.get("repository_head")
     if not isinstance(source_head, str) or not HEX40.fullmatch(source_head):
         raise ReleaseError("release receipt has no exact 40-character repository head")
-    checkout_head = _git_output(root, "rev-parse", "HEAD")
-    integrity_key = (source_head, checkout_head)
+    git_root = (provenance_root or root).absolute().resolve()
+    target = _provenance_target(git_root, provenance_commit)
+    integrity_key = (source_head, target)
     if integrity_key not in verified_git_objects:
-        _verify_git_object_integrity(root, source_head, checkout_head)
+        _verify_git_object_integrity(git_root, source_head, target)
         verified_git_objects.add(integrity_key)
-    tree, committed_at = git_commit_identity(root, source_head)
+    tree, committed_at = git_commit_identity(
+        git_root,
+        source_head,
+        target_commit=target,
+    )
     if subject.get("repository_tree") != tree:
         raise ReleaseError(
             "release gate receipt repository tree disagrees with its head"
         )
     _validate_frozen_manifest(
-        root,
+        git_root,
         subject["repository_head"],
         subject.get("release_manifest_sha256"),
         manifest,
@@ -1245,6 +1310,7 @@ def _rights_register_inventory(
     source_head: str,
     tracked: set[str],
     validation_date: date,
+    provenance_root: Path | None = None,
 ) -> tuple[list[str], list[str], set[str]]:
     """Return the exact cleared use and redacted-receipt inventory.
 
@@ -1277,7 +1343,13 @@ def _rights_register_inventory(
         digest = record.get("sha256")
         if relative not in tracked:
             raise ReleaseError(f"{label} is not tracked by the repository")
-        _verify_commit_record(root, source_head, relative, digest, label)
+        _verify_commit_record(
+            provenance_root or root,
+            source_head,
+            relative,
+            digest,
+            label,
+        )
         validate_public_safe_document(load_json(path, label), label)
         if relative in receipt_paths or digest in receipt_digests:
             raise ReleaseError("rights register reuses a redacted decision receipt")
@@ -1493,7 +1565,13 @@ def _tracked_head_source(
     return path, committed
 
 
-def _load_rights_checker(root: Path, source_head: str):
+def _load_rights_checker(
+    root: Path,
+    source_head: str,
+    *,
+    provenance_root: Path | None = None,
+    data_root: Path | None = None,
+):
     """Return the trusted current verifier after checking its frozen identity.
 
     Historical repository blobs are data identities only.  In particular, a
@@ -1501,16 +1579,28 @@ def _load_rights_checker(root: Path, source_head: str):
     because its digest was recorded in an evidence document.
     """
 
-    _guard_git_checkout(root)
-
     relative = RELEASE_PROOF_GENERATORS["rights-validation"]
-    path, current_bytes = _tracked_head_source(root, relative, "rights checker")
-    source_bytes = _git_bytes(root, "show", f"{source_head}:{relative}")
-    source_digest = hashlib.sha256(source_bytes).hexdigest()
     trusted_path = TRUSTED_RIGHTS_CHECKER_PATH
+    trusted_root = trusted_path.parent.parent
+    _guard_git_checkout(trusted_root)
+    path, current_bytes = _tracked_head_source(
+        trusted_root,
+        relative,
+        "rights checker",
+    )
+    source_git_root = provenance_root or root
+    source_bytes = _git_bytes(
+        source_git_root,
+        "show",
+        f"{source_head}:{relative}",
+    )
+    source_digest = hashlib.sha256(source_bytes).hexdigest()
     trusted_digest = sha256(trusted_path)
     if current_bytes != source_bytes or sha256(path) != source_digest:
-        raise ReleaseError("rights checker differs from the frozen release source")
+        raise ReleaseError(
+            "rights checker differs from the frozen release source and trusted "
+            "current verifier"
+        )
     if source_digest != trusted_digest:
         raise ReleaseError(
             "frozen rights checker identity does not match the trusted current verifier"
@@ -1518,9 +1608,13 @@ def _load_rights_checker(root: Path, source_head: str):
     return _load_trusted_source_module(
         trusted_path,
         "danse_release_trusted_rights_checker",
-        trusted_path.parent.parent,
+        trusted_root,
         source=source_bytes,
-        additional_repository_roots=(root,),
+        additional_repository_roots=tuple(
+            candidate
+            for candidate in (source_git_root, data_root)
+            if candidate is not None and candidate.resolve() != trusted_root.resolve()
+        ),
     )
 
 
@@ -1697,6 +1791,11 @@ def _validate_operational_proof(
     committed_at: datetime,
     pin: dict[str, Any],
     unsupported_authenticity: set[tuple[str, str]],
+    tracked: set[str],
+    *,
+    checker_root: Path | None = None,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
 ) -> tuple[
     str,
     datetime,
@@ -1738,8 +1837,10 @@ def _validate_operational_proof(
         or generator["version"] != f"danse-{kind}-proof-v1"
     ):
         raise ReleaseError(f"{label} names the wrong proof generator")
+    git_root = provenance_root or root
+    target_commit = _provenance_target(git_root, provenance_commit)
     generator_bytes = _git_bytes(
-        root, "show", f"{subject['repository_head']}:{generator_path}"
+        git_root, "show", f"{subject['repository_head']}:{generator_path}"
     )
     generator_sha256 = hashlib.sha256(generator_bytes).hexdigest()
     if (
@@ -1773,7 +1874,6 @@ def _validate_operational_proof(
             ZoneInfo("America/New_York")
         ).date()
         effective_validation_date = _current_rights_validation_date()
-        tracked = _tracked_paths(root)
         register = rights_binding["register"]
         if register["path"] != "rights/register.json":
             raise ReleaseError(f"{label} names the wrong rights register")
@@ -1781,7 +1881,7 @@ def _validate_operational_proof(
             raise ReleaseError(f"{label} rights register is not tracked")
         register_path = verify_record(root, register, f"{label} rights register")
         _verify_commit_record(
-            root,
+            git_root,
             subject["repository_head"],
             register["path"],
             register["sha256"],
@@ -1796,6 +1896,7 @@ def _validate_operational_proof(
                 source_head=subject["repository_head"],
                 tracked=tracked,
                 validation_date=effective_validation_date,
+                provenance_root=git_root,
             )
         )
         zero_record = rights_binding["zero_blockers"]
@@ -1805,8 +1906,8 @@ def _validate_operational_proof(
             raise ReleaseError(f"{label} zero-blocker receipt is not tracked")
         zero_path = verify_record(root, zero_record, f"{label} zero-blocker receipt")
         _verify_commit_record(
-            root,
-            _git_output(root, "rev-parse", "HEAD"),
+            git_root,
+            target_commit,
             zero_record["path"],
             zero_record["sha256"],
             f"{label} zero-blocker receipt",
@@ -1840,14 +1941,32 @@ def _validate_operational_proof(
         ):
             raise ReleaseError(f"{label} has no exact rights validator identity")
         _verify_commit_record(
-            root,
+            git_root,
             subject["repository_head"],
             generator["path"],
             generator["sha256"],
             f"{label} rights validator",
         )
         receipt = zero_document["receipt"]
-        checker = _load_rights_checker(root, subject["repository_head"])
+        checker = _load_rights_checker(
+            checker_root or git_root,
+            subject["repository_head"],
+            provenance_root=git_root,
+            data_root=root,
+        )
+        if provenance_commit is not None:
+            # The trusted rights verifier normally derives its tracked
+            # inventory from the live checkout. A materialized historical
+            # snapshot has no index, so supply the exact ls-tree inventory
+            # already authenticated for the declared target commit.
+            def declared_tracked_paths(requested_root: Path) -> set[str]:
+                if requested_root.absolute().resolve() != root.absolute().resolve():
+                    raise checker.RightsError(
+                        "rights verifier requested an unexpected source root"
+                    )
+                return set(tracked)
+
+            checker.tracked_paths = declared_tracked_paths
         try:
             expected_receipt = checker.build_clearance_scope_receipt(
                 rights_document,
@@ -2049,6 +2168,9 @@ def validate_release_gate_receipt(
     seen_owner_urls: set[str],
     unsupported_authenticity: set[tuple[str, str]],
     verified_git_objects: set[tuple[str, str]],
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
+    checker_root: Path | None = None,
 ) -> dict[str, Any]:
     """Validate one public-safe completion receipt for a non-live gate.
 
@@ -2083,6 +2205,8 @@ def validate_release_gate_receipt(
         manifest,
         contract,
         verified_git_objects,
+        provenance_root=provenance_root,
+        provenance_commit=provenance_commit,
     )
     recorded_at = _validate_receipt_time(
         receipt["recorded_at"],
@@ -2185,6 +2309,7 @@ def validate_release_gate_receipt(
                 subject,
                 committed_at,
                 pin,
+                provenance_root=provenance_root,
             )
             # A repository-authored capture can prove internal shape and source
             # binding, not that an independent system-Chrome Apple-Metal run
@@ -2211,9 +2336,13 @@ def validate_release_gate_receipt(
                 kind,
                 subject,
                 committed_at,
-                pin,
-                unsupported_authenticity,
-            )
+                    pin,
+                    unsupported_authenticity,
+                    tracked,
+                    checker_root=checker_root,
+                    provenance_root=provenance_root,
+                    provenance_commit=provenance_commit,
+                )
         if proof_id in seen_proof_ids:
             raise ReleaseError(f"{label} reuses a proof identity across release gates")
         reused_paths = extra_paths & seen_proof_paths
@@ -2294,7 +2423,11 @@ def unique_ids(records: Iterable[dict[str, Any]], label: str) -> set[str]:
     return set(ids)
 
 
-def _load_opportunity_checker(root: Path):
+def _load_opportunity_checker(
+    root: Path,
+    *,
+    data_root: Path | None = None,
+):
     checker_path, source = _tracked_head_source(
         root,
         "scripts/check-opportunities.py",
@@ -2305,10 +2438,15 @@ def _load_opportunity_checker(root: Path):
         "danse_release_opportunity_checker",
         root,
         source=source,
+        additional_repository_roots=(data_root,) if data_root is not None else (),
     )
 
 
-def _load_installation_checker(root: Path):
+def _load_installation_checker(
+    root: Path,
+    *,
+    data_root: Path | None = None,
+):
     checker_path, source = _tracked_head_source(
         root,
         "installation/contract.py",
@@ -2319,6 +2457,7 @@ def _load_installation_checker(root: Path):
         "danse_release_installation_checker",
         root,
         source=source,
+        additional_repository_roots=(data_root,) if data_root is not None else (),
     )
 
 
@@ -2327,13 +2466,18 @@ def validate_installation_binding(
     manifest: dict[str, Any],
     *,
     verify_only: bool = False,
+    checker_root: Path | None = None,
 ) -> None:
     binding = manifest["installation"]["reference_contract"]
     twin_path = verify_record(root, binding["digital_twin"], "installation digital twin")
     gates_path = verify_record(root, binding["gate_ledger"], "installation gate ledger")
     if verify_only:
         return
-    checker = _load_installation_checker(root)
+    checker_home = checker_root or root
+    checker = _load_installation_checker(
+        checker_home,
+        data_root=root if checker_home.resolve() != root.resolve() else None,
+    )
     try:
         spec = checker.validate_digital_twin(checker.load_json(twin_path), root)
         gates = checker.validate_gates(checker.load_json(gates_path), spec)
@@ -2360,6 +2504,7 @@ def validate_opportunity_binding(
     manifest: dict[str, Any],
     *,
     verify_only: bool = False,
+    checker_root: Path | None = None,
 ) -> None:
     binding = manifest["opportunity_snapshot"]
     if binding["snapshot_id"] != EXPECTED_OPPORTUNITY_ID:
@@ -2418,7 +2563,11 @@ def validate_opportunity_binding(
 
     if verify_only:
         return
-    checker = _load_opportunity_checker(root)
+    checker_home = checker_root or root
+    checker = _load_opportunity_checker(
+        checker_home,
+        data_root=root if checker_home.resolve() != root.resolve() else None,
+    )
     try:
         checker.validate_all(
             snapshot_path=snapshot_path,
@@ -2593,6 +2742,8 @@ def validate_progressive_controls_receipt(
     subject: dict[str, Any],
     committed_at: datetime,
     pin: dict[str, Any],
+    *,
+    provenance_root: Path | None = None,
 ) -> tuple[str, datetime, set[str], None, None, set[str]]:
     """Validate the pinned raw-capture replay for the progressive UI gate."""
     jsonschema = _load_jsonschema(root)
@@ -2685,7 +2836,7 @@ def validate_progressive_controls_receipt(
     if len(digests) != len(set(digests)):
         raise ReleaseError("progressive controls replay reuses a capture digest")
     generator_bytes = _git_bytes(
-        root,
+        provenance_root or root,
         "show",
         f"{subject['repository_head']}:{generator['path']}",
     )
@@ -2697,7 +2848,15 @@ def validate_progressive_controls_receipt(
     return receipt["proof_id"], observed, set(digests), None, None, set()
 
 
-def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
+def _validate_evidence_states(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
+    checker_root: Path | None = None,
+) -> None:
+    git_root = (provenance_root or root).absolute().resolve()
     for claim in manifest["claims"]:
         evidence = claim["evidence"]
         if claim["status"] == "verified":
@@ -2755,12 +2914,25 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
         and gate["id"] != "live-interaction-replay"
         for gate in manifest["gates"]
     )
-    tracked = _tracked_paths(root) if pinned_gate_present else set()
+    target_commit = (
+        _provenance_target(git_root, provenance_commit)
+        if pinned_gate_present
+        else None
+    )
+    tracked = (
+        _tracked_paths(
+            git_root,
+            target_commit=target_commit if provenance_commit is not None else None,
+        )
+        if pinned_gate_present
+        else set()
+    )
     if pinned_gate_present and RELEASE_PROOF_PINS_PATH.as_posix() not in tracked:
         raise ReleaseError("pinned release has no tracked proof pin ledger")
     if pinned_gate_present:
         pin_ledger, pins = load_proof_pins(root)
-        checkout_head = _git_output(root, "rev-parse", "HEAD")
+        assert target_commit is not None
+        checkout_head = target_commit
     else:
         pin_ledger, pins, checkout_head = None, {}, None
     seen_outer_paths: set[str] = set()
@@ -2832,6 +3004,9 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
                     seen_owner_urls=seen_owner_urls,
                     unsupported_authenticity=unsupported_authenticity,
                     verified_git_objects=verified_git_objects,
+                    provenance_root=provenance_root,
+                    provenance_commit=provenance_commit,
+                    checker_root=checker_root,
                 )
                 source_identity = _source_identity(subject)
                 if common_source is None:
@@ -2883,15 +3058,19 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
         }
         assert checkout_head is not None
         _verify_git_object_integrity(
-            root,
+            git_root,
             common_source["repository_head"],
             checkout_head,
         )
         validate_evidence_only_descendant(
-            root, common_source["repository_head"], allowed_paths
+            git_root,
+            common_source["repository_head"],
+            allowed_paths,
+            target_commit=target_commit,
         )
-        validate_clean_checkout(root)
-        if _git_output(root, "rev-parse", "HEAD") != checkout_head:
+        if provenance_commit is None:
+            validate_clean_checkout(git_root)
+        if _provenance_target(git_root, provenance_commit) != checkout_head:
             raise ReleaseError("repository HEAD changed during release validation")
 
     live_gate = next(
@@ -3001,15 +3180,110 @@ def phase_blockers(manifest: dict[str, Any], phase: str) -> list[str]:
     return blockers
 
 
+def _validate_materialized_commit_root(
+    root: Path,
+    provenance_root: Path,
+    provenance_commit: str,
+) -> None:
+    """Require every supplied snapshot file to be the exact declared blob."""
+
+    if root.is_symlink() or not root.is_dir():
+        raise ReleaseError("materialized release root must be a regular directory")
+    tree_payload = _git_bytes(
+        provenance_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        provenance_commit,
+    )
+    committed_files: dict[str, tuple[str, str]] = {}
+    for row in (item for item in tree_payload.split(b"\0") if item):
+        if b"\t" not in row:
+            raise ReleaseError("declared source commit has an invalid tree record")
+        identity, encoded_path = row.split(b"\t", 1)
+        try:
+            mode, kind, object_id = identity.decode("ascii").split()
+            relative = encoded_path.decode("utf-8")
+        except (UnicodeError, ValueError) as exc:
+            raise ReleaseError(
+                "declared source commit has an invalid tree identity"
+            ) from exc
+        if kind == "blob" and mode in {"100644", "100755"}:
+            committed_files[relative] = (mode, object_id)
+    object_format = _git_output(
+        provenance_root,
+        "rev-parse",
+        "--show-object-format",
+    )
+    if object_format not in {"sha1", "sha256"}:
+        raise ReleaseError("declared source repository uses an unknown object format")
+    observed_files: set[str] = set()
+    for current, directories, names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for directory in directories:
+            if (current_path / directory).is_symlink():
+                raise ReleaseError(
+                    "materialized release root contains a symlinked directory"
+                )
+        for name in names:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise ReleaseError(
+                    "materialized release root contains a non-regular file"
+                )
+            relative = path.relative_to(root).as_posix()
+            observed_files.add(relative)
+            try:
+                current_bytes = path.read_bytes()
+            except OSError as exc:
+                raise ReleaseError(
+                    f"cannot read materialized release file {relative}"
+                ) from exc
+            record = committed_files.get(relative)
+            if record is None:
+                raise ReleaseError(
+                    f"materialized release file {relative} is absent from its declared commit"
+                )
+            mode, object_id = record
+            hasher = hashlib.new(object_format)
+            hasher.update(f"blob {len(current_bytes)}\0".encode("ascii"))
+            hasher.update(current_bytes)
+            current_executable = bool(path.stat().st_mode & stat.S_IXUSR)
+            if hasher.hexdigest() != object_id or current_executable != (mode == "100755"):
+                raise ReleaseError(
+                    f"materialized release file {relative} differs from its declared commit"
+                )
+    missing = sorted(set(committed_files) - observed_files)
+    if missing:
+        raise ReleaseError(
+            "materialized release inventory differs from its declared commit; "
+            f"missing regular files: {', '.join(missing)}"
+        )
+
+
 def validate_release(
     root: Path = ROOT,
     *,
     manifest_path: Path | str = MANIFEST,
     phase: str = "draft",
+    checker_root: Path | None = None,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
 ) -> dict[str, Any]:
-    root = root.absolute()
+    root = root.absolute().resolve()
     if (root / ".git").exists():
         _guard_git_checkout(root)
+    if provenance_root is not None:
+        git_root = provenance_root.absolute().resolve()
+        _guard_git_checkout(git_root)
+        target = _provenance_target(git_root, provenance_commit)
+        if root != git_root:
+            _validate_materialized_commit_root(root, git_root, target)
+    elif provenance_commit is not None:
+        raise ReleaseError(
+            "declared release provenance commit requires its repository root"
+        )
     manifest_file = source_file(root, str(manifest_path), "release manifest")
     manifest = load_json(manifest_file, "release manifest")
     validate_schema(root, manifest)
@@ -3046,14 +3320,20 @@ def validate_release(
         )
 
     _validate_graph(manifest)
-    _validate_evidence_states(root, manifest)
+    _validate_evidence_states(
+        root,
+        manifest,
+        provenance_root=provenance_root,
+        provenance_commit=provenance_commit,
+        checker_root=checker_root,
+    )
     # Reject static binding drift in both contracts before either tracked
     # checker is loaded.  The second pass executes only exact tracked HEAD
     # bytes after both public data envelopes are known to be canonical.
     validate_installation_binding(root, manifest, verify_only=True)
     validate_opportunity_binding(root, manifest, verify_only=True)
-    validate_installation_binding(root, manifest)
-    validate_opportunity_binding(root, manifest)
+    validate_installation_binding(root, manifest, checker_root=checker_root)
+    validate_opportunity_binding(root, manifest, checker_root=checker_root)
     blockers = phase_blockers(manifest, phase)
     if blockers:
         preview = "; ".join(blockers[:8])
@@ -3071,3 +3351,105 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
     if not HEX40.fullmatch(commit):
         raise ReleaseError(f"source commit must be a full 40-character Git SHA: {commit!r}")
     return commit
+
+
+def require_commit_object(root: Path, commit: str) -> str:
+    """Require a raw Git commit object, never a tree/tag sharing SHA syntax."""
+    root = root.absolute().resolve()
+    _guard_git_checkout(root)
+    commit = source_commit(root, commit)
+    try:
+        kind = _git_output(root, "cat-file", "-t", commit)
+    except ReleaseError as exc:
+        raise ReleaseError(
+            f"source object {commit} must resolve to a commit object"
+        ) from exc
+    if kind != "commit":
+        raise ReleaseError(f"source object {commit} must resolve to a commit object")
+    try:
+        _verify_git_object_integrity(root, commit)
+    except ReleaseError as exc:
+        raise ReleaseError(
+            f"source commit {commit} failed raw Git object integrity verification"
+        ) from exc
+    return commit
+
+
+def source_commit_blob(
+    root: Path,
+    commit: str,
+    relative: str,
+    label: str,
+) -> tuple[bytes, bool]:
+    """Read one regular file from an already-authenticated raw commit tree.
+
+    Callers authenticate ``commit`` once with :func:`require_commit_object`
+    before reading a batch.  This shared reader preserves the tree mode check
+    so a committed symlink or submodule cannot become an apparently regular
+    file in a checkout configured with ``core.symlinks=false``.
+    """
+    relative = safe_relative(relative, label)
+    root = root.absolute().resolve()
+    _guard_git_checkout(root)
+    entry = subprocess.run(
+        _git_command(
+            root,
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            relative,
+        ),
+        capture_output=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if entry.returncode != 0:
+        detail = entry.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot inspect {label} at source commit {commit}: {detail}")
+    rows = [row for row in entry.stdout.split(b"\0") if row]
+    if len(rows) != 1 or b"\t" not in rows[0]:
+        raise ReleaseError(f"{label} is missing or ambiguous at source commit {commit}")
+    identity, encoded_path = rows[0].split(b"\t", 1)
+    try:
+        mode, kind, object_id = identity.decode("ascii").split()
+        tree_path = encoded_path.decode("utf-8")
+    except (UnicodeError, ValueError) as exc:
+        raise ReleaseError(f"{label} has an invalid Git tree identity") from exc
+    if tree_path != relative or kind != "blob" or mode not in {"100644", "100755"}:
+        raise ReleaseError(f"{label} must be a regular committed file: {relative}")
+    blob = subprocess.run(
+        _git_command(root, "cat-file", "blob", object_id),
+        capture_output=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if blob.returncode != 0:
+        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot read committed {label}: {detail}")
+    return blob.stdout, mode == "100755"
+
+
+def provenance_git_env() -> dict[str, str]:
+    """Return the validator's scrubbed, no-lazy-fetch Git environment."""
+
+    return _git_environment()
+
+
+def provenance_git_command(root: Path, *args: str) -> list[str]:
+    """Return a Git command pinned to the validated checkout and safe config."""
+
+    return _git_command(root.absolute().resolve(), *args)
+
+
+def reject_git_rewrites(root: Path) -> None:
+    """Fail closed on local replacement refs or legacy grafted history."""
+    root = root.absolute().resolve()
+    _guard_git_checkout(root)
+    graft_path = _git_directory(root) / "info" / "grafts"
+    if graft_path.exists():
+        if graft_path.is_symlink() or not graft_path.is_file():
+            raise ReleaseError("legacy Git graft path is not a regular file")
+        if graft_path.stat().st_size:
+            raise ReleaseError("source repository contains a nonempty legacy Git graft file")

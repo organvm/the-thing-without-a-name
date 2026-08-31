@@ -18,7 +18,7 @@
     "restore_rehearsal"
   ],
   "properties": {
-    "schema": {"const": "danse.installation.evidence.v1"},
+    "schema": {"const": "danse.installation.evidence.v2"},
     "evidence_id": {"type": "string", "minLength": 1},
     "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
     "venue": {
@@ -210,7 +210,8 @@
         "observed_at",
         "setup_receipt_sha256",
         "strike_receipt_sha256",
-        "restore_receipt_sha256"
+        "restore_receipt_sha256",
+        "configuration_sha256"
       ],
       "properties": {
         "setup_passed": {"type": "boolean"},
@@ -242,6 +243,12 @@
           ]
         },
         "restore_receipt_sha256": {
+          "anyOf": [
+            {"$ref": "#/$defs/sha256"},
+            {"type": "null"}
+          ]
+        },
+        "configuration_sha256": {
           "anyOf": [
             {"$ref": "#/$defs/sha256"},
             {"type": "null"}
@@ -297,6 +304,8 @@
         "generative_display_returned",
         "manual_repair_required",
         "spec_contract_sha256",
+        "configuration_sha256",
+        "runtime_telemetry_receipt",
         "runtime_telemetry_sha256",
         "receipt_sha256"
       ],
@@ -309,6 +318,31 @@
         "generative_display_returned": {"type": "boolean"},
         "manual_repair_required": {"type": "boolean"},
         "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "runtime_telemetry_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "evidence_id",
+            "proof_id",
+            "session_id",
+            "spec_contract_sha256",
+            "configuration_sha256",
+            "events_sha256",
+            "events_jsonl"
+          ],
+          "properties": {
+            "schema": {"const": "danse.installation.runtime-telemetry-receipt.v2"},
+            "evidence_id": {"type": "string", "minLength": 1},
+            "proof_id": {"type": "string", "minLength": 1},
+            "session_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$"},
+            "spec_contract_sha256": {"$ref": "#/$defs/sha256"},
+            "configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "events_sha256": {"$ref": "#/$defs/sha256"},
+            "events_jsonl": {"type": "string", "minLength": 1, "maxLength": 1048576}
+          }
+        },
         "runtime_telemetry_sha256": {"$ref": "#/$defs/sha256"},
         "receipt_sha256": {"$ref": "#/$defs/sha256"}
       }

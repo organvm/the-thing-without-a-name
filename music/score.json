@@ -9,9 +9,9 @@
   },
   "identity": {
     "work_id": "delibes-screendance-suite",
-    "repertoire_entry_sha256": "ada862dd356c629ebb6d9e264b1e3995321367c1e3fdf255d42b0da6b910da15",
+    "repertoire_entry_sha256": "d7764a7495b893c16ba1cdfd62f5d382e27312f5aa94b947b95ff51b04efa13a",
     "midi_sha256": "a42b36415e6b41f63778e19b6b171b34c65eeca3c862c22eb0f80ee67980f199",
-    "contract_sha256": "682b5fc683c04818acfb286981087a01714ef243dfeb0cdf28d081000bebdc27"
+    "contract_sha256": "8edaac9222b7d9b9de7d8057070c15f0828c2c6fe11ee45f6f834686b60a4d1e"
   },
   "time": {
     "basis": "absolute-seconds",

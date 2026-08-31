@@ -7,19 +7,23 @@ insurance, and public-operation decisions.
 
 ## Before transport
 
-1. Freeze the exact `digital-twin.json` contract digest and canonical release
+1. Run `python3 scripts/check-installation.py --emit workbook` and retain the
+   resulting non-evidentiary worksheet with this procedure. Use its derived role,
+   geometry, calibration, runtime, and receipt inventory as the clean-room setup
+   checklist; do not edit it into a passing evidence file.
+2. Freeze the exact `digital-twin.json` contract digest and canonical release
    manifest. Preserve two checksum-verified release copies on independent media.
-2. Inventory every required hardware role. Keep model, serial, rental, insurance,
+3. Inventory every required hardware role. Keep model, serial, rental, insurance,
    and private location data in the external venue receipt, never this repository.
-3. Obtain written venue approval for measured room dimensions, egress, mounting,
+4. Obtain written venue approval for measured room dimensions, egress, mounting,
    surface material, projector/lens/throw, power distribution, ventilation,
    interface/speaker routing, cabling, level limits, and the foreground launcher.
    Keep every launcher file argument canonical and release-relative; absolute,
    parent-traversing, home-relative, and `file:` arguments fail admission.
-4. Confirm that the release contains no Git metadata or developer-only tooling,
+5. Confirm that the release contains no Git metadata or developer-only tooling,
    and that its manifest inventories every delivered file. The approved launcher
    path, bytes, digest, and executable mode must match that inventory exactly.
-5. Print or retain an offline copy of this procedure, the digital twin, release
+6. Print or retain an offline copy of this procedure, the digital twin, release
    manifest, calibration plan, and venue emergency contacts.
 
 ## Clean setup
@@ -42,6 +46,28 @@ insurance, and public-operation decisions.
    repository. Do not install a LaunchAgent or any persistent service.
 7. Verify release bytes and run `scripts/check-installation.py --phase runtime`
    against the external evidence before the launcher is allowed to start.
+8. Before claiming recovery or restore, run the runtime phase with
+   `--emit runtime-plan`. Use its exact `configuration_sha256` in each v2
+   wall-plug telemetry envelope, canonical observation receipt payload, and the
+   three canonical setup/strike/restore receipt payloads. A sibling digest is not
+   sufficient: retain the exact newline-terminated JSONL telemetry bytes, and the
+   validator rehashes them and verifies their embedded `runtime-admitted`
+   configuration before recomputing every receipt hash from its payload. The
+   restore binding may be `null` only while no restore result or receipt is
+   claimed. These self-hashes establish consistency, not external provenance;
+   they cannot make `--phase complete` pass without the reviewed immutable
+   authority integration described below.
+
+Before transport or venue work, the portable control-plane preflight may be run:
+
+```bash
+python3 scripts/check-installation.py --emit simulation
+```
+
+This exercises logical output tickets and the real supervisor's clean-exit,
+crash-budget, health-failure, and release-integrity paths. A passing portable
+receipt is prerequisite engineering evidence only. It is never a calibration,
+hardware-sync, power-cycle, or restore receipt.
 
 ## Calibration order
 
@@ -76,13 +102,14 @@ spec through review; never raise a threshold merely to obtain green output.
 ## Foreground operation
 
 1. From the venue-approved session, start `installation/runtime.py --run` in the
-   foreground with the external evidence and canonical release root.
+   foreground with the external evidence, canonical release root, and a new
+   non-secret `--session-id` used for this cycle only.
 2. Allow the supervisor to stream the complete manifested release into its
    private runtime snapshot. This admission time and temporary-storage demand
    count against the venue's 180-second wall-plug recovery budget and must be
    proven on the approved host with the final release.
-3. Confirm `runtime-admitted`, `launcher-start`, and (when configured)
-   `health-ready` telemetry before opening to visitors.
+3. Confirm `runtime-admitted`, `launcher-start`, and `runtime-ready` telemetry
+   (plus `health-ready` when configured) before opening to visitors.
 4. Keep the terminal/console and emergency stop accessible to venue staff but
    outside the public projection field.
 5. The supervisor permits three restarts in a five-minute window. Repeated health
@@ -99,8 +126,11 @@ not perform it on this Mac as a substitute for venue evidence.
 
 For each of three distinct cycles:
 
-1. Start a new telemetry receipt and record the exact spec, release, evidence,
-   hardware, calibration, river, and observer identities.
+1. Start a new telemetry receipt with a distinct `--session-id` and record the
+   exact spec, release, evidence, hardware, calibration, river, and observer
+   identities. Record the validator's exact `configuration_sha256`; it must be
+   embedded in the telemetry envelope and canonical observation payload, and
+   identical across the three proofs and the restore rehearsal.
 2. Observe the generative display and visible plane/cue relationship before
    power removal.
 3. Remove power through the venue-approved test point for at least one second.
@@ -111,11 +141,23 @@ For each of three distinct cycles:
    seconds and must rejoin the approved river without changing seed, stream,
    epoch, spec, release, or hardware receipts.
 6. A named human observer confirms the display returned and no repair occurred.
-   Hash the telemetry and observation receipt before the next cycle.
+   Preserve the JSONL bytes and hash the telemetry and observation receipt before
+   the next cycle. Never reuse a runtime session ID or telemetry stream.
 
-The three proof IDs, observation times, and telemetry digests must be distinct.
+The three proof IDs, runtime session IDs, observation times, and telemetry
+digests must be distinct.
 Three software restarts, three browser refreshes, or three fixture runs do not
 satisfy this predicate.
+
+The repository currently has no trusted external authority anchor, so the
+validator deliberately rejects physical completion after checking candidate
+evidence for internal consistency. Before issue #14 can close, repository owners
+must review and integrate an immutable allowlisted authority verifier. It must
+authenticate—not merely rehash—one external receipt per cycle and bind its
+authority identity and immutable receipt identity to that cycle's session ID,
+telemetry digest, physical configuration digest, and observation time. A signing
+key, owner-authored immutable record, or equivalent rail must be chosen and
+approved outside this portable work; do not fabricate or self-approve one.
 
 ## Troubleshooting
 
@@ -154,7 +196,10 @@ satisfy this predicate.
 3. Repeat setup and every calibration stage from the tracked instructions.
 4. Run the exact approved foreground launcher and human-visible plane/cue test.
 5. Perform a documented setup, strike, and second restore. Preserve distinct
-   SHA-256 receipts for all three phases and one named observer/timestamp.
+   canonical SHA-256 receipt payloads for all three phases and one named
+   observer/timestamp. Embed the same `configuration_sha256` used by all three
+   wall-plug proofs; the validator recomputes each phase receipt, so retaining a
+   copied hash from another release or hardware set fails admission.
 
 Issue #14 remains open until this restore and the three physical wall-plug cycles
 validate together against one exact digital-twin digest.
