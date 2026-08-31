@@ -183,6 +183,9 @@ def release_artifact_fixture(base: Path, phase: str) -> Path:
         manifest = RELEASE_SUPPORT.complete_manifest(source, phase="public")
     output = base / f"{phase}-release-artifact"
     if manifest is None:
+        # The release validator executes only checker bytes proven to match a
+        # tracked checkout head, even for a draft-only downstream fixture.
+        RELEASE_SUPPORT.initialize_git_fixture(source)
         RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
     else:
         # These tests exercise Pages' artifact boundary, not authority.  The

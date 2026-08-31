@@ -3,12 +3,76 @@
 
 from __future__ import annotations
 
+# The module is normally imported from ``scripts/``.  Remove repository import
+# roots before *any* ordinary import so an ignored or index-hidden sibling cannot
+# impersonate either a standard-library or third-party dependency before Git
+# checkout guards have a chance to run.  This bootstrap uses only builtins and
+# the already-loaded builtin ``sys`` module.
+_bootstrap_sys = __import__("sys")
+_bootstrap_os = __import__("os")
+if getattr(getattr(_bootstrap_os, "__spec__", None), "origin", None) not in {
+    "built-in",
+    "frozen",
+}:
+    raise RuntimeError("release validator requires the frozen OS path bootstrap")
+_bootstrap_scripts = _bootstrap_os.path.realpath(
+    _bootstrap_os.path.dirname(__file__)
+)
+_bootstrap_root = _bootstrap_os.path.dirname(_bootstrap_scripts)
+_bootstrap_prefix = _bootstrap_os.path.realpath(_bootstrap_sys.prefix)
+_bootstrap_active_venv = _bootstrap_sys.prefix != _bootstrap_sys.base_prefix
+_bootstrap_safe_path: list[str] = []
+_bootstrap_entry = ""
+_bootstrap_candidate = ""
+_bootstrap_common = ""
+_bootstrap_prefix_common = ""
+for _bootstrap_entry in _bootstrap_sys.path:
+    _bootstrap_candidate = _bootstrap_os.path.realpath(
+        _bootstrap_entry or _bootstrap_os.getcwd()
+    )
+    try:
+        _bootstrap_common = _bootstrap_os.path.commonpath(
+            [_bootstrap_candidate, _bootstrap_root]
+        )
+    except ValueError:
+        _bootstrap_common = ""
+    try:
+        _bootstrap_prefix_common = _bootstrap_os.path.commonpath(
+            [_bootstrap_candidate, _bootstrap_prefix]
+        )
+    except ValueError:
+        _bootstrap_prefix_common = ""
+    if (
+        _bootstrap_common == _bootstrap_root
+        and not (
+            _bootstrap_active_venv
+            and _bootstrap_prefix_common == _bootstrap_prefix
+        )
+    ):
+        continue
+    _bootstrap_safe_path.append(_bootstrap_entry)
+_bootstrap_sys.path[:] = _bootstrap_safe_path
+del (
+    _bootstrap_candidate,
+    _bootstrap_common,
+    _bootstrap_entry,
+    _bootstrap_active_venv,
+    _bootstrap_os,
+    _bootstrap_prefix,
+    _bootstrap_prefix_common,
+    _bootstrap_root,
+    _bootstrap_safe_path,
+    _bootstrap_scripts,
+    _bootstrap_sys,
+)
+
 import hashlib
-import importlib.util
 import json
 import os
 import re
 import subprocess
+import sys
+import types
 from copy import deepcopy
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timezone
@@ -17,10 +81,8 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
-import jsonschema
-import rights_contract as _TRUSTED_RIGHTS_CHECKER
-
 ROOT = Path(__file__).resolve().parent.parent
+TRUSTED_RIGHTS_CHECKER_PATH = Path(__file__).resolve().with_name("rights_contract.py")
 MANIFEST = Path("release/manifest.json")
 SCHEMA = Path("release/manifest.schema.json")
 RELEASE_SCHEMA = "danse.release.v1"
@@ -277,6 +339,14 @@ RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
         "package": True,
     },
 }
+RELEASE_GATE_REQUIRED_PHASES = {
+    gate_id: (
+        ("release",)
+        if gate_id in {"release-custody", "restore-rehearsal", "actual-presentation"}
+        else ("public", "release")
+    )
+    for gate_id in RELEASE_GATE_CONTRACTS
+}
 # The schema-closed evidence pin ledger is a review inventory, not a signature or
 # trust root. Keeping mutable proof hashes out of validator code avoids an
 # impossible receipt-hash/source-commit cycle. Repository governance must still
@@ -348,7 +418,9 @@ def _git_environment() -> dict[str, str]:
     """Run provenance Git without ambient repository/object/config redirects."""
     environment = {
         "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "LC_ALL": "C",
@@ -361,6 +433,48 @@ def _git_environment() -> dict[str, str]:
         if value := os.environ.get(key):
             environment[key] = value
     return environment
+
+
+def _git_directory(root: Path) -> Path:
+    """Resolve the checkout's own Git directory without consulting Git config."""
+
+    marker = root / ".git"
+    if marker.is_dir():
+        return marker.resolve()
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ReleaseError("release validation requires an explicit Git checkout") from exc
+    if not value.startswith("gitdir: ") or "\n" in value or "\r" in value:
+        raise ReleaseError("release checkout has a malformed Git directory marker")
+    candidate = Path(value.removeprefix("gitdir: "))
+    if not candidate.is_absolute():
+        candidate = marker.parent / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseError("release checkout names an unavailable Git directory") from exc
+    if not resolved.is_dir():
+        raise ReleaseError("release checkout Git directory is not a directory")
+    return resolved
+
+
+def _git_command(root: Path, *args: str) -> list[str]:
+    """Build one provenance command pinned to the checkout under validation."""
+
+    checkout = root.resolve()
+    return [
+        "git",
+        f"--git-dir={_git_directory(checkout)}",
+        f"--work-tree={checkout}",
+        "-c",
+        f"core.worktree={checkout}",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        *args,
+    ]
 
 
 def sha256(path: Path) -> str:
@@ -522,7 +636,7 @@ def validate_public_safe_document(value: Any, label: str) -> None:
 def _git_output(root: Path, *args: str) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), *args],
+            _git_command(root, *args),
             capture_output=True,
             text=True,
             check=False,
@@ -542,7 +656,7 @@ def _git_output(root: Path, *args: str) -> str:
 def _git_bytes(root: Path, *args: str) -> bytes:
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), *args],
+            _git_command(root, *args),
             capture_output=True,
             check=False,
             env=_git_environment(),
@@ -558,12 +672,175 @@ def _git_bytes(root: Path, *args: str) -> bytes:
     return result.stdout
 
 
+UNSAFE_REPOSITORY_CONFIG = re.compile(
+    r"\A(?:"
+    r"core\.(?:worktree|fsmonitor|hookspath|attributesfile|excludesfile|"
+    r"alternaterefscommand|sshcommand|gitproxy)|"
+    r"diff\.external|diff\..*\.(?:command|textconv)|"
+    r"filter\..*\.(?:clean|smudge|process)|"
+    r"credential(?:\..*)?\.helper|"
+    r"extensions\.partialclone|"
+    r"remote\..*\.(?:promisor|partialclonefilter|vcs)|"
+    r"protocol\..*\.allow|"
+    r"fsck\..*|"
+    r"include(?:if\..*)?\.path"
+    r")\Z",
+    re.IGNORECASE,
+)
+
+
+def _reject_unsafe_repository_config(root: Path) -> None:
+    """Reject local config capable of redirecting or executing provenance Git."""
+
+    payload = _git_bytes(
+        root,
+        "config",
+        "--includes",
+        "--null",
+        "--show-scope",
+        "--show-origin",
+        "--list",
+    )
+    fields = payload.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 3:
+        raise ReleaseError("cannot inspect repository-local Git config")
+    unsafe: list[str] = []
+    for index in range(0, len(fields), 3):
+        try:
+            scope = fields[index].decode("ascii")
+            _origin = fields[index + 1].decode("utf-8")
+            name, _value = fields[index + 2].decode("utf-8").split("\n", 1)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ReleaseError("cannot inspect repository-local Git config") from exc
+        if scope in {"local", "worktree"} and UNSAFE_REPOSITORY_CONFIG.fullmatch(name):
+            unsafe.append(name)
+    if unsafe:
+        raise ReleaseError(
+            "pinned release validation rejects redirecting or executable "
+            "repository-local Git config: " + ", ".join(sorted(set(unsafe)))
+        )
+
+
 def _reject_git_replace_refs(root: Path) -> None:
     replacements = _git_output(
         root, "for-each-ref", "--format=%(refname)", "refs/replace"
     )
     if replacements:
         raise ReleaseError("release validation rejects Git replacement refs")
+
+
+def _reject_shallow_repository(root: Path) -> None:
+    """Reject truncated history before trusting ancestry or reachable objects."""
+
+    shallow = _git_output(root, "rev-parse", "--is-shallow-repository")
+    if shallow not in {"true", "false"}:
+        raise ReleaseError("cannot determine whether the release repository is shallow")
+    if shallow == "true":
+        raise ReleaseError(
+            "pinned release validation rejects shallow repositories; fetch the full "
+            "reachable history before validating terminal evidence"
+        )
+
+
+def _reject_hidden_index_flags(root: Path) -> None:
+    """Reject index hints that can hide substituted worktree bytes."""
+
+    index = _git_bytes(root, "ls-files", "-v", "-z")
+    hidden_paths: list[str] = []
+    for entry in index.split(b"\0"):
+        if not entry:
+            continue
+        if len(entry) < 3 or entry[1:2] != b" ":
+            raise ReleaseError("cannot inspect release checkout index flags")
+        try:
+            marker = chr(entry[0])
+            relative = entry[2:].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseError(
+                "pinned release validation rejects non-UTF-8 tracked paths"
+            ) from exc
+        if marker == "S" or marker.islower():
+            hidden_paths.append(relative)
+    if hidden_paths:
+        raise ReleaseError(
+            "pinned release validation rejects skip-worktree or assume-unchanged "
+            "index flags: " + ", ".join(sorted(hidden_paths))
+        )
+
+
+def _guard_git_checkout(root: Path) -> None:
+    """Apply non-executing provenance guards before reading project inputs."""
+
+    _reject_unsafe_repository_config(root)
+    _reject_shallow_repository(root)
+    _reject_git_replace_refs(root)
+    _reject_hidden_index_flags(root)
+
+
+_JSONSCHEMA: Any | None = None
+
+
+def _load_jsonschema(repository_root: Path):
+    """Load the external schema library only after repository guards run.
+
+    The validator itself is commonly imported from ``scripts/``.  Deferring this
+    third-party import prevents an ignored or index-hidden module beside the
+    validator from executing before the checkout boundary has been inspected.
+    """
+
+    root = repository_root.resolve()
+    if (root / ".git").exists():
+        _guard_git_checkout(root)
+
+    prefix = Path(sys.prefix).resolve()
+    active_venv = sys.prefix != sys.base_prefix
+    global _JSONSCHEMA
+    if _JSONSCHEMA is None:
+        original_path = list(sys.path)
+        safe_path: list[str] = []
+        for entry in original_path:
+            try:
+                candidate = Path(entry or os.getcwd()).resolve()
+                candidate.relative_to(root)
+            except OSError:
+                continue
+            except ValueError:
+                safe_path.append(entry)
+                continue
+            try:
+                candidate.relative_to(prefix)
+            except ValueError:
+                continue
+            if active_venv:
+                safe_path.append(entry)
+        try:
+            sys.path[:] = safe_path
+            module = __import__("jsonschema")
+        except Exception as exc:
+            raise ReleaseError("cannot load the trusted JSON Schema verifier") from exc
+        finally:
+            sys.path[:] = original_path
+        _JSONSCHEMA = module
+
+    origin_value = getattr(_JSONSCHEMA, "__file__", None)
+    if not isinstance(origin_value, str):
+        raise ReleaseError("trusted JSON Schema verifier has no source identity")
+    try:
+        Path(origin_value).resolve().relative_to(root)
+    except (OSError, ValueError):
+        return _JSONSCHEMA
+    if active_venv:
+        try:
+            Path(origin_value).resolve().relative_to(prefix)
+        except (OSError, ValueError):
+            pass
+        else:
+            return _JSONSCHEMA
+    raise ReleaseError(
+        "trusted JSON Schema verifier resolves inside the repository under validation"
+    )
 
 
 def _verify_git_object_integrity(root: Path, *oids: str) -> None:
@@ -577,10 +854,8 @@ def _verify_git_object_integrity(root: Path, *oids: str) -> None:
 
     try:
         result = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
+            _git_command(
+                root,
                 "fsck",
                 "--full",
                 "--strict",
@@ -588,7 +863,7 @@ def _verify_git_object_integrity(root: Path, *oids: str) -> None:
                 "--no-dangling",
                 "--no-progress",
                 *oids,
-            ],
+            ),
             capture_output=True,
             check=False,
             env=_git_environment(),
@@ -626,6 +901,7 @@ def _parse_utc(value: object, label: str) -> datetime:
 def git_commit_identity(root: Path, oid: object) -> tuple[str, datetime]:
     """Resolve one real ancestor commit to its exact tree and committer time."""
 
+    _reject_shallow_repository(root)
     if not isinstance(oid, str) or not HEX40.fullmatch(oid):
         raise ReleaseError("release receipt has no exact 40-character repository head")
     _git_output(root, "cat-file", "-e", f"{oid}^{{commit}}")
@@ -656,18 +932,18 @@ def validate_evidence_only_descendant(
 
     try:
         source_diff = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
+            _git_command(
+                root,
                 "diff",
                 "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
                 "--name-only",
                 "-z",
                 oid,
                 "HEAD",
                 "--",
-            ],
+            ),
             capture_output=True,
             check=False,
             env=_git_environment(),
@@ -746,6 +1022,8 @@ def _validate_frozen_manifest(
 
 
 def validate_clean_checkout(root: Path) -> None:
+    _reject_unsafe_repository_config(root)
+    _reject_hidden_index_flags(root)
     status = _git_bytes(
         root,
         "status",
@@ -1122,6 +1400,7 @@ def _strict_owner_comment_url(value: object, issue: int, comment_id: int) -> str
 
 
 def _load_closed_schema(root: Path, relative: Path, label: str) -> dict[str, Any]:
+    jsonschema = _load_jsonschema(root)
     schema = load_json(
         source_file(root, relative.as_posix(), f"{label} schema"), f"{label} schema"
     )
@@ -1132,6 +1411,88 @@ def _load_closed_schema(root: Path, relative: Path, label: str) -> dict[str, Any
     return schema
 
 
+def _load_trusted_source_module(
+    path: Path,
+    name: str,
+    repository_root: Path,
+    *,
+    source: bytes | None = None,
+    additional_repository_roots: Iterable[Path] = (),
+):
+    """Execute exact reviewed source bytes without bytecode or repo import shadows."""
+
+    try:
+        source_bytes = path.read_bytes() if source is None else source
+        code = compile(source_bytes, str(path), "exec", dont_inherit=True)
+    except (OSError, SyntaxError) as exc:
+        raise ReleaseError(f"cannot compile trusted source module {path}") from exc
+
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = None
+
+    boundaries = (
+        repository_root.resolve(),
+        *(candidate.resolve() for candidate in additional_repository_roots),
+    )
+    prefix = Path(sys.prefix).resolve()
+    active_venv = sys.prefix != sys.base_prefix
+    original_path = list(sys.path)
+    safe_path: list[str] = []
+    for entry in original_path:
+        try:
+            candidate = Path(entry or os.getcwd()).resolve()
+        except OSError:
+            continue
+        inside_repository = False
+        for boundary in boundaries:
+            try:
+                candidate.relative_to(boundary)
+            except ValueError:
+                continue
+            inside_repository = True
+            break
+        try:
+            candidate.relative_to(prefix)
+            inside_active_venv = active_venv
+        except ValueError:
+            inside_active_venv = False
+        if not inside_repository or inside_active_venv:
+            safe_path.append(entry)
+    try:
+        sys.path[:] = safe_path
+        exec(code, module.__dict__)
+    except Exception as exc:
+        raise ReleaseError(f"cannot execute trusted source module {path}") from exc
+    finally:
+        sys.path[:] = original_path
+    return module
+
+
+def _tracked_head_source(
+    root: Path,
+    relative: str,
+    label: str,
+) -> tuple[Path, bytes]:
+    """Return exact tracked HEAD bytes, rejecting worktree substitution first."""
+
+    _guard_git_checkout(root)
+    if relative not in _tracked_paths(root):
+        raise ReleaseError(f"{label} is not tracked at the checkout head")
+    head = _git_output(root, "rev-parse", "HEAD")
+    committed = _git_bytes(root, "show", f"{head}:{relative}")
+    path = source_file(root, relative, label)
+    try:
+        worktree = path.read_bytes()
+    except OSError as exc:
+        raise ReleaseError(f"cannot read {label}") from exc
+    if worktree != committed:
+        raise ReleaseError(f"{label} differs from its exact tracked HEAD bytes")
+    return path, committed
+
+
 def _load_rights_checker(root: Path, source_head: str):
     """Return the trusted current verifier after checking its frozen identity.
 
@@ -1140,23 +1501,31 @@ def _load_rights_checker(root: Path, source_head: str):
     because its digest was recorded in an evidence document.
     """
 
+    _guard_git_checkout(root)
+
     relative = RELEASE_PROOF_GENERATORS["rights-validation"]
-    path = source_file(root, relative, "rights checker")
-    source_digest = hashlib.sha256(
-        _git_bytes(root, "show", f"{source_head}:{relative}")
-    ).hexdigest()
-    trusted_path = Path(_TRUSTED_RIGHTS_CHECKER.__file__).resolve()
+    path, current_bytes = _tracked_head_source(root, relative, "rights checker")
+    source_bytes = _git_bytes(root, "show", f"{source_head}:{relative}")
+    source_digest = hashlib.sha256(source_bytes).hexdigest()
+    trusted_path = TRUSTED_RIGHTS_CHECKER_PATH
     trusted_digest = sha256(trusted_path)
-    if sha256(path) != source_digest:
+    if current_bytes != source_bytes or sha256(path) != source_digest:
         raise ReleaseError("rights checker differs from the frozen release source")
     if source_digest != trusted_digest:
         raise ReleaseError(
             "frozen rights checker identity does not match the trusted current verifier"
         )
-    return _TRUSTED_RIGHTS_CHECKER
+    return _load_trusted_source_module(
+        trusted_path,
+        "danse_release_trusted_rights_checker",
+        trusted_path.parent.parent,
+        source=source_bytes,
+        additional_repository_roots=(root,),
+    )
 
 
 def _validate_schema(document: Any, schema: dict[str, Any], label: str) -> None:
+    jsonschema = _load_jsonschema(ROOT)
     errors = sorted(
         jsonschema.Draft202012Validator(
             schema,
@@ -1591,6 +1960,14 @@ def _validate_operational_proof(
         ):
             raise ReleaseError(f"{label} check digests do not bind its rights inventory")
         consumed_paths.add(zero_record["path"])
+        # Recomputing the public register establishes deterministic consistency,
+        # but it cannot authenticate a contributor/rightsholder decision.  Until
+        # a distinct trusted external authority verifier exists, the terminal
+        # rights gate must remain pending even when every structural predicate is
+        # otherwise satisfied.
+        unsupported_authenticity.add(
+            (gate["id"], "rights-validation-external-authority")
+        )
     elif rights_binding is not None:
         raise ReleaseError(f"{label} invents an out-of-scope rights binding")
     authority_source = document["authority_source"]
@@ -1809,6 +2186,16 @@ def validate_release_gate_receipt(
                 committed_at,
                 pin,
             )
+            # A repository-authored capture can prove internal shape and source
+            # binding, not that an independent system-Chrome Apple-Metal run
+            # actually occurred.  Preserve the structural diagnostics while
+            # refusing terminal completion absent a trusted external verifier.
+            unsupported_authenticity.add(
+                (
+                    gate["id"],
+                    "progressive-controls-replay-external-authenticity",
+                )
+            )
         else:
             (
                 proof_id,
@@ -1908,29 +2295,44 @@ def unique_ids(records: Iterable[dict[str, Any]], label: str) -> set[str]:
 
 
 def _load_opportunity_checker(root: Path):
-    checker_path = source_file(root, "scripts/check-opportunities.py", "opportunity checker")
-    spec = importlib.util.spec_from_file_location("danse_release_opportunity_checker", checker_path)
-    if spec is None or spec.loader is None:
-        raise ReleaseError("cannot load the opportunity checker")
-    checker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(checker)
-    return checker
+    checker_path, source = _tracked_head_source(
+        root,
+        "scripts/check-opportunities.py",
+        "opportunity checker",
+    )
+    return _load_trusted_source_module(
+        checker_path,
+        "danse_release_opportunity_checker",
+        root,
+        source=source,
+    )
 
 
 def _load_installation_checker(root: Path):
-    checker_path = source_file(root, "installation/contract.py", "installation checker")
-    spec = importlib.util.spec_from_file_location("danse_release_installation_checker", checker_path)
-    if spec is None or spec.loader is None:
-        raise ReleaseError("cannot load the installation checker")
-    checker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(checker)
-    return checker
+    checker_path, source = _tracked_head_source(
+        root,
+        "installation/contract.py",
+        "installation checker",
+    )
+    return _load_trusted_source_module(
+        checker_path,
+        "danse_release_installation_checker",
+        root,
+        source=source,
+    )
 
 
-def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_installation_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    verify_only: bool = False,
+) -> None:
     binding = manifest["installation"]["reference_contract"]
     twin_path = verify_record(root, binding["digital_twin"], "installation digital twin")
     gates_path = verify_record(root, binding["gate_ledger"], "installation gate ledger")
+    if verify_only:
+        return
     checker = _load_installation_checker(root)
     try:
         spec = checker.validate_digital_twin(checker.load_json(twin_path), root)
@@ -1953,7 +2355,12 @@ def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
             raise ReleaseError(f"installation reference binding {key} drifted")
 
 
-def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_opportunity_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    verify_only: bool = False,
+) -> None:
     binding = manifest["opportunity_snapshot"]
     if binding["snapshot_id"] != EXPECTED_OPPORTUNITY_ID:
         raise ReleaseError("release manifest consumes the wrong opportunity snapshot id")
@@ -2009,6 +2416,8 @@ def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
     if consumer != {"issue": 12, "binding": "release/manifest.json", "status": "pending"}:
         raise ReleaseError("opportunity receipt no longer reserves issue 12 for release/manifest.json")
 
+    if verify_only:
+        return
     checker = _load_opportunity_checker(root)
     try:
         checker.validate_all(
@@ -2024,6 +2433,7 @@ def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
 
 
 def validate_schema(root: Path, manifest: dict[str, Any]) -> None:
+    jsonschema = _load_jsonschema(root)
     schema = load_json(source_file(root, SCHEMA.as_posix(), "release schema"), "release schema")
     try:
         jsonschema.Draft202012Validator.check_schema(schema)
@@ -2041,7 +2451,31 @@ def validate_schema(root: Path, manifest: dict[str, Any]) -> None:
         raise ReleaseError(f"release manifest schema failure at {location}: {error.message}")
 
 
-def _validate_graph(manifest: dict[str, Any], gate_ids: set[str]) -> None:
+def _validate_gate_inventory(manifest: dict[str, Any]) -> set[str]:
+    """Bind terminal gate identity, order, ownership, and phase routing to code."""
+
+    gates = manifest.get("gates")
+    if not isinstance(gates, list):
+        raise ReleaseError("release gate inventory is malformed")
+    expected_ids = list(RELEASE_GATE_CONTRACTS)
+    actual_ids = [gate.get("id") if isinstance(gate, dict) else None for gate in gates]
+    if actual_ids != expected_ids:
+        raise ReleaseError(
+            "release gate inventory or order differs from the canonical terminal contract"
+        )
+    for gate in gates:
+        gate_id = gate["id"]
+        contract = RELEASE_GATE_CONTRACTS[gate_id]
+        if gate.get("issue") != contract["issue"] or gate.get("owner") != contract["owner"]:
+            raise ReleaseError(f"release gate {gate_id} owner or issue drifted")
+        if tuple(gate.get("required_for", ())) != RELEASE_GATE_REQUIRED_PHASES[gate_id]:
+            raise ReleaseError(
+                f"release gate {gate_id} required phase routing drifted from its canonical contract"
+            )
+    return set(expected_ids)
+
+
+def _validate_graph(manifest: dict[str, Any]) -> None:
     nodes = manifest["installation"]["system_flow"]
     node_ids = unique_ids(nodes, "system-flow node")
     for node in nodes:
@@ -2071,9 +2505,9 @@ def _validate_graph(manifest: dict[str, Any], gate_ids: set[str]) -> None:
 
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
-            if requirement["evidence_gate"] not in gate_ids:
+            if requirement["evidence_gate"] != "installation-evidence":
                 raise ReleaseError(
-                    f"{section} item {requirement['item']!r} names an unknown evidence gate"
+                    f"{section} item {requirement['item']!r} does not use the canonical installation evidence gate"
                 )
 
 
@@ -2161,6 +2595,7 @@ def validate_progressive_controls_receipt(
     pin: dict[str, Any],
 ) -> tuple[str, datetime, set[str], None, None, set[str]]:
     """Validate the pinned raw-capture replay for the progressive UI gate."""
+    jsonschema = _load_jsonschema(root)
     receipt = load_json(path, "progressive controls replay receipt")
     schema_path = source_file(
         root,
@@ -2485,15 +2920,16 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
             for gate_id, kind in sorted(unsupported_authenticity)
         )
         raise ReleaseError(
-            "release gates claim completion from operational proofs with no "
-            f"trusted current authenticity verifier ({claims}); those gates "
-            "must remain pending"
+            "release gates claim completion with no trusted external "
+            f"authenticity verifier or current kind-specific verifier ({claims}); "
+            "those gates must remain pending"
         )
 
 
 def phase_blockers(manifest: dict[str, Any], phase: str) -> list[str]:
     if phase not in PHASES:
         raise ReleaseError(f"unknown release phase {phase!r}")
+    _validate_gate_inventory(manifest)
     if phase == "draft":
         return []
 
@@ -2573,7 +3009,7 @@ def validate_release(
 ) -> dict[str, Any]:
     root = root.absolute()
     if (root / ".git").exists():
-        _reject_git_replace_refs(root)
+        _guard_git_checkout(root)
     manifest_file = source_file(root, str(manifest_path), "release manifest")
     manifest = load_json(manifest_file, "release manifest")
     validate_schema(root, manifest)
@@ -2589,7 +3025,7 @@ def validate_release(
     credit_ids = unique_ids(manifest["credits"], "credit")
     media_ids = unique_ids(manifest["media"], "media")
     product_ids = unique_ids(manifest["products"], "product")
-    gate_ids = unique_ids(manifest["gates"], "gate")
+    _validate_gate_inventory(manifest)
     identity_groups = (claim_ids, credit_ids, media_ids, product_ids)
     if any(
         left & right
@@ -2604,11 +3040,18 @@ def validate_release(
     for item in calendar:
         if item["asset_id"] not in media_ids:
             raise ReleaseError(f"posting calendar names unknown media {item['asset_id']}")
-    if manifest["accessibility"]["review_gate"] not in gate_ids:
-        raise ReleaseError("accessibility review names an unknown gate")
+    if manifest["accessibility"]["review_gate"] != "accessibility-review":
+        raise ReleaseError(
+            "accessibility review does not use its canonical review gate"
+        )
 
-    _validate_graph(manifest, gate_ids)
+    _validate_graph(manifest)
     _validate_evidence_states(root, manifest)
+    # Reject static binding drift in both contracts before either tracked
+    # checker is loaded.  The second pass executes only exact tracked HEAD
+    # bytes after both public data envelopes are known to be canonical.
+    validate_installation_binding(root, manifest, verify_only=True)
+    validate_opportunity_binding(root, manifest, verify_only=True)
     validate_installation_binding(root, manifest)
     validate_opportunity_binding(root, manifest)
     blockers = phase_blockers(manifest, phase)
@@ -2622,16 +3065,8 @@ def validate_release(
 def source_commit(root: Path, explicit: str | None = None) -> str:
     commit = explicit
     if commit is None:
-        done = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=_git_environment(),
-        )
-        if done.returncode != 0:
-            raise ReleaseError(f"cannot resolve source commit: {done.stderr.strip()}")
-        commit = done.stdout.strip()
+        _guard_git_checkout(root)
+        commit = _git_output(root, "rev-parse", "HEAD")
     commit = commit.lower()
     if not HEX40.fullmatch(commit):
         raise ReleaseError(f"source commit must be a full 40-character Git SHA: {commit!r}")

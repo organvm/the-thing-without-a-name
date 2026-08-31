@@ -42,7 +42,10 @@ interface. `progressive-controls-replay` requires a separate exact-head browser 
 at `release/evidence/progressive-controls-replay.json`, validated by the
 [`danse.progressive-controls-replay.v2` schema](progressive-controls-replay.schema.json)
 and its gate-specific identity, check-inventory, Apple-Metal, and privacy-boundary
-validator before public admission. Neither receipt satisfies publication approval.
+validator. That proves only a source-bound, internally consistent record. It cannot
+authenticate that an independent system-Chrome Apple-Metal run occurred, so the gate
+stays pending until a trusted external producer or attestation verifier exists. Neither
+receipt satisfies publication approval.
 
 Terminal receipts use a two-stage source/evidence contract. A real ancestor commit
 freezes `release/manifest.json`, validator and schema code, runtime, media, product,
@@ -50,9 +53,13 @@ rights, and package identities. Its descendants may change only the canonical ga
 state plus the schema-closed evidence envelope. Every gate then binds the same source
 head, source tree, raw release-manifest digest, release identity, and (when applicable)
 package-manifest digest. Post-source changes to copy, schemas, validators, runtime,
-media, or product files fail closed. Validation also rejects dirty or ignored contract
-bytes, shallow history, Git replacement refs, missing objects, wrong trees, future
-timestamps, and cross-gate proof/source reuse.
+media, or product files fail closed. The validator owns the exact fourteen-gate
+inventory, order, issue/owner mapping, public/release phase routes, accessibility review
+route, and installation evidence routes; manifest edits cannot remove or reroute
+terminal predicates. Validation also rejects dirty or ignored contract bytes, shallow
+history, hidden index flags, Git replacement refs, redirecting or executable
+repository-local Git configuration, missing objects, wrong trees, future timestamps,
+and cross-gate proof/source reuse.
 
 `release/evidence/proof-pins.json` is a review-required digest inventory. Its tracked
 hashes prevent accidental substitution, but the ledger is not a signature and cannot
@@ -69,18 +76,21 @@ frozen canonical rights checker. They bind only their registered contributor gat
 asset/use inventory, redacted receipt digests, validation date, and fixed-term expiry.
 They never import final-cut, biography, link behavior, submission, festival scheduling,
 archive participation, regulations, terms, upload, or no-withdrawal decisions. Those
-human actions remain in their own gates and phases. A tool-ready rights receipt alone
-also cannot replace the required owner/rightsholder attestation.
+human actions remain in their own gates and phases. Deterministic recomputation cannot
+authenticate a non-owner contributor or rightsholder decision, so both rights terminal
+gates stay pending until that distinct external authority has a trusted verifier. A
+tool-ready rights receipt alone cannot replace the required owner/rightsholder
+attestation.
 
-Only two terminal machine-proof paths currently have a trusted current authenticity
-verifier: claim-partitioned rights validation and the progressive-controls raw capture.
-The generic proof schema remains useful for closed shape, source identity, and review
-inventory, but its opaque check digests cannot confer completion. Validation therefore
-forces the following operational gates to remain pending until each named producer and
-current verifier exists:
+The proof schemas remain useful for closed shape, source identity, deterministic
+consistency, and review inventory, but self-consistent repository JSON and opaque check
+digests cannot confer external authority. Validation therefore forces these operational
+gates to remain pending until each named producer and current verifier exists:
 
 | Proof kind | Required completion rail |
 | --- | --- |
+| `progressive-controls-replay` | Independently authenticated system-Chrome Apple-Metal producer or authority receipt over the canonical raw capture; repository-authored replay JSON remains structural evidence only. |
+| `rights-validation` | Distinct authenticated contributor/rightsholder authority over the claim-partitioned deterministic rights receipt; repository ownership cannot impersonate that decision. |
 | `accessibility-review` | Canonical exact-head static/browser audit receipt whose alt text, captions, transcript, reduced-motion and silent-fallback results are recomputed from the frozen release inputs; separate owner approval remains required. |
 | `submission-package` | Atomic package producer receipt binding every actual delivered byte, production graph, package manifest and frozen source; the current verifier must rebuild or rehash that exact package. |
 | `submission-validation` | Schema-closed portable and real macOS system-Chrome Apple-Metal raw captures, recomputed checks and exact package identity. |
@@ -90,9 +100,11 @@ current verifier exists:
 | `presentation-lifecycle` | Host-authored immutable lifecycle source binding the actual program, public route, presentation time and exact package. |
 
 Historical generator blobs are digest identities only. Receipt-selected historical
-Python is never imported or executed; current reviewed verifier code evaluates the
-committed raw data. No test fixture, review pin, repository comment or self-authored
-digest substitutes for the human, venue, host, physical-device or production event.
+Python is never imported or executed; current reviewed source-only verifier code
+evaluates the committed raw data after checkout guards run. No terminal machine-proof
+path infers external authority from repository-authored JSON. No test fixture, review
+pin, repository comment or self-authored digest substitutes for the human, venue, host,
+physical-device or production event.
 
 ## Validate and build
 

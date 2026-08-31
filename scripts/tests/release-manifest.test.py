@@ -8,9 +8,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import marshal
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -56,6 +58,8 @@ FIXTURE_FILES = (
     "opportunities/source-evidence-20260826.json",
     "opportunities/opportunity.schema.json",
     "scripts/check-opportunities.py",
+    "scripts/check-release.py",
+    "scripts/build-release.py",
     "submission/screendance-2027.yaml",
     "corpus/manifest.json",
     "scripts/check-danse.py",
@@ -910,7 +914,8 @@ class ProductionManifestTest(unittest.TestCase):
                 {"example_url": "http://example.invalid/#s=1"}
             ),
         )
-        validator = CONTRACT.jsonschema.Draft202012Validator(schema)
+        jsonschema = CONTRACT._load_jsonschema(ROOT)
+        validator = jsonschema.Draft202012Validator(schema)
         for mutate in mutations:
             with self.subTest(mutate=mutate):
                 manifest = copy.deepcopy(self.manifest)
@@ -1025,7 +1030,7 @@ class ProductionManifestTest(unittest.TestCase):
             ROOT / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH,
             "progressive controls replay schema",
         )
-        CONTRACT.jsonschema.Draft202012Validator.check_schema(schema)
+        CONTRACT._load_jsonschema(ROOT).Draft202012Validator.check_schema(schema)
         self.assertEqual(
             schema["properties"]["gate_id"]["const"],
             "progressive-controls-replay",
@@ -1201,7 +1206,7 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
             for phase in ("public", "release"):
                 with self.subTest(phase=phase), self.assertRaisesRegex(
                     CONTRACT.ReleaseError,
-                    "no trusted current authenticity verifier",
+                    "no trusted external authenticity verifier",
                 ) as raised:
                     BUILD.build(root, base / f"{phase}-artifact", phase, TEST_COMMIT)
                 if phase == "release":
@@ -1211,8 +1216,11 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
                         "final-cut-evidence-gate:submission-package",
                         "final-cut-evidence-gate:submission-validation",
                         "installation-evidence:installation-completion",
+                        "press-stills-clearance:rights-validation-external-authority",
+                        "progressive-controls-replay:progressive-controls-replay-external-authenticity",
                         "release-custody:custody-completion",
                         "restore-rehearsal:restore-completion",
+                        "rights-register:rights-validation-external-authority",
                     ):
                         self.assertIn(gate_kind, str(raised.exception))
                 self.assertFalse((base / f"{phase}-artifact").exists())
@@ -1612,10 +1620,13 @@ class AdversarialManifestTest(unittest.TestCase):
             root = fixture_root(Path(temporary))
             complete_manifest(root)
             with self.assertRaisesRegex(
-                CONTRACT.ReleaseError, "no trusted current authenticity verifier"
+                CONTRACT.ReleaseError, "no trusted external authenticity verifier"
             ) as raised:
                 CONTRACT.validate_release(root)
-            self.assertNotIn("progressive-controls-replay", str(raised.exception))
+            self.assertIn(
+                "progressive-controls-replay:progressive-controls-replay-external-authenticity",
+                str(raised.exception),
+            )
 
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
@@ -1855,6 +1866,914 @@ class AdversarialReleaseGateReceiptHardeningTest(unittest.TestCase):
 
     def _rewrite_progressive(self, root: Path, manifest: dict, mutate) -> None:
         rewrite_progressive_fixture(root, manifest, mutate)
+
+    def test_terminal_gate_inventory_and_phase_ownership_cannot_be_removed(
+        self,
+    ) -> None:
+        for case in ("delete-gates", "reroute-release-gates"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                if case == "delete-gates":
+                    manifest["gates"] = [
+                        gate
+                        for gate in manifest["gates"]
+                        if gate["id"] == "live-interaction-replay"
+                    ]
+                    manifest["accessibility"]["review_gate"] = (
+                        "live-interaction-replay"
+                    )
+                    for section in ("spatial_requirements", "technical_rider"):
+                        for requirement in manifest["installation"][section]:
+                            requirement["evidence_gate"] = "live-interaction-replay"
+                    expected = "inventory|ordered terminal gate"
+                else:
+                    for gate in manifest["gates"]:
+                        if gate["id"] == "live-interaction-replay":
+                            continue
+                        gate["required_for"] = ["public"]
+                        gate["state"] = "pending"
+                        gate["evidence"] = None
+                    ledger_path = root / CONTRACT.RELEASE_PROOF_PINS_PATH
+                    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                    ledger["records"] = []
+                    ledger_path.write_bytes(CONTRACT.canonical_json(ledger))
+                    expected = "required.*phase rout"
+                write_manifest(root, manifest)
+                commit_git_fixture(root, f"attempt to bypass terminal gates: {case}")
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root, phase="release")
+
+    def test_terminal_gate_order_and_identity_are_exact(self) -> None:
+        expected = list(CONTRACT.RELEASE_GATE_CONTRACTS)
+        self.assertEqual(
+            [gate["id"] for gate in read_manifest()["gates"]],
+            expected,
+        )
+        for case in ("reorder", "substitute"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = read_manifest(root)
+                if case == "reorder":
+                    manifest["gates"][0], manifest["gates"][1] = (
+                        manifest["gates"][1],
+                        manifest["gates"][0],
+                    )
+                else:
+                    manifest["gates"][0]["id"] = "substituted-terminal-gate"
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "inventory|ordered terminal gate",
+                ):
+                    CONTRACT.validate_release(root, phase="draft")
+
+    def test_every_terminal_gate_has_an_exact_contract_owned_phase_route(
+        self,
+    ) -> None:
+        manifest = read_manifest()
+        self.assertEqual(
+            {
+                gate["id"]: tuple(gate["required_for"])
+                for gate in manifest["gates"]
+            },
+            CONTRACT.RELEASE_GATE_REQUIRED_PHASES,
+        )
+        routes = (("public",), ("release",), ("public", "release"))
+        for gate_id, required_for in CONTRACT.RELEASE_GATE_REQUIRED_PHASES.items():
+            with self.subTest(gate_id=gate_id):
+                changed = copy.deepcopy(manifest)
+                gate = self._gate(changed, gate_id)
+                gate["required_for"] = list(
+                    next(route for route in routes if route != required_for)
+                )
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "required.*phase rout",
+                ):
+                    CONTRACT.phase_blockers(changed, "draft")
+
+    def test_component_gate_routes_are_contract_owned(self) -> None:
+        cases = ("accessibility", "installation-spatial", "installation-technical")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                if case == "accessibility":
+                    manifest["accessibility"]["review_gate"] = (
+                        "final-artistic-approval"
+                    )
+                    expected = "accessibility review.*canonical review gate"
+                else:
+                    section = (
+                        "spatial_requirements"
+                        if case == "installation-spatial"
+                        else "technical_rider"
+                    )
+                    manifest["installation"][section][0]["evidence_gate"] = (
+                        "accessibility-review"
+                    )
+                    expected = "canonical installation evidence gate"
+                write_manifest(root, manifest)
+                commit_git_fixture(root, f"attempt component gate reroute: {case}")
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                    CONTRACT.validate_release(root, phase="release")
+
+    def test_depth_two_clone_cannot_validate_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = fixture_root(base / "source")
+            complete_manifest(source)
+            clone = base / "depth-two"
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "-q",
+                    "--depth=2",
+                    source.resolve().as_uri(),
+                    str(clone),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            shallow = subprocess.run(
+                ["git", "-C", str(clone), "rev-parse", "--is-shallow-repository"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(shallow, "true")
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "shallow repositories"):
+                CONTRACT.validate_release(clone, phase="release")
+
+    def test_hidden_index_flags_cannot_substitute_consumed_worktree_bytes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "assume-unchanged-schema",
+                "--assume-unchanged",
+                "release/gate-proof.schema.json",
+            ),
+            (
+                "skip-worktree-installation",
+                "--skip-worktree",
+                "installation/contract.py",
+            ),
+        )
+        for case, flag, relative in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = fixture_root(base)
+                initialize_git_fixture(root)
+                marker = base / f"{case}-executed"
+                subprocess.run(
+                    ["git", "-C", str(root), "update-index", flag, "--", relative],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                target = root / relative
+                if relative.endswith(".py"):
+                    target.write_text(
+                        target.read_text(encoding="utf-8")
+                        + "\nPath("
+                        + repr(str(marker))
+                        + ").write_text('executed', encoding='utf-8')\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    target.write_text(
+                        target.read_text(encoding="utf-8") + "\n",
+                        encoding="utf-8",
+                    )
+                status = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertEqual(status, "")
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "skip-worktree or assume-unchanged index flags",
+                ):
+                    CONTRACT.validate_release(root, phase="draft")
+                self.assertFalse(marker.exists())
+
+    def test_hidden_rights_checker_cannot_execute_before_index_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            complete_manifest(root)
+            marker = base / "hidden-rights-checker-executed"
+            relative = "scripts/rights_contract.py"
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "update-index",
+                    "--skip-worktree",
+                    "--",
+                    relative,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            checker = root / relative
+            checker.write_text(
+                checker.read_text(encoding="utf-8")
+                + "\nPath("
+                + repr(str(marker))
+                + ").write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+            program = """
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+import release_contract
+
+try:
+    release_contract.validate_release(root, phase="release")
+except release_contract.ReleaseError as exc:
+    print(exc)
+    raise SystemExit(0 if "index flags" in str(exc) else 2)
+raise SystemExit(3)
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", program, str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("index flags", result.stdout)
+            self.assertFalse(marker.exists())
+
+    def test_repository_config_cannot_redirect_or_execute_provenance_git(
+        self,
+    ) -> None:
+        self.assertEqual(CONTRACT._git_environment()["GIT_NO_LAZY_FETCH"], "1")
+        cases = (
+            "core-worktree",
+            "core-fsmonitor",
+            "core-hooks-path",
+            "filter-clean",
+            "worktree-fsmonitor",
+            "promisor-remote",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = fixture_root(base)
+                initialize_git_fixture(root)
+                marker = base / f"{case}-executed"
+                probe = base / f"{case}-probe.py"
+                probe.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                probe.chmod(0o755)
+                if case == "core-worktree":
+                    alternate = base / "alternate-worktree"
+                    alternate.mkdir()
+                    config = ("--local", "core.worktree", str(alternate))
+                elif case == "core-fsmonitor":
+                    config = ("--local", "core.fsmonitor", str(probe))
+                elif case == "core-hooks-path":
+                    hooks = base / "hooks"
+                    hooks.mkdir()
+                    hook = hooks / "post-checkout"
+                    shutil.copyfile(probe, hook)
+                    hook.chmod(0o755)
+                    config = ("--local", "core.hooksPath", str(hooks))
+                elif case == "filter-clean":
+                    config = ("--local", "filter.release.clean", str(probe))
+                elif case == "worktree-fsmonitor":
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(root),
+                            "config",
+                            "--local",
+                            "extensions.worktreeConfig",
+                            "true",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    config = ("--worktree", "core.fsmonitor", str(probe))
+                else:
+                    config = ("--local", "remote.origin.promisor", "true")
+                subprocess.run(
+                    ["git", "-C", str(root), "config", *config],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "repository-local Git config",
+                ):
+                    CONTRACT.validate_release(root, phase="draft")
+                self.assertFalse(marker.exists())
+
+    def test_normal_linked_worktree_passes_early_git_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = fixture_root(base / "source")
+            initialize_git_fixture(source)
+            linked = base / "linked"
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "-q",
+                    str(linked),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            validated = CONTRACT.validate_release(linked, phase="draft")
+            self.assertEqual(validated["release_id"], read_manifest(source)["release_id"])
+
+    def test_ignored_cached_rights_bytecode_is_never_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            manifest = complete_manifest(root)
+            _, outer = self._outer_receipt(root, manifest, "rights-register")
+            source_head = outer["subject"]["repository_head"]
+            marker = base / "cached-rights-bytecode-executed"
+            rights_path = root / "scripts/rights_contract.py"
+            malicious = compile(
+                "from pathlib import Path\n"
+                + f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                str(rights_path),
+                "exec",
+            )
+            stat_result = rights_path.stat()
+            bytecode_path = Path(importlib.util.cache_from_source(str(rights_path)))
+            bytecode_path.parent.mkdir(parents=True, exist_ok=True)
+            bytecode_path.write_bytes(
+                importlib.util.MAGIC_NUMBER
+                + struct.pack(
+                    "<III",
+                    0,
+                    int(stat_result.st_mtime) & 0xFFFFFFFF,
+                    stat_result.st_size & 0xFFFFFFFF,
+                )
+                + marshal.dumps(malicious)
+            )
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+            program = """
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+source_head = sys.argv[2]
+sys.path.insert(0, str(root / "scripts"))
+import release_contract
+
+checker = release_contract._load_rights_checker(root, source_head)
+assert checker.__loader__ is None
+assert callable(checker.build_clearance_scope_receipt)
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", program, str(root), source_head],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_excludes_file_cannot_hide_an_import_shadow_before_rights_guard(
+        self,
+    ) -> None:
+        for relative in (
+            "scripts/argparse.py",
+            "scripts/hashlib.py",
+            "scripts/jsonschema.py",
+            "scripts/subprocess.py",
+            "scripts/yaml.py",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                root = fixture_root(base)
+                complete_manifest(root)
+                marker = base / f"ignored-{Path(relative).stem}-shadow-executed"
+                excludes = base / "release-excludes"
+                excludes.write_text(relative + "\n", encoding="utf-8")
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "config",
+                        "--local",
+                        "core.excludesFile",
+                        str(excludes),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                shadow = root / relative
+                shadow.write_text(
+                    "from pathlib import Path\n"
+                    + f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(root),
+                            "status",
+                            "--porcelain=v1",
+                            "--untracked-files=all",
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout,
+                    "",
+                )
+                program = """
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+scripts_path = Path(sys.argv[2])
+sys.path.insert(0, str(scripts_path))
+import release_contract
+
+try:
+    release_contract.validate_release(root, phase="release")
+except release_contract.ReleaseError as exc:
+    print(exc)
+    raise SystemExit(0 if "repository-local Git config" in str(exc) else 2)
+raise SystemExit(3)
+"""
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(root), str(root / "scripts")],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("repository-local Git config", result.stdout)
+                self.assertFalse(marker.exists())
+
+                if relative == "scripts/hashlib.py":
+                    alias = base / "repository-alias"
+                    alias.symlink_to(root, target_is_directory=True)
+                    for scripts_path in (
+                        root / "scripts/../scripts",
+                        alias / "scripts",
+                    ):
+                        with self.subTest(scripts_path=str(scripts_path)):
+                            aliased = subprocess.run(
+                                [
+                                    sys.executable,
+                                    "-c",
+                                    program,
+                                    str(root),
+                                    str(scripts_path),
+                                ],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                            self.assertEqual(
+                                aliased.returncode,
+                                0,
+                                aliased.stdout + aliased.stderr,
+                            )
+                            self.assertIn(
+                                "repository-local Git config",
+                                aliased.stdout,
+                            )
+                            self.assertFalse(marker.exists())
+
+                entrypoint: list[str] | None = None
+                if relative == "scripts/argparse.py":
+                    entrypoint = [
+                        sys.executable,
+                        str(root / "scripts/check-release.py"),
+                        "--root",
+                        str(root),
+                        "--phase",
+                        "draft",
+                    ]
+                elif relative == "scripts/hashlib.py":
+                    entrypoint = [
+                        sys.executable,
+                        str(root / "scripts/build-release.py"),
+                        "--root",
+                        str(root),
+                        "--phase",
+                        "draft",
+                        "--output",
+                        str(base / "release-output"),
+                    ]
+                if entrypoint is not None:
+                    launched = subprocess.run(
+                        entrypoint,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(launched.returncode, 0)
+                    self.assertIn(
+                        "repository-local Git config",
+                        launched.stdout + launched.stderr,
+                    )
+                    self.assertFalse(marker.exists())
+
+    def test_target_checkout_import_roots_are_removed_before_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base / "target")
+            source_head = initialize_git_fixture(root)
+            entry_marker = base / "target-hashlib-shadow-executed"
+            rights_marker = base / "target-yaml-shadow-executed"
+            excludes = root / ".git/info/exclude"
+            excludes.write_text(
+                excludes.read_text(encoding="utf-8")
+                + "scripts/hashlib.py\n"
+                + "scripts/yaml.py\n",
+                encoding="utf-8",
+            )
+            (root / "scripts/hashlib.py").write_text(
+                "from pathlib import Path\n"
+                + f"Path({str(entry_marker)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            (root / "scripts/yaml.py").write_text(
+                "from pathlib import Path\n"
+                + f"Path({str(rights_marker)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                filter(
+                    None,
+                    (str(root / "scripts"), environment.get("PYTHONPATH", "")),
+                )
+            )
+            entrypoints = (
+                ("check", ROOT / "scripts/check-release.py"),
+                ("build", ROOT / "scripts/build-release.py"),
+            )
+            accepted_root_forms = (
+                ("explicit-equals", [f"--root={root}"], None),
+                ("empty-equals", ["--root="], root),
+                ("empty-value", ["--root", ""], root),
+            )
+            for entrypoint_name, entrypoint in entrypoints:
+                for form, root_arguments, cwd in accepted_root_forms:
+                    with self.subTest(entrypoint=entrypoint_name, form=form):
+                        command = [
+                            sys.executable,
+                            str(entrypoint),
+                            *root_arguments,
+                            "--phase",
+                            "draft",
+                        ]
+                        if entrypoint_name == "build":
+                            command.extend(
+                                [
+                                    "--output",
+                                    str(
+                                        base
+                                        / f"cross-checkout-{entrypoint_name}-{form}"
+                                    ),
+                                ]
+                            )
+                        launched = subprocess.run(
+                            command,
+                            cwd=cwd,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        )
+                        self.assertEqual(
+                            launched.returncode,
+                            0,
+                            launched.stdout + launched.stderr,
+                        )
+                        self.assertFalse(entry_marker.exists())
+                        self.assertFalse(rights_marker.exists())
+
+                abbreviated_root_forms = (
+                    ("separate", ["--roo", str(root)]),
+                    ("equals", [f"--roo={root}"]),
+                )
+                for form, root_arguments in abbreviated_root_forms:
+                    with self.subTest(
+                        entrypoint=entrypoint_name,
+                        form=f"abbreviated-{form}",
+                    ):
+                        command = [
+                            sys.executable,
+                            str(entrypoint),
+                            *root_arguments,
+                            "--phase",
+                            "draft",
+                        ]
+                        if entrypoint_name == "build":
+                            command.extend(
+                                [
+                                    "--output",
+                                    str(
+                                        base
+                                        / f"abbreviated-{entrypoint_name}-{form}"
+                                    ),
+                                ]
+                            )
+                        rejected = subprocess.run(
+                            command,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        )
+                        self.assertNotEqual(rejected.returncode, 0)
+                        self.assertIn(
+                            "unrecognized arguments",
+                            rejected.stdout + rejected.stderr,
+                        )
+                        self.assertFalse(entry_marker.exists())
+                        self.assertFalse(rights_marker.exists())
+
+            program = """
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+trusted_scripts = Path(sys.argv[2])
+source_head = sys.argv[3]
+sys.path.insert(0, str(trusted_scripts))
+import release_contract
+sys.path.insert(0, str(root / "scripts"))
+
+checker = release_contract._load_rights_checker(root, source_head)
+assert callable(checker.build_clearance_scope_receipt)
+"""
+            rights_loaded = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    program,
+                    str(root),
+                    str(ROOT / "scripts"),
+                    source_head,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                rights_loaded.returncode,
+                0,
+                rights_loaded.stdout + rights_loaded.stderr,
+            )
+            self.assertFalse(rights_marker.exists())
+
+    def test_active_repository_venv_dependency_path_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            venv = root / ".venv"
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(venv)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            venv_python = (
+                venv / "Scripts/python.exe"
+                if os.name == "nt"
+                else venv / "bin/python"
+            )
+            site_packages = Path(
+                subprocess.run(
+                    [
+                        str(venv_python),
+                        "-c",
+                        "import site; print(site.getsitepackages()[0])",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PYTHONPATH": ""},
+                ).stdout.strip()
+            )
+            (site_packages / "jsonschema.py").write_text(
+                "SENTINEL = 'active-repository-venv'\n",
+                encoding="utf-8",
+            )
+            program = """
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+import release_contract
+
+module = release_contract._load_jsonschema(root)
+assert module.SENTINEL == "active-repository-venv"
+assert any(
+    Path(entry).resolve().is_relative_to(Path(sys.prefix).resolve())
+    for entry in sys.path
+    if entry
+)
+"""
+            loaded = subprocess.run(
+                [str(venv_python), "-c", program, str(root)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": ""},
+            )
+            self.assertEqual(loaded.returncode, 0, loaded.stdout + loaded.stderr)
+
+    def test_executable_checker_modules_require_exact_tracked_head_bytes(
+        self,
+    ) -> None:
+        for relative in (
+            "installation/contract.py",
+            "scripts/check-opportunities.py",
+        ):
+            for mode in ("dirty-tracked", "ignored-untracked"):
+                with (
+                    self.subTest(relative=relative, mode=mode),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    base = Path(temporary)
+                    root = fixture_root(base)
+                    initialize_git_fixture(root)
+                    marker = base / f"{Path(relative).stem}-{mode}-executed"
+                    target = root / relative
+                    if mode == "ignored-untracked":
+                        exclude = root / ".git/info/exclude"
+                        exclude.write_text(
+                            exclude.read_text(encoding="utf-8") + relative + "\n",
+                            encoding="utf-8",
+                        )
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(root),
+                                "rm",
+                                "--cached",
+                                "--",
+                                relative,
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(root),
+                                "commit",
+                                "-q",
+                                "-m",
+                                f"remove {relative} from tracked source",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                    target.write_text(
+                        target.read_text(encoding="utf-8")
+                        + "\nPath("
+                        + repr(str(marker))
+                        + ").write_text('executed', encoding='utf-8')\n",
+                        encoding="utf-8",
+                    )
+                    expected = (
+                        "not tracked at the checkout head"
+                        if mode == "ignored-untracked"
+                        else "differs from its exact tracked HEAD bytes"
+                    )
+                    with self.assertRaisesRegex(CONTRACT.ReleaseError, expected):
+                        CONTRACT.validate_release(root, phase="draft")
+                    self.assertFalse(marker.exists())
+
+    def test_rights_checker_must_remain_tracked_at_current_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            source_head = initialize_git_fixture(root)
+            relative = "scripts/rights_contract.py"
+            marker = base / "removed-rights-checker-executed"
+            excludes = root / ".git/info/exclude"
+            excludes.write_text(
+                excludes.read_text(encoding="utf-8") + relative + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "rm", "--cached", "--", relative],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            commit_git_fixture(root, "remove current rights checker")
+            target = root / relative
+            target.write_text(
+                target.read_text(encoding="utf-8")
+                + "\nPath("
+                + repr(str(marker))
+                + ").write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "rights checker is not tracked at the checkout head",
+            ):
+                CONTRACT._load_rights_checker(root, source_head)
+            self.assertFalse(marker.exists())
 
     def test_gate_owner_pin_and_local_typed_proof_cannot_be_self_asserted(self) -> None:
         cases = (
@@ -2775,7 +3694,7 @@ class AdversarialReleaseGateReceiptHardeningTest(unittest.TestCase):
                 CONTRACT, "_current_rights_validation_date", return_value=today
             ):
                 with self.assertRaisesRegex(
-                    CONTRACT.ReleaseError, "no trusted current authenticity verifier"
+                    CONTRACT.ReleaseError, "no trusted external authenticity verifier"
                 ):
                     CONTRACT.validate_release(root)
             with mock.patch.object(
