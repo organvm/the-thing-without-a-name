@@ -753,6 +753,55 @@ def require_commit_object(root: Path, commit: str) -> str:
     return commit
 
 
+def source_commit_blob(
+    root: Path,
+    commit: str,
+    relative: str,
+    label: str,
+) -> tuple[bytes, bool]:
+    """Read one regular file from an already-authenticated raw commit tree.
+
+    Callers authenticate ``commit`` once with :func:`require_commit_object`
+    before reading a batch.  This shared reader preserves the tree mode check
+    so a committed symlink or submodule cannot become an apparently regular
+    file in a checkout configured with ``core.symlinks=false``.
+    """
+    relative = safe_relative(relative, label)
+    root = root.absolute().resolve()
+    reject_git_rewrites(root)
+    env = provenance_git_env()
+    entry = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-z", "--full-tree", commit, "--", relative],
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if entry.returncode != 0:
+        detail = entry.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot inspect {label} at source commit {commit}: {detail}")
+    rows = [row for row in entry.stdout.split(b"\0") if row]
+    if len(rows) != 1 or b"\t" not in rows[0]:
+        raise ReleaseError(f"{label} is missing or ambiguous at source commit {commit}")
+    identity, encoded_path = rows[0].split(b"\t", 1)
+    try:
+        mode, kind, object_id = identity.decode("ascii").split()
+        tree_path = encoded_path.decode("utf-8")
+    except (UnicodeError, ValueError) as exc:
+        raise ReleaseError(f"{label} has an invalid Git tree identity") from exc
+    if tree_path != relative or kind != "blob" or mode not in {"100644", "100755"}:
+        raise ReleaseError(f"{label} must be a regular committed file: {relative}")
+    blob = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", object_id],
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if blob.returncode != 0:
+        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot read committed {label}: {detail}")
+    return blob.stdout, mode == "100755"
+
+
 def provenance_git_env() -> dict[str, str]:
     """Return an environment pinned to the repository named by ``git -C``.
 

@@ -20,6 +20,25 @@ import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 
+from release_contract import (
+    ReleaseError as ReleaseContractError,
+)
+from release_contract import (
+    provenance_git_env,
+)
+from release_contract import (
+    reject_git_rewrites as reject_release_git_rewrites,
+)
+from release_contract import (
+    require_commit_object as require_release_commit_object,
+)
+from release_contract import (
+    source_commit as release_source_commit,
+)
+from release_contract import (
+    source_commit_blob as read_release_source_commit_blob,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_MANIFEST = "pages-manifest.json"
 ARTIFACT_SCHEMA = "danse.pages.v1"
@@ -70,69 +89,12 @@ class ArtifactError(RuntimeError):
     """The public artifact would be incomplete or exceed its declared boundary."""
 
 
-def provenance_git_env() -> dict[str, str]:
-    """Return an environment pinned to the repository named by ``git -C``.
-
-    Git gives ambient ``GIT_*`` variables precedence over ``-C`` repository
-    discovery.  In particular, ``GIT_DIR``/``GIT_WORK_TREE`` can make a clean
-    alternate checkout answer provenance queries for the requested root.  Drop
-    every inherited Git control variable, then restore only the fail-closed
-    settings needed by these read-only provenance commands.
-    """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
-    }
-    env.update(
-        {
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_ATTR_NOSYSTEM": "1",
-        }
-    )
-    return env
-
-
 def reject_git_rewrites(root: Path) -> None:
-    """Fail closed on local replacement refs or legacy grafted history."""
-    root = root.absolute().resolve()
-    env = provenance_git_env()
-    replacements = subprocess.run(
-        ["git", "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/replace/"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
-    if replacements.returncode != 0:
-        raise ArtifactError(
-            f"cannot inspect Git replacement refs: {replacements.stderr.strip()}"
-        )
-    if replacements.stdout.strip():
-        raise ArtifactError("source repository contains Git replacement object refs")
-    graft_query = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
-    if graft_query.returncode != 0 or not graft_query.stdout.strip():
-        detail = graft_query.stderr.strip() or "Git returned no graft path"
-        raise ArtifactError(f"cannot inspect legacy Git grafts: {detail}")
-    graft_path = Path(graft_query.stdout.strip())
-    if not graft_path.is_absolute():
-        graft_path = root / graft_path
-    if graft_path.exists():
-        if graft_path.is_symlink() or not graft_path.is_file():
-            raise ArtifactError("legacy Git graft path is not a regular file")
-        if graft_path.stat().st_size:
-            raise ArtifactError(
-                "source repository contains a nonempty legacy Git graft file"
-            )
+    """Translate the shared release-provenance contract into Pages errors."""
+    try:
+        reject_release_git_rewrites(root)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
 
 
 def sha256(path: Path) -> str:
@@ -505,70 +467,19 @@ def source_files(root: Path) -> tuple[str, ...]:
 
 
 def source_commit(root: Path, explicit: str | None = None) -> str:
-    commit = explicit
-    if commit is None:
-        try:
-            reject_git_rewrites(root)
-        except Exception as exc:
-            raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
-        done = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=provenance_git_env(),
-        )
-        if done.returncode != 0:
-            raise ArtifactError(f"cannot resolve source commit: {done.stderr.strip()}")
-        commit = done.stdout.strip()
-    commit = commit.lower()
-    if not COMMIT_RE.fullmatch(commit):
-        raise ArtifactError(f"source commit must be a full 40-character Git SHA: {commit!r}")
-    return commit
+    """Resolve a commit with the shared release-provenance implementation."""
+    try:
+        return release_source_commit(root, explicit)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
 
 
 def require_commit_object(root: Path, commit: str) -> str:
-    """Require a raw Git commit object, never a tree/tag sharing SHA syntax."""
-    root = root.absolute().resolve()
-    commit = source_commit(root, commit)
+    """Authenticate one commit with the shared release-provenance contract."""
     try:
-        reject_git_rewrites(root)
-    except Exception as exc:
-        raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
-    kind = subprocess.run(
-        ["git", "-C", str(root), "cat-file", "-t", commit],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=provenance_git_env(),
-    )
-    if kind.returncode != 0 or kind.stdout.strip() != "commit":
-        detail = kind.stderr.strip() or kind.stdout.strip() or "missing object"
-        raise ArtifactError(
-            f"source object {commit} must resolve to a commit object: {detail}"
-        )
-    integrity = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "fsck",
-            "--strict",
-            "--no-dangling",
-            "--no-reflogs",
-            commit,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=provenance_git_env(),
-    )
-    if integrity.returncode != 0:
-        detail = integrity.stderr.strip() or integrity.stdout.strip() or "Git fsck failed"
-        raise ArtifactError(
-            f"source commit {commit} failed raw Git object integrity verification: {detail}"
-        )
-    return commit
+        return require_release_commit_object(root, commit)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
 
 
 def validate_git_source(root: Path, expected_commit: str) -> None:
@@ -629,29 +540,27 @@ def source_commit_records(
     records: dict[str, dict] = {}
     for relative in files:
         path = source_file(root, relative)
-        committed = subprocess.run(
-            ["git", "-C", str(root), "show", f"{commit}:{relative}"],
-            capture_output=True,
-            check=False,
-            env=provenance_git_env(),
-        )
-        if committed.returncode != 0:
-            detail = committed.stderr.decode("utf-8", errors="replace").strip()
-            raise ArtifactError(
-                f"cannot resolve allowlisted source at {commit}:{relative}: {detail}"
+        try:
+            committed, _executable = read_release_source_commit_blob(
+                root,
+                commit,
+                relative,
+                "allowlisted source",
             )
+        except ReleaseContractError as exc:
+            raise ArtifactError(str(exc)) from exc
         try:
             worktree = path.read_bytes()
         except OSError as exc:
             raise ArtifactError(f"cannot read allowlisted source {relative}: {exc}") from exc
-        if worktree != committed.stdout:
+        if worktree != committed:
             raise ArtifactError(
                 f"allowlisted source bytes drifted from the declared commit: {relative}"
             )
         records[relative] = {
             "path": relative,
-            "bytes": len(committed.stdout),
-            "sha256": hashlib.sha256(committed.stdout).hexdigest(),
+            "bytes": len(committed),
+            "sha256": hashlib.sha256(committed).hexdigest(),
         }
     return records
 

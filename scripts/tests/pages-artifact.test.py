@@ -19,6 +19,9 @@ from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import release_contract as CONTRACT  # noqa: E402
 
 
 def load_pages_builder():
@@ -633,6 +636,65 @@ class ArtifactBoundaryTest(unittest.TestCase):
             PAGES.build(
                 root,
                 self.base / "corrupt-object-pages",
+                commit,
+                require_git_source=True,
+            )
+
+    def test_shared_release_provenance_errors_are_translated(self) -> None:
+        self.assertIs(PAGES.provenance_git_env, CONTRACT.provenance_git_env)
+        self.assertIs(
+            PAGES.read_release_source_commit_blob,
+            CONTRACT.source_commit_blob,
+        )
+        with mock.patch.object(
+            PAGES,
+            "require_release_commit_object",
+            side_effect=CONTRACT.ReleaseError("shared provenance rejection"),
+        ):
+            with self.assertRaisesRegex(
+                PAGES.ArtifactError,
+                "shared provenance rejection",
+            ):
+                PAGES.require_commit_object(self.root, TEST_COMMIT)
+
+    def test_committed_symlink_materialized_as_regular_file_is_rejected(self) -> None:
+        root = self.base / "symlink-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        arrival = root / "arrival.js"
+        arrival.unlink()
+        arrival.symlink_to("index.html")
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "core.symlinks", "false"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        arrival.unlink()
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertTrue(arrival.is_file())
+        self.assertFalse(arrival.is_symlink())
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "allowlisted source must be a regular committed file: arrival.js",
+        ):
+            PAGES.build(
+                root,
+                self.base / "symlink-pages",
                 commit,
                 require_git_source=True,
             )

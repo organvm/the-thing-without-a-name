@@ -43,6 +43,7 @@ from release_contract import (
     safe_relative,
     sha256,
     source_commit,
+    source_commit_blob,
     source_file,
     validate_release,
     validate_schema,
@@ -1612,57 +1613,6 @@ def release_phase_blockers(manifest: dict, phase: str) -> list[str]:
     return phase_blockers(manifest, phase)
 
 
-def _source_commit_blob(
-    root: Path,
-    commit: str,
-    relative: str,
-    label: str,
-) -> tuple[bytes, bool]:
-    """Read one regular file from the raw declared Git tree.
-
-    ``git show`` alone does not expose the tree mode and would turn a committed
-    symlink into apparently ordinary bytes when materialized for validation.
-    Resolve the exact tree entry first, reject non-file modes, then read the raw
-    blob by object id under the provenance-hardened environment.
-    """
-    relative = safe_relative(relative, label)
-    root = root.absolute().resolve()
-    reject_git_rewrites(root)
-    env = provenance_git_env()
-    entry = subprocess.run(
-        ["git", "-C", str(root), "ls-tree", "-z", "--full-tree", commit, "--", relative],
-        capture_output=True,
-        check=False,
-        env=env,
-    )
-    if entry.returncode != 0:
-        detail = entry.stderr.decode("utf-8", errors="replace").strip()
-        raise ReleaseError(
-            f"cannot inspect {label} at source commit {commit}: {detail}"
-        )
-    rows = [row for row in entry.stdout.split(b"\0") if row]
-    if len(rows) != 1 or b"\t" not in rows[0]:
-        raise ReleaseError(f"{label} is missing or ambiguous at source commit {commit}")
-    identity, encoded_path = rows[0].split(b"\t", 1)
-    try:
-        mode, kind, object_id = identity.decode("ascii").split()
-        tree_path = encoded_path.decode("utf-8")
-    except (UnicodeError, ValueError) as exc:
-        raise ReleaseError(f"{label} has an invalid Git tree identity") from exc
-    if tree_path != relative or kind != "blob" or mode not in {"100644", "100755"}:
-        raise ReleaseError(f"{label} must be a regular committed file: {relative}")
-    blob = subprocess.run(
-        ["git", "-C", str(root), "cat-file", "blob", object_id],
-        capture_output=True,
-        check=False,
-        env=env,
-    )
-    if blob.returncode != 0:
-        detail = blob.stderr.decode("utf-8", errors="replace").strip()
-        raise ReleaseError(f"cannot read committed {label}: {detail}")
-    return blob.stdout, mode == "100755"
-
-
 def _manifest_evidence_paths(manifest: dict) -> set[str]:
     """Collect every manifest record that participates in phase admission."""
     paths: set[str] = set()
@@ -1717,7 +1667,7 @@ def validate_source_commit_release(
         snapshot = Path(temporary)
 
         def materialize(relative: str, label: str) -> bytes:
-            data, executable = _source_commit_blob(root, commit, relative, label)
+            data, executable = source_commit_blob(root, commit, relative, label)
             target = snapshot / PurePosixPath(relative)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
