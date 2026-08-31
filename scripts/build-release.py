@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import importlib.util
 import io
 import os
 import platform
@@ -21,37 +22,83 @@ from urllib.parse import quote, unquote, urlsplit
 import pypdf
 import reportlab
 from pypdf import PdfReader
-from release_contract import (
-    EXPECTED_OPPORTUNITY_FROZEN_AT,
-    EXPECTED_OPPORTUNITY_RECEIPT_SHA256,
-    EXPECTED_OPPORTUNITY_SHA256,
-    EXPECTED_SOURCE_EVIDENCE_SHA256,
-    GENERATED_PRODUCT_PATHS,
-    HEX64,
-    MANIFEST,
-    PHASES,
-    ROOT,
-    SCHEMA,
-    ReleaseError,
-    canonical_json,
-    decode_json_object,
-    load_json,
-    phase_blockers,
-    provenance_git_env,
-    reject_git_rewrites,
-    require_commit_object,
-    safe_relative,
-    sha256,
-    source_commit,
-    source_commit_blob,
-    source_file,
-    validate_release,
-    validate_schema,
-)
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
+
+
+def _load_release_contract():
+    """Load only the contract beside this exact builder checkout."""
+    path = Path(__file__).resolve().with_name("release_contract.py")
+    identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"danse_release_contract_{identity}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the sibling release contract")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        required = (
+            "EXPECTED_OPPORTUNITY_FROZEN_AT",
+            "EXPECTED_OPPORTUNITY_RECEIPT_SHA256",
+            "EXPECTED_OPPORTUNITY_SHA256",
+            "EXPECTED_SOURCE_EVIDENCE_SHA256",
+            "GENERATED_PRODUCT_PATHS",
+            "HEX64",
+            "MANIFEST",
+            "PHASES",
+            "ROOT",
+            "SCHEMA",
+            "ReleaseError",
+            "canonical_json",
+            "decode_json_object",
+            "load_json",
+            "phase_blockers",
+            "provenance_git_env",
+            "reject_git_rewrites",
+            "require_commit_object",
+            "safe_relative",
+            "sha256",
+            "source_commit",
+            "source_commit_blob",
+            "source_file",
+            "validate_release",
+            "validate_schema",
+        )
+        if any(not hasattr(module, name) for name in required):
+            raise AttributeError("release contract is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise RuntimeError("cannot load the sibling release contract") from exc
+    return module
+
+
+_RELEASE_CONTRACT = _load_release_contract()
+EXPECTED_OPPORTUNITY_FROZEN_AT = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_FROZEN_AT
+EXPECTED_OPPORTUNITY_RECEIPT_SHA256 = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_RECEIPT_SHA256
+EXPECTED_OPPORTUNITY_SHA256 = _RELEASE_CONTRACT.EXPECTED_OPPORTUNITY_SHA256
+EXPECTED_SOURCE_EVIDENCE_SHA256 = _RELEASE_CONTRACT.EXPECTED_SOURCE_EVIDENCE_SHA256
+GENERATED_PRODUCT_PATHS = _RELEASE_CONTRACT.GENERATED_PRODUCT_PATHS
+HEX64 = _RELEASE_CONTRACT.HEX64
+MANIFEST = _RELEASE_CONTRACT.MANIFEST
+PHASES = _RELEASE_CONTRACT.PHASES
+ROOT = _RELEASE_CONTRACT.ROOT
+SCHEMA = _RELEASE_CONTRACT.SCHEMA
+ReleaseError = _RELEASE_CONTRACT.ReleaseError
+canonical_json = _RELEASE_CONTRACT.canonical_json
+decode_json_object = _RELEASE_CONTRACT.decode_json_object
+load_json = _RELEASE_CONTRACT.load_json
+phase_blockers = _RELEASE_CONTRACT.phase_blockers
+provenance_git_env = _RELEASE_CONTRACT.provenance_git_env
+reject_git_rewrites = _RELEASE_CONTRACT.reject_git_rewrites
+require_commit_object = _RELEASE_CONTRACT.require_commit_object
+safe_relative = _RELEASE_CONTRACT.safe_relative
+sha256 = _RELEASE_CONTRACT.sha256
+source_commit = _RELEASE_CONTRACT.source_commit
+source_commit_blob = _RELEASE_CONTRACT.source_commit_blob
+source_file = _RELEASE_CONTRACT.source_file
+validate_release = _RELEASE_CONTRACT.validate_release
+validate_schema = _RELEASE_CONTRACT.validate_schema
 
 ARTIFACT_SCHEMA = "danse.release-build.v1"
 ARTIFACT_MANIFEST = "release-build.json"
@@ -1220,6 +1267,39 @@ def copy_manifested_media(
     }
 
 
+def write_committed_media(
+    data: bytes,
+    target: Path,
+    record: dict,
+    label: str,
+) -> dict:
+    """Materialize one authenticated source-commit blob without checkout filters."""
+    copied_bytes = len(data)
+    copied_sha256 = hashlib.sha256(data).hexdigest()
+    if copied_bytes != record["bytes"] or copied_sha256 != record["sha256"]:
+        raise ReleaseError(f"{label} does not match its source-manifest identity")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("xb") as target_handle:
+            target_handle.write(data)
+    except FileExistsError as exc:
+        raise ReleaseError(f"{label} destination appeared during the build") from exc
+    except OSError as exc:
+        if target.exists() and not target.is_symlink():
+            target.unlink()
+        raise ReleaseError(f"cannot materialize {label}: {exc}") from exc
+    if target.stat().st_size != copied_bytes or sha256(target) != copied_sha256:
+        target.unlink()
+        raise ReleaseError(f"{label} destination changed during the build")
+    target.chmod(0o644)
+    os.utime(target, (0, 0), follow_symlinks=False)
+    return {
+        "path": target,
+        "bytes": copied_bytes,
+        "sha256": copied_sha256,
+    }
+
+
 def artifact_inventory(root: Path) -> set[str]:
     if root.is_symlink() or not root.is_dir():
         raise ReleaseError(f"release artifact root must be a regular directory: {root}")
@@ -2000,16 +2080,24 @@ def build(
     commit = source_commit(root, commit)
     if require_git_source:
         validate_git_source(root, commit)
-    manifest = validate_release(root, phase=phase)
     source_manifest, source_manifest_sha256 = source_release_manifest(
         root,
         commit,
         allow_worktree_fallback=not require_git_source,
     )
-    if source_manifest != manifest:
-        raise ReleaseError(
-            "validated release manifest does not match the declared source commit"
+    if require_git_source:
+        manifest = validate_source_commit_release(
+            root,
+            commit,
+            source_manifest,
+            phase,
         )
+    else:
+        manifest = validate_release(root, phase=phase)
+        if source_manifest != manifest:
+            raise ReleaseError(
+                "validated release manifest does not match the declared source commit"
+            )
     output = output.absolute()
     if output.is_symlink():
         raise ReleaseError(f"refusing symlinked release output: {output}")
@@ -2031,15 +2119,25 @@ def build(
             or source is None
         ):
             continue
-        source_path = source_file(root, source["path"], f"media {medium['id']} source")
+        label = f"media {medium['id']} source"
         destination = safe_relative(source["destination"], f"media {medium['id']} destination")
         target = output / PurePosixPath(destination)
-        copied_record = copy_manifested_media(
-            source_path,
-            target,
-            source,
-            f"media {medium['id']} source",
-        )
+        if require_git_source:
+            data, _executable = source_commit_blob(
+                root,
+                commit,
+                source["path"],
+                label,
+            )
+            copied_record = write_committed_media(data, target, source, label)
+        else:
+            source_path = source_file(root, source["path"], label)
+            copied_record = copy_manifested_media(
+                source_path,
+                target,
+                source,
+                label,
+            )
         copied.append(
             {
                 "id": medium["id"],

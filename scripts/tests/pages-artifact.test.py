@@ -19,9 +19,6 @@ from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scripts"))
-
-import release_contract as CONTRACT  # noqa: E402
 
 
 def load_pages_builder():
@@ -459,17 +456,33 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertIn("tracked changes", dirty.stderr)
         self.assertFalse(dirty_output.exists())
 
-    def test_clean_checkout_transform_cannot_change_published_runtime_bytes(self) -> None:
-        source = self.base / "transform-source"
+    def test_clean_core_autocrlf_checkout_publishes_only_committed_bytes(self) -> None:
+        source = RELEASE_SUPPORT.fixture_root(self.base / "transform-source")
+        manifest = RELEASE_SUPPORT.complete_manifest(source)
+        manifest["status"] = "public-approved"
         public_fixture(source)
-        (source / ".gitattributes").write_text(
-            "arrival.js text eol=crlf\n",
-            encoding="utf-8",
-        )
+        contract_bound_runtime = (
+            set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+        ) | {"installation/digital-twin.json"}
+        for relative in contract_bound_runtime:
+            shutil.copyfile(ROOT / relative, source / relative)
+        RELEASE_SUPPORT.write_manifest(source, manifest)
         commit = RELEASE_SUPPORT.initialize_git_fixture(source)
         root = self.base / "transform-checkout"
         subprocess.run(
-            ["git", "clone", "-q", str(source), str(root)],
+            ["git", "clone", "-q", "--no-checkout", str(source), str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "core.autocrlf", "true"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "-q", commit],
             check=True,
             capture_output=True,
             text=True,
@@ -488,16 +501,67 @@ class ArtifactBoundaryTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(status.stdout, "", status.stdout)
-        with self.assertRaisesRegex(
-            PAGES.ArtifactError,
-            "allowlisted source bytes drifted from the declared commit: arrival.js",
-        ):
-            PAGES.build(
-                root,
-                self.base / "transformed-pages",
-                commit,
-                require_git_source=True,
-            )
+        release_output = self.base / "transformed-release"
+        release_receipt = RELEASE_BUILD.build(
+            root,
+            release_output,
+            "public",
+            commit,
+            require_git_source=True,
+        )
+        selected_medium = next(
+            medium
+            for medium in manifest["media"]
+            if "public" in medium["required_for"]
+        )
+        source_relative = selected_medium["source"]["path"]
+        destination = selected_medium["source"]["destination"]
+        committed_medium = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{source_relative}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(
+            (release_output / destination).read_bytes(),
+            committed_medium,
+        )
+        self.assertNotEqual(
+            (release_output / destination).read_bytes(),
+            (root / source_relative).read_bytes(),
+        )
+        output = self.base / "transformed-pages"
+        PAGES.build(
+            root,
+            output,
+            commit,
+            release_artifact=release_output,
+            require_git_source=True,
+        )
+        self.assertEqual((output / "arrival.js").read_bytes(), committed)
+        self.assertNotEqual(
+            (output / "arrival.js").read_bytes(),
+            (root / "arrival.js").read_bytes(),
+        )
+
+        plain = self.base / "plain-checkout"
+        subprocess.run(
+            ["git", "clone", "-q", str(source), str(plain)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        RELEASE_BUILD.verify_artifact(
+            release_output,
+            commit,
+            source_root=plain,
+        )
+        PAGES.verify_artifact(
+            output,
+            commit,
+            require_source_manifest=True,
+            source_root=plain,
+        )
+        self.assertEqual(release_receipt["source"]["commit"], commit)
 
     def test_git_replacement_objects_cannot_rewrite_published_provenance(self) -> None:
         root = self.base / "replacement-source"
@@ -641,21 +705,71 @@ class ArtifactBoundaryTest(unittest.TestCase):
             )
 
     def test_shared_release_provenance_errors_are_translated(self) -> None:
-        self.assertIs(PAGES.provenance_git_env, CONTRACT.provenance_git_env)
-        self.assertIs(
-            PAGES.read_release_source_commit_blob,
-            CONTRACT.source_commit_blob,
+        self.assertEqual(
+            Path(PAGES._RELEASE_CONTRACT.__file__).resolve(),
+            (ROOT / "scripts/release_contract.py").resolve(),
         )
         with mock.patch.object(
             PAGES,
             "require_release_commit_object",
-            side_effect=CONTRACT.ReleaseError("shared provenance rejection"),
+            side_effect=PAGES.ReleaseContractError("shared provenance rejection"),
         ):
             with self.assertRaisesRegex(
                 PAGES.ArtifactError,
                 "shared provenance rejection",
             ):
                 PAGES.require_commit_object(self.root, TEST_COMMIT)
+
+    def test_release_builder_keeps_its_own_checkout_scoped_contract(self) -> None:
+        scoped_before = {
+            name for name in sys.modules if name.startswith("danse_release_contract_")
+        }
+        copies = []
+        for name in ("checkout-a", "checkout-b"):
+            scripts = self.base / name / "scripts"
+            scripts.mkdir(parents=True)
+            for leaf in ("build-pages.py", "build-release.py", "release_contract.py"):
+                shutil.copyfile(ROOT / "scripts" / leaf, scripts / leaf)
+            spec = importlib.util.spec_from_file_location(
+                f"pages_{name}",
+                scripts / "build-pages.py",
+            )
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            copies.append(module)
+
+        first, second = copies
+        generic = sys.modules.get("release_contract")
+        isolated_path = [
+            entry
+            for entry in sys.path
+            if not entry or Path(entry).name != "scripts"
+        ]
+        with mock.patch.object(sys, "path", isolated_path):
+            builder = first._load_release_builder()
+        self.assertIsNot(builder.ReleaseError, second.ReleaseContractError)
+        self.assertEqual(
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+            (self.base / "checkout-a/scripts/release_contract.py").resolve(),
+        )
+        self.assertEqual(
+            Path(first._RELEASE_CONTRACT.__file__).resolve(),
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+        )
+        self.assertNotEqual(
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+            Path(second._RELEASE_CONTRACT.__file__).resolve(),
+        )
+        self.assertIs(sys.modules.get("release_contract"), generic)
+        self.assertEqual(
+            {
+                name
+                for name in sys.modules
+                if name.startswith("danse_release_contract_")
+            },
+            scoped_before,
+        )
 
     def test_committed_symlink_materialized_as_regular_file_is_rejected(self) -> None:
         root = self.base / "symlink-source"
@@ -690,7 +804,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             PAGES.ArtifactError,
-            "allowlisted source must be a regular committed file: arrival.js",
+            "must be a regular committed file: arrival.js",
         ):
             PAGES.build(
                 root,

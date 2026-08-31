@@ -20,25 +20,6 @@ import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from release_contract import (
-    ReleaseError as ReleaseContractError,
-)
-from release_contract import (
-    provenance_git_env,
-)
-from release_contract import (
-    reject_git_rewrites as reject_release_git_rewrites,
-)
-from release_contract import (
-    require_commit_object as require_release_commit_object,
-)
-from release_contract import (
-    source_commit as release_source_commit,
-)
-from release_contract import (
-    source_commit_blob as read_release_source_commit_blob,
-)
-
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_MANIFEST = "pages-manifest.json"
 ARTIFACT_SCHEMA = "danse.pages.v1"
@@ -89,6 +70,44 @@ class ArtifactError(RuntimeError):
     """The public artifact would be incomplete or exceed its declared boundary."""
 
 
+def _load_release_contract():
+    """Load the trusted sibling contract without relying on ambient ``sys.path``."""
+    path = Path(__file__).resolve().with_name("release_contract.py")
+    identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"danse_release_contract_{identity}"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise ArtifactError("cannot load the shared release provenance contract")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        required = (
+            "ReleaseError",
+            "provenance_git_env",
+            "reject_git_rewrites",
+            "require_commit_object",
+            "source_commit",
+            "source_commit_blob",
+        )
+        if any(not hasattr(module, name) for name in required):
+            raise AttributeError("release contract is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise ArtifactError("cannot load the shared release provenance contract") from exc
+    return module
+
+
+_RELEASE_CONTRACT = _load_release_contract()
+ReleaseContractError = _RELEASE_CONTRACT.ReleaseError
+provenance_git_env = _RELEASE_CONTRACT.provenance_git_env
+reject_release_git_rewrites = _RELEASE_CONTRACT.reject_git_rewrites
+require_release_commit_object = _RELEASE_CONTRACT.require_commit_object
+release_source_commit = _RELEASE_CONTRACT.source_commit
+read_release_source_commit_blob = _RELEASE_CONTRACT.source_commit_blob
+
+
 def reject_git_rewrites(root: Path) -> None:
     """Translate the shared release-provenance contract into Pages errors."""
     try:
@@ -128,11 +147,41 @@ def source_file(root: Path, relative: str) -> Path:
     return candidate
 
 
-def corpus_files(root: Path) -> set[str]:
-    manifest_path = source_file(root, "corpus/manifest.json")
+def source_bytes(
+    root: Path,
+    relative: str,
+    label: str,
+    commit: str | None = None,
+) -> bytes:
+    """Read fixture bytes or authenticated raw-commit bytes for production."""
+    if commit is not None:
+        try:
+            payload, _executable = read_release_source_commit_blob(
+                root,
+                commit,
+                relative,
+                label,
+            )
+        except ReleaseContractError as exc:
+            raise ArtifactError(str(exc)) from exc
+        return payload
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        return source_file(root, relative).read_bytes()
+    except OSError as exc:
+        raise ArtifactError(f"cannot read {label}: {exc}") from exc
+
+
+def corpus_files(root: Path, commit: str | None = None) -> set[str]:
+    try:
+        manifest = json.loads(
+            source_bytes(
+                root,
+                "corpus/manifest.json",
+                "public corpus manifest",
+                commit,
+            ).decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read the public corpus manifest: {exc}") from exc
 
     if manifest.get("schema") != "danse.corpus.v1":
@@ -184,16 +233,22 @@ def corpus_files(root: Path) -> set[str]:
     return files
 
 
-def vendor_files(root: Path) -> set[str]:
+def vendor_files(root: Path, commit: str | None = None) -> set[str]:
     """Resolve and authenticate the locally served pose runtime.
 
     The browser may load only files named by this reviewed manifest. Digesting
     them here keeps a package update from silently expanding the public surface.
     """
-    manifest_path = source_file(root, VENDOR_MANIFEST)
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            source_bytes(
+                root,
+                VENDOR_MANIFEST,
+                "pose vendor manifest",
+                commit,
+            ).decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read the pose vendor manifest: {exc}") from exc
     if set(manifest) != {"schema", "package", "model", "patch", "files"}:
         raise ArtifactError("pose vendor manifest has an unknown shape")
@@ -243,15 +298,18 @@ def vendor_files(root: Path) -> set[str]:
         if leaf == "manifest.json" or Path(leaf).suffix not in {".js", ".mjs", ".wasm", ".task", ".txt"}:
             raise ArtifactError(f"unsupported pose vendor file: {leaf}")
         relative = f"{VENDOR_BASE}/{leaf}"
-        path = source_file(root, relative)
+        payload = source_bytes(root, relative, "pose vendor file", commit)
         if not isinstance(record["bytes"], int) or record["bytes"] < 0:
             raise ArtifactError(f"invalid pose vendor byte count for {leaf}")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"])):
             raise ArtifactError(f"invalid pose vendor SHA-256 for {leaf}")
-        if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
+        if len(payload) != record["bytes"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
             raise ArtifactError(f"pose vendor digest mismatch: {leaf}")
-        if path.suffix in {".js", ".mjs"}:
-            text = path.read_text(encoding="utf-8", errors="strict")
+        if Path(leaf).suffix in {".js", ".mjs"}:
+            try:
+                text = payload.decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise ArtifactError(f"pose vendor runtime is not UTF-8: {leaf}") from exc
             forbidden = {
                 "Date.now": r"\bDate\.now\b",
                 "performance.now": r"\bperformance\.now\b",
@@ -280,7 +338,12 @@ def _load_release_builder():
     if spec is None or spec.loader is None:
         raise ArtifactError("cannot load the release artifact verifier")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+        if not hasattr(module, "verify_artifact") or not hasattr(module, "_RELEASE_CONTRACT"):
+            raise AttributeError("release artifact verifier is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise ArtifactError("cannot load the release artifact verifier") from exc
     return module
 
 
@@ -433,12 +496,19 @@ def public_release_files(
     return selected, binding
 
 
-def validate_module_closure(root: Path, files: set[str]) -> None:
+def validate_module_closure(
+    root: Path,
+    files: set[str],
+    commit: str | None = None,
+) -> None:
     """Fail when a published module refers to a local module outside the boundary."""
     for relative in sorted(files):
         if relative != "index.html" and not relative.endswith((".js", ".mjs")):
             continue
-        text = source_file(root, relative).read_text(encoding="utf-8")
+        try:
+            text = source_bytes(root, relative, "published module", commit).decode("utf-8")
+        except UnicodeError as exc:
+            raise ArtifactError(f"published module is not UTF-8: {relative}") from exc
         for match in IMPORT_RE.finditer(text):
             reference = match.group("double") or match.group("single")
             reference = reference.split("?", 1)[0].split("#", 1)[0]
@@ -452,17 +522,18 @@ def validate_module_closure(root: Path, files: set[str]) -> None:
                 )
 
 
-def source_files(root: Path) -> tuple[str, ...]:
+def source_files(root: Path, commit: str | None = None) -> tuple[str, ...]:
     root = root.absolute()
     if root.is_symlink():
         raise ArtifactError(f"source root must not be a symlink: {root}")
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactError(f"source root is not a regular directory: {root}")
-    files = set(RUNTIME_FILES) | corpus_files(root) | vendor_files(root)
-    for relative in files:
-        source_file(root, relative)
-    validate_module_closure(root, files)
+    files = set(RUNTIME_FILES) | corpus_files(root, commit) | vendor_files(root, commit)
+    if commit is None:
+        for relative in files:
+            source_file(root, relative)
+    validate_module_closure(root, files, commit)
     return tuple(sorted(files))
 
 
@@ -530,16 +601,16 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
         raise ArtifactError("source checkout has tracked changes")
 
 
-def source_commit_records(
+def source_commit_payloads(
     root: Path,
     commit: str,
     files: tuple[str, ...],
-) -> dict[str, dict]:
-    """Bind every allowlisted worktree byte to its exact committed blob."""
+) -> tuple[dict[str, dict], dict[str, bytes]]:
+    """Return exact records and bytes from one authenticated commit tree."""
     commit = require_commit_object(root, commit)
     records: dict[str, dict] = {}
+    payloads: dict[str, bytes] = {}
     for relative in files:
-        path = source_file(root, relative)
         try:
             committed, _executable = read_release_source_commit_blob(
                 root,
@@ -549,19 +620,22 @@ def source_commit_records(
             )
         except ReleaseContractError as exc:
             raise ArtifactError(str(exc)) from exc
-        try:
-            worktree = path.read_bytes()
-        except OSError as exc:
-            raise ArtifactError(f"cannot read allowlisted source {relative}: {exc}") from exc
-        if worktree != committed:
-            raise ArtifactError(
-                f"allowlisted source bytes drifted from the declared commit: {relative}"
-            )
+        payloads[relative] = committed
         records[relative] = {
             "path": relative,
             "bytes": len(committed),
             "sha256": hashlib.sha256(committed).hexdigest(),
         }
+    return records, payloads
+
+
+def source_commit_records(
+    root: Path,
+    commit: str,
+    files: tuple[str, ...],
+) -> dict[str, dict]:
+    """Return exact source records without exposing payload bytes to verifiers."""
+    records, _payloads = source_commit_payloads(root, commit, files)
     return records
 
 
@@ -697,7 +771,7 @@ def verify_artifact(
         expected_records = source_commit_records(
             source_root,
             source["commit"],
-            source_files(source_root),
+            source_files(source_root, source["commit"]),
         )
         builder = _load_release_builder()
         try:
@@ -862,12 +936,15 @@ def build(
     commit = source_commit(root, commit)
     if require_git_source:
         validate_git_source(root, commit)
-    files = source_files(root)
-    committed_records = (
-        source_commit_records(root, commit, files)
-        if require_git_source
-        else None
-    )
+    files = source_files(root, commit if require_git_source else None)
+    committed_records = None
+    committed_payloads = None
+    if require_git_source:
+        committed_records, committed_payloads = source_commit_payloads(
+            root,
+            commit,
+            files,
+        )
     release_files: dict[str, tuple[Path, dict]] = {}
     release_binding = None
     if release_artifact is not None:
@@ -883,10 +960,13 @@ def build(
     output.mkdir(parents=True, exist_ok=True)
     records = []
     for relative in files:
-        source = source_file(root, relative)
         target = output / PurePosixPath(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target, follow_symlinks=False)
+        if committed_payloads is not None:
+            target.write_bytes(committed_payloads[relative])
+        else:
+            source = source_file(root, relative)
+            shutil.copyfile(source, target, follow_symlinks=False)
         target.chmod(0o644)
         os.utime(target, (0, 0), follow_symlinks=False)
         record = (

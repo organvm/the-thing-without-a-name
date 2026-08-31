@@ -25,8 +25,6 @@ from pypdf import PdfReader
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import release_contract as CONTRACT  # noqa: E402
-
 TEST_COMMIT = "a" * 40
 FIXTURE_FILES = (
     ".gitignore",
@@ -65,6 +63,7 @@ def load_release_builder():
 
 
 BUILD = load_release_builder()
+CONTRACT = BUILD._RELEASE_CONTRACT
 
 
 def replace_loose_object_bytes(
