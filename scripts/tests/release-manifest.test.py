@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
@@ -22,8 +24,6 @@ from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-
-import release_contract as CONTRACT  # noqa: E402
 
 TEST_COMMIT = "a" * 40
 FIXTURE_FILES = (
@@ -63,6 +63,32 @@ def load_release_builder():
 
 
 BUILD = load_release_builder()
+CONTRACT = BUILD._RELEASE_CONTRACT
+
+
+def replace_loose_object_bytes(
+    root: Path,
+    object_id: str,
+    kind: str,
+    payload: bytes,
+) -> None:
+    """Put forged bytes under an existing loose-object hash filename."""
+    loose = root / ".git" / "objects" / object_id[:2] / object_id[2:]
+    if not loose.is_file():
+        raise AssertionError(f"fixture object is not loose: {object_id}")
+    header = f"{kind} {len(payload)}\0".encode("ascii")
+    loose.chmod(0o600)
+    loose.write_bytes(zlib.compress(header + payload))
+
+
+def verify_fixture_artifact(
+    output: Path,
+    expected_commit: str | None = TEST_COMMIT,
+    **kwargs,
+) -> dict:
+    """Verify a synthetic non-Git fixture through the explicit fallback rail."""
+    kwargs.setdefault("allow_worktree_manifest", True)
+    return BUILD.verify_artifact(output, expected_commit, **kwargs)
 
 
 def load_pages_builder():
@@ -406,6 +432,11 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertIn("Draft - not for publication", project)
         self.assertIn("@media (prefers-reduced-motion:reduce)", project)
         self.assertIn("viewport-fit=cover", project)
+        self.assertIn(
+            f'http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}"',
+            project,
+        )
+        self.assertIn('name="referrer" content="no-referrer"', project)
         self.assertNotIn("<script", project)
         self.assertNotIn("sound is not scored to the image", project.lower())
         reference = self.manifest["installation"]["reference_contract"]
@@ -426,6 +457,14 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertIn("#evidence", hrefs)
         robots = [meta for meta in markup.metas if meta.get("name") == "robots"]
         self.assertEqual(robots[0]["content"], "noindex,nofollow")
+        policies = [
+            meta
+            for meta in markup.metas
+            if meta.get("http-equiv") == "Content-Security-Policy"
+        ]
+        self.assertEqual([meta.get("content") for meta in policies], [BUILD.PROJECT_CSP])
+        referrers = [meta for meta in markup.metas if meta.get("name") == "referrer"]
+        self.assertEqual([meta.get("content") for meta in referrers], ["no-referrer"])
 
     def test_project_resources_are_accessible_receipted_artifact_links(self) -> None:
         markup = Markup()
@@ -618,6 +657,67 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
             receipt = BUILD.build(root, base / "public-artifact", "public", TEST_COMMIT)
             self.assertEqual(receipt["phase"], "public")
 
+    def test_draft_omits_public_only_social_card_from_page_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            manifest = complete_manifest(root)
+            social = next(
+                medium
+                for medium in manifest["media"]
+                if medium["id"] == "project-social-card"
+            )
+            self.assertNotIn("draft", social["required_for"])
+
+            output = base / "draft-artifact"
+            receipt = BUILD.build(root, output, "draft", TEST_COMMIT)
+
+            self.assertIsNone(receipt["release"]["project_security"]["social_image"])
+            project = (output / "project/index.html").read_text(encoding="utf-8")
+            self.assertNotIn('property="og:image"', project)
+            self.assertFalse(
+                (output / social["source"]["destination"]).exists(),
+                "draft artifacts must not reference or copy public-only social media",
+            )
+
+    def test_project_page_renderer_contract_is_versioned_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            manifest = CONTRACT.validate_release(root, phase="draft")
+            output = base / "draft-artifact"
+            receipt = BUILD.build(root, output, "draft", TEST_COMMIT)
+
+            self.assertEqual(
+                receipt["release"]["project_security"]["project_contract"],
+                BUILD.PROJECT_PAGE_CONTRACT,
+            )
+            expected = BUILD.project_html(manifest, "draft", TEST_COMMIT)
+            self.assertEqual(
+                expected,
+                BUILD.project_html(
+                    manifest,
+                    "draft",
+                    TEST_COMMIT,
+                    contract=BUILD.PROJECT_PAGE_CONTRACT,
+                ),
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "does not match the source manifest",
+            ):
+                BUILD.project_html(
+                    manifest,
+                    "draft",
+                    TEST_COMMIT,
+                    contract="danse.project-page.v2",
+                )
+
+            self.assertEqual(
+                receipt["release"]["payload_contract"],
+                BUILD.RELEASE_PAYLOAD_CONTRACT,
+            )
+
 
 class ProductionCliSourceTest(unittest.TestCase):
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
@@ -660,7 +760,7 @@ class ProductionCliSourceTest(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(wrong.returncode, 0)
-            self.assertIn("does not match checkout HEAD", wrong.stderr)
+            self.assertIn("must resolve to a commit object", wrong.stderr)
             self.assertFalse(wrong_output.exists())
 
             (root / "tracked-sentinel.txt").write_text("dirty\n", encoding="utf-8")
@@ -687,6 +787,318 @@ class ProductionCliSourceTest(unittest.TestCase):
             self.assertNotEqual(untracked.returncode, 0)
             self.assertIn("untracked files", untracked.stderr)
             self.assertFalse(untracked_output.exists())
+
+    def test_clean_crlf_checkout_hashes_the_committed_manifest_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = fixture_root(base / "source")
+            (source / ".gitattributes").write_text(
+                "release/manifest.json text eol=crlf\n",
+                encoding="utf-8",
+            )
+            commit = initialize_git_fixture(source)
+            root = base / "clean-crlf-checkout"
+            subprocess.run(
+                ["git", "clone", "-q", str(source), str(root)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            manifest_path = root / "release/manifest.json"
+            self.assertIn(b"\r\n", manifest_path.read_bytes())
+            status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(status.stdout, "", status.stdout)
+            committed = subprocess.run(
+                ["git", "-C", str(root), "show", f"{commit}:release/manifest.json"],
+                check=True,
+                capture_output=True,
+            ).stdout
+            committed_sha = hashlib.sha256(committed).hexdigest()
+            receipt = BUILD.build(
+                root,
+                base / "crlf-artifact",
+                "draft",
+                commit,
+                require_git_source=True,
+            )
+            self.assertEqual(
+                receipt["release"]["manifest"]["sha256"],
+                committed_sha,
+            )
+            self.assertNotEqual(CONTRACT.sha256(manifest_path), committed_sha)
+
+    def test_bare_tree_sha_cannot_pose_as_source_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            commit = initialize_git_fixture(root)
+            output = base / "tree-artifact"
+            BUILD.build(
+                root,
+                output,
+                "draft",
+                commit,
+                require_git_source=True,
+            )
+            tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            receipt_path = output / BUILD.ARTIFACT_MANIFEST
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["source"]["commit"] = tree
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "must resolve to a commit object",
+            ):
+                BUILD.verify_artifact(
+                    output,
+                    tree,
+                    source_root=root,
+                )
+
+    def test_forged_loose_object_under_claimed_hash_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            commit = initialize_git_fixture(root)
+            object_id = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "rev-parse",
+                    f"{commit}:release/manifest.json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=CONTRACT.provenance_git_env(),
+            ).stdout.strip()
+            forged = (root / "release/manifest.json").read_bytes().replace(
+                b'"version": "0.1.0-draft"',
+                b'"version": "0.1.1-draft"',
+                1,
+            )
+            replace_loose_object_bytes(root, object_id, "blob", forged)
+            accepted_without_integrity_check = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "show",
+                    f"{commit}:release/manifest.json",
+                ],
+                check=True,
+                capture_output=True,
+                env=CONTRACT.provenance_git_env(),
+            ).stdout
+            self.assertEqual(accepted_without_integrity_check, forged)
+
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "failed raw Git object integrity verification",
+            ):
+                BUILD.source_release_manifest(root, commit)
+
+    def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base / "source")
+            claimed_commit = initialize_git_fixture(root)
+            alternate = base / "alternate"
+            subprocess.run(
+                ["git", "clone", "-q", str(root), str(alternate)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            alternate_manifest = alternate / "release/manifest.json"
+            manifest = json.loads(alternate_manifest.read_text(encoding="utf-8"))
+            manifest["version"] = "0.1.1-draft"
+            alternate_manifest.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(alternate), "add", "release/manifest.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(alternate),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "alternate release manifest",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            alternate_commit = subprocess.run(
+                ["git", "-C", str(alternate), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            shutil.copy2(alternate_manifest, root / "release/manifest.json")
+            self.assertNotEqual(claimed_commit, alternate_commit)
+
+            redirect = {
+                "GIT_DIR": str(alternate / ".git"),
+                "GIT_WORK_TREE": str(root),
+            }
+            ambient = os.environ.copy()
+            ambient.update(redirect)
+            redirected_identity = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=ambient,
+            ).stdout.strip()
+            redirected_status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=ambient,
+            ).stdout
+            self.assertEqual(redirected_identity, alternate_commit)
+            self.assertEqual(redirected_status, "")
+
+            with mock.patch.dict(os.environ, redirect, clear=False):
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "must resolve to a commit object",
+                ):
+                    BUILD.build(
+                        root,
+                        base / "redirected-artifact",
+                        "draft",
+                        alternate_commit,
+                        require_git_source=True,
+                    )
+
+    def test_provenance_git_environment_scrubs_all_ambient_git_controls(self) -> None:
+        controls = {
+            "git_dir": "/alternate/repository",
+            "GIT_WORK_TREE": "/alternate/worktree",
+            "GIT_COMMON_DIR": "/alternate/common",
+            "GIT_OBJECT_DIRECTORY": "/alternate/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/alternate/objects-2",
+            "GIT_INDEX_FILE": "/alternate/index",
+            "GIT_NAMESPACE": "alternate",
+            "GIT_SHALLOW_FILE": "/alternate/shallow",
+            "GIT_CONFIG": "/alternate/config",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": "/alternate/worktree",
+        }
+        with mock.patch.dict(os.environ, controls, clear=False):
+            clean = CONTRACT.provenance_git_env()
+        for key in controls:
+            self.assertNotIn(key, clean)
+        self.assertEqual(clean["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(clean["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(clean["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(clean["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(clean["GIT_ATTR_NOSYSTEM"], "1")
+
+    def test_source_commit_manifest_rejects_duplicate_json_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest_path = root / "release/manifest.json"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8").replace(
+                    '"status": "draft",',
+                    '"status": "draft",\n  "status": "released",',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            commit = initialize_git_fixture(root)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "JSON contains duplicate key 'status'",
+            ):
+                BUILD.source_release_manifest(root, commit)
+
+    def test_source_commit_manifest_rejects_git_replacement_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            claimed_commit = initialize_git_fixture(root)
+            manifest = read_manifest(root)
+            manifest["version"] = "0.1.1-draft"
+            write_manifest(root, manifest)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "release/manifest.json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "replacement manifest",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            replacement_commit = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "replace",
+                    claimed_commit,
+                    replacement_commit,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "replacement object refs",
+            ):
+                BUILD.source_release_manifest(root, claimed_commit)
 
 
 class AdversarialManifestTest(unittest.TestCase):
@@ -872,16 +1284,280 @@ class AdversarialArtifactTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def rehash_project(self) -> None:
+        self.rehash_project_at(self.output)
+
+    def rehash_project_at(self, output: Path) -> None:
+        project = output / "project/index.html"
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in receipt["files"] if record["path"] == "project/index.html"
+        )
+        record["bytes"] = project.stat().st_size
+        record["sha256"] = CONTRACT.sha256(project)
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
     def test_tampered_pdf_digest_fails(self) -> None:
         with (self.output / BUILD.PDF_NAME).open("ab") as handle:
             handle.write(b"tamper")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "digest mismatch"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_historical_pdf_requires_its_receipted_generation_toolchain(self) -> None:
+        for dependency in ("python", "pypdf", "reportlab"):
+            with self.subTest(dependency=dependency):
+                future = BUILD.active_toolchain()
+                future[dependency] = f"{future[dependency]}-future"
+                with mock.patch.object(
+                    BUILD,
+                    "active_toolchain",
+                    return_value=future,
+                ):
+                    with self.assertRaisesRegex(
+                        CONTRACT.ReleaseError,
+                        "exact receipted generation toolchain",
+                    ):
+                        verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_public_phase_validates_evidence_from_raw_source_commit(self) -> None:
+        root = fixture_root(self.base / "committed-evidence-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        valid_commit = initialize_git_fixture(root)
+        output = self.base / "committed-evidence-artifact"
+        BUILD.build(
+            root,
+            output,
+            "public",
+            valid_commit,
+            require_git_source=True,
+        )
+
+        medium = next(
+            item for item in manifest["media"] if item["id"] == "press-still-primary"
+        )
+        medium["source"]["sha256"] = "0" * 64
+        write_manifest(root, manifest)
+        subprocess.run(
+            ["git", "-C", str(root), "add", "release/manifest.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "forge ready media evidence",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        forged_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        committed_manifest = subprocess.run(
+            ["git", "-C", str(root), "show", f"{forged_commit}:release/manifest.json"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["source"]["commit"] = forged_commit
+        receipt["release"]["manifest"]["sha256"] = hashlib.sha256(
+            committed_manifest
+        ).hexdigest()
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "source-commit release manifest failed schema/evidence validation: "
+            ".*media press-still-primary source digest mismatch",
+        ):
+            BUILD.verify_artifact(
+                output,
+                forged_commit,
+                source_root=root,
+            )
+
+    def test_source_validation_never_executes_commit_selected_python(self) -> None:
+        root = fixture_root(self.base / "untrusted-checker-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        sentinel = self.base / "historical-checker-executed"
+        payload = (
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+            "raise RuntimeError('historical checker executed')\n"
+        )
+        (root / "installation/contract.py").write_text(payload, encoding="utf-8")
+        (root / "scripts/check-opportunities.py").write_text(payload, encoding="utf-8")
+        commit = initialize_git_fixture(root)
+
+        validated = BUILD.validate_source_commit_release(
+            root,
+            commit,
+            manifest,
+            "public",
+        )
+        self.assertEqual(validated, manifest)
+        self.assertFalse(sentinel.exists())
 
     def test_unrecorded_file_fails(self) -> None:
         (self.output / "private.txt").write_text("not allowlisted\n")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "inventory mismatch"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_coherently_rehashed_generated_press_claim_fails_source_binding(self) -> None:
+        press = self.output / "press/press-kit.md"
+        press.write_text(
+            "# Approved biography and rights\n\nFalse unreceipted public claims.\n",
+            encoding="utf-8",
+        )
+        press_record = {
+            "path": "press/press-kit.md",
+            "bytes": press.stat().st_size,
+            "sha256": CONTRACT.sha256(press),
+        }
+        inventory_path = self.output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        product = next(
+            row for row in inventory["products"] if row["id"] == "press-kit-copy"
+        )
+        product["artifact"] = {"id": "press-kit-copy", **press_record}
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        by_path = {record["path"]: record for record in receipt["files"]}
+        by_path["press/press-kit.md"].update(press_record)
+        by_path["media/release-media.json"].update(
+            {
+                "bytes": inventory_path.stat().st_size,
+                "sha256": CONTRACT.sha256(inventory_path),
+            }
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "release payload does not reproduce its source-manifest contract",
+        ):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_public_release_cannot_self_receipt_changed_external_media(self) -> None:
+        root = fixture_root(self.base / "public-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "public-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        medium = next(item for item in manifest["media"] if item["id"] == "press-still-primary")
+        relative = medium["source"]["destination"]
+        media_path = output / relative
+        media_path.write_bytes(b"unreceipted replacement pixels\n")
+        media_identity = {
+            "path": relative,
+            "bytes": media_path.stat().st_size,
+            "sha256": CONTRACT.sha256(media_path),
+        }
+        inventory_path = output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        row = next(item for item in inventory["media"] if item["id"] == medium["id"])
+        row["released"] = {"id": medium["id"], **media_identity}
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        by_path = {record["path"]: record for record in receipt["files"]}
+        by_path[relative].update(media_identity)
+        by_path["media/release-media.json"].update(
+            {
+                "bytes": inventory_path.stat().st_size,
+                "sha256": CONTRACT.sha256(inventory_path),
+            }
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "release payload does not reproduce its source-manifest contract",
+        ):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
+    def test_public_release_cannot_omit_a_required_generated_product(self) -> None:
+        root = fixture_root(self.base / "required-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "required-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        relative = "press/credits.txt"
+        (output / relative).unlink()
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["files"] = [
+            record for record in receipt["files"] if record["path"] != relative
+        ]
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing .*press/credits.txt"):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
+    def test_public_receipt_cannot_promote_a_draft_source_manifest(self) -> None:
+        root = fixture_root(self.base / "phase-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "phase-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        manifest["status"] = "draft"
+        write_manifest(root, manifest)
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["release"]["manifest"]["sha256"] = CONTRACT.sha256(
+            root / "release/manifest.json"
+        )
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "source-commit release manifest failed schema/evidence validation: "
+            "public phase blocked",
+        ):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
 
     def test_receipt_omitting_required_output_fails_before_post_inventory_reads(self) -> None:
         for relative in (
@@ -900,7 +1576,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                 ]
                 receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
                 with self.assertRaisesRegex(CONTRACT.ReleaseError, "omits required outputs"):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_self_rehashed_invalid_utf8_output_fails_as_release_error(self) -> None:
         for relative in ("project/index.html", "accessibility/captions.en.vtt"):
@@ -918,7 +1594,7 @@ class AdversarialArtifactTest(unittest.TestCase):
                 record["sha256"] = CONTRACT.sha256(path)
                 receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
                 with self.assertRaisesRegex(CONTRACT.ReleaseError, "not readable UTF-8"):
-                    BUILD.verify_artifact(case, TEST_COMMIT)
+                    verify_fixture_artifact(case, TEST_COMMIT)
 
     def test_receipted_project_link_to_source_manifest_fails(self) -> None:
         project = self.output / "project/index.html"
@@ -929,16 +1605,375 @@ class AdversarialArtifactTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        record = next(
-            record for record in receipt["files"] if record["path"] == "project/index.html"
-        )
-        record["bytes"] = project.stat().st_size
-        record["sha256"] = CONTRACT.sha256(project)
-        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        self.rehash_project()
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing internal target"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_weakened_csp_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                BUILD.PROJECT_CSP,
+                "default-src * 'unsafe-inline' 'unsafe-eval'",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "content security policy"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_active_content_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                "<script>document.body.dataset.changed = 'true'</script></main>",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: script"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_self_closing_event_handler_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<br onmouseover="document.body.dataset.changed = true"/></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "inline event handlers: onmouseover"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_meta_refresh_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<meta http-equiv="refresh" content="0;url=https://example.invalid/"></head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "HTTP-equivalent metadata: refresh"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_inert_security_metadata_fails(self) -> None:
+        for container in ("template", "noscript"):
+            with self.subTest(container=container):
+                case = self.base / f"inert-{container}"
+                shutil.copytree(self.output, case)
+                project = case / "project/index.html"
+                original = project.read_text(encoding="utf-8")
+                csp = (
+                    f'  <meta http-equiv="Content-Security-Policy" '
+                    f'content="{BUILD.PROJECT_CSP}">\n'
+                )
+                referrer = '  <meta name="referrer" content="no-referrer">\n'
+                project.write_text(
+                    original.replace(csp, "").replace(referrer, "").replace(
+                        "</head>",
+                        f"<{container}>\n{csp}{referrer}</{container}>\n</head>",
+                    ),
+                    encoding="utf-8",
+                )
+                self.rehash_project_at(case)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    f"prohibited active elements: {container}",
+                ):
+                    verify_fixture_artifact(case, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_nested_security_metadata_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"<div>{csp}{referrer}</div></head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_reenter_head_after_body(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(referrer, "").replace(
+                "</head>", f"<body></body>{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_reenter_head_after_paragraph(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"<p></p>{csp}{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "malformed head structure"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_reenter_head_after_text(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</head>", f"not-head-text{csp}{referrer}</head>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-whitespace head text"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_place_head_after_body(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "<head>", "<body></body>\n<head>", 1
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "misordered head start"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_image_input_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<input type="image" alt="unmanifested" '
+                'src="https://attacker.example/pixel.png"></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: input"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_unmanifested_image_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</main>",
+                '<img alt="unmanifested" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="></main>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "prohibited active elements: img"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_referrer_policy_override_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                '<a class="skip" href="#content">',
+                '<a class="skip" href="#content" referrerpolicy="unsafe-url">',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "referrer-policy overrides"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_resource_hint_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<link rel="dns-prefetch" href="//attacker.example">\n</head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_external_open_graph_image_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "</head>",
+                '<meta property="og:image" '
+                'content="https://attacker.example/unproven.jpg">\n</head>',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "prohibited property metadata: og:image",
+        ):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_external_canonical_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                BUILD.PROJECT_CANONICAL_URL,
+                "https://attacker.example/project/",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "manifest-bound canonical link"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_pre_csp_html_style_fails(self) -> None:
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                '<html lang="en">',
+                '<html lang="en" '
+                'style="background-image:url(https://attacker.example/pixel.png)">',
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "opening document attributes"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_cannot_change_public_claims(self) -> None:
+        attacks = {
+            "title": lambda value: value.replace(
+                "<title>Danse - a room that never repeats | Project</title>",
+                "<title>Unreceipted exhibition claim</title>",
+            ),
+            "description": lambda value: value.replace(
+                'name="description" content="',
+                'name="description" content="Unreceipted synopsis. ',
+                1,
+            ),
+            "heading": lambda value: value.replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted public title</h1>",
+            ),
+            "status-copy": lambda value: value.replace(
+                "Draft - not for publication",
+                "Approved and already published",
+            ),
+        }
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / f"claims-{label}"
+                shutil.copytree(self.output, case)
+                project = case / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_at(case)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "does not reproduce the source-manifest public claims",
+                ):
+                    verify_fixture_artifact(case, TEST_COMMIT)
+
+    def test_coherently_rehashed_social_claim_still_fails_source_binding(self) -> None:
+        root = fixture_root(self.base / "social-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        output = self.base / "social-artifact"
+        BUILD.build(root, output, "public", TEST_COMMIT)
+
+        social_path = output / "media/assets/project-social-card.bin"
+        social_path.write_bytes(social_path.read_bytes() + b"tampered social bytes\n")
+        social_sha = CONTRACT.sha256(social_path)
+
+        inventory_path = output / "media/release-media.json"
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        social_row = next(
+            row for row in inventory["media"] if row["id"] == "project-social-card"
+        )
+        social_row["released"]["bytes"] = social_path.stat().st_size
+        social_row["released"]["sha256"] = social_sha
+        inventory_path.write_bytes(CONTRACT.canonical_json(inventory))
+
+        project = output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted social-preview claim</h1>",
+            ),
+            encoding="utf-8",
+        )
+
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        records = {record["path"]: record for record in receipt["files"]}
+        for relative in (
+            "media/assets/project-social-card.bin",
+            "media/release-media.json",
+            "project/index.html",
+        ):
+            path = output / relative
+            records[relative]["bytes"] = path.stat().st_size
+            records[relative]["sha256"] = CONTRACT.sha256(path)
+        binding = receipt["release"]["project_security"]["social_image"]
+        binding["bytes"] = social_path.stat().st_size
+        binding["sha256"] = social_sha
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "project security binding drifted from its source manifest",
+        ):
+            verify_fixture_artifact(
+                output,
+                TEST_COMMIT,
+                source_root=root,
+                allow_worktree_manifest=True,
+            )
+
+    def test_self_rehashed_project_with_security_metadata_outside_head_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        referrer = '  <meta name="referrer" content="no-referrer">\n'
+        project.write_text(
+            original.replace(csp, "").replace(referrer, "").replace(
+                "</body>", f"{csp}{referrer}</body>"
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_project_with_late_csp_fails(self) -> None:
+        project = self.output / "project/index.html"
+        original = project.read_text(encoding="utf-8")
+        csp = f'  <meta http-equiv="Content-Security-Policy" content="{BUILD.PROJECT_CSP}">\n'
+        project.write_text(
+            original.replace(csp, "").replace("</head>", f"{csp}</head>"),
+            encoding="utf-8",
+        )
+        self.rehash_project()
+        with self.assertRaisesRegex(CONTRACT.ReleaseError, "precede all head markup"):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_symlinked_project_file_fails(self) -> None:
@@ -948,11 +1983,18 @@ class AdversarialArtifactTest(unittest.TestCase):
         project.unlink()
         project.symlink_to(outside)
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "missing or non-regular"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_wrong_source_commit_fails(self) -> None:
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "does not match expected"):
-            BUILD.verify_artifact(self.output, "b" * 40)
+            verify_fixture_artifact(self.output, "b" * 40)
+
+    def test_nonexistent_source_commit_never_uses_worktree_manifest_by_default(self) -> None:
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "must resolve to a commit object",
+        ):
+            BUILD.verify_artifact(self.output, TEST_COMMIT)
 
     def test_noncanonical_manifest_binding_fails(self) -> None:
         receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
@@ -960,7 +2002,18 @@ class AdversarialArtifactTest(unittest.TestCase):
         receipt["release"]["manifest"]["path"] = "release/other-manifest.json"
         receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "non-canonical release manifest"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_self_rehashed_manifest_digest_cannot_leave_source_commit(self) -> None:
+        receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["release"]["manifest"]["sha256"] = "f" * 64
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "manifest digest does not match its source commit",
+        ):
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
     def test_duplicate_receipt_key_fails(self) -> None:
         receipt_path = self.output / BUILD.ARTIFACT_MANIFEST
@@ -969,7 +2022,7 @@ class AdversarialArtifactTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "duplicate key 'schema'"):
-            BUILD.verify_artifact(self.output, TEST_COMMIT)
+            verify_fixture_artifact(self.output, TEST_COMMIT)
 
 
 if __name__ == "__main__":

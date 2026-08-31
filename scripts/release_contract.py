@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterable, Iterator
@@ -80,6 +81,20 @@ def _no_duplicate_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         if key in value:
             raise ReleaseError(f"JSON contains duplicate key {key!r}")
         value[key] = item
+    return value
+
+
+def decode_json_object(data: bytes, label: str) -> dict[str, Any]:
+    """Decode one UTF-8 JSON object while rejecting duplicate keys."""
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_no_duplicate_object,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"{label} is invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} must be a JSON object")
     return value
 
 
@@ -220,11 +235,16 @@ def _load_installation_checker(root: Path):
     return checker
 
 
-def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_installation_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    checker_root: Path | None = None,
+) -> None:
     binding = manifest["installation"]["reference_contract"]
     twin_path = verify_record(root, binding["digital_twin"], "installation digital twin")
     gates_path = verify_record(root, binding["gate_ledger"], "installation gate ledger")
-    checker = _load_installation_checker(root)
+    checker = _load_installation_checker(checker_root or root)
     try:
         spec = checker.validate_digital_twin(checker.load_json(twin_path), root)
         gates = checker.validate_gates(checker.load_json(gates_path), spec)
@@ -246,7 +266,12 @@ def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
             raise ReleaseError(f"installation reference binding {key} drifted")
 
 
-def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_opportunity_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    checker_root: Path | None = None,
+) -> None:
     binding = manifest["opportunity_snapshot"]
     if binding["snapshot_id"] != EXPECTED_OPPORTUNITY_ID:
         raise ReleaseError("release manifest consumes the wrong opportunity snapshot id")
@@ -302,7 +327,7 @@ def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
     if consumer != {"issue": 12, "binding": "release/manifest.json", "status": "pending"}:
         raise ReleaseError("opportunity receipt no longer reserves issue 12 for release/manifest.json")
 
-    checker = _load_opportunity_checker(root)
+    checker = _load_opportunity_checker(checker_root or root)
     try:
         checker.validate_all(
             snapshot_path=snapshot_path,
@@ -619,6 +644,7 @@ def validate_release(
     *,
     manifest_path: Path | str = MANIFEST,
     phase: str = "draft",
+    checker_root: Path | None = None,
 ) -> dict[str, Any]:
     root = root.absolute()
     manifest_file = source_file(root, str(manifest_path), "release manifest")
@@ -656,8 +682,8 @@ def validate_release(
 
     _validate_graph(manifest, gate_ids)
     _validate_evidence_states(root, manifest)
-    validate_installation_binding(root, manifest)
-    validate_opportunity_binding(root, manifest)
+    validate_installation_binding(root, manifest, checker_root=checker_root)
+    validate_opportunity_binding(root, manifest, checker_root=checker_root)
     blockers = phase_blockers(manifest, phase)
     if blockers:
         preview = "; ".join(blockers[:8])
@@ -669,11 +695,13 @@ def validate_release(
 def source_commit(root: Path, explicit: str | None = None) -> str:
     commit = explicit
     if commit is None:
+        reject_git_rewrites(root)
         done = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
+            env=provenance_git_env(),
         )
         if done.returncode != 0:
             raise ReleaseError(f"cannot resolve source commit: {done.stderr.strip()}")
@@ -682,3 +710,156 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
     if not HEX40.fullmatch(commit):
         raise ReleaseError(f"source commit must be a full 40-character Git SHA: {commit!r}")
     return commit
+
+
+def require_commit_object(root: Path, commit: str) -> str:
+    """Require a raw Git commit object, never a tree/tag sharing SHA syntax."""
+    root = root.absolute().resolve()
+    commit = source_commit(root, commit)
+    reject_git_rewrites(root)
+    kind = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if kind.returncode != 0 or kind.stdout.strip() != "commit":
+        detail = kind.stderr.strip() or kind.stdout.strip() or "missing object"
+        raise ReleaseError(
+            f"source object {commit} must resolve to a commit object: {detail}"
+        )
+    integrity = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "fsck",
+            "--strict",
+            "--no-dangling",
+            "--no-reflogs",
+            commit,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if integrity.returncode != 0:
+        detail = integrity.stderr.strip() or integrity.stdout.strip() or "Git fsck failed"
+        raise ReleaseError(
+            f"source commit {commit} failed raw Git object integrity verification: {detail}"
+        )
+    return commit
+
+
+def source_commit_blob(
+    root: Path,
+    commit: str,
+    relative: str,
+    label: str,
+) -> tuple[bytes, bool]:
+    """Read one regular file from an already-authenticated raw commit tree.
+
+    Callers authenticate ``commit`` once with :func:`require_commit_object`
+    before reading a batch.  This shared reader preserves the tree mode check
+    so a committed symlink or submodule cannot become an apparently regular
+    file in a checkout configured with ``core.symlinks=false``.
+    """
+    relative = safe_relative(relative, label)
+    root = root.absolute().resolve()
+    reject_git_rewrites(root)
+    env = provenance_git_env()
+    entry = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-z", "--full-tree", commit, "--", relative],
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if entry.returncode != 0:
+        detail = entry.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot inspect {label} at source commit {commit}: {detail}")
+    rows = [row for row in entry.stdout.split(b"\0") if row]
+    if len(rows) != 1 or b"\t" not in rows[0]:
+        raise ReleaseError(f"{label} is missing or ambiguous at source commit {commit}")
+    identity, encoded_path = rows[0].split(b"\t", 1)
+    try:
+        mode, kind, object_id = identity.decode("ascii").split()
+        tree_path = encoded_path.decode("utf-8")
+    except (UnicodeError, ValueError) as exc:
+        raise ReleaseError(f"{label} has an invalid Git tree identity") from exc
+    if tree_path != relative or kind != "blob" or mode not in {"100644", "100755"}:
+        raise ReleaseError(f"{label} must be a regular committed file: {relative}")
+    blob = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", object_id],
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if blob.returncode != 0:
+        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+        raise ReleaseError(f"cannot read committed {label}: {detail}")
+    return blob.stdout, mode == "100755"
+
+
+def provenance_git_env() -> dict[str, str]:
+    """Return an environment pinned to the repository named by ``git -C``.
+
+    Git gives ambient ``GIT_*`` variables precedence over ``-C`` repository
+    discovery.  In particular, ``GIT_DIR``/``GIT_WORK_TREE`` can make a clean
+    alternate checkout answer provenance queries for the requested root.  Drop
+    every inherited Git control variable, then restore only the fail-closed
+    settings needed by these read-only provenance commands.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    env.update(
+        {
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+    return env
+
+
+def reject_git_rewrites(root: Path) -> None:
+    """Fail closed on local replacement refs or legacy grafted history."""
+    root = root.absolute().resolve()
+    env = provenance_git_env()
+    replacements = subprocess.run(
+        ["git", "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/replace/"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if replacements.returncode != 0:
+        raise ReleaseError(
+            f"cannot inspect Git replacement refs: {replacements.stderr.strip()}"
+        )
+    if replacements.stdout.strip():
+        raise ReleaseError("source repository contains Git replacement object refs")
+    graft_query = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if graft_query.returncode != 0 or not graft_query.stdout.strip():
+        detail = graft_query.stderr.strip() or "Git returned no graft path"
+        raise ReleaseError(f"cannot inspect legacy Git grafts: {detail}")
+    graft_path = Path(graft_query.stdout.strip())
+    if not graft_path.is_absolute():
+        graft_path = root / graft_path
+    if graft_path.exists():
+        if graft_path.is_symlink() or not graft_path.is_file():
+            raise ReleaseError("legacy Git graft path is not a regular file")
+        if graft_path.stat().st_size:
+            raise ReleaseError("source repository contains a nonempty legacy Git graft file")

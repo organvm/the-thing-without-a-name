@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +48,24 @@ def load_release_support():
 
 RELEASE_SUPPORT = load_release_support()
 RELEASE_BUILD = RELEASE_SUPPORT.BUILD
+
+
+def add_release_validation_fixture(root: Path) -> None:
+    """Add the complete release data contract without replacing the tiny corpus."""
+    for relative in RELEASE_SUPPORT.FIXTURE_FILES:
+        if relative == "corpus/manifest.json":
+            continue
+        source = ROOT / relative
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    manifest = RELEASE_SUPPORT.read_manifest(root)
+    corpus_digest = PAGES.sha256(root / "corpus/manifest.json")
+    corpus_claim = next(
+        claim for claim in manifest["claims"] if claim["id"] == "corpus-session"
+    )
+    corpus_claim["evidence"]["sha256"] = corpus_digest
+    RELEASE_SUPPORT.write_manifest(root, manifest)
 
 
 class Markup(HTMLParser):
@@ -157,7 +177,7 @@ def public_fixture(root: Path) -> None:
     write(root / "project/index.html", b"unapproved project route\n")
 
 
-def release_artifact_fixture(base: Path, phase: str) -> Path:
+def release_artifact_fixture(base: Path, phase: str) -> tuple[Path, Path]:
     source = RELEASE_SUPPORT.fixture_root(base / f"{phase}-release-source")
     if phase == "public":
         manifest = RELEASE_SUPPORT.complete_manifest(source)
@@ -165,7 +185,39 @@ def release_artifact_fixture(base: Path, phase: str) -> Path:
         RELEASE_SUPPORT.write_manifest(source, manifest)
     output = base / f"{phase}-release-artifact"
     RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
-    return output
+    return output, source
+
+
+def authenticated_public_pages_fixture(base: Path) -> tuple[Path, Path, str]:
+    """Build public release + Pages outputs from one exact synthetic Git checkout."""
+    root = RELEASE_SUPPORT.fixture_root(base / "combined-source")
+    manifest = RELEASE_SUPPORT.complete_manifest(root)
+    manifest["status"] = "public-approved"
+    public_fixture(root)
+    contract_bound_runtime = (
+        set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+    ) | {"installation/digital-twin.json"}
+    for relative in contract_bound_runtime:
+        shutil.copyfile(ROOT / relative, root / relative)
+    RELEASE_SUPPORT.write_manifest(root, manifest)
+    commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+    release_artifact = base / "public-release"
+    RELEASE_BUILD.build(
+        root,
+        release_artifact,
+        "public",
+        commit,
+        require_git_source=True,
+    )
+    pages_artifact = base / "public-pages"
+    PAGES.build(
+        root,
+        pages_artifact,
+        commit,
+        release_artifact=release_artifact,
+        require_git_source=True,
+    )
+    return root, pages_artifact, commit
 
 
 class ProductionArtifactTest(unittest.TestCase):
@@ -176,7 +228,12 @@ class ProductionArtifactTest(unittest.TestCase):
         cls._temporary = None
         if supplied:
             cls.output = Path(supplied)
-            cls.manifest = PAGES.verify_artifact(cls.output, expected)
+            cls.manifest = PAGES.verify_artifact(
+                cls.output,
+                expected,
+                require_source_manifest=True,
+                source_root=ROOT,
+            )
         else:
             cls._temporary = tempfile.TemporaryDirectory()
             cls.output = Path(cls._temporary.name) / "pages"
@@ -278,8 +335,12 @@ class ProductionArtifactTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("rights/") for path in paths))
 
     def test_every_recorded_sha256_and_byte_count_verifies(self) -> None:
+        supplied = bool(os.environ.get("DANSE_PAGES_ARTIFACT"))
         verified = PAGES.verify_artifact(
-            self.output, os.environ.get("DANSE_PAGES_SOURCE_SHA") or TEST_COMMIT
+            self.output,
+            os.environ.get("DANSE_PAGES_SOURCE_SHA") or TEST_COMMIT,
+            require_source_manifest=supplied,
+            source_root=ROOT,
         )
         self.assertEqual(verified, self.manifest)
 
@@ -319,6 +380,20 @@ class ArtifactBoundaryTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._temporary.cleanup()
 
+    def rehash_project_manifest(self) -> None:
+        project = self.output / "project/index.html"
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in manifest["files"] if record["path"] == "project/index.html"
+        )
+        record["bytes"] = project.stat().st_size
+        record["sha256"] = PAGES.sha256(project)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def test_unlisted_files_are_not_copied(self) -> None:
         PAGES.build(self.root, self.output, TEST_COMMIT)
         inventory = PAGES.artifact_inventory(self.output)
@@ -332,6 +407,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("corpus/tier-receipts/") for path in inventory))
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
+        add_release_validation_fixture(self.root)
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
         commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
         command = [
@@ -365,7 +441,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(wrong.returncode, 0)
-        self.assertIn("does not match checkout HEAD", wrong.stderr)
+        self.assertIn("must resolve to a commit object", wrong.stderr)
         self.assertFalse(wrong_output.exists())
 
         (self.root / "tracked-sentinel.txt").write_text("dirty\n", encoding="utf-8")
@@ -380,15 +456,511 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertIn("tracked changes", dirty.stderr)
         self.assertFalse(dirty_output.exists())
 
+    def test_clean_core_autocrlf_checkout_publishes_only_committed_bytes(self) -> None:
+        source = RELEASE_SUPPORT.fixture_root(self.base / "transform-source")
+        manifest = RELEASE_SUPPORT.complete_manifest(source)
+        manifest["status"] = "public-approved"
+        public_fixture(source)
+        contract_bound_runtime = (
+            set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+        ) | {"installation/digital-twin.json"}
+        for relative in contract_bound_runtime:
+            shutil.copyfile(ROOT / relative, source / relative)
+        RELEASE_SUPPORT.write_manifest(source, manifest)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(source)
+        root = self.base / "transform-checkout"
+        subprocess.run(
+            ["git", "clone", "-q", "--no-checkout", str(source), str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "core.autocrlf", "true"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "-q", commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn(b"\r\n", (root / "arrival.js").read_bytes())
+        committed = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertNotIn(b"\r\n", committed)
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+        release_output = self.base / "transformed-release"
+        release_receipt = RELEASE_BUILD.build(
+            root,
+            release_output,
+            "public",
+            commit,
+            require_git_source=True,
+        )
+        selected_medium = next(
+            medium
+            for medium in manifest["media"]
+            if "public" in medium["required_for"]
+        )
+        source_relative = selected_medium["source"]["path"]
+        destination = selected_medium["source"]["destination"]
+        committed_medium = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:{source_relative}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(
+            (release_output / destination).read_bytes(),
+            committed_medium,
+        )
+        self.assertNotEqual(
+            (release_output / destination).read_bytes(),
+            (root / source_relative).read_bytes(),
+        )
+        output = self.base / "transformed-pages"
+        PAGES.build(
+            root,
+            output,
+            commit,
+            release_artifact=release_output,
+            require_git_source=True,
+        )
+        self.assertEqual((output / "arrival.js").read_bytes(), committed)
+        self.assertNotEqual(
+            (output / "arrival.js").read_bytes(),
+            (root / "arrival.js").read_bytes(),
+        )
+
+        plain = self.base / "plain-checkout"
+        subprocess.run(
+            ["git", "clone", "-q", str(source), str(plain)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        RELEASE_BUILD.verify_artifact(
+            release_output,
+            commit,
+            source_root=plain,
+        )
+        PAGES.verify_artifact(
+            output,
+            commit,
+            require_source_manifest=True,
+            source_root=plain,
+        )
+        self.assertEqual(release_receipt["source"]["commit"], commit)
+
+    def test_git_replacement_objects_cannot_rewrite_published_provenance(self) -> None:
+        root = self.base / "replacement-source"
+        public_fixture(root)
+        claimed_commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        arrival = root / "arrival.js"
+        arrival.write_bytes(arrival.read_bytes() + b"// replacement payload\n")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "replacement payload",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        replacement_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(root), "replace", claimed_commit, replacement_commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--detach", "-q", claimed_commit],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rewritten = subprocess.run(
+            ["git", "-C", str(root), "show", f"{claimed_commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        raw = subprocess.run(
+            ["git", "-C", str(root), "show", f"{claimed_commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout
+        self.assertNotEqual(rewritten, raw)
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+        with self.assertRaisesRegex(PAGES.ArtifactError, "replacement object refs"):
+            PAGES.build(
+                root,
+                self.base / "replacement-pages",
+                claimed_commit,
+                require_git_source=True,
+            )
+
+    def test_bare_tree_sha_cannot_pose_as_source_commit(self) -> None:
+        root = self.base / "tree-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        output = self.base / "tree-pages"
+        PAGES.build(root, output, commit, require_git_source=True)
+        tree = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["commit"] = tree
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "must resolve to a commit object",
+        ):
+            PAGES.verify_artifact(
+                output,
+                tree,
+                require_source_manifest=True,
+                source_root=root,
+            )
+
+    def test_forged_loose_runtime_object_under_claimed_hash_is_rejected(self) -> None:
+        root = self.base / "corrupt-object-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        object_id = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout.strip()
+        forged = (root / "arrival.js").read_bytes() + b"\n// forged payload\n"
+        RELEASE_SUPPORT.replace_loose_object_bytes(root, object_id, "blob", forged)
+        accepted_without_integrity_check = subprocess.run(
+            ["git", "-C", str(root), "show", f"{commit}:arrival.js"],
+            check=True,
+            capture_output=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout
+        self.assertEqual(accepted_without_integrity_check, forged)
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "failed raw Git object integrity verification",
+        ):
+            PAGES.build(
+                root,
+                self.base / "corrupt-object-pages",
+                commit,
+                require_git_source=True,
+            )
+
+    def test_shared_release_provenance_errors_are_translated(self) -> None:
+        self.assertEqual(
+            Path(PAGES._RELEASE_CONTRACT.__file__).resolve(),
+            (ROOT / "scripts/release_contract.py").resolve(),
+        )
+        with mock.patch.object(
+            PAGES,
+            "require_release_commit_object",
+            side_effect=PAGES.ReleaseContractError("shared provenance rejection"),
+        ):
+            with self.assertRaisesRegex(
+                PAGES.ArtifactError,
+                "shared provenance rejection",
+            ):
+                PAGES.require_commit_object(self.root, TEST_COMMIT)
+
+    def test_release_builder_keeps_its_own_checkout_scoped_contract(self) -> None:
+        scoped_before = {
+            name for name in sys.modules if name.startswith("danse_release_contract_")
+        }
+        copies = []
+        for name in ("checkout-a", "checkout-b"):
+            scripts = self.base / name / "scripts"
+            scripts.mkdir(parents=True)
+            for leaf in ("build-pages.py", "build-release.py", "release_contract.py"):
+                shutil.copyfile(ROOT / "scripts" / leaf, scripts / leaf)
+            spec = importlib.util.spec_from_file_location(
+                f"pages_{name}",
+                scripts / "build-pages.py",
+            )
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            copies.append(module)
+
+        first, second = copies
+        generic = sys.modules.get("release_contract")
+        isolated_path = [
+            entry
+            for entry in sys.path
+            if not entry or Path(entry).name != "scripts"
+        ]
+        with mock.patch.object(sys, "path", isolated_path):
+            builder = first._load_release_builder()
+        self.assertIsNot(builder.ReleaseError, second.ReleaseContractError)
+        self.assertEqual(
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+            (self.base / "checkout-a/scripts/release_contract.py").resolve(),
+        )
+        self.assertEqual(
+            Path(first._RELEASE_CONTRACT.__file__).resolve(),
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+        )
+        self.assertNotEqual(
+            Path(builder._RELEASE_CONTRACT.__file__).resolve(),
+            Path(second._RELEASE_CONTRACT.__file__).resolve(),
+        )
+        self.assertIs(sys.modules.get("release_contract"), generic)
+        self.assertEqual(
+            {
+                name
+                for name in sys.modules
+                if name.startswith("danse_release_contract_")
+            },
+            scoped_before,
+        )
+
+    def test_committed_symlink_materialized_as_regular_file_is_rejected(self) -> None:
+        root = self.base / "symlink-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        arrival = root / "arrival.js"
+        arrival.unlink()
+        arrival.symlink_to("index.html")
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "core.symlinks", "false"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        arrival.unlink()
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertTrue(arrival.is_file())
+        self.assertFalse(arrival.is_symlink())
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout, "", status.stdout)
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "must be a regular committed file: arrival.js",
+        ):
+            PAGES.build(
+                root,
+                self.base / "symlink-pages",
+                commit,
+                require_git_source=True,
+            )
+
+    def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
+        root = self.base / "redirected-source"
+        public_fixture(root)
+        claimed_commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        alternate = self.base / "redirected-alternate"
+        subprocess.run(
+            ["git", "clone", "-q", str(root), str(alternate)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        alternate_arrival = alternate / "arrival.js"
+        alternate_arrival.write_bytes(
+            alternate_arrival.read_bytes() + b"// alternate repository payload\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(alternate), "add", "arrival.js"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(alternate),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "alternate repository payload",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        alternate_commit = subprocess.run(
+            ["git", "-C", str(alternate), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        shutil.copy2(alternate_arrival, root / "arrival.js")
+        self.assertNotEqual(claimed_commit, alternate_commit)
+
+        redirect = {
+            "GIT_DIR": str(alternate / ".git"),
+            "GIT_WORK_TREE": str(root),
+        }
+        ambient = os.environ.copy()
+        ambient.update(redirect)
+        redirected_identity = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=ambient,
+        ).stdout.strip()
+        redirected_status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=ambient,
+        ).stdout
+        self.assertEqual(redirected_identity, alternate_commit)
+        self.assertEqual(redirected_status, "")
+
+        with mock.patch.dict(os.environ, redirect, clear=False):
+            with self.assertRaisesRegex(
+                PAGES.ArtifactError,
+                "must resolve to a commit object",
+            ):
+                PAGES.build(
+                    root,
+                    self.base / "redirected-pages",
+                    alternate_commit,
+                    require_git_source=True,
+                )
+
+    def test_provenance_git_environment_scrubs_all_ambient_git_controls(self) -> None:
+        controls = {
+            "git_dir": "/alternate/repository",
+            "GIT_WORK_TREE": "/alternate/worktree",
+            "GIT_COMMON_DIR": "/alternate/common",
+            "GIT_OBJECT_DIRECTORY": "/alternate/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/alternate/objects-2",
+            "GIT_INDEX_FILE": "/alternate/index",
+            "GIT_NAMESPACE": "alternate",
+            "GIT_SHALLOW_FILE": "/alternate/shallow",
+            "GIT_CONFIG": "/alternate/config",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.worktree",
+            "GIT_CONFIG_VALUE_0": "/alternate/worktree",
+        }
+        with mock.patch.dict(os.environ, controls, clear=False):
+            clean = PAGES.provenance_git_env()
+        for key in controls:
+            self.assertNotIn(key, clean)
+        self.assertEqual(clean["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(clean["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(clean["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(clean["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(clean["GIT_ATTR_NOSYSTEM"], "1")
+
+    def test_legacy_git_grafts_cannot_rewrite_published_provenance(self) -> None:
+        root = self.base / "graft-source"
+        public_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        graft_query = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--git-path", "info/grafts"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=PAGES.provenance_git_env(),
+        ).stdout.strip()
+        graft = Path(graft_query)
+        if not graft.is_absolute():
+            graft = root / graft
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text(f"{commit}\n", encoding="utf-8")
+        with self.assertRaisesRegex(PAGES.ArtifactError, "legacy Git graft"):
+            PAGES.build(
+                root,
+                self.base / "grafted-pages",
+                commit,
+                require_git_source=True,
+            )
+
     def test_verified_public_release_adds_only_declared_outputs_and_keeps_artwork_at_root(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
-        selected, binding = PAGES.public_release_files(release, TEST_COMMIT)
+        release, release_source = release_artifact_fixture(self.base, "public")
+        selected, binding = PAGES.public_release_files(
+            release,
+            TEST_COMMIT,
+            source_root=release_source,
+            allow_worktree_manifest=True,
+        )
         root_index = (self.root / "index.html").read_bytes()
         manifest = PAGES.build(
             self.root,
             self.output,
             TEST_COMMIT,
             release_artifact=release,
+            release_source_root=release_source,
         )
         paths = {record["path"] for record in manifest["files"]}
         self.assertEqual(manifest["release"], binding)
@@ -443,12 +1015,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("submission/") for path in paths))
 
     def test_receipted_project_link_outside_pages_boundary_fails(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         PAGES.build(
             self.root,
             self.output,
             TEST_COMMIT,
             release_artifact=release,
+            release_source_root=release_source,
         )
         project = self.output / "project/index.html"
         project.write_text(
@@ -458,18 +1031,203 @@ class ArtifactBoundaryTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.rehash_project_manifest()
+        with self.assertRaisesRegex(PAGES.ArtifactError, "project links failed verification"):
+            PAGES.verify_artifact(
+                self.output,
+                TEST_COMMIT,
+                allow_unbound_release_fixture=True,
+            )
+
+    def test_rehashed_pages_manifest_cannot_admit_weakened_project_security(self) -> None:
+        release, release_source = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
+            release_source_root=release_source,
+        )
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                RELEASE_BUILD.PROJECT_CSP,
+                "default-src * 'unsafe-inline' 'unsafe-eval'",
+            ),
+            encoding="utf-8",
+        )
+        self.rehash_project_manifest()
+        with self.assertRaisesRegex(PAGES.ArtifactError, "project security failed verification"):
+            PAGES.verify_artifact(
+                self.output,
+                TEST_COMMIT,
+                allow_unbound_release_fixture=True,
+            )
+
+    def test_rehashed_pages_manifest_cannot_admit_browser_security_bypasses(self) -> None:
+        attacks = {
+            "inert-template": lambda value: value.replace(
+                f'  <meta http-equiv="Content-Security-Policy" content="{RELEASE_BUILD.PROJECT_CSP}">\n',
+                "",
+            ).replace(
+                '  <meta name="referrer" content="no-referrer">\n',
+                "",
+            ).replace(
+                "</head>",
+                '<template><meta http-equiv="Content-Security-Policy" '
+                f'content="{RELEASE_BUILD.PROJECT_CSP}">'
+                '<meta name="referrer" content="no-referrer"></template></head>',
+            ),
+            "referrer-override": lambda value: value.replace(
+                '<a class="skip" href="#content">',
+                '<a class="skip" href="#content" referrerpolicy="unsafe-url">',
+            ),
+            "dns-prefetch": lambda value: value.replace(
+                "</head>",
+                '<link rel="dns-prefetch" href="//attacker.example"></head>',
+            ),
+            "unmanifested-image": lambda value: value.replace(
+                "</main>",
+                '<img alt="unmanifested" '
+                'src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">'
+                "</main>",
+            ),
+            "head-after-body": lambda value: value.replace(
+                "<head>", "<body></body><head>", 1
+            ),
+            "image-input": lambda value: value.replace(
+                "</main>",
+                '<input type="image" alt="unmanifested" '
+                'src="https://attacker.example/pixel.png"></main>',
+            ),
+            "external-open-graph-image": lambda value: value.replace(
+                "</head>",
+                '<meta property="og:image" '
+                'content="https://attacker.example/unproven.jpg"></head>',
+            ),
+            "external-canonical": lambda value: value.replace(
+                RELEASE_BUILD.PROJECT_CANONICAL_URL,
+                "https://attacker.example/project/",
+            ),
+            "pre-csp-html-style": lambda value: value.replace(
+                '<html lang="en">',
+                '<html lang="en" '
+                'style="background-image:url(https://attacker.example/pixel.png)">',
+            ),
+        }
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / label
+                output = case / "pages"
+                release, release_source = release_artifact_fixture(case, "public")
+                PAGES.build(
+                    self.root,
+                    output,
+                    TEST_COMMIT,
+                    release_artifact=release,
+                    release_source_root=release_source,
+                )
+                self.output = output
+                project = output / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_manifest()
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "project security failed verification",
+                ):
+                    PAGES.verify_artifact(
+                        output,
+                        TEST_COMMIT,
+                        allow_unbound_release_fixture=True,
+                    )
+
+    def test_rehashed_pages_manifest_cannot_change_public_claims(self) -> None:
+        release, release_source = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
+            release_source_root=release_source,
+        )
+        attacks = {
+            "title": lambda value: value.replace(
+                "<title>Danse - a room that never repeats | Project</title>",
+                "<title>Unreceipted exhibition claim</title>",
+            ),
+            "description": lambda value: value.replace(
+                'name="description" content="',
+                'name="description" content="Unreceipted synopsis. ',
+                1,
+            ),
+            "heading": lambda value: value.replace(
+                "<h1>THE THING WITHOUT A NAME</h1>",
+                "<h1>Unreceipted public title</h1>",
+            ),
+            "status-copy": lambda value: value.replace(
+                "8 gates remain blocked in the bound reference ledger",
+                "Every installation gate is approved worldwide",
+            ),
+        }
+        baseline = self.output
+        for label, attack in attacks.items():
+            with self.subTest(attack=label):
+                case = self.base / f"pages-claims-{label}"
+                shutil.copytree(baseline, case)
+                self.output = case
+                project = case / "project/index.html"
+                project.write_text(
+                    attack(project.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+                self.rehash_project_manifest()
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "project bytes drifted from the verified release receipt",
+                ):
+                    PAGES.verify_artifact(
+                        case,
+                        TEST_COMMIT,
+                        allow_unbound_release_fixture=True,
+                    )
+        self.output = baseline
+
+    def test_release_bearing_artifact_cannot_skip_source_authentication(self) -> None:
+        release, release_source = release_artifact_fixture(self.base, "public")
+        PAGES.build(
+            self.root,
+            self.output,
+            TEST_COMMIT,
+            release_artifact=release,
+            release_source_root=release_source,
+        )
+        project = self.output / "project/index.html"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace(
+                "THE THING WITHOUT A NAME",
+                "UNRECEIPTED PUBLIC CLAIM",
+            ),
+            encoding="utf-8",
+        )
         manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         record = next(
-            record for record in manifest["files"] if record["path"] == "project/index.html"
+            item for item in manifest["files"] if item["path"] == "project/index.html"
         )
         record["bytes"] = project.stat().st_size
         record["sha256"] = PAGES.sha256(project)
+        manifest["release"]["project_sha256"] = record["sha256"]
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(PAGES.ArtifactError, "project links failed verification"):
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "release-bearing artifact verification requires source-manifest",
+        ):
             PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_missing_or_draft_release_artifact_fails_before_pages_bytes(self) -> None:
@@ -483,24 +1241,26 @@ class ArtifactBoundaryTest(unittest.TestCase):
             )
         self.assertFalse(self.output.exists())
 
-        draft = release_artifact_fixture(self.base, "draft")
+        draft, draft_source = release_artifact_fixture(self.base, "draft")
         with self.assertRaisesRegex(PAGES.ArtifactError, "public-phase"):
             PAGES.build(
                 self.root,
                 self.output,
                 TEST_COMMIT,
                 release_artifact=draft,
+                release_source_root=draft_source,
             )
         self.assertFalse(self.output.exists())
 
     def test_release_artifact_wrong_sha_tamper_and_extra_file_fail_closed(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         with self.assertRaisesRegex(PAGES.ArtifactError, "does not match expected"):
             PAGES.build(
                 self.root,
                 self.output,
                 "b" * 40,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
@@ -511,10 +1271,11 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
-        release = release_artifact_fixture(self.base / "extra", "public")
+        release, release_source = release_artifact_fixture(self.base / "extra", "public")
         write(release / "unrecorded-private.txt")
         with self.assertRaisesRegex(PAGES.ArtifactError, "inventory mismatch"):
             PAGES.build(
@@ -522,12 +1283,13 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are unavailable")
     def test_symlinked_release_artifact_or_file_fails_closed(self) -> None:
-        release = release_artifact_fixture(self.base, "public")
+        release, release_source = release_artifact_fixture(self.base, "public")
         alias = self.base / "release-alias"
         alias.symlink_to(release, target_is_directory=True)
         with self.assertRaisesRegex(PAGES.ArtifactError, "missing or symlinked"):
@@ -536,6 +1298,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=alias,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
@@ -550,6 +1313,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 self.output,
                 TEST_COMMIT,
                 release_artifact=release,
+                release_source_root=release_source,
             )
         self.assertFalse(self.output.exists())
 
@@ -617,6 +1381,264 @@ class ArtifactBoundaryTest(unittest.TestCase):
         PAGES.build(self.root, self.output, TEST_COMMIT)
         with self.assertRaisesRegex(PAGES.ArtifactError, "does not match expected"):
             PAGES.verify_artifact(self.output, "b" * 40)
+
+    def test_source_manifest_verification_uses_requested_root(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "requested-root"
+        )
+        command = [
+            sys.executable,
+            str(ROOT / "scripts/build-pages.py"),
+            "--root",
+            str(source_root),
+            "--verify",
+            str(output),
+            "--source-commit",
+            commit,
+        ]
+        verified = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertIn(f"files from {commit} verified", verified.stdout)
+
+    def test_pages_release_requires_its_receipted_generation_toolchain(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "historical-toolchain"
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for dependency in ("python", "pypdf", "reportlab"):
+            with self.subTest(dependency=dependency):
+                case = copy.deepcopy(manifest)
+                case["release"]["toolchain"][dependency] += "-future"
+                manifest_path.write_text(
+                    json.dumps(case, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "exact receipted generation toolchain",
+                ):
+                    PAGES.verify_artifact(
+                        output,
+                        commit,
+                        require_source_manifest=True,
+                        source_root=source_root,
+                    )
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_pages_public_phase_validates_committed_media_evidence(self) -> None:
+        source_root, output, _commit = authenticated_public_pages_fixture(
+            self.base / "forged-evidence"
+        )
+        source_manifest_path = source_root / "release/manifest.json"
+        source_manifest = json.loads(
+            source_manifest_path.read_text(encoding="utf-8")
+        )
+        medium = next(
+            item
+            for item in source_manifest["media"]
+            if item["id"] == "press-still-primary"
+        )
+        medium["source"]["sha256"] = "0" * 64
+        RELEASE_SUPPORT.write_manifest(source_root, source_manifest)
+        subprocess.run(
+            ["git", "-C", str(source_root), "add", "release/manifest.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "forge Pages media evidence",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        forged_commit = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        committed_manifest = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "show",
+                f"{forged_commit}:release/manifest.json",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        pages_manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        pages_manifest = json.loads(
+            pages_manifest_path.read_text(encoding="utf-8")
+        )
+        pages_manifest["source"]["commit"] = forged_commit
+        pages_manifest["release"]["manifest_sha256"] = hashlib.sha256(
+            committed_manifest
+        ).hexdigest()
+        pages_manifest_path.write_text(
+            json.dumps(pages_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "media press-still-primary source digest mismatch",
+        ):
+            PAGES.verify_artifact(
+                output,
+                forged_commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_add_private_file(self) -> None:
+        add_release_validation_fixture(self.root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
+        PAGES.build(
+            self.root,
+            self.output,
+            commit,
+            require_git_source=True,
+        )
+        private = self.output / "release/private.txt"
+        write(private, b"private source bytes\n")
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"].append(
+            {
+                "path": "release/private.txt",
+                "bytes": private.stat().st_size,
+                "sha256": PAGES.sha256(private),
+            }
+        )
+        manifest["files"].sort(key=lambda record: record["path"])
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "extra=.*release/private.txt"):
+            PAGES.verify_artifact(
+                self.output,
+                commit,
+                require_source_manifest=True,
+                source_root=self.root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_substitute_runtime_bytes(self) -> None:
+        add_release_validation_fixture(self.root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
+        PAGES.build(
+            self.root,
+            self.output,
+            commit,
+            require_git_source=True,
+        )
+        runtime = self.output / "arrival.js"
+        runtime.write_bytes(b"self-receipted replacement runtime\n")
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(item for item in manifest["files"] if item["path"] == "arrival.js")
+        record["bytes"] = runtime.stat().st_size
+        record["sha256"] = PAGES.sha256(runtime)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "changed=.*arrival.js"):
+            PAGES.verify_artifact(
+                self.output,
+                commit,
+                require_source_manifest=True,
+                source_root=self.root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_substitute_public_press_copy(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "press-substitution"
+        )
+        press = output / "press/press-kit.md"
+        press.write_text(
+            "# False approved biography and rights claim\n",
+            encoding="utf-8",
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            item for item in manifest["files"] if item["path"] == "press/press-kit.md"
+        )
+        record["bytes"] = press.stat().st_size
+        record["sha256"] = PAGES.sha256(press)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "changed=.*press/press-kit.md"):
+            PAGES.verify_artifact(
+                output,
+                commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
+
+    def test_self_rehashed_pages_manifest_cannot_omit_public_release(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "release-omission"
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        runtime_paths = set(PAGES.source_files(source_root))
+        release_paths = {
+            record["path"]
+            for record in manifest["files"]
+            if record["path"] not in runtime_paths
+        }
+        self.assertTrue(release_paths)
+        for relative in release_paths:
+            (output / relative).unlink()
+        manifest["files"] = [
+            record
+            for record in manifest["files"]
+            if record["path"] in runtime_paths
+        ]
+        manifest["release"] = None
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "admits public phase .* required release binding and files are absent",
+        ):
+            PAGES.verify_artifact(
+                output,
+                commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
 
     def test_tampered_pose_vendor_source_fails_closed(self) -> None:
         vendor = self.root / PAGES.VENDOR_BASE / "vision_bundle.mjs"
