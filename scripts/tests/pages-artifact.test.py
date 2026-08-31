@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +33,19 @@ def load_pages_builder():
 
 PAGES = load_pages_builder()
 TEST_COMMIT = "a" * 40
+
+
+def load_browser_runner():
+    spec = importlib.util.spec_from_file_location(
+        "danse_browser_runner_test", ROOT / "render/browser.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+BROWSER = load_browser_runner()
 
 
 def load_release_support():
@@ -160,12 +175,24 @@ def public_fixture(root: Path) -> None:
 
 def release_artifact_fixture(base: Path, phase: str) -> Path:
     source = RELEASE_SUPPORT.fixture_root(base / f"{phase}-release-source")
+    manifest = None
     if phase == "public":
-        manifest = RELEASE_SUPPORT.complete_manifest(source)
-        manifest["status"] = "public-approved"
-        RELEASE_SUPPORT.write_manifest(source, manifest)
+        # The two-stage release contract freezes every public artifact input
+        # before evidence is minted.  Build a native public-phase fixture
+        # instead of rewriting a completed release manifest after the fact.
+        manifest = RELEASE_SUPPORT.complete_manifest(source, phase="public")
     output = base / f"{phase}-release-artifact"
-    RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
+    if manifest is None:
+        RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
+    else:
+        # These tests exercise Pages' artifact boundary, not authority.  The
+        # synthetic fixture deliberately cannot satisfy terminal operational
+        # gates, so isolate the downstream builder using its already-built
+        # manifest value; production has no equivalent bypass.
+        with mock.patch.object(
+            RELEASE_BUILD, "validate_release", return_value=manifest
+        ):
+            RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
     return output
 
 
@@ -334,6 +361,94 @@ class ArtifactBoundaryTest(unittest.TestCase):
         project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
         self.assertEqual(project_map["schema"], "danse.map.v1")
         self.assertTrue(all(node["href"] is None for node in project_map["nodes"] if node["product_id"]))
+
+    def test_live_project_map_node_is_exactly_the_local_artwork_route(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        mutations = (
+            {"route": "javascript:alert(1)", "href": "javascript:alert(1)"},
+            {"route": "https://example.invalid/", "href": "https://example.invalid/"},
+            {"route": "../private/", "href": "../private/"},
+            {"route": "//example.invalid/live", "href": "//example.invalid/live"},
+            {"product_id": "project-page-copy"},
+            {"fragment": "live"},
+            {"availability": "unavailable"},
+            {"route": 1, "href": 1},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][0].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "canonical local artwork route|malformed node field",
+                ):
+                    PAGES.project_map(self.root)
+
+    def test_project_map_metadata_and_source_node_identities_are_canonical(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+
+        def swap_fragments(project_map: dict) -> None:
+            project_map["nodes"][2]["fragment"], project_map["nodes"][3]["fragment"] = (
+                project_map["nodes"][3]["fragment"],
+                project_map["nodes"][2]["fragment"],
+            )
+
+        mutations = (
+            ("title", lambda project_map: project_map.update(title="Rights cleared")),
+            ("version", lambda project_map: project_map.update(version=999)),
+            (
+                "study label",
+                lambda project_map: project_map["nodes"][1].update(label="Rights cleared"),
+            ),
+            ("fragment swap", swap_fragments),
+            (
+                "evidence label",
+                lambda project_map: project_map["nodes"][5].update(label="Publication evidence"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                project_map = copy.deepcopy(original)
+                mutate(project_map)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "metadata or schema is not canonical|source-node identity drifted",
+                ):
+                    PAGES.project_map(self.root)
+
+    def test_project_map_accepts_only_the_declared_admission_projection(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        source = original["nodes"][1]
+        canonical_href = source["route"]
+        mutations = (
+            {"status": "admitted", "availability": "available", "href": None},
+            {"status": "admitted", "availability": "available", "href": "javascript:alert(1)"},
+            {"status": "admitted", "availability": "available now", "href": canonical_href},
+            {"status": "gated", "availability": "available", "href": canonical_href},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][1].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError, "node resolution is not canonical"
+                ):
+                    PAGES.project_map(self.root, allow_resolved=True)
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
@@ -697,6 +812,34 @@ class InterfaceContractTest(unittest.TestCase):
         cls.script = "\n".join(cls.markup.scripts)
         cls.styles = (ROOT / "interface/styles.css").read_text(encoding="utf-8")
 
+    def test_browser_launcher_requires_the_canonical_apple_metal_identity(self) -> None:
+        runner = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        self.assertIn("if APPLE_ANGLE_METAL_RENDERER.fullmatch(name) is None:", runner)
+        self.assertNotIn("any(w in name.lower() for w in WANTED)", runner)
+        self.assertEqual(
+            BROWSER.APPLE_ANGLE_METAL_RENDERER.pattern,
+            RELEASE_SUPPORT.CONTRACT.APPLE_ANGLE_METAL_RENDERER.pattern,
+        )
+        accepted = (
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+        )
+        rejected = (
+            "Apple Metal Renderer",
+            "ANGLE (Apple, OpenGL Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Google, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, SwiftShader software rasterizer)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)\n",
+            "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device), SwiftShader driver)",
+        )
+        for renderer in accepted:
+            with self.subTest(renderer=renderer):
+                self.assertIsNotNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
+        for renderer in rejected:
+            with self.subTest(renderer=renderer):
+                self.assertIsNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
+
     def test_five_category_surface_and_advanced_sheet_are_accessible(self) -> None:
         tag, hud = self.markup.by_id["hud"]
         self.assertEqual(tag, "section")
@@ -762,25 +905,56 @@ class InterfaceContractTest(unittest.TestCase):
         )
         self.assertIn("baseRenderer = null;", initialization.split("catch (error)", 1)[1])
         self.assertIn('el("renderer-fallback").hidden = false;', initialization)
+        self.assertIn("renderer-fallback-reason", self.markup.by_id)
+        self.assertIn(
+            'el("renderer-fallback-reason").textContent = rendererFallbackMessage;',
+            initialization,
+        )
+        self.assertIn(
+            'el("stage-description").textContent = rendererFallbackMessage;',
+            initialization,
+        )
         self.assertIn("const rendererUnavailableReason = candidateRenderer", initialization)
         self.assertIn('"a required corpus image or texture could not be prepared"', initialization)
         self.assertIn('"WebGL2 could not initialize"', initialization)
         self.assertIn("Danse visual renderer unavailable: ${rendererUnavailableReason}", initialization)
         frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
         self.assertLess(frame.index("interaction.tick("), frame.index("if (!renderer)"))
+        self.assertIn("const fallback = step(corpus, river.seed, t, program", frame)
+        self.assertIn("renderDetails(t, fallback.state);", frame)
         self.assertIn("requestAnimationFrame(frame);", frame.split("if (!renderer)", 1)[1])
+        details = self.script.split("function renderDetails(t, state, rendered = null) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('el("river").textContent = hex(river.seed);', details)
+        self.assertIn(': "unavailable";', details)
+        self.assertIn('el("interaction-summary").textContent = `${interaction.mode}${embodied}`;', details)
         self.assertIn("requestAnimationFrame(frame);", self.script)
         self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
 
     def test_live_frame_synchronizes_the_pressed_score_movement(self) -> None:
-        frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
-        self.assertIn("movement.id === r.state.movement", frame)
-        self.assertIn("controlBus.getState().movement !== liveMovement", frame)
-        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", frame)
+        details = self.script.split(
+            "function renderDetails(t, state, rendered = null) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("movement.id === state.movement", details)
+        self.assertIn("controlBus.getState().movement !== liveMovement", details)
+        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", details)
 
     def test_map_atomically_replaces_the_visual_details_sheet(self) -> None:
         helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
         self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openMap()"))
+
+    def test_map_ignores_stale_fetch_completions_after_close_and_reopen(self) -> None:
+        loader = self.script.split("async function loadProjectMap() {", 1)[1].split("\n}", 1)[0]
+        helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
+        close = self.script.split("function closeVisualSurfaces() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if (!projectMapRequest)", loader)
+        self.assertIn("projectMapData = await projectMapRequest;", loader)
+        self.assertIn("projectMapRequest = null;", loader)
+        self.assertIn("const operation = ++projectMapOperationGeneration;", helper)
+        self.assertGreaterEqual(
+            helper.count("operation !== projectMapOperationGeneration || !projectMap.open"),
+            3,
+        )
+        self.assertIn("projectMapOperationGeneration += 1;", close)
 
     def test_transient_feedback_stays_above_every_progressive_surface(self) -> None:
         self.assertIn("#toast {\n    position: fixed; z-index: 8;", self.html)
@@ -876,9 +1050,40 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
         self.assertIn('#project-map [aria-disabled="true"]', self.styles)
+        self.assertIn(
+            '#project-map a:not([aria-disabled="true"]) { display:inline-flex;',
+            self.styles,
+        )
+        self.assertIn(".fallback-grid input, .fallback-grid select", self.html)
+        self.assertIn("#hud summary { box-sizing: border-box; min-height: 44px", self.html)
         browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
         self.assertIn("presence-receipt')?.textContent", browser)
         self.assertIn("document.getElementById('veil').hidden", browser)
+        self.assertIn("def touch_targets(scope: str, label: str)", browser)
+        self.assertIn('touch_targets("#project-map", "Map")', browser)
+        self.assertIn('touch_targets("#hud", "no-WebGL Details")', browser)
+        fallback = browser.split("fallback_movement_variants =", 1)[1].split(
+            'page.click("#fallback-start")', 1
+        )[0]
+        self.assertIn("danse.program.movements.findIndex", fallback)
+        self.assertIn("movement[\"control\"] == movement[\"expected\"]", fallback)
+        self.assertIn("movement[\"selected\"] == [movement[\"expected\"]]", fallback)
+        self.assertGreaterEqual(fallback.count("0x12345678"), 2)
+        self.assertGreaterEqual(fallback.count("0x87654321"), 2)
+        self.assertNotIn("danse.controlState.movement === 2", fallback)
+        self.assertNotIn("danse.controlState.movement === 3", fallback)
+
+    def test_controls_replay_exercises_the_shipped_score_audio_lifecycle(self) -> None:
+        browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        shipped = browser.split(
+            "# The unavailable-score visit above proves fail-readable controls.", 1
+        )[1].split("page.add_init_script", 1)[0]
+        self.assertIn('page.goto(f"{base}/index.html", wait_until="load")', shipped)
+        self.assertIn("danse.controlState.music === 'playing'", shipped)
+        self.assertIn("danse.controlState.music === 'suspended-by-hold'", shipped)
+        self.assertIn("danse.controlState.music === 'stopped'", shipped)
+        self.assertGreaterEqual(shipped.count("#music-tray"), 3)
+        self.assertEqual(shipped.count("[data-category=\"hold\"]"), 2)
 
     def test_share_feedback_has_its_own_polite_live_region(self) -> None:
         tag, toast = self.markup.by_id["toast"]

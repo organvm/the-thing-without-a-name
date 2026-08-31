@@ -6,12 +6,20 @@
   "additionalProperties": false,
   "required": ["schema", "attestation_id", "gate_id", "issue", "kind", "decision", "recorded_at", "authority", "source", "subject", "package"],
   "properties": {
-    "schema": {"const": "danse.release.owner-attestation.v1"},
+    "schema": {"const": "danse.release.owner-attestation.v2"},
     "attestation_id": {"$ref": "#/$defs/id"},
     "gate_id": {"$ref": "#/$defs/id"},
     "issue": {"type": "integer", "minimum": 1},
     "kind": {"const": "owner-attestation"},
-    "decision": {"const": true},
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "scope_sha256"],
+      "properties": {
+        "claim": {"$ref": "#/$defs/claim"},
+        "scope_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "recorded_at": {"$ref": "#/$defs/timestamp"},
     "authority": {
       "type": "object",
@@ -47,24 +55,30 @@
     "subject": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["release_id", "release_version", "repository_head", "repository_tree", "package_manifest_sha256"],
+      "required": ["release_id", "release_version", "repository_head", "repository_tree", "release_manifest_sha256", "package_manifest_sha256"],
       "properties": {
         "release_id": {"$ref": "#/$defs/id"},
         "release_version": {"type": "string", "minLength": 1},
         "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "repository_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "release_manifest_sha256": {"$ref": "#/$defs/sha256"},
         "package_manifest_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]}
       }
     },
     "package": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["manifest", "manifest_sha256", "repository_head"],
+      "required": ["manifest", "manifest_sha256", "repository_head", "repository_tree", "release_manifest_sha256"],
       "properties": {
         "manifest": {"const": "manifest.json"},
         "manifest_sha256": {"$ref": "#/$defs/sha256"},
-        "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "repository_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "release_manifest_sha256": {"$ref": "#/$defs/sha256"}
       }
+    },
+    "claim": {
+      "enum": ["accessibility-approved", "contact-approved", "custody-complete", "final-cut-approved", "identity-approved", "publication-approved", "restore-complete", "rights-cleared", "stills-cleared"]
     }
   }
 }

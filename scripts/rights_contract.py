@@ -41,6 +41,29 @@ PHASE_SCOPES = {
     "submitted": ("package", "uploaded", "submitted"),
     "release": ("public", "package", "release"),
 }
+CLEARANCE_SCOPES = {
+    "rights-register": {
+        "human_gates": {
+            "rights-declaration-approved",
+            "dancer-release-and-credit",
+            "pictured-objects-reviewed",
+            "music-cleared",
+            "mediapipe-attribution-retained",
+        },
+        "media": None,
+    },
+    "press-stills-clearance": {
+        "human_gates": {"press-stills-cleared"},
+        "media": {"still", "press", "festival-promotion"},
+    },
+}
+STILL_CLEARANCE_MEDIA = {
+    "still",
+    "press",
+    "festival-promotion",
+}
+FILING_ONLY_MEDIA = {"festival-archive"}
+CLEARANCE_REQUIRED_PHASES = {"public", "package", "release"}
 MAX_JSON_BYTES = 8 << 20
 EXPECTED_CATEGORIES = {
     "performer",
@@ -599,6 +622,7 @@ def tracked_paths(root: Path) -> set[str]:
             ["git", "-C", str(root), "ls-files", "-z"],
             capture_output=True,
             check=False,
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
         )
     except OSError as exc:
         raise RightsError(f"cannot query the Git source inventory: {exc}") from exc
@@ -3263,6 +3287,7 @@ def validate_release_manifest(
             f"release media boundary contains {len(unmanifested)} artifact(s) not listed in the release manifest"
         )
 
+    assets = {asset["id"]: asset for asset in document["assets"]}
     credit_rules = {row["credit_id"]: row for row in document["credit_rules"]}
     credit_rows = manifest.get("credits")
     if not isinstance(credit_rows, list):
@@ -3270,7 +3295,6 @@ def validate_release_manifest(
         credit_rows = []
     credit_ids: set[str] = set()
     gates = {gate["id"]: gate for gate in document["human_gates"]}
-    assets = {asset["id"]: asset for asset in document["assets"]}
     for row in credit_rows:
         if (
             not isinstance(row, dict)
@@ -3513,6 +3537,235 @@ def phase_blockers(
         ):
             blockers.append("package attestation changed during phase validation")
     return sorted(set(blockers)), inputs
+
+
+def validate_clearance_scope_document(
+    document: dict[str, Any],
+    *,
+    scope: str,
+    root: Path = ROOT,
+    schema: dict[str, Any] | None = None,
+) -> list[str]:
+    """Validate the exact public-safe records consumed by one rights scope."""
+
+    definition = CLEARANCE_SCOPES.get(scope)
+    if definition is None:
+        return [f"unknown clearance scope {scope!r}"]
+    if schema is None:
+        schema = load_json(root / "rights/register.schema.json", "rights schema")
+    errors = _schema_errors(document, schema)
+    for location, value in _strings(document):
+        if PRIVATE_PATH.search(value) or ABSOLUTE_PATH.search(value):
+            errors.append(f"{location}: contains a private or machine-local path")
+        if EMAIL.search(value):
+            errors.append(f"{location}: contains an email address")
+        if PHONE.search(value):
+            errors.append(f"{location}: contains a phone number")
+    for location, key in _keys(document):
+        if key.lower() in SENSITIVE_KEYS:
+            errors.append(f"{location}: prohibited sensitive field {key!r}")
+    if errors:
+        return errors
+
+    try:
+        tracked = tracked_paths(root)
+    except RightsError as exc:
+        return [str(exc)]
+    verified: dict[str, Path] = {}
+    path_digests: dict[str, str] = {}
+    for label, record in _source_records(document):
+        path = record.get("path")
+        digest = record.get("sha256")
+        if isinstance(path, str) and isinstance(digest, str):
+            previous = path_digests.setdefault(path, digest)
+            if previous != digest:
+                errors.append(f"{label}: {path} is declared with conflicting digests")
+                continue
+        try:
+            verified[label] = verify_record(root, record, label, tracked)
+        except RightsError as exc:
+            errors.append(str(exc))
+
+    gates = {gate["id"]: gate for gate in document["human_gates"]}
+    for gate_id in sorted(definition["human_gates"]):
+        gate = gates.get(gate_id)
+        if gate is None:
+            errors.append(f"clearance scope {scope} is missing human gate {gate_id}")
+            continue
+        if gate["state"] != "satisfied" or gate["evidence"] is None:
+            errors.append(f"clearance scope {scope} human gate {gate_id} is not satisfied")
+            continue
+        gate_index = document["human_gates"].index(gate)
+        receipt_path = verified.get(f"human_gates[{gate_index}] evidence")
+        if receipt_path is not None:
+            _, receipt_errors = validate_gate_decision_receipt(
+                receipt_path,
+                gate,
+                approved_credit_contract(document, gate_id),
+            )
+            errors.extend(receipt_errors)
+
+    for asset_index, asset in enumerate(document["assets"]):
+        selected = [
+            (use_index, use)
+            for use_index, use in enumerate(asset["uses"])
+            if set(use.get("required_for", [])) & CLEARANCE_REQUIRED_PHASES
+            and (
+                use["medium"] in STILL_CLEARANCE_MEDIA
+                if scope == "press-stills-clearance"
+                else use["medium"] not in STILL_CLEARANCE_MEDIA
+                and use["medium"] not in FILING_ONLY_MEDIA
+            )
+        ]
+        if not selected:
+            continue
+        if asset["disposition"] == "blocked":
+            errors.append(f"clearance scope {scope} asset {asset['id']} is blocked")
+        if asset["public_credit"]["state"] == "pending":
+            errors.append(f"clearance scope {scope} asset {asset['id']} has pending credit")
+        private = asset["private_evidence"]
+        if private["state"] not in {"verified", "not-required"}:
+            errors.append(
+                f"clearance scope {scope} asset {asset['id']} has unresolved private evidence"
+            )
+        for use_index, use in selected:
+            if use["status"] == "excluded" and asset["disposition"] == "excluded":
+                continue
+            if use["status"] != "cleared" or use["evidence"] is None:
+                errors.append(
+                    f"clearance scope {scope} asset use {asset['id']}/{use['id']} is not cleared"
+                )
+                continue
+            receipt_path = verified.get(
+                f"assets[{asset_index}] uses[{use_index}] evidence"
+            )
+            if receipt_path is not None:
+                errors.extend(validate_use_decision_receipt(receipt_path, asset, use))
+
+    # These canonical machine-owned identities are part of every score/image
+    # rights scope. They are recomputed here without importing filing choices.
+    errors.extend(_validate_delibes_custody(root, document, tracked))
+    errors.extend(_validate_audio_use_profiles(root, document, tracked))
+    return errors
+
+
+def build_clearance_scope_receipt(
+    document: dict[str, Any],
+    *,
+    scope: str,
+    register_path: Path = REGISTER,
+    schema_path: Path = SCHEMA,
+    root: Path = ROOT,
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    """Recompute one rights-only gate without importing filing decisions.
+
+    The release rights gates deliberately exclude final-cut, biography, link,
+    submission, archive-participation, regulations, and no-withdrawal choices.
+    Those decisions belong to their own human-owned gates. This receipt proves
+    only the registered contributor/asset-use scope named below.
+    """
+
+    definition = CLEARANCE_SCOPES.get(scope)
+    if definition is None:
+        raise RightsError(f"unknown clearance scope {scope!r}")
+    validation_date = as_of or project_today()
+    schema = load_json(schema_path, "rights schema")
+    blockers = validate_clearance_scope_document(
+        document, scope=scope, root=root, schema=schema
+    )
+    if document.get("status") not in {"reviewed", "cleared"}:
+        blockers.append("rights register has not reached reviewed status")
+
+    gates = {gate["id"]: gate for gate in document.get("human_gates", [])}
+    gate_ids = sorted(definition["human_gates"])
+    receipt_sha256s: set[str] = set()
+    for gate_id in gate_ids:
+        gate = gates.get(gate_id)
+        if gate is None:
+            blockers.append(f"clearance scope {scope} is missing human gate {gate_id}")
+            continue
+        if gate.get("state") != "satisfied" or not isinstance(gate.get("evidence"), dict):
+            blockers.append(f"clearance scope {scope} human gate {gate_id} is not satisfied")
+            continue
+        digest = gate["evidence"].get("sha256")
+        if isinstance(digest, str) and HEX64.fullmatch(digest):
+            receipt_sha256s.add(digest)
+
+    asset_use_ids: list[str] = []
+    for asset in document.get("assets", []):
+        selected = [
+            use
+            for use in asset.get("uses", [])
+            if set(use.get("required_for", [])) & CLEARANCE_REQUIRED_PHASES
+            and (
+                use.get("medium") in STILL_CLEARANCE_MEDIA
+                if scope == "press-stills-clearance"
+                else use.get("medium") not in STILL_CLEARANCE_MEDIA
+                and use.get("medium") not in FILING_ONLY_MEDIA
+            )
+        ]
+        if not selected:
+            continue
+        if asset.get("disposition") == "blocked":
+            blockers.append(f"clearance scope {scope} asset {asset.get('id')} is blocked")
+        if asset.get("public_credit", {}).get("state") == "pending":
+            blockers.append(
+                f"clearance scope {scope} asset {asset.get('id')} has pending credit"
+            )
+        private = asset.get("private_evidence", {})
+        if private.get("state") == "verified" and isinstance(private.get("receipt"), dict):
+            digest = private["receipt"].get("sha256")
+            if isinstance(digest, str) and HEX64.fullmatch(digest):
+                receipt_sha256s.add(digest)
+        elif private.get("state") != "not-required":
+            blockers.append(
+                f"clearance scope {scope} asset {asset.get('id')} has unresolved private evidence"
+            )
+        for use in selected:
+            identity = f"{asset.get('id')}/{use.get('id')}"
+            asset_use_ids.append(identity)
+            if use.get("status") == "excluded" and asset.get("disposition") == "excluded":
+                continue
+            if use.get("status") != "cleared" or not isinstance(use.get("evidence"), dict):
+                blockers.append(f"clearance scope {scope} asset use {identity} is not cleared")
+                continue
+            if use.get("term") == "fixed":
+                expires = use.get("expires")
+                try:
+                    expired = not isinstance(expires, str) or date.fromisoformat(expires) < validation_date
+                except ValueError:
+                    expired = True
+                if expired:
+                    blockers.append(
+                        f"clearance scope {scope} asset use {identity} expired before validation"
+                    )
+            digest = use["evidence"].get("sha256")
+            if isinstance(digest, str) and HEX64.fullmatch(digest):
+                receipt_sha256s.add(digest)
+
+    inputs = {
+        "validation_date": validation_date.isoformat(),
+        "validation_timezone": project_zone()[0],
+        "human_gate_ids": gate_ids,
+        "asset_use_ids": sorted(asset_use_ids),
+        "redacted_receipt_sha256s": sorted(receipt_sha256s),
+    }
+    blockers = sorted(set(blockers))
+    return {
+        "schema": "danse.rights.clearance-receipt.v1",
+        "scope": scope,
+        "status": "ready" if not blockers else "blocked",
+        "register": {
+            "schema": document["schema"],
+            "sha256": sha256(register_path),
+            "schema_sha256": sha256(schema_path),
+            "assessment_date": document["assessment"]["date"],
+            "status": document["status"],
+        },
+        "inputs": inputs,
+        "blockers": blockers,
+    }
 
 
 def build_receipt(

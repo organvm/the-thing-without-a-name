@@ -67,6 +67,10 @@ FIXTURE_SCHEMAS = {
 }
 HEX64 = re.compile(r"[0-9a-f]{64}")
 GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
 CHANNELS = ("divergence", "azimuth", "elevation", "spread", "projK", "turnover")
 PRODUCTION_TIER = "film"
 PRODUCTION_WIDTH = 1920
@@ -1600,8 +1604,8 @@ def _load_frame_receipt(
     for field, value in expected_capture.items():
         if capture.get(field) != value:
             errors.append(f"frame capture has stale {field}")
-    renderer = str(capture.get("renderer", "")).lower()
-    if "apple" not in renderer or "metal" not in renderer:
+    renderer = capture.get("renderer")
+    if not isinstance(renderer, str) or APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer) is None:
         errors.append("frame capture is not authenticated as Apple Metal")
     expected_rows = [
         {
@@ -2715,10 +2719,10 @@ def _canonical_segment_replay(
             raise EvidenceError(
                 f"canonical {mode} segment {ordinal} replay has no exact GPU capture"
             )
-        renderer = str(capture.get("renderer", "")).lower()
+        renderer = capture.get("renderer")
         if (
-            "apple" not in renderer
-            or "metal" not in renderer
+            not isinstance(renderer, str)
+            or APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer) is None
             or type(capture.get("missing")) is not int
             or capture.get("missing") != 0
             or not isinstance(capture.get("raw_rgba_sha256"), str)
@@ -2930,8 +2934,8 @@ def _producer_receipt_errors(
             if control_source is not None and inputs.get("source_tree_sha256") != control_source:
                 errors.append(f"control render segment {ordinal} has a stale no-score source tree")
         capture = segment.get("capture") if isinstance(segment.get("capture"), dict) else {}
-        renderer = str(capture.get("renderer", "")).lower()
-        if "apple" not in renderer or "metal" not in renderer:
+        renderer = capture.get("renderer")
+        if not isinstance(renderer, str) or APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer) is None:
             errors.append(f"{mode} render segment {ordinal} is not authenticated as Apple Metal")
         if type(capture.get("missing")) is not int or capture.get("missing") != 0:
             errors.append(f"{mode} render segment {ordinal} has missing photographic plates")

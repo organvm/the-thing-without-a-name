@@ -250,7 +250,10 @@ class EvidenceFixture:
                         "width": AB.PRODUCTION_WIDTH,
                         "height": AB.PRODUCTION_HEIGHT,
                         "fps": AB.PRODUCTION_FPS,
-                        "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                        "renderer": (
+                            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, "
+                            "Unspecified Version)"
+                        ),
                         **AB.capture_contract_identity(ROOT),
                     },
                     "contact_sheet": reference(sheet, self.base),
@@ -378,7 +381,10 @@ class EvidenceFixture:
                         "frames": 30,
                         "inputs": inputs,
                         "capture": {
-                            "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                            "renderer": (
+                                "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, "
+                                "Unspecified Version)"
+                            ),
                             "raw_rgba_sha256": (
                                 "5" if mode == "with_score" else "6"
                             )
@@ -638,6 +644,72 @@ class EvidenceFixture:
 
 
 class ProductionScoreMotionTest(unittest.TestCase):
+    def test_receipt_validators_require_the_canonical_apple_metal_renderer(self) -> None:
+        accepted = (
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M12 Ultra, Unspecified Version)",
+        )
+        rejected = (
+            "Apple software renderer with Metal in label",
+            "ANGLE (Apple, Apple M5 Pro, Unspecified Version)",
+            "ANGLE (Unknown, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: SwiftShader, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version) approved",
+            "ANGLE (Apple, ANGLE Metal Renderer: Final Cut Approved Rights Cleared)",
+        )
+        for renderer in accepted:
+            with self.subTest(renderer=renderer):
+                self.assertIsNotNone(
+                    AB.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer)
+                )
+        for renderer in rejected:
+            with self.subTest(renderer=renderer):
+                self.assertIsNone(
+                    AB.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer)
+                )
+
+    def test_frame_and_segment_receipts_reject_renderer_label_spoofs(self) -> None:
+        invalid_renderers = (
+            "Apple software renderer with Metal in label",
+            "ANGLE (Apple, Apple M5 Pro, Unspecified Version)",
+            "ANGLE (Unknown, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version) approved",
+        )
+        for renderer in invalid_renderers:
+            with self.subTest(renderer=renderer), tempfile.TemporaryDirectory() as temporary:
+                fixture = EvidenceFixture(Path(temporary))
+                frame = json.loads(fixture.frame.read_text())
+                frame["capture"]["renderer"] = renderer
+                fixture.frame.write_text(json.dumps(frame, indent=2) + "\n")
+
+                concat_path = fixture.producer_paths["with_score"]
+                concat = json.loads(concat_path.read_text())
+                segment_path = concat_path.parent / (
+                    concat["segments"][0]["name"] + ".receipt.json"
+                )
+                segment = json.loads(segment_path.read_text())
+                segment["capture"]["renderer"] = renderer
+                segment_path.write_text(json.dumps(segment, indent=2) + "\n")
+                concat["segments"][0]["receipt_sha256"] = digest(segment_path)
+                concat_path.write_text(json.dumps(concat, indent=2) + "\n")
+                fixture.write_receipt()
+
+                errors = fixture.production_errors()
+                self.assertTrue(
+                    "frame capture is not authenticated as Apple Metal" in errors
+                    or any(
+                        error.startswith("production frame receipt schema failed")
+                        for error in errors
+                    ),
+                    errors,
+                )
+                self.assertIn(
+                    "with_score render segment 0 is not authenticated as Apple Metal",
+                    errors,
+                )
+
     def test_portable_probe_uses_current_production_score_and_choreography(self) -> None:
         rows = AB.generate_sample_rows(ROOT)
         self.assertGreaterEqual(len(rows), 40)

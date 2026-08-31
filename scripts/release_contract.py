@@ -6,15 +6,19 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import subprocess
+from copy import deepcopy
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo
 
 import jsonschema
+import rights_contract as _TRUSTED_RIGHTS_CHECKER
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = Path("release/manifest.json")
@@ -23,6 +27,9 @@ RELEASE_SCHEMA = "danse.release.v1"
 RELEASE_GATE_RECEIPT_SCHEMA_PATH = Path("release/gate-receipt.schema.json")
 RELEASE_GATE_PROOF_SCHEMA_PATH = Path("release/gate-proof.schema.json")
 RELEASE_OWNER_ATTESTATION_SCHEMA_PATH = Path("release/owner-attestation.schema.json")
+RELEASE_PROOF_PINS_SCHEMA_PATH = Path("release/proof-pins.schema.json")
+RELEASE_PROOF_PINS_PATH = Path("release/evidence/proof-pins.json")
+RIGHTS_REGISTER_SCHEMA_PATH = Path("rights/register.schema.json")
 EXPECTED_OPPORTUNITY_ID = "omega-20260829"
 EXPECTED_OPPORTUNITY_FROZEN_AT = "2026-08-29T22:12:19Z"
 EXPECTED_OPPORTUNITY_SHA256 = "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294"
@@ -33,6 +40,10 @@ LIVE_INTERACTION_COMMENT_BODY_SHA256 = "4cc41f9ed353c92c27b172907800b123c7b4e85e
 LIVE_INTERACTION_DEPLOYED_COMMIT = "f19244afbce94015e78b7f746b07d267ed9e67ae"
 PROGRESSIVE_CONTROLS_EVIDENCE_PATH = "release/evidence/progressive-controls-replay.json"
 PROGRESSIVE_CONTROLS_SCHEMA_PATH = "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY = (
+    "Exact-head progressive-controls replay only; does not establish final-cut, "
+    "rights, package, upload, or filing readiness."
+)
 PROGRESSIVE_CONTROLS_CHECKS = (
     "exact-head",
     "desktop-layout",
@@ -43,13 +54,16 @@ PROGRESSIVE_CONTROLS_CHECKS = (
     "keyboard-focus",
     "reduced-motion",
     "receipt-state",
+    "shipped-score-audio",
     "map-gating",
     "console-clean",
     "http-clean",
 )
-RELEASE_GATE_RECEIPT_SCHEMA = "danse.release.gate.v2"
+RELEASE_GATE_RECEIPT_SCHEMA = "danse.release.gate.v3"
 RELEASE_GATE_PROOF_SCHEMA = "danse.release.gate-proof.v1"
-RELEASE_OWNER_ATTESTATION_SCHEMA = "danse.release.owner-attestation.v1"
+RELEASE_OWNER_ATTESTATION_SCHEMA = "danse.release.owner-attestation.v2"
+RELEASE_PROOF_PINS_SCHEMA = "danse.release.proof-pins.v1"
+PROGRESSIVE_CONTROLS_SCHEMA = "danse.progressive-controls-replay.v2"
 RELEASE_REPOSITORY = "organvm/the-thing-without-a-name"
 RELEASE_OWNER_NAME = "Anthony J. Padavano"
 RELEASE_OWNER_LOGIN = "4444J99"
@@ -108,12 +122,13 @@ RELEASE_PROOF_CHECKS = {
         "portable",
         "source-restore",
     ),
-    "rights-release": (
+    "rights-validation": (
         "asset-census",
         "credits",
         "included-use-clearance",
         "press-stills",
         "private-evidence",
+        "zero-blockers",
     ),
     "submission-package": (
         "delivery-chain",
@@ -128,6 +143,40 @@ RELEASE_PROOF_CHECKS = {
         "portable",
     ),
 }
+RELEASE_PROOF_ISSUER_KINDS = {
+    "accessibility-review": "tool",
+    "custody-completion": "tool",
+    "installation-completion": "venue",
+    "presentation-lifecycle": "host",
+    "progressive-controls-replay": "tool",
+    "restore-completion": "tool",
+    "rights-validation": "tool",
+    "submission-package": "tool",
+    "submission-validation": "tool",
+}
+RELEASE_PROOF_GENERATORS = {
+    "accessibility-review": "scripts/release_contract.py",
+    "custody-completion": "scripts/private_custody.py",
+    "installation-completion": "installation/contract.py",
+    "presentation-lifecycle": "scripts/release_contract.py",
+    "restore-completion": "scripts/private_custody.py",
+    "rights-validation": "scripts/rights_contract.py",
+    "submission-package": "render/deliver.py",
+    "submission-validation": "render/deliver.py",
+}
+RIGHTS_CLEARANCE_GATES = {
+    "rights-register": {
+        "rights-declaration-approved",
+        "dancer-release-and-credit",
+        "pictured-objects-reviewed",
+        "music-cleared",
+        "mediapipe-attribution-retained",
+    },
+    "press-stills-clearance": {"press-stills-cleared"},
+}
+RIGHTS_STILL_MEDIA = {"still", "press", "festival-promotion"}
+RIGHTS_FILING_ONLY_MEDIA = {"festival-archive"}
+RIGHTS_CLEARANCE_REQUIRED_PHASES = {"public", "package", "release"}
 RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
     "final-artistic-approval": {
         "issue": 10,
@@ -153,14 +202,14 @@ RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
     "rights-register": {
         "issue": 16,
         "owner": "Issue 16, Anthony, and contributors",
-        "proofs": ("rights-release",),
+        "proofs": ("rights-validation", "owner-attestation"),
         "affirms": ("rights-cleared",),
         "package": True,
     },
     "press-stills-clearance": {
         "issue": 16,
         "owner": "Issue 16 and Anthony",
-        "proofs": ("owner-attestation", "rights-release"),
+        "proofs": ("owner-attestation", "rights-validation"),
         "affirms": ("stills-cleared",),
         "package": True,
     },
@@ -195,7 +244,7 @@ RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
     "progressive-controls-replay": {
         "issue": 17,
         "owner": "Issue 17 and Anthony",
-        "proofs": (),
+        "proofs": ("progressive-controls-replay",),
         "affirms": (),
         "package": False,
     },
@@ -209,14 +258,14 @@ RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
     "release-custody": {
         "issue": 12,
         "owner": "Issue 12 and Anthony",
-        "proofs": ("custody-completion",),
+        "proofs": ("custody-completion", "owner-attestation"),
         "affirms": ("custody-complete",),
         "package": True,
     },
     "restore-rehearsal": {
         "issue": 12,
         "owner": "Issue 12 and Anthony",
-        "proofs": ("restore-completion",),
+        "proofs": ("restore-completion", "owner-attestation"),
         "affirms": ("restore-complete",),
         "package": True,
     },
@@ -228,11 +277,11 @@ RELEASE_GATE_CONTRACTS: dict[str, dict[str, Any]] = {
         "package": True,
     },
 }
-# A generic receipt cannot introduce its own authority. Each completed proof must
-# be pinned here by a reviewed code change after the typed public-safe receipt
-# has been checked against its private/domain source. No terminal proof is
-# currently pinned; the tracked release intentionally remains a draft.
-PINNED_GATE_PROOFS: dict[tuple[str, str], dict[str, Any]] = {}
+# The schema-closed evidence pin ledger is a review inventory, not a signature or
+# trust root. Keeping mutable proof hashes out of validator code avoids an
+# impossible receipt-hash/source-commit cycle. Repository governance must still
+# supply independent review of each tracked pin change. The ledger is empty in
+# draft state.
 PHASES = ("draft", "public", "release")
 GENERATED_PRODUCT_PATHS = {
     "project-page-copy": "project/index.html",
@@ -267,6 +316,10 @@ SENSITIVE_KEYS = {
     "signature",
     "token",
 }
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
 PRIVATE_PREFIXES = (
     ".git/",
     ".work/",
@@ -289,6 +342,25 @@ PUBLIC_MARKERS = re.compile(
 
 class ReleaseError(ValueError):
     """The release manifest or artifact violates its declared contract."""
+
+
+def _git_environment() -> dict[str, str]:
+    """Run provenance Git without ambient repository/object/config redirects."""
+    environment = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "LC_ALL": "C",
+    }
+    # Git for Windows needs SYSTEMROOT; temporary-path variables are harmless
+    # process prerequisites. Deliberately do not inherit any other ambient key,
+    # especially GIT_DIR, GIT_WORK_TREE, index/object redirects, namespaces, or
+    # GIT_CONFIG_COUNT/KEY/VALUE injection.
+    for key in ("SYSTEMROOT", "TMPDIR", "TMP", "TEMP"):
+        if value := os.environ.get(key):
+            environment[key] = value
+    return environment
 
 
 def sha256(path: Path) -> str:
@@ -394,34 +466,42 @@ def keys(value: Any) -> Iterator[str]:
 
 
 CONTROL_CHAR = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-ASSERTIVE_SUMMARY = re.compile(
-    r"\b(?:accepted?|approved?|authorized?|cleared?|completed?|deployed?|filed?|"
-    r"final(?:[- ]cut)?|ready|rights?|submitted?|submission|terms?|uploaded?|upload)\b",
+SENSITIVE_TEXT = re.compile(
+    r"\b(?:api[ _-]?key|authorization|credential|password|private[ _-]?key|"
+    r"secret|token)\b\s*(?::|=|\bis\b)\s*\S"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"|\bgh[pousr]_[A-Za-z0-9]{20,}\b"
+    r"|\bAKIA[0-9A-Z]{16}\b",
     re.IGNORECASE,
 )
-APPLE_METAL_RENDERER = re.compile(
-    r"^ANGLE \(Apple(?: Inc\.)?, ANGLE Metal Renderer: [^\r\n()]+\)$"
-)
-RUNTIME_NEGATION = re.compile(r"\b(?:no|not|without)\b", re.IGNORECASE)
 
 
 def _decoded_variants(value: str) -> Iterator[str]:
     """Expose nested percent-encoding before applying public-safety rules."""
 
     current = value
-    for _ in range(5):
+    for _ in range(10):
         yield current
         decoded = unquote(current)
         if decoded == current:
             return
         current = decoded
+    raise ReleaseError("public-safe text exceeds the percent-decoding depth limit")
 
 
 def validate_public_safe_document(value: Any, label: str) -> None:
     """Reject private, contact, credential, encoded, or control data everywhere."""
 
     sensitive_key = next(
-        (key for key in keys(value) if key.lower() in SENSITIVE_KEYS), None
+        (
+            key
+            for key in keys(value)
+            if any(
+                decoded.lower() in SENSITIVE_KEYS
+                for decoded in _decoded_variants(key)
+            )
+        ),
+        None,
     )
     if sensitive_key:
         raise ReleaseError(f"{label} exposes sensitive field {sensitive_key!r}")
@@ -432,8 +512,11 @@ def validate_public_safe_document(value: Any, label: str) -> None:
                 or PRIVATE_PATH_MARKER.search(candidate)
                 or EMAIL.search(candidate)
                 or PHONE.search(candidate)
+                or SENSITIVE_TEXT.search(candidate)
             ):
-                raise ReleaseError(f"{label} exposes private contact or path data")
+                raise ReleaseError(
+                    f"{label} exposes private contact or path data or credentials"
+                )
 
 
 def _git_output(root: Path, *args: str) -> str:
@@ -443,6 +526,7 @@ def _git_output(root: Path, *args: str) -> str:
             capture_output=True,
             text=True,
             check=False,
+            env=_git_environment(),
         )
     except OSError as exc:
         raise ReleaseError(
@@ -453,6 +537,80 @@ def _git_output(root: Path, *args: str) -> str:
             "release receipt names an unavailable Git object or relationship"
         )
     return result.stdout.strip()
+
+
+def _git_bytes(root: Path, *args: str) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=False,
+            env=_git_environment(),
+        )
+    except OSError as exc:
+        raise ReleaseError(
+            "release receipt requires an available Git repository"
+        ) from exc
+    if result.returncode != 0:
+        raise ReleaseError(
+            "release receipt names an unavailable Git object or relationship"
+        )
+    return result.stdout
+
+
+def _reject_git_replace_refs(root: Path) -> None:
+    replacements = _git_output(
+        root, "for-each-ref", "--format=%(refname)", "refs/replace"
+    )
+    if replacements:
+        raise ReleaseError("release validation rejects Git replacement refs")
+
+
+def _verify_git_object_integrity(root: Path, *oids: str) -> None:
+    """Recompute reachable Git object identities under the repository hash.
+
+    Normal object lookup can consume a loose object from the pathname of a
+    different hash.  `git fsck --full` independently walks the declared roots
+    and verifies commit, tree and blob identities before a release may rely on
+    their contents.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "fsck",
+                "--full",
+                "--strict",
+                "--no-reflogs",
+                "--no-dangling",
+                "--no-progress",
+                *oids,
+            ],
+            capture_output=True,
+            check=False,
+            env=_git_environment(),
+        )
+    except OSError as exc:
+        raise ReleaseError("cannot verify raw Git object integrity") from exc
+    if result.returncode != 0:
+        raise ReleaseError(
+            "release receipt source or evidence fails raw Git object integrity"
+        )
+
+
+def _json_bytes(payload: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            payload.decode("utf-8"), object_pairs_hook=_no_duplicate_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReleaseError(f"{label} must be a JSON object")
+    return value
 
 
 def _parse_utc(value: object, label: str) -> datetime:
@@ -484,8 +642,10 @@ def git_commit_identity(root: Path, oid: object) -> tuple[str, datetime]:
     return tree, committed_at
 
 
-def validate_evidence_only_descendant(root: Path, oid: str) -> None:
-    """Require checkout drift from a reviewed source to be evidence-only.
+def validate_evidence_only_descendant(
+    root: Path, oid: str, allowed_paths: set[str]
+) -> None:
+    """Require checkout drift from a frozen source to be evidence-only.
 
     A tracked receipt cannot name the tree that contains its own digest without
     becoming self-referential.  The admissible relation is therefore one real
@@ -501,6 +661,7 @@ def validate_evidence_only_descendant(root: Path, oid: str) -> None:
                 "-C",
                 str(root),
                 "diff",
+                "--no-renames",
                 "--name-only",
                 "-z",
                 oid,
@@ -509,29 +670,121 @@ def validate_evidence_only_descendant(root: Path, oid: str) -> None:
             ],
             capture_output=True,
             check=False,
+            env=_git_environment(),
         )
     except OSError as exc:
-        raise ReleaseError("cannot compare the reviewed release source tree") from exc
+        raise ReleaseError("cannot compare the frozen release source tree") from exc
     if source_diff.returncode != 0:
-        raise ReleaseError("cannot compare the reviewed release source tree")
+        raise ReleaseError("cannot compare the frozen release source tree")
     try:
         changed = {
             item.decode("utf-8") for item in source_diff.stdout.split(b"\0") if item
         }
     except UnicodeDecodeError as exc:
-        raise ReleaseError("reviewed release source diff contains a non-UTF-8 path") from exc
-    invalid = sorted(
-        path
-        for path in changed
-        if path != MANIFEST.as_posix()
-        and path != PROGRESSIVE_CONTROLS_EVIDENCE_PATH
-        and not re.fullmatch(r"release/evidence/[a-z0-9-]+-receipt\.json", path)
-        and not re.fullmatch(r"release/evidence/proofs/[a-z0-9-]+\.json", path)
-    )
+        raise ReleaseError("frozen release source diff contains a non-UTF-8 path") from exc
+    invalid = sorted(changed - allowed_paths)
     if invalid:
         raise ReleaseError(
-            "release receipt source drift is not limited to its tracked evidence envelope"
+            "release receipt source drift is not limited to its exact tracked evidence envelope: "
+            + ", ".join(invalid)
         )
+
+
+def _manifest_without_gate_completion(manifest: dict[str, Any]) -> dict[str, Any]:
+    projected = deepcopy(manifest)
+    for gate in projected.get("gates", []):
+        if isinstance(gate, dict):
+            gate.pop("state", None)
+            gate.pop("evidence", None)
+    return projected
+
+
+def _validate_frozen_manifest(
+    root: Path,
+    source_head: str,
+    expected_sha256: object,
+    current: dict[str, Any],
+) -> None:
+    payload = _git_bytes(root, "show", f"{source_head}:{MANIFEST.as_posix()}")
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 != actual_sha256:
+        raise ReleaseError(
+            "release gate receipt source manifest digest disagrees with its exact head"
+        )
+    source = _json_bytes(payload, "source release manifest")
+    if _manifest_without_gate_completion(source) != _manifest_without_gate_completion(
+        current
+    ):
+        raise ReleaseError(
+            "release manifest changed outside gate state and evidence completion"
+        )
+    source_gates = source.get("gates")
+    current_gates = current.get("gates")
+    if not isinstance(source_gates, list) or not isinstance(current_gates, list):
+        raise ReleaseError("release manifest gate inventory is malformed")
+    if len(source_gates) != len(current_gates):
+        raise ReleaseError("release manifest gate inventory changed after source freeze")
+    for before, after in zip(source_gates, current_gates, strict=True):
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ReleaseError("release manifest gate inventory is malformed")
+        if before.get("id") != after.get("id"):
+            raise ReleaseError("release manifest gate order changed after source freeze")
+        if before.get("state") == "satisfied" and (
+            after.get("state") != "satisfied"
+            or after.get("evidence") != before.get("evidence")
+        ):
+            raise ReleaseError(
+                f"completed gate {before.get('id')} changed after source freeze"
+            )
+        if before.get("state") == "pending" and after.get("state") not in {
+            "pending",
+            "satisfied",
+        }:
+            raise ReleaseError(
+                f"gate {before.get('id')} has an invalid completion transition"
+            )
+
+
+def validate_clean_checkout(root: Path) -> None:
+    status = _git_bytes(
+        root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    if status:
+        raise ReleaseError(
+            "pinned release validation requires a clean committed checkout"
+        )
+    ignored = _git_bytes(
+        root,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+        "--",
+        "release",
+        "rights",
+    )
+    if ignored:
+        raise ReleaseError(
+            "pinned release validation rejects ignored contract or evidence files"
+        )
+
+
+def _verify_commit_record(
+    root: Path,
+    commit: str,
+    relative: str,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    payload = _git_bytes(root, "show", f"{commit}:{relative}")
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected_sha256:
+        raise ReleaseError(f"{label} is not the exact tracked blob at its bound commit")
 
 
 def _validate_receipt_time(
@@ -547,6 +800,12 @@ def _validate_receipt_time(
     return observed_at
 
 
+def _current_rights_validation_date() -> date:
+    return datetime.now(timezone.utc).astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+
+
 def _tracked_paths(root: Path) -> set[str]:
     payload = _git_output(root, "ls-files", "-z")
     return {item for item in payload.split("\0") if item}
@@ -557,12 +816,14 @@ def _validate_subject(
     subject: object,
     manifest: dict[str, Any],
     contract: dict[str, Any],
+    verified_git_objects: set[tuple[str, str]],
 ) -> tuple[dict[str, Any], datetime]:
     if not isinstance(subject, dict) or set(subject) != {
         "release_id",
         "release_version",
         "repository_head",
         "repository_tree",
+        "release_manifest_sha256",
         "package_manifest_sha256",
     }:
         raise ReleaseError("release gate receipt has no exact release subject")
@@ -579,13 +840,39 @@ def _validate_subject(
         or subject.get("release_version") != manifest["version"]
     ):
         raise ReleaseError("release gate receipt names a different release subject")
-    tree, committed_at = git_commit_identity(root, subject.get("repository_head"))
+    source_head = subject.get("repository_head")
+    if not isinstance(source_head, str) or not HEX40.fullmatch(source_head):
+        raise ReleaseError("release receipt has no exact 40-character repository head")
+    checkout_head = _git_output(root, "rev-parse", "HEAD")
+    integrity_key = (source_head, checkout_head)
+    if integrity_key not in verified_git_objects:
+        _verify_git_object_integrity(root, source_head, checkout_head)
+        verified_git_objects.add(integrity_key)
+    tree, committed_at = git_commit_identity(root, source_head)
     if subject.get("repository_tree") != tree:
         raise ReleaseError(
             "release gate receipt repository tree disagrees with its head"
         )
-    validate_evidence_only_descendant(root, subject["repository_head"])
+    _validate_frozen_manifest(
+        root,
+        subject["repository_head"],
+        subject.get("release_manifest_sha256"),
+        manifest,
+    )
     return subject, committed_at
+
+
+def _source_identity(subject: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: subject[key]
+        for key in (
+            "release_id",
+            "release_version",
+            "repository_head",
+            "repository_tree",
+            "release_manifest_sha256",
+        )
+    }
 
 
 def _expected_package(subject: dict[str, Any]) -> dict[str, Any] | None:
@@ -596,7 +883,215 @@ def _expected_package(subject: dict[str, Any]) -> dict[str, Any] | None:
         "manifest": "manifest.json",
         "manifest_sha256": digest,
         "repository_head": subject["repository_head"],
+        "repository_tree": subject["repository_tree"],
+        "release_manifest_sha256": subject["release_manifest_sha256"],
     }
+
+
+def _owner_scope_sha256(
+    root: Path,
+    gate: dict[str, Any],
+    subject: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    scope: dict[str, Any] = {
+        "gate_id": gate["id"],
+        "issue": gate["issue"],
+        "claim": RELEASE_GATE_CONTRACTS[gate["id"]]["affirms"][0],
+        "subject": subject,
+    }
+    if gate["id"] in {"rights-register", "press-stills-clearance"}:
+        rights_path = source_file(root, "rights/register.json", "rights register")
+        scope["rights_register_sha256"] = sha256(rights_path)
+    if gate["id"] == "press-stills-clearance":
+        scope["still_ids"] = sorted(
+            medium["id"]
+            for medium in manifest["media"]
+            if medium["kind"] in {"still", "social-card"}
+        )
+    return hashlib.sha256(canonical_json(scope)).hexdigest()
+
+
+def _owner_approval_body_sha256(
+    root: Path,
+    gate: dict[str, Any],
+    subject: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    contract = RELEASE_GATE_CONTRACTS[gate["id"]]
+    payload = {
+        "schema": "danse.release.owner-approval.v1",
+        "gate_id": gate["id"],
+        "issue": gate["issue"],
+        "authority_login": RELEASE_OWNER_LOGIN,
+        "decision": {
+            "claim": contract["affirms"][0],
+            "scope_sha256": _owner_scope_sha256(root, gate, subject, manifest),
+        },
+        "subject": subject,
+        "package": _expected_package(subject),
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def _rights_check_digest(kind: str, payload: object) -> str:
+    return hashlib.sha256(
+        canonical_json({"check": kind, "value": payload})
+    ).hexdigest()
+
+
+def _external_authority_body_sha256(
+    gate: dict[str, Any],
+    kind: str,
+    authority_login: str,
+    subject: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "schema": "danse.release.external-authority-approval.v1",
+        "gate_id": gate["id"],
+        "issue": gate["issue"],
+        "proof_kind": kind,
+        "authority_login": authority_login,
+        "subject": subject,
+        "checks": checks,
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def _rights_register_inventory(
+    root: Path,
+    document: dict[str, Any],
+    *,
+    gate_id: str,
+    source_head: str,
+    tracked: set[str],
+    validation_date: date,
+) -> tuple[list[str], list[str], set[str]]:
+    """Return the exact cleared use and redacted-receipt inventory.
+
+    This is deliberately narrower than legal review. It ensures a machine proof
+    cannot call a still-blocked register "zero blockers" or omit a tracked
+    human/use receipt. The separate owner attestation remains mandatory and the
+    repository review rail remains responsible for evaluating those decisions.
+    """
+
+    _validate_schema(
+        document,
+        _load_closed_schema(root, RIGHTS_REGISTER_SCHEMA_PATH, "rights register"),
+        "rights register",
+    )
+    if document.get("status") not in {"reviewed", "cleared"}:
+        raise ReleaseError("rights validation proof binds an unreviewed register")
+    required_gates = RIGHTS_CLEARANCE_GATES.get(gate_id)
+    if required_gates is None:
+        raise ReleaseError("rights validation proof names an unknown clearance scope")
+    validate_public_safe_document(document, "rights register")
+
+    receipt_digests: set[str] = set()
+    receipt_paths: set[str] = set()
+
+    def bind_receipt(record: object, label: str) -> None:
+        if not isinstance(record, dict):
+            raise ReleaseError(f"{label} has no redacted receipt")
+        path = verify_record(root, record, label)
+        relative = path.relative_to(root).as_posix()
+        digest = record.get("sha256")
+        if relative not in tracked:
+            raise ReleaseError(f"{label} is not tracked by the repository")
+        _verify_commit_record(root, source_head, relative, digest, label)
+        validate_public_safe_document(load_json(path, label), label)
+        if relative in receipt_paths or digest in receipt_digests:
+            raise ReleaseError("rights register reuses a redacted decision receipt")
+        receipt_paths.add(relative)
+        receipt_digests.add(digest)
+
+    gates = {gate.get("id"): gate for gate in document.get("human_gates", [])}
+    for required_gate in sorted(required_gates):
+        gate = gates.get(required_gate)
+        if gate is None:
+            raise ReleaseError(
+                f"rights clearance scope {gate_id} is missing gate {required_gate}"
+            )
+        if gate.get("state") != "satisfied":
+            raise ReleaseError(
+                f"rights register human gate {gate.get('id')} is not satisfied"
+            )
+        bind_receipt(gate.get("evidence"), f"rights human gate {gate.get('id')}")
+
+    asset_use_ids: list[str] = []
+    for asset in document.get("assets", []):
+        scoped_uses = [
+            use
+            for use in asset.get("uses", [])
+            if set(use.get("required_for", [])) & RIGHTS_CLEARANCE_REQUIRED_PHASES
+            and (
+                use.get("medium") in RIGHTS_STILL_MEDIA
+                if gate_id == "press-stills-clearance"
+                else use.get("medium") not in RIGHTS_STILL_MEDIA
+                and use.get("medium") not in RIGHTS_FILING_ONLY_MEDIA
+            )
+        ]
+        if not scoped_uses:
+            continue
+        asset_id = asset.get("id")
+        disposition = asset.get("disposition")
+        if disposition == "blocked":
+            raise ReleaseError(f"rights register asset {asset_id} remains blocked")
+        credit = asset.get("public_credit", {})
+        if credit.get("state") == "pending":
+            raise ReleaseError(f"rights register asset {asset_id} has pending credit")
+        private = asset.get("private_evidence", {})
+        if private.get("state") == "verified":
+            bind_receipt(
+                private.get("receipt"),
+                f"rights asset {asset_id} private evidence",
+            )
+        elif private.get("state") != "not-required" or private.get("receipt") is not None:
+            raise ReleaseError(
+                f"rights register asset {asset_id} has unresolved private evidence"
+            )
+        for use in scoped_uses:
+            use_id = use.get("id")
+            identity = f"{asset_id}/{use_id}"
+            asset_use_ids.append(identity)
+            status = use.get("status")
+            if disposition == "excluded":
+                if status != "excluded" or use.get("evidence") is not None:
+                    raise ReleaseError(
+                        f"rights register excluded use {identity} is inconsistent"
+                    )
+                continue
+            if status != "cleared":
+                raise ReleaseError(f"rights register asset use {identity} is not cleared")
+            if any(
+                use.get(field) == "pending"
+                for field in ("territory", "term", "promotion", "archive")
+            ):
+                raise ReleaseError(
+                    f"rights register asset use {identity} has unsettled scope"
+                )
+            expires = use.get("expires")
+            if use.get("term") == "fixed" and expires is None:
+                raise ReleaseError(
+                    f"rights register asset use {identity} has no fixed-term expiry"
+                )
+            if expires is not None:
+                try:
+                    expiry_date = date.fromisoformat(expires)
+                except (TypeError, ValueError) as exc:
+                    raise ReleaseError(
+                        f"rights register asset use {identity} has an invalid expiry"
+                    ) from exc
+                if expiry_date < validation_date:
+                    raise ReleaseError(
+                        f"rights register asset use {identity} expired before validation"
+                    )
+            bind_receipt(use.get("evidence"), f"rights asset use {identity}")
+
+    if len(asset_use_ids) != len(set(asset_use_ids)):
+        raise ReleaseError("rights register asset/use inventory is not unique")
+    return sorted(asset_use_ids), sorted(receipt_digests), receipt_paths
 
 
 def _strict_owner_comment_url(value: object, issue: int, comment_id: int) -> str:
@@ -637,6 +1132,30 @@ def _load_closed_schema(root: Path, relative: Path, label: str) -> dict[str, Any
     return schema
 
 
+def _load_rights_checker(root: Path, source_head: str):
+    """Return the trusted current verifier after checking its frozen identity.
+
+    Historical repository blobs are data identities only.  In particular, a
+    receipt-selected source commit must never become executable Python merely
+    because its digest was recorded in an evidence document.
+    """
+
+    relative = RELEASE_PROOF_GENERATORS["rights-validation"]
+    path = source_file(root, relative, "rights checker")
+    source_digest = hashlib.sha256(
+        _git_bytes(root, "show", f"{source_head}:{relative}")
+    ).hexdigest()
+    trusted_path = Path(_TRUSTED_RIGHTS_CHECKER.__file__).resolve()
+    trusted_digest = sha256(trusted_path)
+    if sha256(path) != source_digest:
+        raise ReleaseError("rights checker differs from the frozen release source")
+    if source_digest != trusted_digest:
+        raise ReleaseError(
+            "frozen rights checker identity does not match the trusted current verifier"
+        )
+    return _TRUSTED_RIGHTS_CHECKER
+
+
 def _validate_schema(document: Any, schema: dict[str, Any], label: str) -> None:
     errors = sorted(
         jsonschema.Draft202012Validator(
@@ -651,6 +1170,80 @@ def _validate_schema(document: Any, schema: dict[str, Any], label: str) -> None:
         raise ReleaseError(f"{label} schema failure at {location}: {error.message}")
 
 
+def load_proof_pins(
+    root: Path,
+) -> tuple[dict[str, Any], dict[tuple[str, str], dict[str, Any]]]:
+    """Load the schema-closed review-required pin inventory."""
+
+    path = source_file(root, RELEASE_PROOF_PINS_PATH.as_posix(), "proof pin ledger")
+    document = load_json(path, "proof pin ledger")
+    _validate_schema(
+        document,
+        _load_closed_schema(
+            root, RELEASE_PROOF_PINS_SCHEMA_PATH, "proof pin ledger"
+        ),
+        "proof pin ledger",
+    )
+    if document["schema"] != RELEASE_PROOF_PINS_SCHEMA:
+        raise ReleaseError("proof pin ledger has the wrong schema")
+    validate_public_safe_document(document, "proof pin ledger")
+    records = document["records"]
+    ordered = sorted(records, key=lambda item: (item["gate_id"], item["kind"]))
+    if records != ordered:
+        raise ReleaseError("proof pin ledger records are not canonically ordered")
+    pins: dict[tuple[str, str], dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+    seen_digests: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_owner_comments: set[tuple[str, int, int]] = set()
+    seen_owner_urls: set[str] = set()
+    for record in records:
+        key = (record["gate_id"], record["kind"])
+        receipt = record["receipt"]
+        if key in pins:
+            raise ReleaseError("proof pin ledger repeats a gate and proof kind")
+        if receipt["path"] in seen_paths or receipt["sha256"] in seen_digests:
+            raise ReleaseError("proof pin ledger reuses a proof path or digest")
+        if record["proof_id"] in seen_ids:
+            raise ReleaseError("proof pin ledger reuses a proof identity")
+        source = record["source"]
+        if source is not None:
+            identity = (
+                source["repository"],
+                source["issue"],
+                source["comment_id"],
+            )
+            if identity in seen_owner_comments or source["comment_url"] in seen_owner_urls:
+                raise ReleaseError("proof pin ledger reuses an owner comment identity")
+            seen_owner_comments.add(identity)
+            seen_owner_urls.add(source["comment_url"])
+        pins[key] = record
+        seen_paths.add(receipt["path"])
+        seen_digests.add(receipt["sha256"])
+        seen_ids.add(record["proof_id"])
+    return document, pins
+
+
+def gate_receipt_summary(gate_id: str) -> str:
+    if gate_id == "progressive-controls-replay":
+        return PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY
+    return f"Typed evidence receipt for gate {gate_id}."
+
+
+def gate_receipt_path(gate_id: str) -> str:
+    return f"release/evidence/{gate_id}-receipt.json"
+
+
+def gate_proof_path(gate_id: str, kind: str) -> str:
+    if kind == "progressive-controls-replay":
+        return PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    return f"release/evidence/proofs/{gate_id}-{kind}.json"
+
+
+def rights_validation_receipt_path(gate_id: str) -> str:
+    return f"release/evidence/proofs/{gate_id}-rights-zero-blockers.json"
+
+
 def _validate_owner_attestation(
     root: Path,
     path: Path,
@@ -658,7 +1251,8 @@ def _validate_owner_attestation(
     subject: dict[str, Any],
     committed_at: datetime,
     pin: dict[str, Any],
-) -> tuple[str, datetime, set[str]]:
+    manifest: dict[str, Any],
+) -> tuple[str, datetime, set[str], tuple[str, int, int], str, set[str]]:
     label = f"release gate {gate['id']} owner attestation"
     document = load_json(path, label)
     _validate_schema(
@@ -670,6 +1264,7 @@ def _validate_owner_attestation(
         document["gate_id"] != gate["id"]
         or document["issue"] != gate["issue"]
         or document["kind"] != "owner-attestation"
+        or document["attestation_id"] != pin["proof_id"]
         or document["subject"] != subject
         or document["package"] != _expected_package(subject)
     ):
@@ -679,15 +1274,25 @@ def _validate_owner_attestation(
         "github_login": RELEASE_OWNER_LOGIN,
     }:
         raise ReleaseError(f"{label} has no pinned canonical owner")
+    contract = RELEASE_GATE_CONTRACTS[gate["id"]]
+    if len(contract["affirms"]) != 1 or document["decision"] != {
+        "claim": contract["affirms"][0],
+        "scope_sha256": _owner_scope_sha256(root, gate, subject, manifest),
+    }:
+        raise ReleaseError(f"{label} does not bind its exact decision scope")
     source = document["source"]
     if source != pin.get("source"):
-        raise ReleaseError(f"{label} does not match its reviewed owner-authored source")
+        raise ReleaseError(f"{label} does not match its pinned owner-authored source")
     if (
         source["repository"] != RELEASE_REPOSITORY
         or source["issue"] != gate["issue"]
         or source["comment_author"] != RELEASE_OWNER_LOGIN
+        or source["comment_body_sha256"]
+        != _owner_approval_body_sha256(root, gate, subject, manifest)
     ):
-        raise ReleaseError(f"{label} names a different repository authority")
+        raise ReleaseError(
+            f"{label} does not bind the exact canonical owner approval payload"
+        )
     _strict_owner_comment_url(
         source["comment_url"], gate["issue"], source["comment_id"]
     )
@@ -703,7 +1308,15 @@ def _validate_owner_attestation(
     if not created <= updated <= recorded:
         raise ReleaseError(f"{label} source and recording times are inconsistent")
     validate_public_safe_document(document, label)
-    return document["attestation_id"], recorded, {source["comment_body_sha256"]}
+    identity = (source["repository"], source["issue"], source["comment_id"])
+    return (
+        document["attestation_id"],
+        recorded,
+        {source["comment_body_sha256"]},
+        identity,
+        source["comment_url"],
+        set(),
+    )
 
 
 def _validate_operational_proof(
@@ -714,7 +1327,15 @@ def _validate_operational_proof(
     subject: dict[str, Any],
     committed_at: datetime,
     pin: dict[str, Any],
-) -> tuple[str, datetime, set[str]]:
+    unsupported_authenticity: set[tuple[str, str]],
+) -> tuple[
+    str,
+    datetime,
+    set[str],
+    tuple[str, int, int] | None,
+    str | None,
+    set[str],
+]:
     label = f"release gate {gate['id']} {kind} proof"
     document = load_json(path, label)
     _validate_schema(
@@ -726,11 +1347,14 @@ def _validate_operational_proof(
         document["gate_id"] != gate["id"]
         or document["issue"] != gate["issue"]
         or document["kind"] != kind
+        or document["proof_id"] != pin["proof_id"]
         or document["subject"] != subject
         or document["package"] != _expected_package(subject)
         or document["issuer"] != pin.get("issuer")
     ):
         raise ReleaseError(f"{label} belongs to a different source, issuer, or release")
+    if document["issuer"]["kind"] != RELEASE_PROOF_ISSUER_KINDS[kind]:
+        raise ReleaseError(f"{label} uses an authority type that cannot issue this proof")
     expected_checks = RELEASE_PROOF_CHECKS[kind]
     checks = document["checks"]
     if [check["id"] for check in checks] != list(expected_checks):
@@ -738,19 +1362,297 @@ def _validate_operational_proof(
     check_digests = [check["receipt_sha256"] for check in checks]
     if len(check_digests) != len(set(check_digests)):
         raise ReleaseError(f"{label} reuses a source receipt digest")
+    generator = document["generator"]
+    generator_path = RELEASE_PROOF_GENERATORS[kind]
+    if (
+        generator["path"] != generator_path
+        or generator["version"] != f"danse-{kind}-proof-v1"
+    ):
+        raise ReleaseError(f"{label} names the wrong proof generator")
+    generator_bytes = _git_bytes(
+        root, "show", f"{subject['repository_head']}:{generator_path}"
+    )
+    generator_sha256 = hashlib.sha256(generator_bytes).hexdigest()
+    if (
+        generator["sha256"] != generator_sha256
+        or document["issuer"]["identity"]
+        != f"{generator_path}@sha256:{generator_sha256}"
+    ):
+        raise ReleaseError(f"{label} is not bound to its exact source generator")
+    observed = _validate_receipt_time(
+        document["observed_at"], f"{label} observation", committed_at
+    )
+    if kind != "rights-validation":
+        # Continue validating the document's structural/source boundaries so a
+        # malformed proof cannot hide another contract defect, but never let
+        # opaque, self-authored check digests confer completion.  The caller
+        # rejects every collected kind after all independently verifiable
+        # receipts have been checked.
+        unsupported_authenticity.add((gate["id"], kind))
     if kind == "submission-package":
         package_check = next(
             check for check in checks if check["id"] == "package-manifest"
         )
         if package_check["receipt_sha256"] != subject["package_manifest_sha256"]:
             raise ReleaseError(
-                f"{label} does not authenticate its exact package manifest"
+                f"{label} does not bind its exact package manifest"
             )
-    observed = _validate_receipt_time(
-        document["observed_at"], f"{label} observation", committed_at
-    )
+    consumed_paths: set[str] = set()
+    rights_binding = document["rights_binding"]
+    if kind == "rights-validation":
+        proof_validation_date = observed.astimezone(
+            ZoneInfo("America/New_York")
+        ).date()
+        effective_validation_date = _current_rights_validation_date()
+        tracked = _tracked_paths(root)
+        register = rights_binding["register"]
+        if register["path"] != "rights/register.json":
+            raise ReleaseError(f"{label} names the wrong rights register")
+        if register["path"] not in tracked:
+            raise ReleaseError(f"{label} rights register is not tracked")
+        register_path = verify_record(root, register, f"{label} rights register")
+        _verify_commit_record(
+            root,
+            subject["repository_head"],
+            register["path"],
+            register["sha256"],
+            f"{label} rights register",
+        )
+        rights_document = load_json(register_path, f"{label} rights register")
+        asset_use_ids, redacted_receipt_sha256s, _redacted_paths = (
+            _rights_register_inventory(
+                root,
+                rights_document,
+                gate_id=gate["id"],
+                source_head=subject["repository_head"],
+                tracked=tracked,
+                validation_date=effective_validation_date,
+            )
+        )
+        zero_record = rights_binding["zero_blockers"]
+        if zero_record["path"] != rights_validation_receipt_path(gate["id"]):
+            raise ReleaseError(f"{label} does not use its canonical rights receipt path")
+        if zero_record["path"] not in tracked:
+            raise ReleaseError(f"{label} zero-blocker receipt is not tracked")
+        zero_path = verify_record(root, zero_record, f"{label} zero-blocker receipt")
+        _verify_commit_record(
+            root,
+            _git_output(root, "rev-parse", "HEAD"),
+            zero_record["path"],
+            zero_record["sha256"],
+            f"{label} zero-blocker receipt",
+        )
+        zero_document = load_json(zero_path, f"{label} zero-blocker receipt")
+        validate_public_safe_document(zero_document, f"{label} zero-blocker receipt")
+        expected_keys = {
+            "schema",
+            "gate_id",
+            "issue",
+            "result",
+            "subject",
+            "generator",
+            "receipt",
+        }
+        if set(zero_document) != expected_keys:
+            raise ReleaseError(f"{label} has no closed rights validation receipt")
+        generator = zero_document["generator"]
+        if not isinstance(generator, dict) or set(generator) != {
+            "path",
+            "sha256",
+            "receipt_schema",
+        }:
+            raise ReleaseError(f"{label} has no exact rights validator identity")
+        if (
+            generator["path"] != "scripts/rights_contract.py"
+            or generator["receipt_schema"]
+            != "danse.rights.clearance-receipt.v1"
+            or not isinstance(generator["sha256"], str)
+            or not HEX64.fullmatch(generator["sha256"])
+        ):
+            raise ReleaseError(f"{label} has no exact rights validator identity")
+        _verify_commit_record(
+            root,
+            subject["repository_head"],
+            generator["path"],
+            generator["sha256"],
+            f"{label} rights validator",
+        )
+        receipt = zero_document["receipt"]
+        checker = _load_rights_checker(root, subject["repository_head"])
+        try:
+            expected_receipt = checker.build_clearance_scope_receipt(
+                rights_document,
+                scope=gate["id"],
+                register_path=register_path,
+                schema_path=source_file(
+                    root,
+                    RIGHTS_REGISTER_SCHEMA_PATH.as_posix(),
+                    f"{label} rights schema",
+                ),
+                root=root,
+                as_of=proof_validation_date,
+            )
+            current_receipt = checker.build_clearance_scope_receipt(
+                rights_document,
+                scope=gate["id"],
+                register_path=register_path,
+                schema_path=source_file(
+                    root,
+                    RIGHTS_REGISTER_SCHEMA_PATH.as_posix(),
+                    f"{label} rights schema",
+                ),
+                root=root,
+                as_of=effective_validation_date,
+            )
+        except Exception as exc:
+            raise ReleaseError(f"{label} canonical rights validation failed") from exc
+        if (
+            zero_document["schema"] != "danse.release.rights-validation.v1"
+            or zero_document["gate_id"] != gate["id"]
+            or zero_document["issue"] != gate["issue"]
+            or zero_document["result"] != "passed"
+            or zero_document["subject"] != subject
+            or receipt != expected_receipt
+            or receipt["status"] != "ready"
+            or receipt["blockers"] != []
+            or current_receipt["status"] != "ready"
+            or current_receipt["blockers"] != []
+        ):
+            raise ReleaseError(f"{label} has no exact ready rights validator receipt")
+        inputs = receipt["inputs"]
+        expected_validation_date = proof_validation_date.isoformat()
+        if (
+            not isinstance(inputs, dict)
+            or set(inputs)
+            != {
+                "validation_date",
+                "validation_timezone",
+                "human_gate_ids",
+                "asset_use_ids",
+                "redacted_receipt_sha256s",
+            }
+            or inputs["validation_timezone"] != "America/New_York"
+            or inputs["validation_date"] != expected_validation_date
+            or inputs["human_gate_ids"] != sorted(RIGHTS_CLEARANCE_GATES[gate["id"]])
+            or inputs["asset_use_ids"] != asset_use_ids
+            or inputs["redacted_receipt_sha256s"] != redacted_receipt_sha256s
+        ):
+            raise ReleaseError(f"{label} rights validator inputs are not exact")
+        check_by_id = {check["id"]: check["receipt_sha256"] for check in checks}
+        scoped_asset_ids = {identity.split("/", 1)[0] for identity in asset_use_ids}
+        credit_inventory = sorted(
+            (
+                {
+                    "asset_id": asset["id"],
+                    "state": asset["public_credit"]["state"],
+                    "label": asset["public_credit"]["label"],
+                }
+                for asset in rights_document["assets"]
+                if asset["id"] in scoped_asset_ids
+            ),
+            key=lambda item: item["asset_id"],
+        )
+        expected_rights_checks = {
+            "asset-census": _rights_check_digest(
+                "asset-census",
+                {"gate_id": gate["id"], "asset_use_ids": asset_use_ids},
+            ),
+            "included-use-clearance": _rights_check_digest(
+                "included-use-clearance",
+                {"gate_id": gate["id"], "asset_use_ids": asset_use_ids},
+            ),
+            "credits": _rights_check_digest(
+                "credits",
+                {"gate_id": gate["id"], "credits": credit_inventory},
+            ),
+            "press-stills": _rights_check_digest(
+                "press-stills",
+                {
+                    "gate_id": gate["id"],
+                    "asset_use_ids": (
+                        asset_use_ids
+                        if gate["id"] == "press-stills-clearance"
+                        else []
+                    ),
+                },
+            ),
+            "private-evidence": _rights_check_digest(
+                "private-evidence",
+                {
+                    "gate_id": gate["id"],
+                    "redacted_receipt_sha256s": redacted_receipt_sha256s,
+                },
+            ),
+            "zero-blockers": zero_record["sha256"],
+        }
+        if any(
+            check_by_id[check_id] != digest
+            for check_id, digest in expected_rights_checks.items()
+        ):
+            raise ReleaseError(f"{label} check digests do not bind its rights inventory")
+        consumed_paths.add(zero_record["path"])
+    elif rights_binding is not None:
+        raise ReleaseError(f"{label} invents an out-of-scope rights binding")
+    authority_source = document["authority_source"]
+    owner_identity: tuple[str, int, int] | None = None
+    owner_url: str | None = None
+    source_digests = set(check_digests)
+    if document["issuer"]["kind"] in {"venue", "host"}:
+        if not isinstance(authority_source, dict) or authority_source != pin.get(
+            "source"
+        ):
+            raise ReleaseError(f"{label} has no pinned external authority source")
+        if (
+            authority_source["repository"] != RELEASE_REPOSITORY
+            or authority_source["issue"] != gate["issue"]
+            or authority_source["comment_author"] == RELEASE_OWNER_LOGIN
+            or authority_source["comment_body_sha256"]
+            != _external_authority_body_sha256(
+                gate,
+                kind,
+                authority_source["comment_author"],
+                subject,
+                checks,
+            )
+        ):
+            raise ReleaseError(
+                f"{label} does not bind a distinct external authority payload"
+            )
+        _strict_owner_comment_url(
+            authority_source["comment_url"],
+            gate["issue"],
+            authority_source["comment_id"],
+        )
+        created = _validate_receipt_time(
+            authority_source["comment_created_at"],
+            f"{label} authority source creation",
+            committed_at,
+        )
+        updated = _validate_receipt_time(
+            authority_source["comment_updated_at"],
+            f"{label} authority source update",
+            committed_at,
+        )
+        if not created <= updated <= observed:
+            raise ReleaseError(f"{label} authority source times are inconsistent")
+        owner_identity = (
+            authority_source["repository"],
+            authority_source["issue"],
+            authority_source["comment_id"],
+        )
+        owner_url = authority_source["comment_url"]
+        source_digests.add(authority_source["comment_body_sha256"])
+    elif authority_source is not None or pin.get("source") is not None:
+        raise ReleaseError(f"{label} invents an out-of-scope authority source")
     validate_public_safe_document(document, label)
-    return document["proof_id"], observed, set(check_digests)
+    return (
+        document["proof_id"],
+        observed,
+        source_digests,
+        owner_identity,
+        owner_url,
+        consumed_paths,
+    )
 
 
 def validate_release_gate_receipt(
@@ -759,19 +1661,26 @@ def validate_release_gate_receipt(
     gate: dict[str, Any],
     manifest: dict[str, Any],
     *,
+    pins: dict[tuple[str, str], dict[str, Any]],
+    consumed_pin_keys: set[tuple[str, str]],
     tracked: set[str],
     seen_proof_paths: set[str],
     seen_proof_digests: set[str],
     seen_proof_ids: set[str],
     seen_source_digests: set[str],
-) -> str | None:
-    """Authenticate one public-safe completion receipt for a non-live gate.
+    seen_owner_comments: set[tuple[str, int, int]],
+    seen_owner_urls: set[str],
+    unsupported_authenticity: set[tuple[str, str]],
+    verified_git_objects: set[tuple[str, str]],
+) -> dict[str, Any]:
+    """Validate one public-safe completion receipt for a non-live gate.
 
     A digest-bound arbitrary file is not evidence that a human decision, final
     package, restore, custody copy, deployment, or presentation occurred. The
-    receipt therefore binds the exact gate and issue, the release identity, an
-    gate-specific reviewed proof pins and a real ancestor commit/tree. Private
-    evidence remains external behind a typed, pinned, public-safe redacted proof.
+    receipt therefore binds the exact gate and issue, the release identity,
+    gate-specific review pins, and a real ancestor commit/tree. The ledger is
+    structural integrity metadata; repository review remains the trust rail.
+    Private evidence remains external behind typed public-safe redacted proofs.
     """
 
     receipt = load_json(path, f"release gate {gate['id']} receipt")
@@ -792,7 +1701,11 @@ def validate_release_gate_receipt(
         raise ReleaseError(f"release gate {gate['id']} receipt is not satisfied")
     contract = RELEASE_GATE_CONTRACTS[gate["id"]]
     subject, committed_at = _validate_subject(
-        root, receipt["subject"], manifest, contract
+        root,
+        receipt["subject"],
+        manifest,
+        contract,
+        verified_git_objects,
     )
     recorded_at = _validate_receipt_time(
         receipt["recorded_at"],
@@ -822,30 +1735,24 @@ def validate_release_gate_receipt(
             "id",
             "kind",
             "receipt",
-            "summary",
         }:
             raise ReleaseError(f"{label} has an unknown shape")
         row_id = row.get("id")
         kind = row.get("kind")
         record = row.get("receipt")
-        summary = row.get("summary")
         if not isinstance(row_id, str) or not SAFE_ID.fullmatch(row_id) or row_id in evidence_ids:
             raise ReleaseError(f"{label} has a malformed or duplicate id")
         evidence_ids.add(row_id)
         if kind not in contract["proofs"] or kind in evidence_kinds:
             raise ReleaseError(f"{label} has an unsupported or duplicate proof kind")
         evidence_kinds.append(kind)
-        if (
-            not isinstance(summary, str)
-            or not summary.strip()
-            or ASSERTIVE_SUMMARY.search(summary)
-        ):
-            raise ReleaseError(f"{label} has an authoritative or unsafe summary")
         if not isinstance(record, dict) or set(record) != {"path", "sha256", "schema"}:
             raise ReleaseError(f"{label} has no closed local receipt record")
         proof_path = safe_relative(record.get("path"), f"{label} receipt path")
         digest = record.get("sha256")
         schema_name = record.get("schema")
+        if proof_path != gate_proof_path(gate["id"], kind):
+            raise ReleaseError(f"{label} does not use its canonical proof path")
         if proof_path not in tracked:
             raise ReleaseError(
                 f"{label} receipt is not tracked by the source repository"
@@ -854,21 +1761,47 @@ def validate_release_gate_receipt(
             raise ReleaseError(
                 f"{label} reuses a proof path or digest across release gates"
             )
-        pin = PINNED_GATE_PROOFS.get((gate["id"], kind))
-        expected_schema = (
-            RELEASE_OWNER_ATTESTATION_SCHEMA
-            if kind == "owner-attestation"
-            else RELEASE_GATE_PROOF_SCHEMA
-        )
+        key = (gate["id"], kind)
+        pin = pins.get(key)
+        expected_schema = {
+            "owner-attestation": RELEASE_OWNER_ATTESTATION_SCHEMA,
+            "progressive-controls-replay": PROGRESSIVE_CONTROLS_SCHEMA,
+        }.get(kind, RELEASE_GATE_PROOF_SCHEMA)
         if (
             pin is None
-            or record != {key: pin.get(key) for key in ("path", "sha256", "schema")}
+            or pin["gate_id"] != gate["id"]
+            or pin["issue"] != gate["issue"]
+            or record != pin["receipt"]
             or schema_name != expected_schema
         ):
-            raise ReleaseError(f"{label} has no authenticated reviewed proof pin")
+            raise ReleaseError(f"{label} has no matching review-required proof pin")
         proof_file = verify_record(root, record, f"{label} receipt")
         if kind == "owner-attestation":
-            proof_id, proof_time, source_digests = _validate_owner_attestation(
+            (
+                proof_id,
+                proof_time,
+                source_digests,
+                owner_identity,
+                owner_url,
+                extra_paths,
+            ) = _validate_owner_attestation(
+                root,
+                proof_file,
+                gate,
+                subject,
+                committed_at,
+                pin,
+                manifest,
+            )
+        elif kind == "progressive-controls-replay":
+            (
+                proof_id,
+                proof_time,
+                source_digests,
+                owner_identity,
+                owner_url,
+                extra_paths,
+            ) = validate_progressive_controls_receipt(
                 root,
                 proof_file,
                 gate,
@@ -877,7 +1810,14 @@ def validate_release_gate_receipt(
                 pin,
             )
         else:
-            proof_id, proof_time, source_digests = _validate_operational_proof(
+            (
+                proof_id,
+                proof_time,
+                source_digests,
+                owner_identity,
+                owner_url,
+                extra_paths,
+            ) = _validate_operational_proof(
                 root,
                 proof_file,
                 gate,
@@ -885,16 +1825,27 @@ def validate_release_gate_receipt(
                 subject,
                 committed_at,
                 pin,
+                unsupported_authenticity,
             )
         if proof_id in seen_proof_ids:
             raise ReleaseError(f"{label} reuses a proof identity across release gates")
+        reused_paths = extra_paths & seen_proof_paths
+        if reused_paths:
+            raise ReleaseError(f"{label} reuses a subordinate proof path")
         reused_sources = source_digests & seen_source_digests
         if reused_sources:
             raise ReleaseError(f"{label} reuses a source receipt across release gates")
+        if owner_identity is not None:
+            if owner_identity in seen_owner_comments or owner_url in seen_owner_urls:
+                raise ReleaseError(f"{label} reuses an owner comment identity")
+            seen_owner_comments.add(owner_identity)
+            seen_owner_urls.add(owner_url)
         seen_proof_paths.add(proof_path)
+        seen_proof_paths.update(extra_paths)
         seen_proof_digests.add(digest)
         seen_proof_ids.add(proof_id)
         seen_source_digests.update(source_digests)
+        consumed_pin_keys.add(key)
         proof_times.append(proof_time)
 
     if evidence_kinds != list(contract["proofs"]):
@@ -906,7 +1857,7 @@ def validate_release_gate_receipt(
             f"release gate {gate['id']} receipt predates one of its proofs"
         )
     validate_public_safe_document(receipt, f"release gate {gate['id']} receipt")
-    return subject["package_manifest_sha256"]
+    return subject
 
 
 def public_copy_strings(manifest: dict[str, Any]) -> Iterator[str]:
@@ -1201,8 +2152,15 @@ def validate_live_interaction_receipt(path: Path) -> None:
     validate_public_safe_document(receipt, "live interaction replay receipt")
 
 
-def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
-    """Validate the distinct exact-head browser receipt for the progressive UI gate."""
+def validate_progressive_controls_receipt(
+    root: Path,
+    path: Path,
+    gate: dict[str, Any],
+    subject: dict[str, Any],
+    committed_at: datetime,
+    pin: dict[str, Any],
+) -> tuple[str, datetime, set[str], None, None, set[str]]:
+    """Validate the pinned raw-capture replay for the progressive UI gate."""
     receipt = load_json(path, "progressive controls replay receipt")
     schema_path = source_file(
         root,
@@ -1224,29 +2182,84 @@ def validate_progressive_controls_receipt(root: Path, path: Path) -> None:
             f"progressive controls replay receipt violates schema at {location}: {exc.message}"
         ) from exc
 
-    check_ids = [check["id"] for check in receipt["checks"]]
-    if check_ids != list(PROGRESSIVE_CONTROLS_CHECKS):
-        raise ReleaseError("progressive controls replay check inventory drifted")
-    source = receipt["source"]
-    tree, committed_at = git_commit_identity(root, source["exact_head"])
-    if source["tree"] != tree:
+    if (
+        receipt["schema"] != PROGRESSIVE_CONTROLS_SCHEMA
+        or receipt["proof_id"] != pin["proof_id"]
+        or receipt["gate_id"] != gate["id"]
+        or receipt["issue"] != gate["issue"]
+        or receipt["subject"] != subject
+    ):
         raise ReleaseError(
-            "progressive controls replay tree disagrees with its exact head"
+            "progressive controls replay belongs to a different proof or release"
         )
-    validate_evidence_only_descendant(root, source["exact_head"])
-    _validate_receipt_time(
+    generator = receipt["generator"]
+    expected_issuer = {
+        "kind": "tool",
+        "identity": f"{generator['path']}@sha256:{generator['sha256']}",
+    }
+    if pin["issuer"] != expected_issuer or pin.get("source") is not None:
+        raise ReleaseError(
+            "progressive controls replay pin does not name only its exact generator"
+        )
+    observed = _validate_receipt_time(
         receipt["observed_at"],
         "progressive controls replay observation",
         committed_at,
     )
-    renderer = receipt["runtime"]["graphics"]["renderer"]
-    if not APPLE_METAL_RENDERER.fullmatch(renderer) or RUNTIME_NEGATION.search(
-        renderer
+    check_ids = [check["id"] for check in receipt["checks"]]
+    if check_ids != list(PROGRESSIVE_CONTROLS_CHECKS):
+        raise ReleaseError("progressive controls replay check inventory drifted")
+    raw_capture = receipt["raw_capture"]
+    if (
+        raw_capture["subject"] != subject
+        or raw_capture["runtime"] != receipt["runtime"]
+        or raw_capture["observed_at"] != receipt["observed_at"]
+        or raw_capture["check_ids"] != list(PROGRESSIVE_CONTROLS_CHECKS)
     ):
         raise ReleaseError(
-            "progressive controls replay is not authenticated as Apple Metal"
+            "progressive controls raw capture belongs to a different source or runtime"
+        )
+    raw_digest = hashlib.sha256(canonical_json(raw_capture)).hexdigest()
+    if raw_digest != receipt["raw_capture_sha256"]:
+        raise ReleaseError("progressive controls raw capture digest drifted")
+    empty_log_digest = hashlib.sha256(canonical_json([])).hexdigest()
+    if (
+        raw_capture["console_error_log_sha256"] != empty_log_digest
+        or raw_capture["http_error_log_sha256"] != empty_log_digest
+    ):
+        raise ReleaseError("progressive controls passed replay carries an error log")
+    screenshot_ids = [item["id"] for item in raw_capture["screenshots"]]
+    if len(screenshot_ids) != len(set(screenshot_ids)):
+        raise ReleaseError("progressive controls raw capture reuses a screenshot identity")
+    for check in receipt["checks"]:
+        expected_digest = hashlib.sha256(
+            canonical_json(
+                {
+                    "check_id": check["id"],
+                    "raw_capture_sha256": raw_digest,
+                }
+            )
+        ).hexdigest()
+        if check["receipt_sha256"] != expected_digest:
+            raise ReleaseError(
+                "progressive controls check is not bound to its raw capture"
+            )
+    digests = [receipt["raw_capture_sha256"]] + [
+        check["receipt_sha256"] for check in receipt["checks"]
+    ]
+    if len(digests) != len(set(digests)):
+        raise ReleaseError("progressive controls replay reuses a capture digest")
+    generator_bytes = _git_bytes(
+        root,
+        "show",
+        f"{subject['repository_head']}:{generator['path']}",
+    )
+    if hashlib.sha256(generator_bytes).hexdigest() != generator["sha256"]:
+        raise ReleaseError(
+            "progressive controls replay generator does not belong to its source"
         )
     validate_public_safe_document(receipt, "progressive controls replay receipt")
+    return receipt["proof_id"], observed, set(digests), None, None, set()
 
 
 def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
@@ -1301,20 +2314,33 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
     if products != GENERATED_PRODUCT_PATHS:
         raise ReleaseError("generated release product inventory or destination drifted")
 
-    authenticated_gate_present = any(
+    pinned_gate_present = any(
         gate["state"] == "satisfied"
         and gate["evidence"] is not None
         and gate["id"] != "live-interaction-replay"
         for gate in manifest["gates"]
     )
-    tracked = _tracked_paths(root) if authenticated_gate_present else set()
+    tracked = _tracked_paths(root) if pinned_gate_present else set()
+    if pinned_gate_present and RELEASE_PROOF_PINS_PATH.as_posix() not in tracked:
+        raise ReleaseError("pinned release has no tracked proof pin ledger")
+    if pinned_gate_present:
+        pin_ledger, pins = load_proof_pins(root)
+        checkout_head = _git_output(root, "rev-parse", "HEAD")
+    else:
+        pin_ledger, pins, checkout_head = None, {}, None
     seen_outer_paths: set[str] = set()
     seen_outer_digests: set[str] = set()
     seen_proof_paths: set[str] = set()
     seen_proof_digests: set[str] = set()
     seen_proof_ids: set[str] = set()
     seen_source_digests: set[str] = set()
-    package_digest: str | None = None
+    seen_owner_comments: set[tuple[str, int, int]] = set()
+    seen_owner_urls: set[str] = set()
+    consumed_pin_keys: set[tuple[str, str]] = set()
+    unsupported_authenticity: set[tuple[str, str]] = set()
+    verified_git_objects: set[tuple[str, str]] = set()
+    common_source: dict[str, Any] | None = None
+    package_identity: dict[str, Any] | None = None
 
     for gate in manifest["gates"]:
         contract = RELEASE_GATE_CONTRACTS.get(gate["id"])
@@ -1329,18 +2355,10 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
             if evidence is None:
                 raise ReleaseError(f"satisfied gate {gate['id']} has no evidence")
             if gate["id"] != "live-interaction-replay":
-                summary = evidence.get("summary")
-                if (
-                    not isinstance(summary, str)
-                    or not summary.strip()
-                    or ASSERTIVE_SUMMARY.search(summary)
-                ):
+                if evidence.get("summary") != gate_receipt_summary(gate["id"]):
                     raise ReleaseError(
-                        f"release gate {gate['id']} has an authoritative or unsafe evidence summary"
+                        f"release gate {gate['id']} evidence summary is not the exact neutral template"
                     )
-                validate_public_safe_document(
-                    summary, f"release gate {gate['id']} evidence summary"
-                )
             evidence_path = verify_record(root, evidence, f"gate {gate['id']} evidence")
             outer_path = evidence["path"]
             outer_digest = evidence["sha256"]
@@ -1354,41 +2372,92 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
                 if evidence["path"] != LIVE_INTERACTION_EVIDENCE_PATH:
                     raise ReleaseError("live interaction replay names the wrong evidence receipt")
                 validate_live_interaction_receipt(evidence_path)
-            elif gate["id"] == "progressive-controls-replay":
-                if evidence["path"] != PROGRESSIVE_CONTROLS_EVIDENCE_PATH:
-                    raise ReleaseError(
-                        "progressive controls replay names the wrong evidence receipt"
-                    )
-                if evidence["path"] not in tracked:
-                    raise ReleaseError(
-                        "progressive controls replay receipt is not tracked"
-                    )
-                validate_progressive_controls_receipt(root, evidence_path)
             else:
+                if evidence["path"] != gate_receipt_path(gate["id"]):
+                    raise ReleaseError(
+                        f"release gate {gate['id']} does not use its canonical receipt path"
+                    )
                 if evidence["path"] not in tracked:
                     raise ReleaseError(
                         f"release gate {gate['id']} receipt is not tracked"
                     )
-                gate_package_digest = validate_release_gate_receipt(
+                subject = validate_release_gate_receipt(
                     root,
                     evidence_path,
                     gate,
                     manifest,
+                    pins=pins,
+                    consumed_pin_keys=consumed_pin_keys,
                     tracked=tracked,
                     seen_proof_paths=seen_proof_paths,
                     seen_proof_digests=seen_proof_digests,
                     seen_proof_ids=seen_proof_ids,
                     seen_source_digests=seen_source_digests,
+                    seen_owner_comments=seen_owner_comments,
+                    seen_owner_urls=seen_owner_urls,
+                    unsupported_authenticity=unsupported_authenticity,
+                    verified_git_objects=verified_git_objects,
                 )
-                if gate_package_digest is not None:
-                    if package_digest is None:
-                        package_digest = gate_package_digest
-                    elif gate_package_digest != package_digest:
+                source_identity = _source_identity(subject)
+                if common_source is None:
+                    common_source = source_identity
+                elif source_identity != common_source:
+                    raise ReleaseError(
+                        "release gate repository source identity differs across gates"
+                    )
+                expected_package = _expected_package(subject)
+                if expected_package is not None:
+                    if package_identity is None:
+                        package_identity = expected_package
+                    elif expected_package != package_identity:
                         raise ReleaseError(
-                            "package binding digest differs across release gates"
+                            "complete package binding differs across release gates"
                         )
         elif evidence is not None:
             raise ReleaseError(f"pending gate {gate['id']} may not carry completion evidence")
+
+    if pinned_gate_present:
+        assert pin_ledger is not None and common_source is not None
+        if pin_ledger["source"] != common_source:
+            raise ReleaseError(
+                "proof pin ledger names a different frozen release source"
+            )
+        if consumed_pin_keys != set(pins):
+            raise ReleaseError(
+                "proof pin ledger inventory differs from the satisfied gate proofs"
+            )
+        contract_paths = {
+            gate_receipt_path(gate["id"])
+            for gate in manifest["gates"]
+            if gate["state"] == "satisfied"
+            and gate["id"] != "live-interaction-replay"
+        }
+        for gate in manifest["gates"]:
+            if gate["state"] != "satisfied" or gate["id"] == "live-interaction-replay":
+                continue
+            contract = RELEASE_GATE_CONTRACTS[gate["id"]]
+            contract_paths.update(
+                gate_proof_path(gate["id"], kind) for kind in contract["proofs"]
+            )
+            if "rights-validation" in contract["proofs"]:
+                contract_paths.add(rights_validation_receipt_path(gate["id"]))
+        allowed_paths = {
+            MANIFEST.as_posix(),
+            RELEASE_PROOF_PINS_PATH.as_posix(),
+            *contract_paths,
+        }
+        assert checkout_head is not None
+        _verify_git_object_integrity(
+            root,
+            common_source["repository_head"],
+            checkout_head,
+        )
+        validate_evidence_only_descendant(
+            root, common_source["repository_head"], allowed_paths
+        )
+        validate_clean_checkout(root)
+        if _git_output(root, "rev-parse", "HEAD") != checkout_head:
+            raise ReleaseError("repository HEAD changed during release validation")
 
     live_gate = next(
         (gate for gate in manifest["gates"] if gate["id"] == "live-interaction-replay"),
@@ -1409,6 +2478,17 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
         if not cue["text"].strip() or "-->" in cue["text"] or "\n" in cue["text"] or "\r" in cue["text"]:
             raise ReleaseError(f"caption cue {index} must contain one safe non-empty text line")
         previous_end = end
+
+    if unsupported_authenticity:
+        claims = ", ".join(
+            f"{gate_id}:{kind}"
+            for gate_id, kind in sorted(unsupported_authenticity)
+        )
+        raise ReleaseError(
+            "release gates claim completion from operational proofs with no "
+            f"trusted current authenticity verifier ({claims}); those gates "
+            "must remain pending"
+        )
 
 
 def phase_blockers(manifest: dict[str, Any], phase: str) -> list[str]:
@@ -1492,6 +2572,8 @@ def validate_release(
     phase: str = "draft",
 ) -> dict[str, Any]:
     root = root.absolute()
+    if (root / ".git").exists():
+        _reject_git_replace_refs(root)
     manifest_file = source_file(root, str(manifest_path), "release manifest")
     manifest = load_json(manifest_file, "release manifest")
     validate_schema(root, manifest)
@@ -1545,6 +2627,7 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
             capture_output=True,
             text=True,
             check=False,
+            env=_git_environment(),
         )
         if done.returncode != 0:
             raise ReleaseError(f"cannot resolve source commit: {done.stderr.strip()}")

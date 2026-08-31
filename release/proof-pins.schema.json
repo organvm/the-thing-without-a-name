@@ -1,0 +1,104 @@
+{
+  "$id": "https://organvm.github.io/the-thing-without-a-name/release/proof-pins.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Danse review-required terminal proof pin ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "source", "records"],
+  "properties": {
+    "schema": {"const": "danse.release.proof-pins.v1"},
+    "source": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/source"}]},
+    "records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/record"}
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "release_version", "repository_head", "repository_tree", "release_manifest_sha256"],
+      "properties": {
+        "release_id": {"$ref": "#/$defs/id"},
+        "release_version": {"type": "string", "minLength": 1},
+        "repository_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "repository_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "release_manifest_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "schema"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^release/evidence/(?:proofs/)?[a-z0-9-]+(?:-receipt)?\\.json$"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema": {"enum": ["danse.progressive-controls-replay.v2", "danse.release.gate-proof.v1", "danse.release.owner-attestation.v2"]}
+      }
+    },
+    "issuer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "identity"],
+      "properties": {
+        "kind": {"enum": ["host", "tool", "venue"]},
+        "identity": {"type": "string", "pattern": "^[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "authoritySource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "issue", "comment_id", "comment_url", "comment_author", "comment_created_at", "comment_updated_at", "comment_body_sha256"],
+      "properties": {
+        "repository": {"const": "organvm/the-thing-without-a-name"},
+        "issue": {"type": "integer", "minimum": 1},
+        "comment_id": {"type": "integer", "minimum": 1},
+        "comment_url": {"type": "string", "pattern": "^https://github\\.com/"},
+        "comment_author": {"type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"},
+        "comment_created_at": {"$ref": "#/$defs/timestamp"},
+        "comment_updated_at": {"$ref": "#/$defs/timestamp"},
+        "comment_body_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_id", "issue", "kind", "proof_id", "receipt", "issuer", "source"],
+      "properties": {
+        "gate_id": {"$ref": "#/$defs/id"},
+        "issue": {"type": "integer", "minimum": 1},
+        "kind": {"enum": ["accessibility-review", "custody-completion", "installation-completion", "owner-attestation", "presentation-lifecycle", "progressive-controls-replay", "restore-completion", "rights-validation", "submission-package", "submission-validation"]},
+        "proof_id": {"$ref": "#/$defs/id"},
+        "receipt": {"$ref": "#/$defs/receipt"},
+        "issuer": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/issuer"}]},
+        "source": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/authoritySource"}]}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {"const": "owner-attestation"},
+            "issuer": {"type": "null"},
+            "source": {"$ref": "#/$defs/authoritySource"}
+          }
+        },
+        {
+          "properties": {
+            "kind": {"enum": ["installation-completion", "presentation-lifecycle"]},
+            "issuer": {"$ref": "#/$defs/issuer"},
+            "source": {"$ref": "#/$defs/authoritySource"}
+          }
+        },
+        {
+          "properties": {
+            "kind": {"enum": ["accessibility-review", "custody-completion", "progressive-controls-replay", "restore-completion", "rights-validation", "submission-package", "submission-validation"]},
+            "issuer": {"$ref": "#/$defs/issuer"},
+            "source": {"type": "null"}
+          }
+        }
+      ]
+    }
+  }
+}

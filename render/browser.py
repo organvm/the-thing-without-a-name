@@ -26,21 +26,272 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import hashlib
 import http.server
 import json
+import os
+import re
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-APP = Path(__file__).resolve().parent.parent
+import jsonschema
 
-# ANGLE on macOS reports e.g. "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, …)".
-# SwiftShader reports "SwiftShader" and llvmpipe reports "llvmpipe" — either means
-# the frame is being drawn on the CPU.
-WANTED = ("metal", "apple")
+APP = Path(__file__).resolve().parent.parent
+PROGRESSIVE_RECEIPT = APP / "release/evidence/progressive-controls-replay.json"
+PROGRESSIVE_SCHEMA = APP / "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CHECKS = (
+    "exact-head",
+    "desktop-layout",
+    "mobile-320-layout",
+    "mobile-390-layout",
+    "zoom-200-layout",
+    "touch-targets",
+    "keyboard-focus",
+    "reduced-motion",
+    "receipt-state",
+    "shipped-score-audio",
+    "map-gating",
+    "console-clean",
+    "http-clean",
+)
+APPLE_METAL_RENDERER = re.compile(
+    r"^ANGLE \(Apple, ANGLE Metal Renderer: Apple M([1-9][0-9]*)"
+    r"(?: (Pro|Max|Ultra))?, Unspecified Version\)$"
+)
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
+
+
+def canonical_json(value) -> bytes:
+    return (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git(*args: str, root: Path = APP, text: bool = True):
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=text,
+        check=False,
+        env=environment,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("cannot resolve the exact progressive-controls source")
+    return result.stdout.strip() if text else result.stdout
+
+
+def parse_apple_metal_renderer(value: str) -> dict[str, object]:
+    """Reduce the exact Chrome string to non-prose structured hardware identity."""
+
+    match = APPLE_METAL_RENDERER.fullmatch(value)
+    if match is None:
+        raise RuntimeError("progressive controls require canonical Apple Metal ANGLE")
+    generation, tier = match.groups()
+    return {
+        "vendor": "Apple",
+        "api": "Metal",
+        "generation": int(generation),
+        "tier": (tier or "base").lower(),
+        "raw_renderer_sha256": sha256_bytes(value.encode("utf-8")),
+    }
+
+
+def capture_controls_source(root: Path = APP) -> dict[str, object]:
+    """Freeze the clean pre-evidence source identity for one replay."""
+
+    if _git("for-each-ref", "--format=%(refname)", "refs/replace", root=root):
+        raise RuntimeError("progressive controls reject Git replacement refs")
+    if _git("status", "--porcelain=v1", "--untracked-files=all", root=root):
+        raise RuntimeError("progressive controls require a clean committed checkout")
+    head = _git("rev-parse", "HEAD", root=root)
+    tree = _git("rev-parse", "HEAD^{tree}", root=root)
+    manifest_path = root / "release/manifest.json"
+    for source_path in (
+        "release/manifest.json",
+        "release/progressive-controls-replay.schema.json",
+        "render/browser.py",
+    ):
+        _git("ls-files", "--error-unmatch", source_path, root=root)
+        committed = _git("show", f"{head}:{source_path}", root=root, text=False)
+        if (root / source_path).read_bytes() != committed:
+            raise RuntimeError(
+                "progressive controls require tracked source bytes from exact HEAD"
+            )
+    manifest = json.loads(
+        _git("show", f"{head}:release/manifest.json", root=root, text=False).decode(
+            "utf-8"
+        )
+    )
+    return {
+        "release_id": manifest["release_id"],
+        "release_version": manifest["version"],
+        "repository_head": head,
+        "repository_tree": tree,
+        "release_manifest_sha256": sha256_bytes(
+            _git(
+                "show",
+                f"{head}:release/manifest.json",
+                root=root,
+                text=False,
+            )
+        ),
+        "package_manifest_sha256": None,
+    }
+
+
+def build_controls_receipt(
+    *,
+    source: dict[str, object],
+    browser_version: str,
+    renderer: str,
+    screenshots: list[dict[str, object]],
+    observed_at: str | None = None,
+    root: Path = APP,
+) -> dict[str, object]:
+    """Build, but do not write, one passed machine replay receipt."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("progressive controls receipts require the authorized macOS host")
+    observed = observed_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    graphics = parse_apple_metal_renderer(renderer)
+    runtime = {
+        "platform": "darwin",
+        "browser": {"name": "Google Chrome", "version": browser_version},
+        "graphics": graphics,
+    }
+    raw_capture = {
+        "schema": "danse.progressive-controls-raw-capture.v1",
+        "observed_at": observed,
+        "subject": source,
+        "runtime": runtime,
+        "check_ids": list(PROGRESSIVE_CHECKS),
+        "screenshots": sorted(screenshots, key=lambda item: str(item["id"])),
+        "failure_count": 0,
+        "console_error_count": 0,
+        "http_error_count": 0,
+        "console_error_log_sha256": sha256_bytes(canonical_json([])),
+        "http_error_log_sha256": sha256_bytes(canonical_json([])),
+    }
+    raw_digest = sha256_bytes(canonical_json(raw_capture))
+    generator_bytes = _git(
+        "show",
+        f"{source['repository_head']}:render/browser.py",
+        root=root,
+        text=False,
+    )
+    generator_digest = sha256_bytes(generator_bytes)
+    return {
+        "schema": "danse.progressive-controls-replay.v2",
+        "proof_id": "progressive-controls-exact-head-replay",
+        "gate_id": "progressive-controls-replay",
+        "issue": 17,
+        "result": "passed",
+        "observed_at": observed,
+        "subject": source,
+        "generator": {
+            "path": "render/browser.py",
+            "sha256": generator_digest,
+            "version": "danse-browser-replay.v1",
+            "pull_request": 43,
+        },
+        "runtime": runtime,
+        "raw_capture": raw_capture,
+        "raw_capture_sha256": raw_digest,
+        "checks": [
+            {
+                "id": check_id,
+                "result": "passed",
+                "receipt_sha256": sha256_bytes(
+                    canonical_json(
+                        {"check_id": check_id, "raw_capture_sha256": raw_digest}
+                    )
+                ),
+            }
+            for check_id in PROGRESSIVE_CHECKS
+        ],
+        "claim_scope": "progressive-controls-verified-only",
+    }
+
+
+def write_controls_receipt(path: Path, receipt: dict[str, object]) -> None:
+    """Schema-check and atomically publish one successful replay receipt."""
+
+    schema = json.loads(PROGRESSIVE_SCHEMA.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    ).validate(receipt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise RuntimeError("progressive controls receipt already exists")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if temporary.exists():
+        raise RuntimeError("progressive controls receipt staging path already exists")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(canonical_json(receipt))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def publish_controls_receipt(
+    *,
+    result: int,
+    source: dict[str, object],
+    browser_version: str,
+    renderer: str,
+    screenshots: list[dict[str, object]],
+    root: Path = APP,
+    path: Path = PROGRESSIVE_RECEIPT,
+) -> bool:
+    """Publish only a successful, unchanged, exact-source machine replay."""
+
+    if result != 0:
+        return False
+    if path.resolve() != (root / PROGRESSIVE_RECEIPT.relative_to(APP)).resolve():
+        raise RuntimeError("progressive controls receipt must use its canonical path")
+    if capture_controls_source(root) != source:
+        raise RuntimeError("progressive controls source changed during replay")
+    receipt = build_controls_receipt(
+        source=source,
+        browser_version=browser_version,
+        renderer=renderer,
+        screenshots=screenshots,
+        root=root,
+    )
+    write_controls_receipt(path, receipt)
+    return True
 
 READ_RENDERER = """
 () => {
@@ -142,11 +393,12 @@ def browser(headless: bool = True, width: int = 1024, height: int = 768):
             if not gpu["ok"]:
                 raise SystemExit(f"no WebGL2: {gpu['renderer']}")
             name = str(gpu["renderer"])
-            if not any(w in name.lower() for w in WANTED):
+            if APPLE_ANGLE_METAL_RENDERER.fullmatch(name) is None:
                 raise SystemExit(
                     f"refusing to render on {name!r}.\n"
-                    "This is a software rasteriser. The film would take a day and come out wrong.\n"
-                    "Check that Google Chrome is installed and that channel='chrome' resolved to it."
+                    "The renderer is not the canonical system-Chrome ANGLE Apple-Metal backend.\n"
+                    "Check that Google Chrome is installed, channel='chrome' resolved to it, "
+                    "and ANGLE reports the Apple Metal device identity."
                 )
             page.gl_renderer = name
             yield page
@@ -315,11 +567,17 @@ def run_interaction(page, base: str) -> int:
     return 1
 
 
-def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
+def run_controls(
+    page,
+    base: str,
+    screenshot_dir: Path | None = None,
+    audit: dict[str, object] | None = None,
+) -> int:
     """Exercise the progressive controls against the live engine adapter."""
     failures: list[str] = []
     console_errors: list[str] = []
     http_errors: list[str] = []
+    screenshot_receipts: list[dict[str, object]] = []
     page.on("console", lambda message: console_errors.append(f"{message.text} @ {message.location}") if message.type == "error" else None)
     page.on("response", lambda response: http_errors.append(f"{response.status} {response.url}") if response.status >= 400 else None)
 
@@ -337,7 +595,55 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
           const toast = document.getElementById('toast');
           if (toast) { toast.hidden = true; toast.textContent = ''; }
         }""")
-        page.screenshot(path=str(screenshot_dir / f"{name}.png"), full_page=False)
+        screenshot_path = screenshot_dir / f"{name}.png"
+        page.screenshot(path=str(screenshot_path), full_page=False)
+        screenshot_receipts.append(
+            {
+                "id": name,
+                "sha256": sha256_file(screenshot_path),
+                "bytes": screenshot_path.stat().st_size,
+            }
+        )
+
+    def touch_targets(scope: str, label: str) -> None:
+        targets = page.evaluate(
+            """(scope) => {
+              const root = document.querySelector(scope);
+              if (!root) return [];
+              const selector = [
+                'button:not([disabled])',
+                'a[href]:not([aria-disabled="true"])',
+                'input:not([disabled]):not([type="hidden"])',
+                'select:not([disabled])',
+                'summary',
+                'label.file-control',
+              ].join(',');
+              return [...root.querySelectorAll(selector)].flatMap((target) => {
+                const style = getComputedStyle(target);
+                const box = target.getBoundingClientRect();
+                if (
+                  target.hidden || target.closest('[hidden]') ||
+                  style.display === 'none' || style.visibility === 'hidden' ||
+                  style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+                  box.width <= 0 || box.height <= 0
+                ) return [];
+                return [{
+                  name: target.id || target.dataset.category ||
+                    target.getAttribute('aria-label') || target.textContent.trim().slice(0, 48),
+                  width: box.width,
+                  height: box.height,
+                }];
+              });
+            }""",
+            scope,
+        )
+        want(bool(targets), f"{label} exposed no visible interactive targets")
+        undersized = [
+            target
+            for target in targets
+            if target["width"] < 44 or target["height"] < 44
+        ]
+        want(not undersized, f"{label} has targets below 44px: {undersized}")
 
     page.set_viewport_size({"width": 1024, "height": 768})
     page.emulate_media(reduced_motion="no-preference")
@@ -352,10 +658,12 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#danse-dock button").count() == 5, "five-category dock is incomplete")
     want(page.locator("#danse-dock").is_visible(), "initialized dock stayed hidden")
     want(page.locator("#hud-toggle").is_visible(), "initialized Details control stayed hidden")
+    touch_targets("#danse-dock", "desktop dock")
     shot("desktop-closed")
 
     page.click('[data-category="river"]')
     want(page.locator('#surface-tray[data-open="river"]').is_visible(), "River tray did not open")
+    touch_targets("#surface-tray", "River tray")
     first_seed = page.evaluate("() => danse.seed")
     page.click("#river-new")
     second_seed = page.evaluate("() => danse.seed")
@@ -412,6 +720,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     shot("desktop-river-tray")
 
     page.click('[data-category="score"]')
+    touch_targets("#surface-tray", "Score tray")
     page.click("#program-free")
     want(page.evaluate("() => danse.controlState.program") == "free", "Free did not change the shared program state")
     page.click("#program-score")
@@ -423,6 +732,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want("cutout=1" in page.url, "Figure cutout did not enter shareable presentation state")
     page.click("#score-details")
     want(page.locator("#hud").is_visible(), "visual audition sheet did not open")
+    touch_targets("#hud", "Score Details")
     page.select_option("#conductor-model", "waltz")
     want(page.evaluate("() => danse.controlState.audition") == "override-active", "conductor override did not become active")
     shared = page.evaluate("""async () => {
@@ -458,7 +768,9 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => document.activeElement?.dataset.category") == "score", "advanced-sheet focus did not return to the Score control")
 
     page.click('[data-category="presence"]')
+    touch_targets("#surface-tray", "Presence tray")
     page.click("#presence-details")
+    touch_targets("#hud", "Presence Details")
     page.focus("#fallback-x")
     page.press("#fallback-x", "ArrowRight")
     want(page.evaluate("() => danse.interaction.snapshot().mode") == "off", "a slider activated Presence implicitly")
@@ -514,9 +826,46 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.evaluate("() => danse.controlState.cutout") == "on", "letter shortcut fired while a slider held focus")
     page.press("#fallback-x", "Escape")
 
+    page.evaluate("""async () => {
+      const original = window.fetch.bind(window);
+      const payload = await original('./interface/map.v1.json').then((response) => response.json());
+      const requests = [];
+      window.__projectMapRace = {
+        requests,
+        resolve(index) {
+          requests[index].resolve(new Response(JSON.stringify(payload), {
+            status: 200,
+            headers: {'Content-Type': 'application/json'},
+          }));
+        },
+        reject(index) { requests[index].reject(new Error('stale map request failed')); },
+        restore() { window.fetch = original; delete window.__projectMapRace; },
+      };
+      window.fetch = (url, ...args) => String(url).endsWith('interface/map.v1.json')
+        ? new Promise((resolve, reject) => requests.push({resolve, reject}))
+        : original(url, ...args);
+    }""")
     page.click('[data-category="map"]')
+    page.wait_for_function("() => window.__projectMapRace.requests.length === 1")
+    page.press("#map-close", "Escape")
+    page.click('[data-category="map"]')
+    page.wait_for_timeout(50)
+    map_request_count = page.evaluate("() => window.__projectMapRace.requests.length")
+    if map_request_count == 1:
+        page.evaluate("() => window.__projectMapRace.resolve(0)")
+    else:
+        page.evaluate("() => window.__projectMapRace.resolve(window.__projectMapRace.requests.length - 1)")
     page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
+    if map_request_count > 1:
+        page.evaluate("() => window.__projectMapRace.reject(0)")
+        page.wait_for_timeout(50)
+    want(
+        "Available routes" in page.locator("#project-map-status").inner_text(),
+        "a stale Map request overwrote the reopened Map",
+    )
+    page.evaluate("() => window.__projectMapRace.restore()")
     want(page.locator("#project-map").is_visible(), "Map did not open")
+    touch_targets("#project-map", "Map")
     want(page.locator('#project-map-list a[href="./project/"]').count() == 0, "gated Study was rendered as a link")
     want("unavailable" in page.locator("#project-map-list").inner_text().lower(), "gated Study was not visibly unavailable")
     native_before = page.evaluate("() => ({ seed:danse.seed, playback:danse.controlState.playback, program:danse.controlState.program, cutout:danse.controlState.cutout, movement:danse.controlState.movement })")
@@ -544,6 +893,7 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     for width in (320, 390):
         page.set_viewport_size({"width": width, "height": 780})
         page.click('[data-category="score"]')
+        touch_targets("#surface-tray", f"{width}px Score tray")
         metrics = page.evaluate("""() => ({
           overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
           targets: [...document.querySelectorAll('#danse-dock button')].map((button) => ({ width:button.getBoundingClientRect().width, height:button.getBoundingClientRect().height })),
@@ -581,6 +931,29 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     page.wait_for_function("() => danse.controlState.playback === 'running'")
     shot("reduced-motion-opt-in")
 
+    # The unavailable-score visit above proves fail-readable controls. A second
+    # phase must load the shipped score and choreography and exercise Web Audio;
+    # otherwise missing production files or a broken audio integration could
+    # still produce a green progressive-controls receipt.
+    page.goto(f"{base}/index.html", wait_until="load")
+    page.wait_for_function("() => !!window.danse?.actions", timeout=180_000)
+    page.wait_for_function("() => document.getElementById('veil').hidden", timeout=180_000)
+    want(page.evaluate("() => danse.controlState.music") == "stopped", "shipped score did not initialize Music")
+    want(not page.locator("#music-tray").is_disabled(), "shipped score left Music unavailable")
+    page.click('[data-category="score"]')
+    page.click("#music-tray")
+    page.wait_for_function("() => danse.controlState.music === 'playing'")
+    want("follows" in page.locator("#music-status").inner_text().lower(), "shipped score did not start Web Audio")
+    page.click('[data-category="hold"]')
+    page.wait_for_function("() => danse.controlState.music === 'suspended-by-hold'")
+    want("suspended" in page.locator("#music-status").inner_text().lower(), "Hold did not suspend shipped score audio")
+    page.click('[data-category="hold"]')
+    page.wait_for_function("() => danse.controlState.music === 'playing'")
+    page.click("#music-tray")
+    page.wait_for_function("() => danse.controlState.music === 'stopped'")
+    want("stopped" in page.locator("#music-status").inner_text().lower(), "shipped score audio did not stop")
+    shot("shipped-score-audio")
+
     page.add_init_script("""(() => {
       const getContext = HTMLCanvasElement.prototype.getContext;
       HTMLCanvasElement.prototype.getContext = function(kind, ...args) {
@@ -597,11 +970,62 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
     want(page.locator("#danse-dock").is_visible(), "no-WebGL visit did not initialize the primary controls")
     page.press("body", "h")
     want(page.locator("#hud").is_visible(), "H did not open Details without WebGL")
+    touch_targets("#hud", "no-WebGL Details")
+    page.wait_for_function("() => document.getElementById('river').textContent !== '—'")
+    want(page.locator("#planes").inner_text() == "unavailable", "renderer fallback reported a fake plane count")
+    want(page.locator("#cut").inner_text() != "—", "renderer fallback left the deterministic cut unknown")
+    # Arrival supplies a random passage stream even when the displayed seed is
+    # pinned. Derive the expected control index from the movement actually
+    # rendered for that complete river identity instead of asserting a flaky
+    # seed-only movement number.
+    fallback_movement_variants = (
+        (0x12345678, 60),
+        (0x12345678, 90),
+        (0x87654321, 60),
+        (0x87654321, 90),
+    )
+    for fallback_seed, fallback_time in fallback_movement_variants:
+        movement = page.evaluate(
+            """async ({ seed, time }) => {
+              danse.seed = seed;
+              danse.t = time;
+              await new Promise((resolve) => requestAnimationFrame(
+                () => requestAnimationFrame(resolve)
+              ));
+              const movementId = document.getElementById('cut').textContent.split(' · ')[0];
+              const expected = danse.program.movements.findIndex(
+                (candidate) => candidate.id === movementId
+              ) + 1;
+              const selected = [...document.querySelectorAll('[data-movement]')]
+                .filter((button) => button.getAttribute('aria-pressed') === 'true')
+                .map((button) => Number(button.dataset.movement));
+              return {
+                movementId,
+                expected,
+                control: danse.controlState.movement,
+                selected,
+              };
+            }""",
+            {"seed": fallback_seed, "time": fallback_time},
+        )
+        want(
+            movement["expected"] > 0
+            and movement["control"] == movement["expected"]
+            and movement["selected"] == [movement["expected"]],
+            "no-WebGL movement did not synchronize its live Details state and "
+            f"pressed Score control at seed {fallback_seed:#010x}, t={fallback_time}: "
+            f"{movement}",
+        )
+    page.click("#fallback-start")
+    page.wait_for_function("() => document.getElementById('interaction-summary').textContent === 'fallback'")
+    want(page.locator("#interaction-summary").inner_text() == "fallback", "renderer fallback left Details interaction stale")
+    page.click("#interaction-stop")
     page.press("#sheet-close", "Escape")
     want(page.locator("#hud").is_hidden(), "Escape did not close Details without WebGL")
     page.click('[data-category="map"]')
     page.wait_for_function("() => document.getElementById('project-map-status').textContent.includes('Available routes')")
     want(page.locator("#project-map").is_visible(), "Map did not open without WebGL")
+    touch_targets("#project-map", "no-WebGL Map")
     page.press("#map-close", "Escape")
 
     if console_errors:
@@ -616,6 +1040,16 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
             print(f"  BROKEN — {failure}")
         print("\nPROGRESSIVE CONTROLS BROKEN")
         return 1
+    if audit is not None:
+        audit.clear()
+        audit.update(
+            {
+                "screenshots": screenshot_receipts,
+                "failure_count": 0,
+                "console_error_count": 0,
+                "http_error_count": 0,
+            }
+        )
     print("\nPROGRESSIVE CONTROLS HOLD — shared actions, focus, status, and layouts passed")
     return 0
 
@@ -628,13 +1062,28 @@ def main() -> int:
     ap.add_argument("--probe", action="store_true", help="run probe.html's projection-continuity self-test")
     ap.add_argument("--interaction", action="store_true", help="run local pose/fallback/privacy verification")
     ap.add_argument("--controls", action="store_true", help="run progressive-control and responsive-layout verification")
+    ap.add_argument(
+        "--controls-receipt",
+        action="store_true",
+        help="atomically write the canonical receipt after an exact successful controls replay",
+    )
     ap.add_argument("--screenshots", type=Path, help="write control verification screenshots")
     ap.add_argument("--headed", action="store_true", help="show the window (debugging)")
     ap.add_argument("--base", help="use an already-running server instead of starting one")
     args = ap.parse_args()
 
+    if args.controls_receipt and not args.controls:
+        ap.error("--controls-receipt requires --controls")
+    if args.controls_receipt and any(
+        (args.check, args.verify, args.arrival, args.probe, args.interaction)
+    ):
+        ap.error("--controls-receipt may only accompany --controls")
+
     if not args.check and not args.verify and not args.arrival and not args.probe and not args.interaction and not args.controls:
         ap.error("nothing to do — pass --check, --verify, --arrival, --probe, --interaction or --controls")
+
+    receipt_source = capture_controls_source() if args.controls_receipt else None
+    controls_audit: dict[str, object] = {}
 
     with contextlib.ExitStack() as stack:
         if args.base:
@@ -658,7 +1107,25 @@ def main() -> int:
         if args.interaction:
             rc = run_interaction(page, base) or rc
         if args.controls:
-            rc = run_controls(page, base, args.screenshots) or rc
+            controls_rc = run_controls(
+                page,
+                base,
+                args.screenshots,
+                controls_audit if args.controls_receipt else None,
+            )
+            rc = controls_rc or rc
+            if args.controls_receipt and receipt_source is not None:
+                launched = page.context.browser
+                if launched is None:
+                    raise RuntimeError("cannot identify the exact Chrome runtime")
+                if publish_controls_receipt(
+                    result=controls_rc,
+                    source=receipt_source,
+                    browser_version=launched.version,
+                    renderer=page.gl_renderer,
+                    screenshots=list(controls_audit.get("screenshots", [])),
+                ):
+                    print(f"receipt     {PROGRESSIVE_RECEIPT.relative_to(APP)}")
         return rc
 
 
