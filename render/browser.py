@@ -76,7 +76,7 @@ GPU_ARGS = [
 # project Mac is unavailable.  This is deliberately opt-in: production and
 # exhibition captures still require the measured Metal path above.  Chromium's
 # supported SwiftShader WebGL backend keeps the render deterministic and lets a
-# portal-valid 720p screener be recovered entirely from committed source.
+# portal-valid 1080p screener be recovered entirely from committed source.
 SOFTWARE_GPU_ARGS = [
     "--use-gl=angle",
     "--use-angle=swiftshader",
@@ -145,13 +145,19 @@ def reachable(url: str, timeout: float = 0.4) -> bool:
 
 
 @contextlib.contextmanager
-def browser(headless: bool = True, width: int = 1024, height: int = 768):
-    """A page on the system Chrome, GPU asserted before anything is drawn."""
+def browser(
+    headless: bool = True,
+    width: int = 1024,
+    height: int = 768,
+    *,
+    allow_software: bool = False,
+    executable: str | None = None,
+):
+    """Open an asserted renderer; software mode requires an explicit call-site opt-in."""
     from playwright.sync_api import sync_playwright
 
-    allow_software = os.environ.get("DANSE_ALLOW_SOFTWARE_RENDER") == "1"
     gpu_args = SOFTWARE_GPU_ARGS if allow_software else GPU_ARGS
-    executable = os.environ.get("DANSE_CHROME_EXECUTABLE")
+    executable = executable or os.environ.get("DANSE_CHROME_EXECUTABLE")
     launch_target = {"executable_path": executable} if executable else {"channel": "chrome"}
     with sync_playwright() as p:
         launched = p.chromium.launch(headless=headless, args=gpu_args, **launch_target)
