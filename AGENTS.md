@@ -48,7 +48,8 @@ visitor arrival, and projection continuity. The terminal package predicate is:
 - Never commit `.work/`, raw photographs, private recordings, `sound/sources.json`,
   generated packages, credentials, or personal paths.
 - The tracked corpus is the publishable derivative corpus. Raw/private inputs hydrate
-  only ignored local roots and external archival custody.
+  only ignored roots from the exact private lock in `assets/` and remain in external
+  archival custody; remote availability never changes their publication status.
 - Use topic branches and pull requests for future changes. Do not rewrite a reviewed
   exact head merely because the base moved.
 - Current source lineage is machine-readable in `LINEAGE.json`. Future work belongs in

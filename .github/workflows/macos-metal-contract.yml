@@ -1,0 +1,59 @@
+name: macOS Metal contract
+
+on:
+  pull_request:
+    paths:
+      - "render/**"
+      - "engine/**"
+      - "interface/**"
+      - "interaction/**"
+      - "sound/**"
+      - "assets/**"
+      - "scripts/assets.py"
+      - "scripts/tests/assets.test.py"
+      - ".github/workflows/macos-metal-contract.yml"
+  push:
+    branches: [main]
+    paths:
+      - "render/**"
+      - "engine/**"
+      - "interface/**"
+      - "interaction/**"
+      - "sound/**"
+      - "assets/**"
+      - "scripts/assets.py"
+      - "scripts/tests/assets.test.py"
+      - ".github/workflows/macos-metal-contract.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: metal-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    if: github.repository == 'organvm/the-thing-without-a-name'
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install runtime
+        run: python -m pip install '.[media]'
+      - name: Require system Chrome and Apple Metal
+        run: |
+          test -d '/Applications/Google Chrome.app'
+          args=(--check --verify --arrival --probe)
+          if python render/browser.py --help | grep -q -- '--controls'; then
+            args+=(--controls)
+          fi
+          python render/browser.py "${args[@]}"

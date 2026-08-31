@@ -2,6 +2,7 @@
 # state. Each owning pipeline also ignores its own cache; this root catches the
 # shared orchestration scratch used by deliver.py and one-off rehearsals.
 .work/
+.asset-cache/
 .wrangler/
 .DS_Store
 __pycache__/

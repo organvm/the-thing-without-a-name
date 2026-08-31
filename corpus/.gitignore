@@ -3,8 +3,8 @@
 # Full-camera plates (3264px) for the 4K master: ~250 MB across 162 frames × 2
 # kinds. Git ships `browse` (512) and `screen` (1024) — 28 MB, which is what the
 # browser needs and what the payload budget allows. The film tier is rebuilt on
-# whatever machine renders the film, from the originals already in
-# pipeline/.work/raw:
+# whatever machine renders the film, from originals verified and hydrated into
+# pipeline/.work/raw by the private asset contract:
 #
 #     pipeline/4_corpus.py --tiers film --skip-room
 #
