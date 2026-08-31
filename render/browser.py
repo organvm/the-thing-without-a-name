@@ -28,6 +28,7 @@ import contextlib
 import functools
 import http.server
 import json
+import os
 import socket
 import socketserver
 import sys
@@ -68,6 +69,20 @@ GPU_ARGS = [
     "--disable-gpu-driver-bug-workarounds",
     # The film's plates are large and numerous; the default cache evicts them
     # mid-segment and the reads stall behind refetches.
+    "--disable-dev-shm-usage",
+]
+
+# A deadline screener can be rendered on a standard cloud runner when the
+# project Mac is unavailable.  This is deliberately opt-in: production and
+# exhibition captures still require the measured Metal path above.  Chromium's
+# supported SwiftShader WebGL backend keeps the render deterministic and lets a
+# portal-valid 720p screener be recovered entirely from committed source.
+SOFTWARE_GPU_ARGS = [
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+    "--disable-gpu-driver-bug-workarounds",
     "--disable-dev-shm-usage",
 ]
 
@@ -134,15 +149,24 @@ def browser(headless: bool = True, width: int = 1024, height: int = 768):
     """A page on the system Chrome, GPU asserted before anything is drawn."""
     from playwright.sync_api import sync_playwright
 
+    allow_software = os.environ.get("DANSE_ALLOW_SOFTWARE_RENDER") == "1"
+    gpu_args = SOFTWARE_GPU_ARGS if allow_software else GPU_ARGS
+    executable = os.environ.get("DANSE_CHROME_EXECUTABLE")
+    launch_target = {"executable_path": executable} if executable else {"channel": "chrome"}
     with sync_playwright() as p:
-        launched = p.chromium.launch(channel="chrome", headless=headless, args=GPU_ARGS)
+        launched = p.chromium.launch(headless=headless, args=gpu_args, **launch_target)
         try:
             page = launched.new_page(viewport={"width": width, "height": height})
             gpu = page.evaluate(READ_RENDERER)
             if not gpu["ok"]:
                 raise SystemExit(f"no WebGL2: {gpu['renderer']}")
             name = str(gpu["renderer"])
-            if not any(w in name.lower() for w in WANTED):
+            if allow_software and "swiftshader" not in name.lower():
+                raise SystemExit(
+                    f"refusing deadline software render on {name!r}; "
+                    "the portable path requires Chromium SwiftShader"
+                )
+            if not allow_software and not any(w in name.lower() for w in WANTED):
                 raise SystemExit(
                     f"refusing to render on {name!r}.\n"
                     "This is a software rasteriser. The film would take a day and come out wrong.\n"

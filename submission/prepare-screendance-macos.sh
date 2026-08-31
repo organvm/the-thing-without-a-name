@@ -49,7 +49,11 @@ python3 "$ROOT/render/render.py" \
 ffmpeg -hide_banner -loglevel error -y \
   -i "$PICTURE" -i "$AUDIO" \
   -map 0:v:0 -map 1:a:0 \
-  -vf "drawbox=color=black:t=fill:enable='gte(t,346.896343125)',drawtext=fontfile=$FONT:text='THE THING WITHOUT A NAME\\nA FILM BY ANTHONY J. PADAVANO\\nMUSIC BY LÉO DELIBES\\nSOURCE ARRANGEMENTS\\: PAUL DE BRA (CC BY 4.0)':fontcolor=white:fontsize=34:line_spacing=18:x=(w-text_w)/2:y=(h-text_h)/2:enable='gte(t,346.896343125)'" \
+  -vf "drawbox=color=black:t=fill:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='THE THING WITHOUT A NAME':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=350:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='A FILM BY ANTHONY J. PADAVANO':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=470:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='MUSIC BY LÉO DELIBES':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=540:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='SOURCE ARRANGEMENTS · PAUL DE BRA · CC BY 4.0':fontcolor=white:fontsize=30:x=(w-text_w)/2:y=610:enable='gte(t,346.896343125)'" \
   -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p \
   -c:a aac -b:a 320k -ar 48000 -ac 2 \
   -movflags +faststart -shortest "$FINAL"
