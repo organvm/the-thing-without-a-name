@@ -462,6 +462,7 @@ def public_release_files(
         "phase": receipt["phase"],
         "release_id": receipt["release"]["id"],
         "version": receipt["release"]["version"],
+        "toolchain": dict(receipt["toolchain"]),
         "payload_contract": receipt["release"]["payload_contract"],
         "manifest_sha256": receipt["release"]["manifest"]["sha256"],
         "project_sha256": receipt_files["project/index.html"]["sha256"],
@@ -526,10 +527,33 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
     return commit
 
 
+def require_commit_object(root: Path, commit: str) -> str:
+    """Require a raw Git commit object, never a tree/tag sharing SHA syntax."""
+    root = root.absolute().resolve()
+    commit = source_commit(root, commit)
+    try:
+        reject_git_rewrites(root)
+    except Exception as exc:
+        raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
+    kind = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if kind.returncode != 0 or kind.stdout.strip() != "commit":
+        detail = kind.stderr.strip() or kind.stdout.strip() or "missing object"
+        raise ArtifactError(
+            f"source object {commit} must resolve to a commit object: {detail}"
+        )
+    return commit
+
+
 def validate_git_source(root: Path, expected_commit: str) -> None:
     """Bind a production CLI build to one clean, exact Git worktree."""
     root = root.absolute().resolve()
-    expected_commit = source_commit(root, expected_commit)
+    expected_commit = require_commit_object(root, expected_commit)
     try:
         reject_git_rewrites(root)
     except Exception as exc:
@@ -580,6 +604,7 @@ def source_commit_records(
     files: tuple[str, ...],
 ) -> dict[str, dict]:
     """Bind every allowlisted worktree byte to its exact committed blob."""
+    commit = require_commit_object(root, commit)
     records: dict[str, dict] = {}
     for relative in files:
         path = source_file(root, relative)
@@ -667,6 +692,7 @@ def verify_artifact(
             "phase",
             "release_id",
             "version",
+            "toolchain",
             "payload_contract",
             "manifest_sha256",
             "project_sha256",
@@ -680,6 +706,12 @@ def verify_artifact(
             or not release["release_id"]
             or not isinstance(release["version"], str)
             or not release["version"]
+            or not isinstance(release["toolchain"], dict)
+            or set(release["toolchain"]) != {"python", "pypdf", "reportlab"}
+            or not all(
+                isinstance(value, str) and value
+                for value in release["toolchain"].values()
+            )
             or release["payload_contract"] != "danse.release-payload.v1"
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["manifest_sha256"]))
             or not re.fullmatch(r"[0-9a-f]{64}", str(release["project_sha256"]))
@@ -744,10 +776,20 @@ def verify_artifact(
                 source["commit"],
                 allow_worktree_fallback=False,
             )
-            try:
-                blockers = builder.phase_blockers(source_manifest, "public")
-            except (KeyError, TypeError, ValueError) as exc:
-                blockers = [f"source manifest cannot prove public eligibility: {exc}"]
+            validated_source_manifest = builder.validate_source_commit_release(
+                source_root,
+                source["commit"],
+                source_manifest,
+                "draft",
+            )
+            if validated_source_manifest != source_manifest:
+                raise ArtifactError(
+                    "artifact source manifest drifted during committed validation"
+                )
+            blockers = builder.release_phase_blockers(
+                validated_source_manifest,
+                "public",
+            )
             if not blockers and release is None:
                 raise ArtifactError(
                     "artifact source manifest admits public phase but its required "
@@ -759,6 +801,11 @@ def verify_artifact(
                     "artifact source manifest blocks public phase: " + preview
                 )
             if release is not None:
+                if release["toolchain"] != builder.active_toolchain():
+                    raise ArtifactError(
+                        "artifact release requires its exact receipted generation "
+                        "toolchain"
+                    )
                 if manifest_sha256 != release["manifest_sha256"]:
                     raise ArtifactError(
                         "artifact release manifest drifted from the source commit"

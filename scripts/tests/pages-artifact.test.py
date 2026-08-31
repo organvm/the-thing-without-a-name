@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -47,6 +48,24 @@ def load_release_support():
 
 RELEASE_SUPPORT = load_release_support()
 RELEASE_BUILD = RELEASE_SUPPORT.BUILD
+
+
+def add_release_validation_fixture(root: Path) -> None:
+    """Add the complete release data contract without replacing the tiny corpus."""
+    for relative in RELEASE_SUPPORT.FIXTURE_FILES:
+        if relative == "corpus/manifest.json":
+            continue
+        source = ROOT / relative
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    manifest = RELEASE_SUPPORT.read_manifest(root)
+    corpus_digest = PAGES.sha256(root / "corpus/manifest.json")
+    corpus_claim = next(
+        claim for claim in manifest["claims"] if claim["id"] == "corpus-session"
+    )
+    corpus_claim["evidence"]["sha256"] = corpus_digest
+    RELEASE_SUPPORT.write_manifest(root, manifest)
 
 
 class Markup(HTMLParser):
@@ -388,6 +407,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("corpus/tier-receipts/") for path in inventory))
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
+        add_release_validation_fixture(self.root)
         (self.root / "tracked-sentinel.txt").write_text("clean\n", encoding="utf-8")
         commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
         command = [
@@ -421,7 +441,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(wrong.returncode, 0)
-        self.assertIn("does not match checkout HEAD", wrong.stderr)
+        self.assertIn("must resolve to a commit object", wrong.stderr)
         self.assertFalse(wrong_output.exists())
 
         (self.root / "tracked-sentinel.txt").write_text("dirty\n", encoding="utf-8")
@@ -552,6 +572,38 @@ class ArtifactBoundaryTest(unittest.TestCase):
                 require_git_source=True,
             )
 
+    def test_bare_tree_sha_cannot_pose_as_source_commit(self) -> None:
+        root = self.base / "tree-source"
+        public_fixture(root)
+        add_release_validation_fixture(root)
+        commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+        output = self.base / "tree-pages"
+        PAGES.build(root, output, commit, require_git_source=True)
+        tree = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["commit"] = tree
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "must resolve to a commit object",
+        ):
+            PAGES.verify_artifact(
+                output,
+                tree,
+                require_source_manifest=True,
+                source_root=root,
+            )
+
     def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
         root = self.base / "redirected-source"
         public_fixture(root)
@@ -627,7 +679,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
         with mock.patch.dict(os.environ, redirect, clear=False):
             with self.assertRaisesRegex(
                 PAGES.ArtifactError,
-                "does not match checkout HEAD",
+                "must resolve to a commit object",
             ):
                 PAGES.build(
                     root,
@@ -1144,7 +1196,118 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertIn(f"files from {commit} verified", verified.stdout)
 
+    def test_pages_release_requires_its_receipted_generation_toolchain(self) -> None:
+        source_root, output, commit = authenticated_public_pages_fixture(
+            self.base / "historical-toolchain"
+        )
+        manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for dependency in ("python", "pypdf", "reportlab"):
+            with self.subTest(dependency=dependency):
+                case = copy.deepcopy(manifest)
+                case["release"]["toolchain"][dependency] += "-future"
+                manifest_path.write_text(
+                    json.dumps(case, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "exact receipted generation toolchain",
+                ):
+                    PAGES.verify_artifact(
+                        output,
+                        commit,
+                        require_source_manifest=True,
+                        source_root=source_root,
+                    )
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_pages_public_phase_validates_committed_media_evidence(self) -> None:
+        source_root, output, _commit = authenticated_public_pages_fixture(
+            self.base / "forged-evidence"
+        )
+        source_manifest_path = source_root / "release/manifest.json"
+        source_manifest = json.loads(
+            source_manifest_path.read_text(encoding="utf-8")
+        )
+        medium = next(
+            item
+            for item in source_manifest["media"]
+            if item["id"] == "press-still-primary"
+        )
+        medium["source"]["sha256"] = "0" * 64
+        RELEASE_SUPPORT.write_manifest(source_root, source_manifest)
+        subprocess.run(
+            ["git", "-C", str(source_root), "add", "release/manifest.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "forge Pages media evidence",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        forged_commit = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        committed_manifest = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "show",
+                f"{forged_commit}:release/manifest.json",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        pages_manifest_path = output / PAGES.ARTIFACT_MANIFEST
+        pages_manifest = json.loads(
+            pages_manifest_path.read_text(encoding="utf-8")
+        )
+        pages_manifest["source"]["commit"] = forged_commit
+        pages_manifest["release"]["manifest_sha256"] = hashlib.sha256(
+            committed_manifest
+        ).hexdigest()
+        pages_manifest_path.write_text(
+            json.dumps(pages_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            PAGES.ArtifactError,
+            "media press-still-primary source digest mismatch",
+        ):
+            PAGES.verify_artifact(
+                output,
+                forged_commit,
+                require_source_manifest=True,
+                source_root=source_root,
+            )
+
     def test_self_rehashed_pages_manifest_cannot_add_private_file(self) -> None:
+        add_release_validation_fixture(self.root)
         commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
         PAGES.build(
             self.root,
@@ -1177,6 +1340,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
             )
 
     def test_self_rehashed_pages_manifest_cannot_substitute_runtime_bytes(self) -> None:
+        add_release_validation_fixture(self.root)
         commit = RELEASE_SUPPORT.initialize_git_fixture(self.root)
         PAGES.build(
             self.root,

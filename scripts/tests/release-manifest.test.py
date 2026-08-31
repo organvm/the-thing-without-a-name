@@ -745,7 +745,7 @@ class ProductionCliSourceTest(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(wrong.returncode, 0)
-            self.assertIn("does not match checkout HEAD", wrong.stderr)
+            self.assertIn("must resolve to a commit object", wrong.stderr)
             self.assertFalse(wrong_output.exists())
 
             (root / "tracked-sentinel.txt").write_text("dirty\n", encoding="utf-8")
@@ -816,6 +816,40 @@ class ProductionCliSourceTest(unittest.TestCase):
                 committed_sha,
             )
             self.assertNotEqual(CONTRACT.sha256(manifest_path), committed_sha)
+
+    def test_bare_tree_sha_cannot_pose_as_source_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            commit = initialize_git_fixture(root)
+            output = base / "tree-artifact"
+            BUILD.build(
+                root,
+                output,
+                "draft",
+                commit,
+                require_git_source=True,
+            )
+            tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            receipt_path = output / BUILD.ARTIFACT_MANIFEST
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["source"]["commit"] = tree
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "must resolve to a commit object",
+            ):
+                BUILD.verify_artifact(
+                    output,
+                    tree,
+                    source_root=root,
+                )
 
     def test_ambient_git_repository_redirect_cannot_substitute_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -896,7 +930,7 @@ class ProductionCliSourceTest(unittest.TestCase):
             with mock.patch.dict(os.environ, redirect, clear=False):
                 with self.assertRaisesRegex(
                     CONTRACT.ReleaseError,
-                    "does not match checkout HEAD",
+                    "must resolve to a commit object",
                 ):
                     BUILD.build(
                         root,
@@ -1211,6 +1245,121 @@ class AdversarialArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "digest mismatch"):
             verify_fixture_artifact(self.output, TEST_COMMIT)
 
+    def test_historical_pdf_requires_its_receipted_generation_toolchain(self) -> None:
+        for dependency in ("python", "pypdf", "reportlab"):
+            with self.subTest(dependency=dependency):
+                future = BUILD.active_toolchain()
+                future[dependency] = f"{future[dependency]}-future"
+                with mock.patch.object(
+                    BUILD,
+                    "active_toolchain",
+                    return_value=future,
+                ):
+                    with self.assertRaisesRegex(
+                        CONTRACT.ReleaseError,
+                        "exact receipted generation toolchain",
+                    ):
+                        verify_fixture_artifact(self.output, TEST_COMMIT)
+
+    def test_public_phase_validates_evidence_from_raw_source_commit(self) -> None:
+        root = fixture_root(self.base / "committed-evidence-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        valid_commit = initialize_git_fixture(root)
+        output = self.base / "committed-evidence-artifact"
+        BUILD.build(
+            root,
+            output,
+            "public",
+            valid_commit,
+            require_git_source=True,
+        )
+
+        medium = next(
+            item for item in manifest["media"] if item["id"] == "press-still-primary"
+        )
+        medium["source"]["sha256"] = "0" * 64
+        write_manifest(root, manifest)
+        subprocess.run(
+            ["git", "-C", str(root), "add", "release/manifest.json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "forge ready media evidence",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        forged_commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        committed_manifest = subprocess.run(
+            ["git", "-C", str(root), "show", f"{forged_commit}:release/manifest.json"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        receipt_path = output / BUILD.ARTIFACT_MANIFEST
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["source"]["commit"] = forged_commit
+        receipt["release"]["manifest"]["sha256"] = hashlib.sha256(
+            committed_manifest
+        ).hexdigest()
+        receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+
+        with self.assertRaisesRegex(
+            CONTRACT.ReleaseError,
+            "source-commit release manifest failed schema/evidence validation: "
+            ".*media press-still-primary source digest mismatch",
+        ):
+            BUILD.verify_artifact(
+                output,
+                forged_commit,
+                source_root=root,
+            )
+
+    def test_source_validation_never_executes_commit_selected_python(self) -> None:
+        root = fixture_root(self.base / "untrusted-checker-source")
+        manifest = complete_manifest(root)
+        manifest["status"] = "public-approved"
+        write_manifest(root, manifest)
+        sentinel = self.base / "historical-checker-executed"
+        payload = (
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n"
+            "raise RuntimeError('historical checker executed')\n"
+        )
+        (root / "installation/contract.py").write_text(payload, encoding="utf-8")
+        (root / "scripts/check-opportunities.py").write_text(payload, encoding="utf-8")
+        commit = initialize_git_fixture(root)
+
+        validated = BUILD.validate_source_commit_release(
+            root,
+            commit,
+            manifest,
+            "public",
+        )
+        self.assertEqual(validated, manifest)
+        self.assertFalse(sentinel.exists())
+
     def test_unrecorded_file_fails(self) -> None:
         (self.output / "private.txt").write_text("not allowlisted\n")
         with self.assertRaisesRegex(CONTRACT.ReleaseError, "inventory mismatch"):
@@ -1341,7 +1490,8 @@ class AdversarialArtifactTest(unittest.TestCase):
         receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
         with self.assertRaisesRegex(
             CONTRACT.ReleaseError,
-            "source-commit manifest blocks public phase",
+            "source-commit release manifest failed schema/evidence validation: "
+            "public phase blocked",
         ):
             verify_fixture_artifact(
                 output,
@@ -1783,7 +1933,7 @@ class AdversarialArtifactTest(unittest.TestCase):
     def test_nonexistent_source_commit_never_uses_worktree_manifest_by_default(self) -> None:
         with self.assertRaisesRegex(
             CONTRACT.ReleaseError,
-            "cannot resolve release manifest at source commit",
+            "must resolve to a commit object",
         ):
             BUILD.verify_artifact(self.output, TEST_COMMIT)
 

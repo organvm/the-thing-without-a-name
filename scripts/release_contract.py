@@ -235,11 +235,16 @@ def _load_installation_checker(root: Path):
     return checker
 
 
-def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_installation_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    checker_root: Path | None = None,
+) -> None:
     binding = manifest["installation"]["reference_contract"]
     twin_path = verify_record(root, binding["digital_twin"], "installation digital twin")
     gates_path = verify_record(root, binding["gate_ledger"], "installation gate ledger")
-    checker = _load_installation_checker(root)
+    checker = _load_installation_checker(checker_root or root)
     try:
         spec = checker.validate_digital_twin(checker.load_json(twin_path), root)
         gates = checker.validate_gates(checker.load_json(gates_path), spec)
@@ -261,7 +266,12 @@ def validate_installation_binding(root: Path, manifest: dict[str, Any]) -> None:
             raise ReleaseError(f"installation reference binding {key} drifted")
 
 
-def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
+def validate_opportunity_binding(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    checker_root: Path | None = None,
+) -> None:
     binding = manifest["opportunity_snapshot"]
     if binding["snapshot_id"] != EXPECTED_OPPORTUNITY_ID:
         raise ReleaseError("release manifest consumes the wrong opportunity snapshot id")
@@ -317,7 +327,7 @@ def validate_opportunity_binding(root: Path, manifest: dict[str, Any]) -> None:
     if consumer != {"issue": 12, "binding": "release/manifest.json", "status": "pending"}:
         raise ReleaseError("opportunity receipt no longer reserves issue 12 for release/manifest.json")
 
-    checker = _load_opportunity_checker(root)
+    checker = _load_opportunity_checker(checker_root or root)
     try:
         checker.validate_all(
             snapshot_path=snapshot_path,
@@ -634,6 +644,7 @@ def validate_release(
     *,
     manifest_path: Path | str = MANIFEST,
     phase: str = "draft",
+    checker_root: Path | None = None,
 ) -> dict[str, Any]:
     root = root.absolute()
     manifest_file = source_file(root, str(manifest_path), "release manifest")
@@ -671,8 +682,8 @@ def validate_release(
 
     _validate_graph(manifest, gate_ids)
     _validate_evidence_states(root, manifest)
-    validate_installation_binding(root, manifest)
-    validate_opportunity_binding(root, manifest)
+    validate_installation_binding(root, manifest, checker_root=checker_root)
+    validate_opportunity_binding(root, manifest, checker_root=checker_root)
     blockers = phase_blockers(manifest, phase)
     if blockers:
         preview = "; ".join(blockers[:8])
@@ -698,6 +709,26 @@ def source_commit(root: Path, explicit: str | None = None) -> str:
     commit = commit.lower()
     if not HEX40.fullmatch(commit):
         raise ReleaseError(f"source commit must be a full 40-character Git SHA: {commit!r}")
+    return commit
+
+
+def require_commit_object(root: Path, commit: str) -> str:
+    """Require a raw Git commit object, never a tree/tag sharing SHA syntax."""
+    root = root.absolute().resolve()
+    commit = source_commit(root, commit)
+    reject_git_rewrites(root)
+    kind = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=provenance_git_env(),
+    )
+    if kind.returncode != 0 or kind.stdout.strip() != "commit":
+        detail = kind.stderr.strip() or kind.stdout.strip() or "missing object"
+        raise ReleaseError(
+            f"source object {commit} must resolve to a commit object: {detail}"
+        )
     return commit
 
 
