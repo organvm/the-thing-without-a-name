@@ -23,8 +23,10 @@ SOUND = ROOT / "sound"
 sys.path.insert(0, str(SOUND))
 
 from render_music import (  # noqa: E402
+    load_json,
     loudness_gate,
     render_once,
+    require_hash,
     sha256,
 )
 
@@ -61,6 +63,30 @@ def version(executable: Path, *arguments: str) -> str:
     return line[0]
 
 
+def repository_identity() -> dict:
+    """Return the clean tracked commit/tree that owns the portable producer."""
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(f"git {' '.join(arguments)} failed")
+        return result.stdout.strip()
+
+    dirty = git("status", "--porcelain=v1", "--untracked-files=no")
+    if dirty:
+        raise ValueError("tracked worktree is dirty; portable evidence requires reviewed source")
+    return {
+        "head": git("rev-parse", "HEAD"),
+        "tree": git("rev-parse", "HEAD^{tree}"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -75,6 +101,8 @@ def main() -> int:
     mix_path = ROOT / "music" / "delibes-mix.json"
     toolchain_path = ROOT / "music" / "audio-toolchain.json"
     choreography_path = ROOT / "render" / "choreography.json"
+    audio_uses_path = ROOT / "sound" / "audio-uses.json"
+    renderer_path = ROOT / "sound" / "render_music.py"
 
     try:
         if args.fluidsynth is None or args.ffmpeg is None:
@@ -88,11 +116,38 @@ def main() -> int:
         mix = document(mix_path, "danse.audio.mix.v1")
         toolchain = document(toolchain_path, "danse.audio.toolchain.v1")
         choreography = document(choreography_path, "danse.choreography.v1")
+        audio_uses = load_json(audio_uses_path, "danse.audio.uses.v1")
+        profile_id = audio_uses.get("competition_profile")
+        profiles = audio_uses.get("profiles")
+        profile = profiles.get(profile_id) if isinstance(profiles, dict) else None
+        if not isinstance(profile, dict) or profile.get("package_eligible") is not True:
+            raise ValueError(f"audio use profile {profile_id!r} is not package-eligible")
 
         require_bound(toolchain["midi"], midi_path, "MIDI")
         require_bound(toolchain["adaptation"], adaptation_path, "adaptation")
         require_bound(toolchain["mix"], mix_path, "mix")
         require_bound(toolchain["soundfont"], args.soundfont, "soundfont")
+        require_bound(toolchain["renderer"], renderer_path, "renderer")
+
+        declared_sources = profile.get("declared_sources")
+        if not isinstance(declared_sources, list):
+            raise ValueError("competition audio profile must declare its sources")
+        forbidden = set(profile.get("forbidden_source_kinds") or [])
+        for index, source in enumerate(declared_sources):
+            if not isinstance(source, dict):
+                raise ValueError(f"audio source {index} is malformed")
+            if source.get("kind") in forbidden:
+                raise ValueError(f"audio source {source.get('id')} is forbidden")
+            require_hash(source, f"audio source {source.get('id')}")
+            if isinstance(source.get("license_notice"), dict):
+                require_hash(
+                    source["license_notice"],
+                    f"audio source {source.get('id')}.license_notice",
+                )
+        stems = mix.get("stems")
+        required_stems = profile.get("required_stems")
+        if not isinstance(stems, list) or [row.get("id") for row in stems] != required_stems:
+            raise ValueError("mix stem order differs from the competition audio profile")
 
         midi_digest = sha256(midi_path)
         if score.get("identity", {}).get("midi_sha256") != midi_digest:
@@ -142,6 +197,7 @@ def main() -> int:
             or not polyphonic
             or not loudness_ok
             or not peak_ok
+            or outputs["master"]["frames"] != frames
         ):
             raise ValueError("portable master failed silence/loudness/true-peak checks")
 
@@ -149,7 +205,21 @@ def main() -> int:
             "schema": "danse.submission.portable-audio.v1",
             "purpose": "ScreenDance Miami 2027 deadline screener",
             "canonical_exhibition_receipt": False,
+            "repository": repository_identity(),
             "inputs": {
+                "toolchain": {
+                    "path": toolchain_path.relative_to(ROOT).as_posix(),
+                    "sha256": sha256(toolchain_path),
+                },
+                "audio_uses": {
+                    "path": audio_uses_path.relative_to(ROOT).as_posix(),
+                    "sha256": sha256(audio_uses_path),
+                    "profile": profile_id,
+                },
+                "renderer": {
+                    "path": renderer_path.relative_to(ROOT).as_posix(),
+                    "sha256": sha256(renderer_path),
+                },
                 "score": {"path": score_path.relative_to(ROOT).as_posix(), "sha256": sha256(score_path)},
                 "choreography": {
                     "path": choreography_path.relative_to(ROOT).as_posix(),
