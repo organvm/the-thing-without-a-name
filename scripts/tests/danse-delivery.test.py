@@ -486,6 +486,27 @@ def retained_score_package(
 
 
 class DeliveryContractTest(unittest.TestCase):
+    def test_normalization_targets_are_owned_by_the_mix_contract(self) -> None:
+        settings = {
+            "target_lufs": -18.0,
+            "tolerance_lu": 0.75,
+            "target_true_peak_dbtp": -2.1,
+            "max_true_peak_dbtp": -2.0,
+            "target_lra_lu": 9.0,
+        }
+        self.assertEqual(
+            DELIVER.normalization_targets_from_mix(settings),
+            {
+                "integrated_lufs": -18.0,
+                "tolerance_lu": 0.75,
+                "target_true_peak_dbtp": -2.1,
+                "max_true_peak_dbtp": -2.0,
+                "lra_lu": 9.0,
+            },
+        )
+        with self.assertRaisesRegex(SystemExit, "internally inconsistent"):
+            DELIVER.normalization_targets_from_mix({**settings, "tolerance_lu": 0})
+
     def test_production_delivery_rejects_nonzero_score_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with (
@@ -6742,6 +6763,25 @@ class DeliveryContractTest(unittest.TestCase):
             self.assertEqual(report.rows[0][2], CHECK.FAIL)
             self.assertIn("blocker(s)", report.rows[0][3])
             self.assertNotIn(str(package), report.rows[0][3])
+
+    def test_submission_rights_path_loads_pages_contract_without_scripts_on_sys_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            (package / "attest.yaml").write_text("{}\n")
+            scripts = (ROOT / "scripts").resolve()
+            isolated_path = [
+                entry
+                for entry in sys.path
+                if not entry or Path(entry).resolve() != scripts
+            ]
+            report = CHECK.Report()
+            with mock.patch.object(sys, "path", isolated_path):
+                CHECK.check_rights(package, "package", report)
+            self.assertEqual(len(report.rows), 1)
+            self.assertEqual(report.rows[0][1], "redacted exact-manifest contract")
+            self.assertEqual(report.rows[0][2], CHECK.FAIL)
+            self.assertIn("blocker(s)", report.rows[0][3])
+            self.assertNotIn("validation failed", report.rows[0][3])
 
     def test_rights_checker_exception_never_leaks_a_machine_local_path(self) -> None:
         report = CHECK.Report()

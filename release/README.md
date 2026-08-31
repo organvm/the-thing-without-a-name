@@ -76,7 +76,39 @@ The builder accepts only an absent or empty output outside the repository, rejec
 symlinks and path traversal, and checks that CLI builds start and finish on the clean
 Git worktree named by the exact source commit. It sets deterministic file timestamps
 and reproduces the same PDF and other bytes for the same manifest, phase, dependency
-version, and source commit. Generated outputs are not committed from the draft phase.
+version, and source commit. The generated project page is passive by contract: an exact
+fail-closed Content Security Policy blocks scripts, connections, frames, objects, forms,
+workers, and all image or media loads, while a no-referrer policy prevents outbound link
+navigation from disclosing the project path. Artifact verification rejects a weakened
+policy, active elements, redirect metadata, duplicate attributes, or inline event
+handlers even if a modified artifact is self-rehashed. Inert security metadata,
+element-level referrer overrides, and background network resource hints also fail
+closed. Image or media elements remain prohibited until a future integration binds
+every displayed source to the release-media receipt. The opening document attributes
+and first two head records are exact, so no attribute can initiate a request before the
+CSP and referrer policy. Canonical and Open Graph discovery metadata are bound to the
+manifest-derived project URL and, when cleared, the exact receipted social-card bytes.
+Verification also resolves the release manifest at the declared source commit and
+reproduces the complete project page byte-for-byte, so titles, synopsis, credits,
+statuses, links, and other passive public claims cannot be changed by rehashing an
+artifact receipt. The source manifest binds the historical renderers as
+`danse.project-page.v1` and `danse.release-payload.v1`; any future template must
+introduce a new source-manifest contract and retain the historical renderer so
+authentic earlier receipts remain verifiable. Verification regenerates and byte-compares
+every generated document and inventory, and binds every copied medium to its exact
+source-manifest destination, byte count, and digest. Production receipts hash the
+committed manifest blob rather than checkout-normalized bytes, so a clean CRLF checkout
+verifies against the same source object. Pages inputs must also equal their raw committed
+blobs, and every provenance Git command disables replacement-object interpretation while
+rejecting replacement refs and nonempty legacy grafts. Public/release verification also reruns the
+source-bound phase blockers; a self-rehashed receipt cannot promote a draft manifest.
+Generated outputs are not committed from the draft phase. The Pages
+receipt retains the source-manifest, release identity/payload, project-byte, and discovery
+bindings and reapplies the same policy after composition, so rehashing the outer Pages
+manifest cannot admit weakened project markup, unmanifested files, substituted public
+copy, or omitted required media/products. A public-eligible source manifest also makes
+the release binding and its complete file set mandatory; an outer receipt cannot
+downgrade the composition to a runtime-only Pages artifact.
 
 ## Closing a gate
 

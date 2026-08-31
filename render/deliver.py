@@ -733,6 +733,34 @@ def contract_sha256(value: dict, label: str) -> str:
     return declared
 
 
+def normalization_targets_from_mix(settings: object) -> dict[str, float]:
+    """Return the one normalization target vocabulary owned by the mix contract."""
+    if not isinstance(settings, dict):
+        raise SystemExit("audio mix has no loudness-normalization settings")
+    source_keys = {
+        "integrated_lufs": "target_lufs",
+        "tolerance_lu": "tolerance_lu",
+        "target_true_peak_dbtp": "target_true_peak_dbtp",
+        "max_true_peak_dbtp": "max_true_peak_dbtp",
+        "lra_lu": "target_lra_lu",
+    }
+    targets: dict[str, float] = {}
+    for target_key, source_key in source_keys.items():
+        value = settings.get(source_key)
+        if type(value) not in (int, float) or not math.isfinite(float(value)):
+            raise SystemExit(f"audio mix normalization {source_key} must be finite and numeric")
+        targets[target_key] = float(value)
+    if (
+        targets["tolerance_lu"] <= 0
+        or targets["lra_lu"] < 0
+        or targets["integrated_lufs"] > 0
+        or targets["target_true_peak_dbtp"] > targets["max_true_peak_dbtp"]
+        or targets["max_true_peak_dbtp"] > 0
+    ):
+        raise SystemExit("audio mix normalization targets are internally inconsistent")
+    return targets
+
+
 def competition_audio_provenance(span: dict) -> dict:
     """Authenticate every producer identity behind the fixed competition master."""
     score = regular_json(MUSIC_SCORE, "danse.music.score.v1")
@@ -946,13 +974,7 @@ def competition_audio_provenance(span: dict) -> dict:
     normalization = receipt.get("normalization")
     settings = mix.get("master", {}).get("normalization")
     output_loudness = normalization.get("output") if isinstance(normalization, dict) else None
-    expected_targets = {
-        "integrated_lufs": -16.0,
-        "tolerance_lu": 0.5,
-        "target_true_peak_dbtp": -1.1,
-        "max_true_peak_dbtp": -1.0,
-        "lra_lu": 11.0,
-    }
+    expected_targets = normalization_targets_from_mix(settings)
     if (
         not isinstance(settings, dict)
         or settings.get("method") != "ffmpeg-loudnorm-two-pass"

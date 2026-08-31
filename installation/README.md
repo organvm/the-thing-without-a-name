@@ -16,6 +16,7 @@ drop, or venue has been approved, installed, measured, or observed.
 | `evidence.schema.json` | Shape a venue-owned external evidence receipt must have. No completed evidence is committed here. |
 | `release-manifest.schema.json` | Exact canonical-release inventory, byte counts, digests, executable modes, and installation-contract binding. |
 | `runtime.py` | On-demand foreground supervisor for one exact venue-approved launcher in a canonical release. |
+| `simulation.py` | Executes the real supervisor against ephemeral fixture releases and receipts bounded crash, health, and integrity scenarios without claiming physical proof. |
 | `archive-disposition.json` | Claim-by-claim port/reject/defer record for the non-authoritative Limen proposal. |
 | `OPERATIONS.md` | Setup, calibration, operation, recovery, strike, transport, restore, troubleshooting, and conservation procedure. |
 
@@ -76,6 +77,16 @@ runtime recovery. Admission thresholds are:
 These are candidate acceptance thresholds. A venue must approve the exact twin
 before its measurements can satisfy them.
 
+`python3 scripts/check-installation.py --emit workbook` derives a clean-setup
+worksheet directly from the authenticated twin. It inventories every private
+receipt, hardware role, surface/output assignment, calibration stage, runtime
+constraint, and completion proof without inventing a venue value. Its explicit
+`worksheet-not-evidence` status prevents the worksheet itself from satisfying a
+physical gate. The `evidence_contract.required_fields` list is derived directly
+from the evidence schema, including per-asset identity/verification/receipt
+fields and aggregate cabling, power, and ventilation receipts; schema additions
+therefore cannot silently disappear from the setup checklist.
+
 ## Runtime boundary
 
 The runtime is one foreground process supervising one exact argument vector from
@@ -110,6 +121,8 @@ captured in evidence. Do not install one on this Mac.
 python3 scripts/check-installation.py
 python3 scripts/check-installation.py --emit calibration
 python3 scripts/check-installation.py --emit frame --seed 20170620 --stream 0 --frame 120
+python3 scripts/check-installation.py --emit workbook
+python3 scripts/check-installation.py --emit simulation
 
 # Expected to fail until external evidence and a canonical release exist.
 python3 scripts/check-installation.py --phase complete
@@ -119,8 +132,49 @@ python3 installation/runtime.py --check \
   --evidence /external/evidence.json --release-root /external/release
 python3 installation/runtime.py --run \
   --evidence /external/evidence.json --release-root /external/release \
+  --session-id venue-cycle-20260804-01 \
   --telemetry /external/recovery-session.jsonl
 ```
+
+The portable simulation executes the actual foreground supervisor against a
+temporary manifest-bound release. It covers clean exit, bounded crash recovery,
+startup-health exhaustion, release-integrity failure, seek-stable shared frame
+tickets, and the declared safety thresholds. Its receipt is deliberately marked
+`passed-not-physical-evidence`; it cannot stand in for hardware sync, calibration,
+wall-plug, or restore observations.
+
+Evidence v2 replaces v1 because physical-receipt binding is not backward
+inferable. Do not relabel a v1 receipt: re-collect or re-envelope the original
+venue-owned telemetry and observations under v2, preserving their original
+bytes and timestamps. Runtime-plan v2 is likewise required; obsolete or missing
+plan fields fail with a `runtime-plan-invalid` telemetry event instead of an
+uncaught field error.
+
+Every external wall-plug telemetry envelope and observation receipt, plus each
+setup/strike/restore receipt payload, must include the configuration digest
+computed from the exact venue, geometry, release manifest and launcher, hardware,
+calibration, runtime approval/arguments/health contract, river, and output set.
+The telemetry envelope must carry the exact newline-terminated JSONL bytes, not
+only their digest. The validator rehashes those bytes, requires a unique runtime
+session, strict monotonic sequence/time, one leading `runtime-admitted` event,
+and a final `runtime-ready` event without a terminal failure. Its configuration,
+spec, evidence, release, and launcher bindings must match the admitted runtime.
+All other supplied SHA-256 values are recomputed from their canonical payloads.
+These hashes prove internal consistency only: because a submitter can rewrite
+bytes and recompute every self-authored hash, they do not authenticate a physical
+observation or its provenance.
+
+Accordingly, `--phase complete` intentionally fails closed even for an
+internally consistent v2 candidate. Completion additionally requires a reviewed
+external authority verifier backed by an immutable allowlist. Each of the three
+cycles must be bound by that verifier to a distinct authority receipt identity,
+runtime session, telemetry digest, configuration digest, and observation time.
+The repository does not yet choose or configure a signing key, immutable
+owner-authored record, or other authority rail, so no portable run can certify
+physical completion. Before any recovery or restore claim exists, the restore
+binding may remain `null`;
+`--phase runtime --emit runtime-plan` returns the exact `configuration_sha256`
+used to build the three telemetry/observation envelopes and restore receipts.
 
 ## Current blockers
 
@@ -128,5 +182,6 @@ The tracked gate ledger intentionally records all eight physical gates as
 blocked. Completion still requires venue approval; exact hardware, cabling,
 power, ventilation, and safety receipts; projector/speaker/AV measurements; the
 human-visible plane/cue test; launcher approval; three distinct human-observed
-wall-plug recoveries; and setup/strike/clean-restore evidence. A green reference
-suite cannot close issue #14.
+wall-plug recoveries; setup/strike/clean-restore evidence; and integration of the
+reviewed immutable authority verifier described above. A green reference suite
+cannot close issue #14.

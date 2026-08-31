@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -24,6 +26,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 try:
     from .contract import (
@@ -45,14 +48,21 @@ except ImportError:  # Direct `python3 installation/runtime.py` execution.
     )
 
 TELEMETRY_SCHEMA = "danse.installation.telemetry.v1"
+RUNTIME_PLAN_SCHEMA = "danse.installation.runtime-plan.v2"
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 
 
 def canonical_relative_path(value: Any, label: str) -> PurePosixPath:
-    if not isinstance(value, str) or "\\" in value:
+    if not isinstance(value, str) or "\\" in value or "\0" in value:
         raise ContractError(f"{label} must be a canonical relative path")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"{label} must be a canonical relative path") from exc
     pure = PurePosixPath(value)
     if (
         pure.is_absolute()
+        or not pure.parts
         or pure.as_posix() != value
         or any(part in {"", ".", ".."} for part in pure.parts)
     ):
@@ -93,6 +103,301 @@ def probe_health(url: str, timeout: float) -> bool:
             return 200 <= response.status < 300
     except (OSError, urllib.error.URLError, ValueError):
         return False
+
+
+def validate_session_id(value: Any) -> str:
+    """Validate one venue-owned, non-secret runtime-cycle identifier."""
+    if not isinstance(value, str) or SESSION_ID.fullmatch(value) is None:
+        raise ContractError(
+            "--session-id must be 8-128 safe characters and unique to this runtime cycle"
+        )
+    return value
+
+
+def validate_runtime_plan_contract(
+    plan: Any, *, expected_spec: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Reject obsolete or incomplete plan contracts before field access."""
+
+    def exact_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != keys:
+            raise ContractError(f"installation runtime plan {label} is malformed")
+        return value
+
+    def nonempty(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ContractError(f"installation runtime plan {label} is empty")
+        return value
+
+    def sha256(value: Any, label: str) -> str:
+        result = nonempty(value, label)
+        if len(result) != 64 or any(
+            character not in "0123456789abcdef" for character in result
+        ):
+            raise ContractError(f"installation runtime plan {label} is not SHA-256")
+        return result
+
+    def utf8(value: Any, label: str) -> bytes:
+        result = nonempty(value, label)
+        if "\0" in result:
+            raise ContractError(f"installation runtime plan {label} is malformed")
+        try:
+            return result.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ContractError(
+                f"installation runtime plan {label} is malformed"
+            ) from exc
+
+    def number(value: Any, label: str, minimum: float = 0) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContractError(f"installation runtime plan {label} is not numeric")
+        try:
+            result = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ContractError(
+                f"installation runtime plan {label} is not numeric"
+            ) from exc
+        if not math.isfinite(result) or result < minimum:
+            raise ContractError(f"installation runtime plan {label} is not numeric")
+        return result
+
+    if not isinstance(plan, dict) or plan.get("schema") != RUNTIME_PLAN_SCHEMA:
+        raise ContractError("unknown installation runtime plan schema")
+    required = {
+        "schema",
+        "spec_contract_sha256",
+        "evidence_id",
+        "evidence_sha256",
+        "release_manifest_sha256",
+        "release_manifest",
+        "release_files",
+        "launcher",
+        "configuration_sha256",
+        "argv",
+        "health_url",
+        "river",
+        "outputs",
+        "policy",
+    }
+    if set(plan) != required:
+        raise ContractError("installation runtime plan fields do not match v2")
+    for key in (
+        "spec_contract_sha256",
+        "evidence_sha256",
+        "release_manifest_sha256",
+        "configuration_sha256",
+    ):
+        sha256(plan[key], key)
+    utf8(plan["evidence_id"], "evidence_id")
+
+    manifest = exact_object(
+        plan["release_manifest"], {"path", "content"}, "release_manifest"
+    )
+    canonical_relative_path(manifest["path"], "runtime manifest path")
+    manifest_content = nonempty(manifest["content"], "release_manifest.content")
+    if (
+        hashlib.sha256(utf8(manifest_content, "release_manifest.content")).hexdigest()
+        != plan["release_manifest_sha256"]
+    ):
+        raise ContractError("installation runtime plan manifest digest drifted")
+
+    def release_record(value: Any, label: str) -> dict[str, Any]:
+        record = exact_object(value, {"path", "bytes", "sha256", "executable"}, label)
+        canonical_relative_path(record["path"], f"runtime {label} path")
+        if (
+            isinstance(record["bytes"], bool)
+            or not isinstance(record["bytes"], int)
+            or record["bytes"] < 0
+        ):
+            raise ContractError(f"installation runtime plan {label} bytes is invalid")
+        sha256(record["sha256"], f"{label}.sha256")
+        if not isinstance(record["executable"], bool):
+            raise ContractError(
+                f"installation runtime plan {label} executable is invalid"
+            )
+        return record
+
+    files = plan["release_files"]
+    if not isinstance(files, list) or not files:
+        raise ContractError("installation runtime plan release_files is malformed")
+    records = [
+        release_record(record, f"release_files[{index}]")
+        for index, record in enumerate(files)
+    ]
+    paths = [record["path"] for record in records]
+    if len(set(paths)) != len(paths):
+        raise ContractError("installation runtime plan release paths are duplicated")
+    launcher = release_record(plan["launcher"], "launcher")
+    matching_launcher = [
+        record for record in records if record["path"] == launcher["path"]
+    ]
+    if len(matching_launcher) != 1 or matching_launcher[0] != launcher:
+        raise ContractError(
+            "installation runtime plan launcher is not in release_files"
+        )
+
+    argv = plan["argv"]
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(argument, str) and argument for argument in argv)
+        or argv[0] != launcher["path"]
+    ):
+        raise ContractError("installation runtime plan argv is malformed")
+    for index, argument in enumerate(argv[1:], start=1):
+        validate_snapshot_argument(argument, index)
+
+    health_url = plan["health_url"]
+    if health_url is not None:
+        if not isinstance(health_url, str):
+            raise ContractError("installation runtime plan health_url is malformed")
+        try:
+            parsed = urlsplit(health_url)
+            port = parsed.port
+        except ValueError as exc:
+            raise ContractError(
+                "installation runtime plan health_url is malformed"
+            ) from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is None
+            or not 1 <= port <= 65535
+            or parsed.fragment
+        ):
+            raise ContractError("installation runtime plan health_url is unsafe")
+
+    river = exact_object(plan["river"], {"seed", "stream", "epoch_ms"}, "river")
+    for key, maximum in (
+        ("seed", 0xFFFFFFFF),
+        ("stream", 0xFFFFFFFF),
+        ("epoch_ms", 9_007_199_254_740_991),
+    ):
+        value = river[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= maximum
+        ):
+            raise ContractError(f"installation runtime plan river.{key} is invalid")
+
+    outputs = plan["outputs"]
+    if (
+        not isinstance(outputs, list)
+        or not outputs
+        or not all(isinstance(output, str) and output for output in outputs)
+        or len(set(outputs)) != len(outputs)
+    ):
+        raise ContractError("installation runtime plan outputs is malformed")
+    for index, output in enumerate(outputs):
+        utf8(output, f"outputs[{index}]")
+
+    policy = exact_object(
+        plan["policy"],
+        {
+            "mode",
+            "persistent_host_service",
+            "single_approved_launcher",
+            "forbidden_host_mutations",
+            "health",
+            "recovery",
+        },
+        "policy",
+    )
+    if (
+        policy["mode"] != "foreground-supervisor"
+        or policy["persistent_host_service"] is not False
+        or policy["single_approved_launcher"] is not True
+        or not isinstance(policy["forbidden_host_mutations"], list)
+        or not all(
+            isinstance(item, str) and item
+            for item in policy["forbidden_host_mutations"]
+        )
+    ):
+        raise ContractError("installation runtime plan policy boundary is malformed")
+    health = exact_object(
+        policy["health"],
+        {
+            "probe_interval_seconds",
+            "startup_timeout_seconds",
+            "probe_timeout_seconds",
+            "max_consecutive_failures",
+        },
+        "policy.health",
+    )
+    for key in (
+        "probe_interval_seconds",
+        "startup_timeout_seconds",
+        "probe_timeout_seconds",
+    ):
+        number(health[key], f"policy.health.{key}", 0.001)
+    if (
+        isinstance(health["max_consecutive_failures"], bool)
+        or not isinstance(health["max_consecutive_failures"], int)
+        or health["max_consecutive_failures"] < 1
+    ):
+        raise ContractError(
+            "installation runtime plan policy.health.max_consecutive_failures is invalid"
+        )
+    recovery = exact_object(
+        policy["recovery"],
+        {
+            "max_restarts",
+            "window_seconds",
+            "stable_seconds",
+            "backoff_seconds",
+            "wall_plug_return_timeout_seconds",
+            "wall_plug_proofs_required",
+        },
+        "policy.recovery",
+    )
+    for key in (
+        "max_restarts",
+        "wall_plug_proofs_required",
+    ):
+        if (
+            isinstance(recovery[key], bool)
+            or not isinstance(recovery[key], int)
+            or recovery[key] < 0
+        ):
+            raise ContractError(
+                f"installation runtime plan policy.recovery.{key} is invalid"
+            )
+    for key in (
+        "window_seconds",
+        "stable_seconds",
+        "wall_plug_return_timeout_seconds",
+    ):
+        number(recovery[key], f"policy.recovery.{key}", 0.001)
+    backoff = recovery["backoff_seconds"]
+    if not isinstance(backoff, list) or len(backoff) < recovery["max_restarts"]:
+        raise ContractError(
+            "installation runtime plan policy.recovery.backoff_seconds is malformed"
+        )
+    for index, value in enumerate(backoff):
+        number(value, f"policy.recovery.backoff_seconds[{index}]")
+    if expected_spec is not None:
+        expected_outputs = [
+            output["id"]
+            for output in sorted(
+                expected_spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ]
+        if plan["spec_contract_sha256"] != expected_spec["identity"]["contract_sha256"]:
+            raise ContractError(
+                "installation runtime plan contract drifted from the authenticated digital twin"
+            )
+        if outputs != expected_outputs:
+            raise ContractError(
+                "installation runtime plan outputs drifted from the authenticated digital twin"
+            )
+        if policy != expected_spec["runtime"]:
+            raise ContractError(
+                "installation runtime plan policy drifted from the authenticated digital twin"
+            )
+    return plan
 
 
 def terminate(process: subprocess.Popen[Any]) -> None:
@@ -344,6 +649,12 @@ def supervise(
     health_probe: Callable[[str, float], bool] = probe_health,
 ) -> int:
     """Run one admitted launcher and recover only within its declared budget."""
+    try:
+        expected_spec = load_reference_contracts()[0]
+        plan = validate_runtime_plan_contract(plan, expected_spec=expected_spec)
+    except (ContractError, OSError):
+        telemetry.emit("runtime-plan-invalid", attempt=0)
+        return 78
     policy = plan["policy"]
     health = policy["health"]
     recovery = policy["recovery"]
@@ -360,6 +671,7 @@ def supervise(
             "DANSE_INSTALLATION_CONTRACT_SHA256": plan["spec_contract_sha256"],
             "DANSE_INSTALLATION_EVIDENCE_ID": plan["evidence_id"],
             "DANSE_INSTALLATION_EVIDENCE_SHA256": plan["evidence_sha256"],
+            "DANSE_INSTALLATION_CONFIGURATION_SHA256": plan["configuration_sha256"],
             "DANSE_INSTALLATION_RELEASE_MANIFEST_SHA256": plan[
                 "release_manifest_sha256"
             ],
@@ -426,17 +738,31 @@ def supervise(
 
             started = clock()
             ever_healthy = plan["health_url"] is None
+            readiness_emitted = False
             consecutive_failures = 0
             forced_failure: str | None = None
             try:
                 while process.poll() is None:
-                    if plan["health_url"] is not None:
+                    if plan["health_url"] is None:
+                        if not readiness_emitted:
+                            telemetry.emit(
+                                "runtime-ready",
+                                attempt=attempt,
+                                readiness="process-running",
+                            )
+                            readiness_emitted = True
+                    else:
                         ok = health_probe(
                             plan["health_url"], health["probe_timeout_seconds"]
                         )
                         if ok:
-                            if not ever_healthy:
+                            if not ever_healthy or consecutive_failures > 0:
                                 telemetry.emit("health-ready", attempt=attempt)
+                                telemetry.emit(
+                                    "runtime-ready",
+                                    attempt=attempt,
+                                    readiness="health-probe",
+                                )
                             ever_healthy = True
                             consecutive_failures = 0
                         else:
@@ -519,6 +845,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--telemetry", default="-", help="JSONL receipt path; - writes to stdout"
     )
+    value.add_argument(
+        "--session-id",
+        help="venue-owned unique ID for this --run telemetry cycle",
+    )
     return value
 
 
@@ -542,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     stream: TextIO | None = None
     close_stream = False
     try:
+        session_id = validate_session_id(args.session_id) if args.run else None
         spec, _, _ = load_reference_contracts()
         evidence = load_json(args.evidence)
         plan = runtime_plan(evidence, spec, args.release_root)
@@ -552,9 +883,11 @@ def main(argv: list[str] | None = None) -> int:
         telemetry = Telemetry(stream)
         telemetry.emit(
             "runtime-admitted",
+            session_id=session_id,
             spec_contract_sha256=plan["spec_contract_sha256"],
             evidence_id=plan["evidence_id"],
             evidence_sha256=plan["evidence_sha256"],
+            configuration_sha256=plan["configuration_sha256"],
             release_manifest_sha256=plan["release_manifest_sha256"],
             launcher_sha256=plan["launcher"]["sha256"],
         )

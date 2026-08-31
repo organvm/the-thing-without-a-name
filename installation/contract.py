@@ -25,9 +25,11 @@ HERE = Path(__file__).resolve().parent
 SPEC = HERE / "digital-twin.json"
 GATES = HERE / "gates.json"
 ARCHIVE_DISPOSITION = HERE / "archive-disposition.json"
+EVIDENCE_SCHEMA = HERE / "evidence.schema.json"
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+RUNTIME_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 UINT32_MAX = 0xFFFFFFFF
 REQUIRED_SOURCE_CONTRACTS = {
     "projector-camera",
@@ -132,13 +134,14 @@ def _sha256(value: Any, label: str) -> str:
 def _finite(
     value: Any, label: str, low: float = -math.inf, high: float = math.inf
 ) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ContractError(f"{label} must be finite")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ContractError(f"{label} must be finite") from exc
+    if not math.isfinite(result):
+        raise ContractError(f"{label} must be finite")
     if result < low or result > high:
         raise ContractError(f"{label} must be in [{low}, {high}]")
     return result
@@ -308,6 +311,10 @@ def validate_snapshot_argument(value: Any, index: int) -> str:
     """Require every trailing file argument to resolve inside the snapshot."""
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ContractError(f"runtime argv[{index}] is invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError(f"runtime argv[{index}] is invalid") from exc
     candidate = (
         value.split("=", 1)[1] if value.startswith("-") and "=" in value else value
     )
@@ -1035,6 +1042,254 @@ def calibration_plan(spec: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def evidence_required_fields(schema: dict[str, Any]) -> list[str]:
+    """Return every required leaf in the evidence schema as a JSON-style path."""
+
+    def resolve(node: dict[str, Any]) -> dict[str, Any]:
+        reference = node.get("$ref")
+        if not isinstance(reference, str):
+            return node
+        if not reference.startswith("#/"):
+            raise ContractError(
+                "installation evidence schema has an external reference"
+            )
+        value: Any = schema
+        for part in reference[2:].split("/"):
+            value = value[part.replace("~1", "/").replace("~0", "~")]
+        if not isinstance(value, dict):
+            raise ContractError(
+                "installation evidence schema reference is not an object"
+            )
+        return value
+
+    fields: list[str] = []
+
+    def visit(node: dict[str, Any], path: str) -> None:
+        node = resolve(node)
+        alternatives = node.get("anyOf")
+        if isinstance(alternatives, list):
+            selected = next(
+                (
+                    child
+                    for child in alternatives
+                    if isinstance(child, dict) and child.get("type") != "null"
+                ),
+                None,
+            )
+            if selected is None:
+                fields.append(path)
+            else:
+                visit(selected, path)
+            return
+        required = node.get("required")
+        properties = node.get("properties")
+        if isinstance(required, list) and isinstance(properties, dict):
+            for key in required:
+                visit(properties[key], f"{path}.{key}" if path else key)
+            return
+        items = node.get("items")
+        if isinstance(items, dict):
+            visit(items, f"{path}[]")
+            return
+        fields.append(path)
+
+    visit(schema, "")
+    return sorted(fields)
+
+
+def installation_workbook(
+    spec: dict[str, Any], gates: dict[str, Any]
+) -> dict[str, Any]:
+    """Emit a deterministic, non-evidentiary worksheet for a clean venue setup.
+
+    The workbook contains no invented hardware, venue, or measurement values. It
+    derives every logical assignment and threshold from the authenticated twin so
+    an operator can collect the private receipts needed by ``evidence.schema.json``
+    without copying a stale prose checklist.
+    """
+    validate_digital_twin(spec)
+    validate_gates(gates, spec)
+    evidence_schema = load_json(EVIDENCE_SCHEMA)
+    meters = float(spec["coordinate_system"]["meters_per_unit"])
+    surfaces = {surface["id"]: surface for surface in spec["surfaces"]}
+    workbook = {
+        "schema": "danse.installation.workbook.v1",
+        "status": "worksheet-not-evidence",
+        "spec_contract_sha256": spec["identity"]["contract_sha256"],
+        "private_values": "collect-externally-never-commit",
+        "evidence_contract": {
+            "schema": evidence_schema["properties"]["schema"]["const"],
+            "required_fields": evidence_required_fields(evidence_schema),
+            "all_required_fields_must_be_collected": True,
+            "worksheet_values_are_evidence": False,
+        },
+        "blocked_gates": [
+            gate["id"] for gate in gates["gates"] if gate["status"] == "blocked"
+        ],
+        "venue_safety_receipts": [
+            "venue-approval",
+            "egress",
+            "mounting",
+            "power",
+            "ventilation",
+        ],
+        "hardware_roles": list(spec["hardware_roles"]),
+        "hardware": {
+            "assets": [
+                {
+                    "role": role,
+                    "asset_id": "required-private",
+                    "verified": "required-true",
+                    "receipt_sha256": "required-private",
+                }
+                for role in spec["hardware_roles"]
+            ],
+            "cabling_receipt_sha256": "required-private",
+            "power_receipt_sha256": "required-private",
+            "ventilation_receipt_sha256": "required-private",
+        },
+        "surfaces": [
+            {
+                "reference_surface": surface_id,
+                "hardware_role": REFERENCE_SURFACE_HARDWARE_ROLES[surface_id],
+                "expected_center_m": [
+                    round(value * meters, 9) for value in surface["center"]
+                ],
+                "expected_rotation_radians": list(surface["rotation_radians"]),
+                "expected_size_m": [
+                    round(2 * value * meters, 9) for value in surface["half_extents"]
+                ],
+                "private_measurement_receipt": "required",
+            }
+            for surface_id, surface in sorted(surfaces.items())
+        ],
+        "projectors": [
+            {
+                "output": output["id"],
+                "hardware_role": output["id"],
+                "surface": output["surface"],
+                "channel": output["channel"],
+                "refresh_hz": spec["synchronization"]["fps"],
+                "edge_policy": output["edge_policy"],
+                "overlap_px": output["overlap_px"],
+                "private_pose_lens_receipt": "required",
+            }
+            for output in sorted(
+                spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ],
+        "calibration": calibration_plan(spec),
+        "runtime": {
+            "mode": spec["runtime"]["mode"],
+            "canonical_release_required": spec["release"]["canonical_release_required"],
+            "manifest_name": spec["release"]["manifest_name"],
+            "persistent_host_service": spec["runtime"]["persistent_host_service"],
+            "forbidden_host_mutations": sorted(
+                spec["runtime"]["forbidden_host_mutations"]
+            ),
+            "health": copy.deepcopy(spec["runtime"]["health"]),
+            "recovery": copy.deepcopy(spec["runtime"]["recovery"]),
+            "private_launcher_approval_receipt": "required",
+        },
+        "completion": {
+            "wall_plug_proofs_required": spec["runtime"]["recovery"][
+                "wall_plug_proofs_required"
+            ],
+            "wall_plug_return_timeout_seconds": spec["runtime"]["recovery"][
+                "wall_plug_return_timeout_seconds"
+            ],
+            "human_observation_required": True,
+            "configuration_binding_required": True,
+            "setup_strike_restore_receipts_required": 3,
+            "portable_simulation_is_physical_proof": False,
+        },
+    }
+    workbook["workbook_sha256"] = canonical_sha256(workbook)
+    return workbook
+
+
+def physical_configuration_sha256(
+    value: dict[str, Any], spec: dict[str, Any], launcher_sha256: str
+) -> str:
+    """Bind a physical proof to the exact admitted configuration.
+
+    Wall-plug and restore receipts live outside the repository. This fingerprint
+    gives their canonical receipt payloads one stable identity for the venue,
+    geometry, release, hardware, calibration, launcher, health contract, river,
+    and output set. Semantically keyed arrays are sorted so serializer order does
+    not change that identity.
+    """
+    launcher = _sha256(launcher_sha256, "runtime launcher digest")
+    geometry = copy.deepcopy(value["geometry"])
+    geometry["surfaces"] = sorted(
+        geometry["surfaces"], key=lambda item: item["reference_surface"]
+    )
+    geometry["projectors"] = sorted(
+        geometry["projectors"], key=lambda item: item["output"]
+    )
+    hardware = copy.deepcopy(value["hardware"])
+    hardware["assets"] = sorted(hardware["assets"], key=lambda item: item["role"])
+    binding = {
+        "schema": "danse.installation.physical-configuration.v1",
+        "spec_contract_sha256": spec["identity"]["contract_sha256"],
+        "evidence_id": value["evidence_id"],
+        "venue_sha256": canonical_sha256(value["venue"]),
+        "geometry_sha256": canonical_sha256(geometry),
+        "release_sha256": canonical_sha256(value["release"]),
+        "launcher_sha256": launcher,
+        "hardware_sha256": canonical_sha256(hardware),
+        "calibration_sha256": canonical_sha256(value["calibration"]),
+        "runtime_sha256": canonical_sha256(value["runtime"]),
+        "outputs": [
+            output["id"]
+            for output in sorted(
+                spec["projection_outputs"], key=lambda item: item["channel"]
+            )
+        ],
+    }
+    return canonical_sha256(binding)
+
+
+def wall_plug_receipt_sha256(evidence_id: str, proof: dict[str, Any]) -> str:
+    """Hash the complete wall-plug observation rather than an opaque sibling.
+
+    The supplied runtime telemetry receipt is part of this payload. Changing the
+    admitted configuration, telemetry digest, observer, timing, or result while
+    retaining an older receipt hash therefore fails closed.
+    """
+    payload = {
+        "schema": "danse.installation.wall-plug-receipt.v2",
+        "evidence_id": evidence_id,
+        "proof": {
+            key: copy.deepcopy(value)
+            for key, value in proof.items()
+            if key != "receipt_sha256"
+        },
+    }
+    return canonical_sha256(payload)
+
+
+def restore_phase_receipt_sha256(
+    evidence_id: str, restore: dict[str, Any], phase: str
+) -> str:
+    """Hash one setup/strike/restore observation with its configuration."""
+    if phase not in {"setup", "strike", "restore"}:
+        raise ContractError(f"unknown restore receipt phase {phase!r}")
+    payload = {
+        "schema": "danse.installation.restore-phase-receipt.v2",
+        "evidence_id": evidence_id,
+        "phase": phase,
+        "configuration_sha256": restore["configuration_sha256"],
+        "observer": restore["observer"],
+        "observed_at": restore["observed_at"],
+        "passed": restore[f"{phase}_passed"],
+        "canonical_release_restored": (
+            restore["canonical_release_restored"] if phase == "restore" else None
+        ),
+    }
+    return canonical_sha256(payload)
+
+
 def _receipt_sha(value: Any, label: str) -> str:
     return _sha256(value, label)
 
@@ -1258,7 +1513,7 @@ def validate_evidence(
         },
         "installation evidence",
     )
-    if value["schema"] != "danse.installation.evidence.v1":
+    if value["schema"] != "danse.installation.evidence.v2":
         raise ContractError("unknown installation evidence schema")
     _nonempty(value["evidence_id"], "evidence_id")
     if value["spec_contract_sha256"] != spec["identity"]["contract_sha256"]:
@@ -1610,6 +1865,10 @@ def validate_evidence(
             "runtime river epoch_ms must be a non-negative safe integer"
         )
 
+    configuration_sha256 = physical_configuration_sha256(
+        value, spec, launcher["sha256"]
+    )
+
     proofs = value["wall_plug_proofs"]
     required = spec["runtime"]["recovery"]["wall_plug_proofs_required"]
     if (
@@ -1632,9 +1891,41 @@ def validate_evidence(
             "setup_receipt_sha256",
             "strike_receipt_sha256",
             "restore_receipt_sha256",
+            "configuration_sha256",
         },
         "restore_rehearsal",
     )
+    restore_flags = (
+        "setup_passed",
+        "strike_passed",
+        "restore_passed",
+        "canonical_release_restored",
+    )
+    restore_receipts = (
+        "setup_receipt_sha256",
+        "strike_receipt_sha256",
+        "restore_receipt_sha256",
+    )
+    restore_claimed = any(restore[key] is not False for key in restore_flags) or any(
+        restore[key] is not None
+        for key in ("observer", "observed_at", *restore_receipts)
+    )
+    restore_configuration = restore["configuration_sha256"]
+    if restore_configuration is not None:
+        if (
+            _sha256(
+                restore_configuration,
+                "restore rehearsal configuration_sha256",
+            )
+            != configuration_sha256
+        ):
+            raise ContractError(
+                "restore rehearsal belongs to another admitted physical configuration"
+            )
+    elif phase == "complete" or restore_claimed:
+        raise ContractError(
+            "restore rehearsal must bind the admitted physical configuration"
+        )
     if phase == "complete" and len(proofs) != required:
         raise ContractError(
             f"physical completion requires exactly {required} wall-plug proofs"
@@ -1643,6 +1934,8 @@ def validate_evidence(
         by_proof = _unique(proofs, "id", "wall_plug_proofs")
         observed_times: set[str] = set()
         telemetry: set[str] = set()
+        telemetry_events: set[str] = set()
+        telemetry_sessions: set[str] = set()
         proof_receipts: set[str] = set()
         for proof_id, proof in by_proof.items():
             _exact_keys(
@@ -1656,6 +1949,8 @@ def validate_evidence(
                     "generative_display_returned",
                     "manual_repair_required",
                     "spec_contract_sha256",
+                    "configuration_sha256",
+                    "runtime_telemetry_receipt",
                     "runtime_telemetry_sha256",
                     "receipt_sha256",
                 },
@@ -1700,10 +1995,271 @@ def validate_evidence(
                 raise ContractError(
                     f"wall-plug proof {proof_id} belongs to another configuration"
                 )
+            if (
+                _sha256(
+                    proof["configuration_sha256"],
+                    f"wall-plug proof {proof_id} configuration_sha256",
+                )
+                != configuration_sha256
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} belongs to another admitted physical configuration"
+                )
+            telemetry_receipt = _exact_keys(
+                proof["runtime_telemetry_receipt"],
+                {
+                    "schema",
+                    "evidence_id",
+                    "proof_id",
+                    "session_id",
+                    "spec_contract_sha256",
+                    "configuration_sha256",
+                    "events_sha256",
+                    "events_jsonl",
+                },
+                f"wall-plug proof {proof_id} runtime telemetry receipt",
+            )
+            if (
+                telemetry_receipt["schema"]
+                != "danse.installation.runtime-telemetry-receipt.v2"
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} has an unknown runtime telemetry receipt schema"
+                )
+            if (
+                telemetry_receipt["evidence_id"] != value["evidence_id"]
+                or telemetry_receipt["proof_id"] != proof_id
+                or telemetry_receipt["spec_contract_sha256"]
+                != spec["identity"]["contract_sha256"]
+                or _sha256(
+                    telemetry_receipt["configuration_sha256"],
+                    f"wall-plug proof {proof_id} telemetry configuration_sha256",
+                )
+                != configuration_sha256
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry belongs to another admitted physical configuration"
+                )
+            session_id = telemetry_receipt["session_id"]
+            if (
+                not isinstance(session_id, str)
+                or RUNTIME_SESSION_ID.fullmatch(session_id) is None
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry session_id is malformed"
+                )
+            _sha256(
+                telemetry_receipt["events_sha256"],
+                f"wall-plug proof {proof_id} telemetry events digest",
+            )
+            events_jsonl = telemetry_receipt["events_jsonl"]
+            if not isinstance(events_jsonl, str) or not events_jsonl.endswith("\n"):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry must be newline-terminated JSONL"
+                )
+            try:
+                events_bytes = events_jsonl.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry is not valid UTF-8 text"
+                ) from exc
+            if len(events_bytes) > 1_048_576:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry exceeds the receipt size limit"
+                )
+            if (
+                hashlib.sha256(events_bytes).hexdigest()
+                != telemetry_receipt["events_sha256"]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry events digest does not match supplied bytes"
+                )
+            if telemetry_receipt["events_sha256"] in telemetry_events:
+                raise ContractError(
+                    "wall-plug proofs must preserve distinct underlying telemetry bytes"
+                )
+            telemetry_events.add(telemetry_receipt["events_sha256"])
+            if session_id in telemetry_sessions:
+                raise ContractError(
+                    "wall-plug proofs must preserve distinct runtime session ids"
+                )
+            telemetry_sessions.add(session_id)
+            event_records: list[dict[str, Any]] = []
+            previous_elapsed = -math.inf
+            for index, line in enumerate(events_jsonl.splitlines()):
+                if not line:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry contains a blank event"
+                    )
+                record = load_json_bytes(
+                    line.encode("utf-8"),
+                    f"wall-plug proof {proof_id} telemetry event {index}",
+                )
+                elapsed_value = record.get("elapsed_seconds")
+                try:
+                    elapsed = (
+                        float(elapsed_value)
+                        if not isinstance(elapsed_value, bool)
+                        and isinstance(elapsed_value, (int, float))
+                        else math.nan
+                    )
+                except (OverflowError, ValueError):
+                    elapsed = math.nan
+                if (
+                    record.get("schema") != "danse.installation.telemetry.v1"
+                    or isinstance(record.get("sequence"), bool)
+                    or not isinstance(record.get("sequence"), int)
+                    or record.get("sequence") != index
+                    or not math.isfinite(elapsed)
+                    or elapsed < 0
+                    or not isinstance(record.get("event"), str)
+                    or not record["event"]
+                ):
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry event sequence is malformed"
+                    )
+                if elapsed < previous_elapsed:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} telemetry elapsed time moved backwards"
+                    )
+                previous_elapsed = elapsed
+                event_records.append(record)
+            admitted = [
+                record
+                for record in event_records
+                if record["event"] == "runtime-admitted"
+            ]
+            if len(admitted) != 1:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry must contain one runtime-admitted event"
+                )
+            admission = _exact_keys(
+                admitted[0],
+                {
+                    "schema",
+                    "sequence",
+                    "elapsed_seconds",
+                    "event",
+                    "session_id",
+                    "spec_contract_sha256",
+                    "evidence_id",
+                    "evidence_sha256",
+                    "configuration_sha256",
+                    "release_manifest_sha256",
+                    "launcher_sha256",
+                },
+                f"wall-plug proof {proof_id} runtime-admitted event",
+            )
+            if (
+                admission["sequence"] != 0
+                or admission["session_id"] != session_id
+                or admission["spec_contract_sha256"]
+                != spec["identity"]["contract_sha256"]
+                or admission["evidence_id"] != value["evidence_id"]
+                or admission["configuration_sha256"] != configuration_sha256
+                or admission["release_manifest_sha256"]
+                != value["release"]["manifest_sha256"]
+                or admission["launcher_sha256"] != launcher["sha256"]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry bytes belong to another admitted physical configuration"
+                )
+            _sha256(
+                admission["evidence_sha256"],
+                f"wall-plug proof {proof_id} admitted evidence digest",
+            )
+            terminal_events = {
+                "runtime-plan-invalid",
+                "release-integrity-failed",
+                "recovery-budget-exhausted",
+                "operator-stop",
+            }
+            if any(record["event"] in terminal_events for record in event_records):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry terminates in a failure state"
+                )
+            if any(
+                record["event"] == "launcher-exit" and record.get("returncode") == 0
+                for record in event_records
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry shows the admitted runtime exited"
+                )
+            if event_records[-1]["event"] != "runtime-ready":
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry does not end ready"
+                )
+            ready = _exact_keys(
+                event_records[-1],
+                {
+                    "schema",
+                    "sequence",
+                    "elapsed_seconds",
+                    "event",
+                    "attempt",
+                    "readiness",
+                },
+                f"wall-plug proof {proof_id} runtime-ready event",
+            )
+            ready_attempt = ready["attempt"]
+            if (
+                isinstance(ready_attempt, bool)
+                or not isinstance(ready_attempt, int)
+                or ready_attempt < 1
+                or ready["readiness"] not in {"process-running", "health-probe"}
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} runtime-ready event is malformed"
+                )
+            launcher_started = any(
+                record["event"] == "launcher-start"
+                and record.get("attempt") == ready_attempt
+                for record in event_records[:-1]
+            )
+            if not launcher_started:
+                raise ContractError(
+                    f"wall-plug proof {proof_id} became ready without a launcher start"
+                )
+            if value["runtime"]["health_url"] is None:
+                if ready["readiness"] != "process-running":
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} has the wrong readiness contract"
+                    )
+            else:
+                health_ready = any(
+                    record["event"] == "health-ready"
+                    and record.get("attempt") == ready_attempt
+                    for record in event_records[:-1]
+                )
+                if ready["readiness"] != "health-probe" or not health_ready:
+                    raise ContractError(
+                        f"wall-plug proof {proof_id} lacks a successful health receipt"
+                    )
+            recoverable_failures = {
+                "launcher-error",
+                "launcher-unhealthy",
+                "launcher-exit",
+            }
+            if any(
+                record["event"] in recoverable_failures
+                and (
+                    isinstance(record.get("attempt"), bool)
+                    or not isinstance(record.get("attempt"), int)
+                    or record["attempt"] >= ready_attempt
+                )
+                for record in event_records[:-1]
+            ):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry has an unrecovered launcher failure"
+                )
             telemetry_sha = _receipt_sha(
                 proof["runtime_telemetry_sha256"],
                 f"wall-plug proof {proof_id} telemetry",
             )
+            if telemetry_sha != canonical_sha256(telemetry_receipt):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} telemetry receipt digest does not match its payload"
+                )
             if telemetry_sha in telemetry:
                 raise ContractError(
                     "wall-plug proofs must preserve distinct telemetry receipts"
@@ -1712,38 +2268,39 @@ def validate_evidence(
             proof_receipt = _receipt_sha(
                 proof["receipt_sha256"], f"wall-plug proof {proof_id} receipt"
             )
+            if proof_receipt != wall_plug_receipt_sha256(value["evidence_id"], proof):
+                raise ContractError(
+                    f"wall-plug proof {proof_id} receipt digest does not match its payload"
+                )
             if proof_receipt in proof_receipts:
                 raise ContractError(
                     "wall-plug proofs must preserve distinct observation receipts"
                 )
             proof_receipts.add(proof_receipt)
-    restore_flags = (
-        "setup_passed",
-        "strike_passed",
-        "restore_passed",
-        "canonical_release_restored",
-    )
-    restore_receipts = (
-        "setup_receipt_sha256",
-        "strike_receipt_sha256",
-        "restore_receipt_sha256",
-    )
-    restore_claimed = any(restore[key] is not False for key in restore_flags) or any(
-        restore[key] is not None
-        for key in ("observer", "observed_at", *restore_receipts)
-    )
     if phase == "complete" or restore_claimed:
         for key in restore_flags:
             _approved(restore[key], f"restore rehearsal {key}")
         _nonempty(restore["observer"], "restore_rehearsal.observer")
         _timestamp(restore["observed_at"], "restore_rehearsal.observed_at")
         receipt_values: list[str] = []
-        for receipt in restore_receipts:
-            receipt_values.append(
-                _receipt_sha(restore[receipt], f"restore rehearsal {receipt}")
-            )
+        for phase_name, receipt in zip(
+            ("setup", "strike", "restore"), restore_receipts, strict=True
+        ):
+            receipt_sha = _receipt_sha(restore[receipt], f"restore rehearsal {receipt}")
+            if receipt_sha != restore_phase_receipt_sha256(
+                value["evidence_id"], restore, phase_name
+            ):
+                raise ContractError(
+                    f"restore rehearsal {receipt} digest does not match its payload"
+                )
+            receipt_values.append(receipt_sha)
         if len(set(receipt_values)) != len(receipt_values):
             raise ContractError("setup, strike, and restore receipts must be distinct")
+    if phase == "complete":
+        raise ContractError(
+            "BLOCKED: physical completion requires an immutable allowlisted authority "
+            "attestation; no trusted external authority anchor is configured"
+        )
     return value
 
 
@@ -1757,7 +2314,7 @@ def runtime_plan(
     )
     launcher = release_files[runtime["argv"][0]]
     return {
-        "schema": "danse.installation.runtime-plan.v1",
+        "schema": "danse.installation.runtime-plan.v2",
         "spec_contract_sha256": spec["identity"]["contract_sha256"],
         "evidence_id": value["evidence_id"],
         "evidence_sha256": canonical_sha256(value),
@@ -1768,6 +2325,9 @@ def runtime_plan(
         },
         "release_files": copy.deepcopy(list(release_files.values())),
         "launcher": copy.deepcopy(launcher),
+        "configuration_sha256": physical_configuration_sha256(
+            value, spec, launcher["sha256"]
+        ),
         "argv": list(runtime["argv"]),
         "health_url": runtime["health_url"],
         "river": copy.deepcopy(runtime["river"]),

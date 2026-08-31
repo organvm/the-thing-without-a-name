@@ -10,19 +10,28 @@ edition, MIDI, performance, recording, or sample clearance.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
 import re
 import subprocess
-from pathlib import Path
-from typing import Any
+from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
 
 import yaml
+
+from record_recording_custody import (
+    CANONICAL_REPOSITORY_INPUTS,
+    CANONICAL_STEMS,
+    hydrated_receipt_errors,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTER = ROOT / "music" / "repertoire.yaml"
 DEFAULT_SCHEMA = ROOT / "music" / "repertoire.schema.json"
+RECORDING_CUSTODY_SCHEMA = ROOT / "music" / "recording-custody.schema.json"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LAYERS = ("composition", "edition", "arrangement_midi", "performance", "recording", "samples")
 RIGHTS_STATUSES = {
@@ -130,6 +139,9 @@ def _schema_errors(
         minimum = rule.get("minItems")
         if isinstance(minimum, int) and len(value) < minimum:
             errors.append(f"{location}: must contain at least {minimum} item(s)")
+        maximum = rule.get("maxItems")
+        if isinstance(maximum, int) and len(value) > maximum:
+            errors.append(f"{location}: must contain at most {maximum} item(s)")
         child = rule.get("items")
         if isinstance(child, dict):
             for index, item in enumerate(value):
@@ -158,13 +170,168 @@ def validate_schema_instance(
     register: Any,
     path: Path = DEFAULT_SCHEMA,
 ) -> list[str]:
+    return validate_json_instance(register, path, "register")
+
+
+def validate_json_instance(value: Any, path: Path, label: str) -> list[str]:
     try:
         schema = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         return [f"schema document: {exc}"]
     if not isinstance(schema, dict):
         return ["schema document: root must be an object"]
-    return _schema_errors(register, schema, schema, "register")
+    return _schema_errors(value, schema, schema, label)
+
+
+def validate_recording_custody_schema(
+    receipt: Any,
+    path: Path = RECORDING_CUSTODY_SCHEMA,
+) -> list[str]:
+    try:
+        schema = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"recording custody schema: {exc}"]
+    if not isinstance(schema, dict):
+        return ["recording custody schema: root must be an object"]
+    errors = _schema_errors(receipt, schema, schema, "recording custody receipt")
+    if not isinstance(receipt, dict):
+        return errors
+
+    def validate_digest(value: Any, location: str) -> None:
+        # JSON Schema's regular-expression `$` may match immediately before a
+        # trailing newline.  Receipt identities are security boundaries, so
+        # enforce byte-for-byte digest syntax independently of the schema
+        # engine and of whether the private render graph is hydrated.
+        if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+            errors.append(f"{location}: must be exactly one lowercase SHA-256 digest")
+
+    def validate_work_path(value: Any, location: str) -> None:
+        if not isinstance(value, str):
+            return
+        pure = PurePosixPath(value)
+        if (
+            pure.as_posix() != value
+            or not value.startswith(".work/")
+            or any(part in {"", ".", ".."} for part in pure.parts)
+        ):
+            errors.append(f"{location}: must be a canonical POSIX path below .work/")
+
+    def validate_artifact(row: Any, location: str, *, audio: bool) -> None:
+        if not isinstance(row, dict):
+            return
+        validate_work_path(row.get("path"), f"{location}.path")
+        validate_digest(row.get("sha256"), f"{location}.sha256")
+        if not audio:
+            return
+        frames = row.get("frames")
+        sample_rate = row.get("sample_rate")
+        duration = row.get("duration_seconds")
+        if type(frames) is int and type(sample_rate) is int and sample_rate > 0 and type(duration) in (int, float):
+            expected_duration = round(frames / sample_rate, 9)
+            if duration != expected_duration:
+                errors.append(
+                    f"{location}.duration_seconds: must equal frames / sample_rate "
+                    f"rounded to 9 decimals ({expected_duration})"
+                )
+
+    validate_artifact(receipt.get("audio_render"), "recording custody receipt.audio_render", audio=False)
+    recorded_on = receipt.get("recorded_on")
+    if isinstance(recorded_on, str):
+        try:
+            dt.date.fromisoformat(recorded_on)
+        except ValueError:
+            errors.append("recording custody receipt.recorded_on: must be a valid calendar date")
+    master = receipt.get("master")
+    verification = receipt.get("verification")
+    if isinstance(master, dict) and isinstance(verification, dict):
+        validate_digest(
+            verification.get("repeat_master_sha256"),
+            "recording custody receipt.verification.repeat_master_sha256",
+        )
+        if verification.get("repeat_master_sha256") != master.get("sha256"):
+            errors.append(
+                "recording custody receipt.verification.repeat_master_sha256: "
+                "must equal the final master digest"
+            )
+        probes = verification.get("seek_probes")
+        if isinstance(probes, list):
+            for index, probe in enumerate(probes):
+                if isinstance(probe, dict):
+                    validate_digest(
+                        probe.get("sha256"),
+                        f"recording custody receipt.verification.seek_probes[{index}].sha256",
+                    )
+                    validate_digest(
+                        probe.get("repeat_sha256"),
+                        f"recording custody receipt.verification.seek_probes[{index}].repeat_sha256",
+                    )
+                if isinstance(probe, dict) and probe.get("sha256") != probe.get("repeat_sha256"):
+                    errors.append(
+                        f"recording custody receipt.verification.seek_probes[{index}]: "
+                        "repeat digest must equal the first digest"
+                    )
+                if isinstance(probe, dict):
+                    start_frame = probe.get("start_frame")
+                    probe_frames = probe.get("frames")
+                    master_frames = master.get("frames")
+                    if (
+                        type(start_frame) is int
+                        and type(probe_frames) is int
+                        and type(master_frames) is int
+                        and (start_frame < 0 or probe_frames <= 0 or start_frame + probe_frames > master_frames)
+                    ):
+                        errors.append(
+                            f"recording custody receipt.verification.seek_probes[{index}]: "
+                            "range must be non-empty and contained in the final master"
+                        )
+    stems = receipt.get("stems")
+    artifacts = [receipt.get("pre_normalized_master"), master]
+    if isinstance(stems, list):
+        artifacts.extend(stems)
+        stem_ids = [row.get("id") for row in stems if isinstance(row, dict) and isinstance(row.get("id"), str)]
+        if len(stem_ids) != len(set(stem_ids)):
+            errors.append("recording custody receipt.stems: ids must be unique")
+        if len(stem_ids) == len(stems) and tuple(stem_ids) != CANONICAL_STEMS:
+            errors.append("recording custody receipt.stems: ids must equal the canonical competition mix order")
+    artifact_names = ["pre_normalized_master", "master"] + [f"stems[{index}]" for index in range(max(0, len(artifacts) - 2))]
+    for artifact, name in zip(artifacts, artifact_names, strict=True):
+        validate_artifact(artifact, f"recording custody receipt.{name}", audio=True)
+        if isinstance(artifact, dict) and "polyphonic_frames" in artifact:
+            polyphonic_frames = artifact.get("polyphonic_frames")
+            frames = artifact.get("frames")
+            if (
+                type(polyphonic_frames) is int
+                and type(frames) is int
+                and not 0 < polyphonic_frames <= frames
+            ):
+                errors.append(
+                    f"recording custody receipt.{name}.polyphonic_frames: "
+                    "must be positive and no greater than frames"
+                )
+    if (
+        isinstance(artifacts[0], dict)
+        and isinstance(artifacts[1], dict)
+        and artifacts[0].get("polyphonic_frames") != artifacts[1].get("polyphonic_frames")
+    ):
+        errors.append(
+            "recording custody receipt: pre-normalized and normalized masters "
+            "must declare the same polyphonic frame count"
+        )
+    paths = [row.get("path") for row in artifacts if isinstance(row, dict) and isinstance(row.get("path"), str)]
+    if len(paths) != len(set(paths)):
+        errors.append("recording custody receipt: audio output paths must be unique")
+    shapes = [
+        (row.get("frames"), row.get("sample_rate"), row.get("channels"), row.get("sample_format"))
+        for row in artifacts
+        if isinstance(row, dict)
+        and type(row.get("frames")) is int
+        and type(row.get("sample_rate")) is int
+        and type(row.get("channels")) is int
+        and isinstance(row.get("sample_format"), str)
+    ]
+    if len(shapes) == len(artifacts) and len(set(shapes)) != 1:
+        errors.append("recording custody receipt: all audio outputs must share one exact PCM shape")
+    return errors
 
 
 def sha256(path: Path) -> str:
@@ -186,6 +353,292 @@ def _inside(root: Path, candidate: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def validate_derived_recording_custody(
+    *,
+    work: dict[str, Any],
+    work_id: str,
+    recording: dict[str, Any],
+    recording_source: tuple[str, str] | None,
+    recording_source_row: dict[str, Any],
+    arrangement_source: tuple[str, str] | None,
+    layer_rows: dict[str, dict[str, Any]],
+    root: Path,
+    require_hydrated: bool,
+    location: str,
+    error: Callable[[str, str], None],
+    source: Callable[..., tuple[str, str] | None],
+) -> None:
+    """Authenticate a tracked custody bridge against the current render graph."""
+    if recording.get("status") != "project-authored":
+        error(
+            f"{location}.recording.status",
+            "hydrated-derived custody is valid only for a project-authored recording",
+        )
+    receipt_reference = recording_source_row.get("receipt")
+    if not isinstance(receipt_reference, dict) or not isinstance(receipt_reference.get("path"), str):
+        return
+    receipt_path = root / receipt_reference["path"]
+    try:
+        receipt_document = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        error(f"{location}.recording.source.receipt", f"cannot read recording custody receipt: {exc}")
+        return
+
+    receipt_location = f"{location}.recording.source.receipt"
+    for receipt_error in validate_recording_custody_schema(receipt_document):
+        error(receipt_location, receipt_error)
+    if not isinstance(receipt_document, dict):
+        return
+    if receipt_document.get("work_id") != work_id:
+        error(f"{receipt_location}.work_id", "must identify the repertoire work")
+
+    master = receipt_document.get("master")
+    master_identity = (
+        (master.get("path"), master.get("sha256"))
+        if isinstance(master, dict)
+        else None
+    )
+    if recording_source is not None and master_identity != recording_source:
+        error(
+            f"{location}.recording.source",
+            "must equal the master identity in its tracked custody receipt",
+        )
+
+    for metadata_name in ("generator", "source_schema"):
+        source(
+            receipt_document.get(metadata_name),
+            f"{receipt_location}.{metadata_name}",
+            required=True,
+        )
+    contracts = receipt_document.get("contracts")
+    if not isinstance(contracts, dict):
+        for receipt_error in hydrated_receipt_errors(
+            receipt_document,
+            root=root,
+            require_hydrated=require_hydrated,
+        ):
+            error(receipt_location, receipt_error)
+        return
+
+    for contract_name, expected_path in CANONICAL_REPOSITORY_INPUTS.items():
+        contract_row = contracts.get(contract_name)
+        declared_path = contract_row.get("path") if isinstance(contract_row, dict) else None
+        if declared_path != expected_path:
+            error(
+                f"{receipt_location}.contracts.{contract_name}.path",
+                f"must equal the canonical current artifact {expected_path}",
+            )
+
+    contract_identities: dict[str, tuple[str, str] | None] = {}
+    for contract_name, contract_row in contracts.items():
+        if contract_name == "soundfont":
+            continue
+        contract_identities[contract_name] = source(
+            contract_row,
+            f"{receipt_location}.contracts.{contract_name}",
+            required=True,
+        )
+
+    derived_by_kind: dict[str, tuple[str, str]] = {}
+    derived_rows = work.get("derived_artifacts")
+    if isinstance(derived_rows, list):
+        for derived_row in derived_rows:
+            if (
+                isinstance(derived_row, dict)
+                and isinstance(derived_row.get("kind"), str)
+                and isinstance(derived_row.get("path"), str)
+                and isinstance(derived_row.get("sha256"), str)
+            ):
+                derived_by_kind[derived_row["kind"]] = (
+                    derived_row["path"],
+                    derived_row["sha256"],
+                )
+    expected_contracts = {
+        "midi": arrangement_source,
+        "adaptation": derived_by_kind.get("adaptation-contract"),
+        "toolchain": derived_by_kind.get("audio-toolchain-contract"),
+        "audio_uses": derived_by_kind.get("audio-use-manifest"),
+    }
+    for contract_name, expected_identity in expected_contracts.items():
+        if contract_identities.get(contract_name) != expected_identity:
+            error(
+                f"{receipt_location}.contracts.{contract_name}",
+                "must equal the current repertoire/toolchain source identity",
+            )
+
+    parsed_contracts: dict[str, dict[str, Any]] = {}
+    for contract_name in ("score", "choreography", "toolchain", "mix"):
+        identity = contract_identities.get(contract_name)
+        if identity is None:
+            continue
+        try:
+            parsed = json.loads((root / identity[0]).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            error(
+                f"{receipt_location}.contracts.{contract_name}",
+                f"cannot read current contract: {exc}",
+            )
+        else:
+            if isinstance(parsed, dict):
+                parsed_contracts[contract_name] = parsed
+
+    toolchain = parsed_contracts.get("toolchain", {})
+    for contract_name in ("mix", "soundfont"):
+        expected_row = toolchain.get(contract_name)
+        receipt_row = contracts.get(contract_name)
+        expected_identity = (
+            (expected_row.get("path"), expected_row.get("sha256"))
+            if isinstance(expected_row, dict)
+            else None
+        )
+        receipt_identity = (
+            (receipt_row.get("path"), receipt_row.get("sha256"))
+            if isinstance(receipt_row, dict)
+            else None
+        )
+        if receipt_identity != expected_identity:
+            error(
+                f"{receipt_location}.contracts.{contract_name}",
+                "must equal the current audio-toolchain source identity",
+            )
+
+    score_document = parsed_contracts.get("score", {})
+    score_identity = score_document.get("identity")
+    score_row = contracts.get("score")
+    midi_row = contracts.get("midi")
+    if isinstance(score_identity, dict) and isinstance(score_row, dict):
+        if score_identity.get("work_id") != work_id:
+            error(f"{receipt_location}.contracts.score", "must identify the repertoire work")
+        midi_digest = midi_row.get("sha256") if isinstance(midi_row, dict) else None
+        if score_identity.get("midi_sha256") != midi_digest:
+            error(f"{receipt_location}.contracts.score", "must bind the current repertoire MIDI")
+        if score_identity.get("contract_sha256") != score_row.get("contract_sha256"):
+            error(f"{receipt_location}.contracts.score", "contract identity is stale")
+
+    choreography_document = parsed_contracts.get("choreography", {})
+    choreography_identity = choreography_document.get("identity")
+    choreography_row = contracts.get("choreography")
+    if isinstance(choreography_identity, dict) and isinstance(choreography_row, dict):
+        if choreography_identity.get("contract_sha256") != choreography_row.get("contract_sha256"):
+            error(f"{receipt_location}.contracts.choreography", "contract identity is stale")
+        if choreography_identity.get("score_contract_sha256") != (
+            score_row.get("contract_sha256") if isinstance(score_row, dict) else None
+        ):
+            error(
+                f"{receipt_location}.contracts.choreography",
+                "must bind the custody receipt score contract",
+            )
+
+    executables = receipt_document.get("executables")
+    if isinstance(executables, dict):
+        for executable_name in ("fluidsynth", "ffmpeg"):
+            expected = toolchain.get(executable_name)
+            declared = executables.get(executable_name)
+            expected_identity = (
+                (expected.get("executable_sha256"), expected.get("version"))
+                if isinstance(expected, dict)
+                else None
+            )
+            declared_identity = (
+                (declared.get("sha256"), declared.get("version"))
+                if isinstance(declared, dict)
+                else None
+            )
+            if declared_identity != expected_identity:
+                error(
+                    f"{receipt_location}.executables.{executable_name}",
+                    "must equal the current pinned executable identity",
+                )
+
+    mix_document = parsed_contracts.get("mix", {})
+    mix_master = mix_document.get("master")
+    mix_normalization = mix_master.get("normalization") if isinstance(mix_master, dict) else None
+    custody_normalization = receipt_document.get("normalization")
+    if isinstance(mix_normalization, dict) and isinstance(custody_normalization, dict):
+        expected_targets = {
+            "integrated_lufs": mix_normalization.get("target_lufs"),
+            "tolerance_lu": mix_normalization.get("tolerance_lu"),
+            "target_true_peak_dbtp": mix_normalization.get("target_true_peak_dbtp"),
+            "max_true_peak_dbtp": mix_normalization.get("max_true_peak_dbtp"),
+            "lra_lu": mix_normalization.get("target_lra_lu"),
+        }
+        if custody_normalization.get("method") != mix_normalization.get("method"):
+            error(f"{receipt_location}.normalization.method", "must equal the current mix")
+        if custody_normalization.get("targets") != expected_targets:
+            error(f"{receipt_location}.normalization.targets", "must equal the current mix")
+        output = custody_normalization.get("output")
+        integrated = output.get("integrated_lufs") if isinstance(output, dict) else None
+        true_peak = output.get("true_peak_dbtp") if isinstance(output, dict) else None
+        target_lufs = expected_targets["integrated_lufs"]
+        tolerance_lu = expected_targets["tolerance_lu"]
+        max_true_peak = expected_targets["max_true_peak_dbtp"]
+        if (
+            type(integrated) in (int, float)
+            and type(target_lufs) in (int, float)
+            and type(tolerance_lu) in (int, float)
+            and abs(integrated - target_lufs) > tolerance_lu
+        ):
+            error(
+                f"{receipt_location}.normalization.output.integrated_lufs",
+                "must remain within the current mix tolerance",
+            )
+        if (
+            type(true_peak) in (int, float)
+            and type(max_true_peak) in (int, float)
+            and true_peak > max_true_peak
+        ):
+            error(
+                f"{receipt_location}.normalization.output.true_peak_dbtp",
+                "must not exceed the current mix ceiling",
+            )
+
+    score_time = score_document.get("time")
+    duration = score_time.get("duration_seconds") if isinstance(score_time, dict) else None
+    if type(duration) in (int, float):
+        expected_frames = int(
+            (Decimal(str(duration)) * 48_000).to_integral_value(rounding=ROUND_HALF_UP)
+        )
+        audio_rows = [receipt_document.get("pre_normalized_master"), master]
+        stems = receipt_document.get("stems")
+        if isinstance(stems, list):
+            audio_rows.extend(stems)
+        for audio_index, audio_row in enumerate(audio_rows):
+            if isinstance(audio_row, dict) and audio_row.get("frames") != expected_frames:
+                error(
+                    f"{receipt_location}.audio[{audio_index}].frames",
+                    f"must equal the current score duration ({expected_frames} frames)",
+                )
+
+    sample_items = layer_rows["samples"].get("items")
+    sample_identities: set[tuple[Any, Any]] = set()
+    if isinstance(sample_items, list):
+        for sample_item in sample_items:
+            sample_source = sample_item.get("source") if isinstance(sample_item, dict) else None
+            if isinstance(sample_source, dict):
+                sample_path = sample_source.get("path")
+                sample_digest = sample_source.get("sha256")
+                if isinstance(sample_path, str) and isinstance(sample_digest, str):
+                    sample_identities.add((sample_path, sample_digest))
+    soundfont_row = contracts.get("soundfont")
+    soundfont_identity = (
+        (soundfont_row.get("path"), soundfont_row.get("sha256"))
+        if isinstance(soundfont_row, dict)
+        else None
+    )
+    if soundfont_identity not in sample_identities:
+        error(
+            f"{receipt_location}.contracts.soundfont",
+            "must identify a current repertoire sample source",
+        )
+
+    for receipt_error in hydrated_receipt_errors(
+        receipt_document,
+        root=root,
+        require_hydrated=require_hydrated,
+    ):
+        error(receipt_location, receipt_error)
 
 
 def validate_document(
@@ -250,6 +703,7 @@ def validate_document(
         *,
         required: bool,
         allow_hydrated: bool = False,
+        allow_derived: bool = False,
     ) -> tuple[str, str] | None:
         if value is None:
             if required:
@@ -265,10 +719,19 @@ def validate_document(
             error(f"{location}.sha256", "must be a lowercase SHA-256 digest")
             return None
         normalized = Path(relative).as_posix()
+        if (
+            "\\" in relative
+            or normalized != relative
+            or any(part in {"", ".", ".."} for part in PurePosixPath(relative).parts)
+        ):
+            error(f"{location}.path", "must use one canonical POSIX repository-relative spelling")
         custody = row.get("custody")
-        if custody == "hydrated-local":
-            if not allow_hydrated:
+        if custody in {"hydrated-local", "hydrated-derived"}:
+            if custody == "hydrated-local" and not allow_hydrated:
                 error(f"{location}.custody", "hydrated-local is not allowed for this provenance layer")
+                return relative, digest
+            if custody == "hydrated-derived" and not allow_derived:
+                error(f"{location}.custody", "hydrated-derived is allowed only for a rendered recording")
                 return relative, digest
             relative_path = Path(relative)
             work_root = (root / ".work").resolve()
@@ -277,13 +740,16 @@ def validate_document(
                 or any(part in {"", ".", ".."} for part in relative_path.parts)
                 or not _inside(work_root, (root / relative_path).resolve())
             ):
-                error(f"{location}.path", "hydrated-local bytes must live below .work/")
+                error(f"{location}.path", f"{custody} bytes must live below .work/")
             if tracked is not None and normalized in tracked:
-                error(f"{location}.path", "hydrated-local bytes must remain untracked")
-            if not isinstance(row.get("source_url"), str) or not row["source_url"].strip():
-                error(f"{location}.source_url", "must identify the hydration source")
-            notice = row.get("license_notice")
-            source(notice, f"{location}.license_notice", required=True)
+                error(f"{location}.path", f"{custody} bytes must remain untracked")
+            if custody == "hydrated-local":
+                if not isinstance(row.get("source_url"), str) or not row["source_url"].strip():
+                    error(f"{location}.source_url", "must identify the hydration source")
+                notice = row.get("license_notice")
+                source(notice, f"{location}.license_notice", required=True)
+            else:
+                source(row.get("receipt"), f"{location}.receipt", required=True)
             candidate = root / relative
             if not candidate.exists():
                 if require_hydrated:
@@ -404,16 +870,48 @@ def validate_document(
             layer = layer_rows[layer_name]
             source(layer.get("source"), f"{location}.{layer_name}.source", required=False)
         recording = layer_rows["recording"]
-        source(
+        recording_source = source(
             recording.get("source"),
             f"{location}.recording.source",
             required=recording.get("status") in {"project-authored", "licensed"},
+            allow_derived=True,
         )
-        source(
+        recording_source_row = recording.get("source")
+        if isinstance(recording_source_row, dict) and recording_source_row.get("custody") == "hydrated-derived":
+            validate_derived_recording_custody(
+                work=work,
+                work_id=work_id,
+                recording=recording,
+                recording_source=recording_source,
+                recording_source_row=recording_source_row,
+                arrangement_source=arrangement_source,
+                layer_rows=layer_rows,
+                root=root,
+                require_hydrated=require_hydrated,
+                location=location,
+                error=error,
+                source=source,
+            )
+        derived_recording = (
+            isinstance(recording_source_row, dict)
+            and recording_source_row.get("custody") == "hydrated-derived"
+        )
+        render_contract_identity = source(
             recording.get("render_contract"),
             f"{location}.recording.render_contract",
-            required=recording.get("status") == "pending-render",
+            required=recording.get("status") == "pending-render" or derived_recording,
         )
+        if render_contract_identity is not None:
+            canonical_render_contract = "music/audio-render.schema.json"
+            expected_render_contract = (
+                canonical_render_contract,
+                sha256(root / canonical_render_contract),
+            )
+            if render_contract_identity != expected_render_contract:
+                error(
+                    f"{location}.recording.render_contract",
+                    "must equal the canonical deterministic audio-render contract",
+                )
 
         samples = layer_rows["samples"]
         items = samples.get("items")

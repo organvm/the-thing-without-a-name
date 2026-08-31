@@ -147,6 +147,52 @@ class ArtifactError(RuntimeError):
     """The public artifact would be incomplete or exceed its declared boundary."""
 
 
+def _load_release_contract():
+    """Load the trusted sibling contract without relying on ambient ``sys.path``."""
+    path = Path(__file__).resolve().with_name("release_contract.py")
+    identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"danse_release_contract_{identity}"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise ArtifactError("cannot load the shared release provenance contract")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        required = (
+            "ReleaseError",
+            "provenance_git_env",
+            "reject_git_rewrites",
+            "require_commit_object",
+            "source_commit",
+            "source_commit_blob",
+        )
+        if any(not hasattr(module, name) for name in required):
+            raise AttributeError("release contract is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise ArtifactError("cannot load the shared release provenance contract") from exc
+    return module
+
+
+_RELEASE_CONTRACT = _load_release_contract()
+ReleaseContractError = _RELEASE_CONTRACT.ReleaseError
+provenance_git_env = _RELEASE_CONTRACT.provenance_git_env
+reject_release_git_rewrites = _RELEASE_CONTRACT.reject_git_rewrites
+require_release_commit_object = _RELEASE_CONTRACT.require_commit_object
+release_source_commit = _RELEASE_CONTRACT.source_commit
+read_release_source_commit_blob = _RELEASE_CONTRACT.source_commit_blob
+
+
+def reject_git_rewrites(root: Path) -> None:
+    """Translate the shared release-provenance contract into Pages errors."""
+    try:
+        reject_release_git_rewrites(root)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -166,11 +212,18 @@ def safe_relative(value: object, label: str) -> str:
     return PurePosixPath(*parts).as_posix()
 
 
-def project_map(root: Path, *, admit_study: bool = False, allow_resolved: bool = False) -> dict:
-    path = source_file(root, PROJECT_MAP)
+def project_map(
+    root: Path,
+    *,
+    admit_study: bool = False,
+    allow_resolved: bool = False,
+    commit: str | None = None,
+) -> dict:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(
+            source_bytes(root, PROJECT_MAP, "project map", commit).decode("utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read project map: {exc}") from exc
     if (
         not isinstance(value, dict)
@@ -228,11 +281,41 @@ def source_file(root: Path, relative: str) -> Path:
     return candidate
 
 
-def corpus_files(root: Path) -> set[str]:
-    manifest_path = source_file(root, "corpus/manifest.json")
+def source_bytes(
+    root: Path,
+    relative: str,
+    label: str,
+    commit: str | None = None,
+) -> bytes:
+    """Read fixture bytes or authenticated raw-commit bytes for production."""
+    if commit is not None:
+        try:
+            payload, _executable = read_release_source_commit_blob(
+                root,
+                commit,
+                relative,
+                label,
+            )
+        except ReleaseContractError as exc:
+            raise ArtifactError(str(exc)) from exc
+        return payload
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        return source_file(root, relative).read_bytes()
+    except OSError as exc:
+        raise ArtifactError(f"cannot read {label}: {exc}") from exc
+
+
+def corpus_files(root: Path, commit: str | None = None) -> set[str]:
+    try:
+        manifest = json.loads(
+            source_bytes(
+                root,
+                "corpus/manifest.json",
+                "public corpus manifest",
+                commit,
+            ).decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read the public corpus manifest: {exc}") from exc
 
     if manifest.get("schema") != "danse.corpus.v1":
@@ -284,16 +367,22 @@ def corpus_files(root: Path) -> set[str]:
     return files
 
 
-def vendor_files(root: Path) -> set[str]:
+def vendor_files(root: Path, commit: str | None = None) -> set[str]:
     """Resolve and authenticate the locally served pose runtime.
 
     The browser may load only files named by this reviewed manifest. Digesting
     them here keeps a package update from silently expanding the public surface.
     """
-    manifest_path = source_file(root, VENDOR_MANIFEST)
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            source_bytes(
+                root,
+                VENDOR_MANIFEST,
+                "pose vendor manifest",
+                commit,
+            ).decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ArtifactError(f"cannot read the pose vendor manifest: {exc}") from exc
     if set(manifest) != {"schema", "package", "model", "patch", "files"}:
         raise ArtifactError("pose vendor manifest has an unknown shape")
@@ -343,15 +432,18 @@ def vendor_files(root: Path) -> set[str]:
         if leaf == "manifest.json" or Path(leaf).suffix not in {".js", ".mjs", ".wasm", ".task", ".txt"}:
             raise ArtifactError(f"unsupported pose vendor file: {leaf}")
         relative = f"{VENDOR_BASE}/{leaf}"
-        path = source_file(root, relative)
+        payload = source_bytes(root, relative, "pose vendor file", commit)
         if not isinstance(record["bytes"], int) or record["bytes"] < 0:
             raise ArtifactError(f"invalid pose vendor byte count for {leaf}")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record["sha256"])):
             raise ArtifactError(f"invalid pose vendor SHA-256 for {leaf}")
-        if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
+        if len(payload) != record["bytes"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
             raise ArtifactError(f"pose vendor digest mismatch: {leaf}")
-        if path.suffix in {".js", ".mjs"}:
-            text = path.read_text(encoding="utf-8", errors="strict")
+        if Path(leaf).suffix in {".js", ".mjs"}:
+            try:
+                text = payload.decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise ArtifactError(f"pose vendor runtime is not UTF-8: {leaf}") from exc
             forbidden = {
                 "Date.now": r"\bDate\.now\b",
                 "performance.now": r"\bperformance\.now\b",
@@ -380,13 +472,21 @@ def _load_release_builder():
     if spec is None or spec.loader is None:
         raise ArtifactError("cannot load the release artifact verifier")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+        if not hasattr(module, "verify_artifact") or not hasattr(module, "_RELEASE_CONTRACT"):
+            raise AttributeError("release artifact verifier is missing its required API")
+    except (ImportError, OSError, RuntimeError, SyntaxError, ValueError, AttributeError) as exc:
+        raise ArtifactError("cannot load the release artifact verifier") from exc
     return module
 
 
 def public_release_files(
     release_artifact: Path,
     expected_commit: str,
+    *,
+    source_root: Path = ROOT,
+    allow_worktree_manifest: bool = False,
 ) -> tuple[dict[str, tuple[Path, dict]], dict]:
     """Verify one public release artifact and select only declared public outputs."""
     release_artifact = release_artifact.absolute()
@@ -395,7 +495,12 @@ def public_release_files(
     release_artifact = release_artifact.resolve()
     builder = _load_release_builder()
     try:
-        receipt = builder.verify_artifact(release_artifact, expected_commit)
+        receipt = builder.verify_artifact(
+            release_artifact,
+            expected_commit,
+            source_root=source_root,
+            allow_worktree_manifest=allow_worktree_manifest,
+        )
     except Exception as exc:
         raise ArtifactError(f"public release artifact failed verification: {exc}") from exc
     if receipt.get("phase") != "public":
@@ -511,23 +616,33 @@ def public_release_files(
 
     if "project/index.html" not in selected:
         raise ArtifactError("public release artifact does not declare project/index.html")
-    release_receipt = release_artifact / builder.ARTIFACT_MANIFEST
     binding = {
         "schema": receipt["schema"],
         "phase": receipt["phase"],
         "release_id": receipt["release"]["id"],
         "version": receipt["release"]["version"],
-        "receipt_sha256": sha256(release_receipt),
+        "toolchain": dict(receipt["toolchain"]),
+        "payload_contract": receipt["release"]["payload_contract"],
+        "manifest_sha256": receipt["release"]["manifest"]["sha256"],
+        "project_sha256": receipt_files["project/index.html"]["sha256"],
+        "project_security": receipt["release"]["project_security"],
     }
     return selected, binding
 
 
-def validate_module_closure(root: Path, files: set[str]) -> None:
+def validate_module_closure(
+    root: Path,
+    files: set[str],
+    commit: str | None = None,
+) -> None:
     """Fail when a published module refers to a local module outside the boundary."""
     for relative in sorted(files):
         if relative != "index.html" and not relative.endswith((".js", ".mjs")):
             continue
-        text = source_file(root, relative).read_text(encoding="utf-8")
+        try:
+            text = source_bytes(root, relative, "published module", commit).decode("utf-8")
+        except UnicodeError as exc:
+            raise ArtifactError(f"published module is not UTF-8: {relative}") from exc
         for match in IMPORT_RE.finditer(text):
             reference = match.group("double") or match.group("single")
             reference = reference.split("?", 1)[0].split("#", 1)[0]
@@ -541,48 +656,53 @@ def validate_module_closure(root: Path, files: set[str]) -> None:
                 )
 
 
-def source_files(root: Path) -> tuple[str, ...]:
+def source_files(root: Path, commit: str | None = None) -> tuple[str, ...]:
     root = root.absolute()
     if root.is_symlink():
         raise ArtifactError(f"source root must not be a symlink: {root}")
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactError(f"source root is not a regular directory: {root}")
-    project_map(root)
-    files = set(RUNTIME_FILES) | corpus_files(root) | vendor_files(root)
-    for relative in files:
-        source_file(root, relative)
-    validate_module_closure(root, files)
+    project_map(root, commit=commit)
+    files = set(RUNTIME_FILES) | corpus_files(root, commit) | vendor_files(root, commit)
+    if commit is None:
+        for relative in files:
+            source_file(root, relative)
+    validate_module_closure(root, files, commit)
     return tuple(sorted(files))
 
 
 def source_commit(root: Path, explicit: str | None = None) -> str:
-    commit = explicit
-    if commit is None:
-        done = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if done.returncode != 0:
-            raise ArtifactError(f"cannot resolve source commit: {done.stderr.strip()}")
-        commit = done.stdout.strip()
-    commit = commit.lower()
-    if not COMMIT_RE.fullmatch(commit):
-        raise ArtifactError(f"source commit must be a full 40-character Git SHA: {commit!r}")
-    return commit
+    """Resolve a commit with the shared release-provenance implementation."""
+    try:
+        return release_source_commit(root, explicit)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
+
+
+def require_commit_object(root: Path, commit: str) -> str:
+    """Authenticate one commit with the shared release-provenance contract."""
+    try:
+        return require_release_commit_object(root, commit)
+    except ReleaseContractError as exc:
+        raise ArtifactError(str(exc)) from exc
 
 
 def validate_git_source(root: Path, expected_commit: str) -> None:
     """Bind a production CLI build to one clean, exact Git worktree."""
     root = root.absolute().resolve()
-    expected_commit = source_commit(root, expected_commit)
+    expected_commit = require_commit_object(root, expected_commit)
+    try:
+        reject_git_rewrites(root)
+    except Exception as exc:
+        raise ArtifactError(f"cannot authenticate raw Git objects: {exc}") from exc
+    git_env = provenance_git_env()
     identity = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2:
@@ -608,11 +728,50 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
         capture_output=True,
         text=True,
         check=False,
+        env=git_env,
     )
     if status.returncode != 0:
         raise ArtifactError(f"cannot inspect source checkout: {status.stderr.strip()}")
     if status.stdout:
         raise ArtifactError("source checkout has tracked changes")
+
+
+def source_commit_payloads(
+    root: Path,
+    commit: str,
+    files: tuple[str, ...],
+) -> tuple[dict[str, dict], dict[str, bytes]]:
+    """Return exact records and bytes from one authenticated commit tree."""
+    commit = require_commit_object(root, commit)
+    records: dict[str, dict] = {}
+    payloads: dict[str, bytes] = {}
+    for relative in files:
+        try:
+            committed, _executable = read_release_source_commit_blob(
+                root,
+                commit,
+                relative,
+                "allowlisted source",
+            )
+        except ReleaseContractError as exc:
+            raise ArtifactError(str(exc)) from exc
+        payloads[relative] = committed
+        records[relative] = {
+            "path": relative,
+            "bytes": len(committed),
+            "sha256": hashlib.sha256(committed).hexdigest(),
+        }
+    return records, payloads
+
+
+def source_commit_records(
+    root: Path,
+    commit: str,
+    files: tuple[str, ...],
+) -> dict[str, dict]:
+    """Return exact source records without exposing payload bytes to verifiers."""
+    records, _payloads = source_commit_payloads(root, commit, files)
+    return records
 
 
 def artifact_inventory(root: Path) -> set[str]:
@@ -634,7 +793,14 @@ def artifact_inventory(root: Path) -> set[str]:
     return files
 
 
-def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
+def verify_artifact(
+    output: Path,
+    expected_commit: str | None = None,
+    *,
+    require_source_manifest: bool = False,
+    source_root: Path = ROOT,
+    allow_unbound_release_fixture: bool = False,
+) -> dict:
     output = output.absolute()
     if output.is_symlink():
         raise ArtifactError(f"artifact root must not be a symlink: {output}")
@@ -665,7 +831,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             "phase",
             "release_id",
             "version",
-            "receipt_sha256",
+            "toolchain",
+            "payload_contract",
+            "manifest_sha256",
+            "project_sha256",
+            "project_security",
         }:
             raise ArtifactError("artifact release binding has an unknown shape")
         if (
@@ -675,14 +845,28 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
             or not release["release_id"]
             or not isinstance(release["version"], str)
             or not release["version"]
-            or not re.fullmatch(r"[0-9a-f]{64}", str(release["receipt_sha256"]))
+            or not isinstance(release["toolchain"], dict)
+            or set(release["toolchain"]) != {"python", "pypdf", "reportlab"}
+            or not all(
+                isinstance(value, str) and value
+                for value in release["toolchain"].values()
+            )
+            or release["payload_contract"] != "danse.release-payload.v1"
+            or not re.fullmatch(r"[0-9a-f]{64}", str(release["manifest_sha256"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(release["project_sha256"]))
         ):
             raise ArtifactError("artifact release binding is invalid")
+        if not require_source_manifest and not allow_unbound_release_fixture:
+            raise ArtifactError(
+                "release-bearing artifact verification requires source-manifest "
+                "authentication"
+            )
 
     records = manifest.get("files")
     if not isinstance(records, list):
         raise ArtifactError("artifact manifest files must be a list")
     paths: list[str] = []
+    delivered_records: dict[str, dict] = {}
     for record in records:
         if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
             raise ArtifactError("artifact manifest contains a malformed file record")
@@ -699,6 +883,11 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         if path.stat().st_size != record["bytes"] or sha256(path) != record["sha256"]:
             raise ArtifactError(f"artifact digest mismatch: {relative}")
         paths.append(relative)
+        delivered_records[relative] = {
+            "path": relative,
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+        }
 
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ArtifactError("artifact manifest paths must be unique and sorted")
@@ -708,11 +897,125 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         extra = sorted(inventory - expected)
         missing = sorted(expected - inventory)
         raise ArtifactError(f"artifact inventory mismatch; extra={extra}, missing={missing}")
+
+    source_manifest = None
+    builder = None
+    if require_source_manifest:
+        source_root = source_root.absolute().resolve()
+        validate_git_source(source_root, source["commit"])
+        expected_records = source_commit_records(
+            source_root,
+            source["commit"],
+            source_files(source_root, source["commit"]),
+        )
+        expected_map = (
+            json.dumps(
+                project_map(
+                    source_root,
+                    admit_study=release is not None,
+                    commit=source["commit"],
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        expected_records[PROJECT_MAP] = {
+            "path": PROJECT_MAP,
+            "bytes": len(expected_map),
+            "sha256": hashlib.sha256(expected_map).hexdigest(),
+        }
+        builder = _load_release_builder()
+        try:
+            source_manifest, manifest_sha256 = builder.source_release_manifest(
+                source_root,
+                source["commit"],
+                allow_worktree_fallback=False,
+            )
+            validated_source_manifest = builder.validate_source_commit_release(
+                source_root,
+                source["commit"],
+                source_manifest,
+                "draft",
+            )
+            if validated_source_manifest != source_manifest:
+                raise ArtifactError(
+                    "artifact source manifest drifted during committed validation"
+                )
+            blockers = builder.release_phase_blockers(
+                validated_source_manifest,
+                "public",
+            )
+            if not blockers and release is None:
+                raise ArtifactError(
+                    "artifact source manifest admits public phase but its required "
+                    "release binding and files are absent"
+                )
+            if blockers and release is not None:
+                preview = "; ".join(blockers[:8])
+                raise ArtifactError(
+                    "artifact source manifest blocks public phase: " + preview
+                )
+            if release is not None:
+                if release["toolchain"] != builder.active_toolchain():
+                    raise ArtifactError(
+                        "artifact release requires its exact receipted generation "
+                        "toolchain"
+                    )
+                if manifest_sha256 != release["manifest_sha256"]:
+                    raise ArtifactError(
+                        "artifact release manifest drifted from the source commit"
+                    )
+                if (
+                    release["release_id"] != source_manifest["release_id"]
+                    or release["version"] != source_manifest["version"]
+                    or release["payload_contract"]
+                    != source_manifest["artifact_contracts"]["release_payload"]
+                ):
+                    raise ArtifactError(
+                        "artifact release identity drifted from the source manifest"
+                    )
+                if builder.project_security_contract(
+                    source_manifest,
+                    "public",
+                ) != release["project_security"]:
+                    raise ArtifactError(
+                        "artifact project security drifted from the source manifest"
+                    )
+                release_records = builder.selected_release_records(
+                    source_manifest,
+                    "public",
+                    source["commit"],
+                )
+                collisions = set(expected_records) & set(release_records)
+                if collisions:
+                    raise ArtifactError(
+                        f"source and release records collide: {sorted(collisions)}"
+                    )
+                expected_records.update(release_records)
+        except ArtifactError:
+            raise
+        except Exception as exc:
+            raise ArtifactError(
+                f"artifact source-manifest binding failed verification: {exc}"
+            ) from exc
+        if delivered_records != expected_records:
+            extra = sorted(set(delivered_records) - set(expected_records))
+            missing = sorted(set(expected_records) - set(delivered_records))
+            changed = sorted(
+                path
+                for path in set(delivered_records) & set(expected_records)
+                if delivered_records[path] != expected_records[path]
+            )
+            raise ArtifactError(
+                "artifact files exceed or drift from the source-bound public set; "
+                f"extra={extra}, missing={missing}, changed={changed}"
+            )
     has_project = "project/index.html" in paths
     if has_project != (release is not None):
         raise ArtifactError("artifact project route disagrees with its public release binding")
     if has_project:
-        builder = _load_release_builder()
+        builder = builder or _load_release_builder()
         try:
             builder.verify_project_links(
                 output,
@@ -728,6 +1031,42 @@ def verify_artifact(output: Path, expected_commit: str | None = None) -> dict:
         raise ArtifactError("project map admits study routes partially")
     if bool(admitted) != has_project:
         raise ArtifactError("project map admission disagrees with the delivered project route")
+    if has_project:
+        try:
+            project = (output / "project/index.html").read_text(encoding="utf-8")
+            builder.verify_project_security(
+                project,
+                release["project_security"],
+                delivered_records,
+            )
+        except Exception as exc:
+            raise ArtifactError(f"artifact project security failed verification: {exc}") from exc
+        if delivered_records["project/index.html"]["sha256"] != release["project_sha256"]:
+            raise ArtifactError(
+                "artifact project bytes drifted from the verified release receipt"
+            )
+        if require_source_manifest:
+            try:
+                if source_manifest is None:
+                    raise ArtifactError("artifact source manifest was not authenticated")
+                expected_project = builder.project_html(
+                    source_manifest,
+                    "public",
+                    source["commit"],
+                    contract=release["project_security"]["project_contract"],
+                )
+                if hashlib.sha256(expected_project).hexdigest() != release[
+                    "project_sha256"
+                ]:
+                    raise ArtifactError(
+                        "artifact project bytes drifted from the source manifest"
+                    )
+            except ArtifactError:
+                raise
+            except Exception as exc:
+                raise ArtifactError(
+                    f"artifact source-manifest binding failed verification: {exc}"
+                ) from exc
     return manifest
 
 
@@ -737,6 +1076,7 @@ def build(
     commit: str,
     release_artifact: Path | None = None,
     *,
+    release_source_root: Path | None = None,
     require_git_source: bool = False,
 ) -> dict:
     root = root.absolute()
@@ -756,33 +1096,68 @@ def build(
     commit = source_commit(root, commit)
     if require_git_source:
         validate_git_source(root, commit)
-    files = source_files(root)
+    files = source_files(root, commit if require_git_source else None)
+    committed_records = None
+    committed_payloads = None
+    if require_git_source:
+        committed_records, committed_payloads = source_commit_payloads(
+            root,
+            commit,
+            files,
+        )
     release_files: dict[str, tuple[Path, dict]] = {}
     release_binding = None
     if release_artifact is not None:
-        release_files, release_binding = public_release_files(release_artifact, commit)
+        release_files, release_binding = public_release_files(
+            release_artifact,
+            commit,
+            source_root=release_source_root or root,
+            allow_worktree_manifest=not require_git_source,
+        )
     collisions = set(files) & set(release_files)
     if collisions:
         raise ArtifactError(f"public release outputs collide with the artwork: {sorted(collisions)}")
     output.mkdir(parents=True, exist_ok=True)
     records = []
     for relative in files:
-        source = source_file(root, relative)
         target = output / PurePosixPath(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         if relative == PROJECT_MAP:
-            target.write_text(
-                json.dumps(project_map(root, admit_study="project/index.html" in release_files), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-                newline="\n",
+            target.write_bytes(
+                (
+                    json.dumps(
+                        project_map(
+                            root,
+                            admit_study="project/index.html" in release_files,
+                            commit=commit if require_git_source else None,
+                        ),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
             )
+        elif committed_payloads is not None:
+            target.write_bytes(committed_payloads[relative])
         else:
+            source = source_file(root, relative)
             shutil.copyfile(source, target, follow_symlinks=False)
         target.chmod(0o644)
         os.utime(target, (0, 0), follow_symlinks=False)
-        records.append(
-            {"path": relative, "bytes": target.stat().st_size, "sha256": sha256(target)}
+        record = (
+            dict(committed_records[relative])
+            if committed_records is not None and relative != PROJECT_MAP
+            else {
+                "path": relative,
+                "bytes": target.stat().st_size,
+                "sha256": sha256(target),
+            }
         )
+        if target.stat().st_size != record["bytes"] or sha256(target) != record["sha256"]:
+            raise ArtifactError(
+                f"allowlisted source changed while copying: {relative}"
+            )
+        records.append(record)
     for relative in sorted(release_files):
         source, expected = release_files[relative]
         target = output / PurePosixPath(relative)
@@ -809,7 +1184,15 @@ def build(
     )
     manifest_path.chmod(0o644)
     os.utime(manifest_path, (0, 0), follow_symlinks=False)
-    return verify_artifact(output, commit)
+    return verify_artifact(
+        output,
+        commit,
+        require_source_manifest=require_git_source,
+        source_root=root,
+        allow_unbound_release_fixture=(
+            release_binding is not None and not require_git_source
+        ),
+    )
 
 
 def main() -> int:
@@ -837,7 +1220,12 @@ def main() -> int:
                 require_git_source=True,
             )
         else:
-            manifest = verify_artifact(args.verify, args.source_commit)
+            manifest = verify_artifact(
+                args.verify,
+                args.source_commit,
+                require_source_manifest=True,
+                source_root=args.root,
+            )
     except ArtifactError as exc:
         parser.exit(1, f"pages artifact: {exc}\n")
     print(

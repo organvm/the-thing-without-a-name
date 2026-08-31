@@ -2,11 +2,11 @@
   "schema": "danse.choreography.v1",
   "identity": {
     "id": "delibes-screendance-suite-competition-film",
-    "score_contract_sha256": "682b5fc683c04818acfb286981087a01714ef243dfeb0cdf28d081000bebdc27",
-    "score_file_sha256": "a5bff93175b5e80c81ff46c6317676044b4ed2a07b999823fa616cd0eb542ae1",
+    "score_contract_sha256": "8edaac9222b7d9b9de7d8057070c15f0828c2c6fe11ee45f6f834686b60a4d1e",
+    "score_file_sha256": "8b3843cda7a7d9af1da6aad56488f82e9a881c58b4d6779221b5718e03746ca7",
     "corpus_manifest_sha256": "970b0aa062a0d8a4d96f64688034ccd745b1dde5cfdaf4002de173509accb371",
     "corpus_score_sha256": "6527591842af960dee9937e95cfbba1edc4ed383869ca5d643b6e587c642e9a5",
-  "contract_sha256": "ed63928bf2ece16a5a49a26ec4aec94c23291c831f1ea4e40c94b3dc85494ac9"
+  "contract_sha256": "e845582c9123f5bd7c8abb4bbfade7bec02493f29ead1a28ecf1737450bbad10"
   },
   "legibility": {
     "minimum_pose_dwell_bars": 2,
