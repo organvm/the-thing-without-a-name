@@ -296,6 +296,7 @@ def segment_identity(args, segment: int, frames: int) -> dict:
             "width": args.width,
             "height": args.height,
             "fps": args.fps,
+            "render_backend": "swiftshader" if args.portable_software_render else "apple-metal",
             "segment_frames": args.segment_frames,
             "source_tree_sha256": source_tree_sha256(args),
         },
@@ -662,7 +663,12 @@ def render_segment(args, segment: int, dest: Path) -> dict:
         # The window's format unless overridden; the page is asked for exactly
         # this size so the drawing buffer IS the delivery format.
         page_url = film_url(base, args)
-        with browser(headless=not args.headed, width=320, height=240) as page:
+        with browser(
+            headless=not args.headed,
+            width=320,
+            height=240,
+            allow_software=args.portable_software_render,
+        ) as page:
             page.goto(page_url, wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
             renderer = str(page.gl_renderer)
@@ -974,6 +980,11 @@ def main() -> int:
     ap.add_argument("--height", type=int, help="override the window's height")
     ap.add_argument("--fps", type=float, help="override the window's frame rate")
     ap.add_argument(
+        "--portable-software-render",
+        action="store_true",
+        help="deadline screener only: require Chromium SwiftShader instead of the production Apple-Metal path",
+    )
+    ap.add_argument(
         "--score",
         help="opt into a compiled score contract (for example music/score.json); omitted keeps the current artwork",
     )
@@ -1055,7 +1066,12 @@ def main() -> int:
     total = None
     if segments is None:
         # Ask the page for the window length rather than assuming it here.
-        with serve() as base, browser(headless=True, width=320, height=240) as page:
+        with serve() as base, browser(
+            headless=True,
+            width=320,
+            height=240,
+            allow_software=args.portable_software_render,
+        ) as page:
             page.goto(film_url(base, args), wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
             w = page.evaluate("() => ({ ...window.danseFilm.window, passage: window.danseFilm.passage })")
