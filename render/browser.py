@@ -43,6 +43,9 @@ APP = Path(__file__).resolve().parent.parent
 # the frame is being drawn on the CPU.
 WANTED = ("metal", "apple")
 
+CANONICAL_RENDER_CONTEXT = "canonical"
+EMERGENCY_SOFTWARE_CAPTURE_CONTEXT = "emergency-software-capture"
+
 READ_RENDERER = """
 () => {
   const c = document.createElement("canvas");
@@ -76,7 +79,7 @@ GPU_ARGS = [
 # project Mac is unavailable.  This is deliberately opt-in: production and
 # exhibition captures still require the measured Metal path above.  Chromium's
 # supported SwiftShader WebGL backend keeps the render deterministic and lets a
-# portal-valid 1080p screener be recovered entirely from committed source.
+# portal-valid 720p screener be recovered entirely from committed source.
 SOFTWARE_GPU_ARGS = [
     "--use-gl=angle",
     "--use-angle=swiftshader",
@@ -150,15 +153,28 @@ def browser(
     width: int = 1024,
     height: int = 768,
     *,
-    allow_software: bool = False,
-    executable: str | None = None,
+    render_context: str = CANONICAL_RENDER_CONTEXT,
 ):
-    """Open an asserted renderer; software mode requires an explicit call-site opt-in."""
+    """A page under one explicit renderer contract, asserted before drawing.
+
+    Canonical callers always use system Chrome and Apple Metal. The emergency
+    SwiftShader path is reachable only through an explicit capture context; an
+    ambient ``DANSE_ALLOW_SOFTWARE_RENDER`` cannot weaken verification or a
+    production render. The executable override is likewise emergency-only.
+    """
     from playwright.sync_api import sync_playwright
 
-    gpu_args = SOFTWARE_GPU_ARGS if allow_software else GPU_ARGS
-    executable = executable or os.environ.get("DANSE_CHROME_EXECUTABLE")
-    launch_target = {"executable_path": executable} if executable else {"channel": "chrome"}
+    if render_context == CANONICAL_RENDER_CONTEXT:
+        allow_software = False
+        gpu_args = GPU_ARGS
+        launch_target = {"channel": "chrome"}
+    elif render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
+        allow_software = True
+        gpu_args = SOFTWARE_GPU_ARGS
+        executable = os.environ.get("DANSE_CHROME_EXECUTABLE")
+        launch_target = {"executable_path": executable} if executable else {"channel": "chrome"}
+    else:
+        raise ValueError(f"unknown browser render context: {render_context!r}")
     with sync_playwright() as p:
         launched = p.chromium.launch(headless=headless, args=gpu_args, **launch_target)
         try:

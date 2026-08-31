@@ -48,7 +48,12 @@ APP = HERE.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(APP / "pipeline"))
 sys.path.insert(0, str(APP / "sound"))
-from browser import browser, serve  # noqa: E402
+from browser import (  # noqa: E402
+    CANONICAL_RENDER_CONTEXT,
+    EMERGENCY_SOFTWARE_CAPTURE_CONTEXT,
+    browser,
+    serve,
+)
 from choreography import validate as validate_choreography  # noqa: E402
 from corpus_contract import authorize_render_tier  # noqa: E402
 from media_identity import (  # noqa: E402
@@ -281,6 +286,13 @@ def film_url(base: str, args) -> str:
     return f"{base}/film.html?{urlencode(params)}"
 
 
+def browser_render_context(args) -> str:
+    """Select software rendering only for an explicit emergency capture."""
+    if getattr(args, "emergency_software_render", False):
+        return EMERGENCY_SOFTWARE_CAPTURE_CONTEXT
+    return CANONICAL_RENDER_CONTEXT
+
+
 def segment_identity(args, segment: int, frames: int) -> dict:
     payload = {
         "schema": "danse.render.segment.v1",
@@ -296,7 +308,6 @@ def segment_identity(args, segment: int, frames: int) -> dict:
             "width": args.width,
             "height": args.height,
             "fps": args.fps,
-            "render_backend": "swiftshader" if args.portable_software_render else "apple-metal",
             "segment_frames": args.segment_frames,
             "source_tree_sha256": source_tree_sha256(args),
         },
@@ -314,6 +325,10 @@ def segment_identity(args, segment: int, frames: int) -> dict:
             "mode": "fixed-passage",
             "seconds": timing_score["duration_seconds"],
         }
+    render_context = browser_render_context(args)
+    if render_context != CANONICAL_RENDER_CONTEXT:
+        # A deadline SwiftShader segment must never satisfy canonical --resume.
+        payload["inputs"]["browser_render_context"] = render_context
     return payload
 
 
@@ -667,7 +682,7 @@ def render_segment(args, segment: int, dest: Path) -> dict:
             headless=not args.headed,
             width=320,
             height=240,
-            allow_software=args.portable_software_render,
+            render_context=browser_render_context(args),
         ) as page:
             page.goto(page_url, wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
@@ -980,11 +995,6 @@ def main() -> int:
     ap.add_argument("--height", type=int, help="override the window's height")
     ap.add_argument("--fps", type=float, help="override the window's frame rate")
     ap.add_argument(
-        "--portable-software-render",
-        action="store_true",
-        help="deadline screener only: require Chromium SwiftShader instead of the production Apple-Metal path",
-    )
-    ap.add_argument(
         "--score",
         help="opt into a compiled score contract (for example music/score.json); omitted keeps the current artwork",
     )
@@ -1000,6 +1010,11 @@ def main() -> int:
     ap.add_argument("--segment-frames", type=int, default=600)
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument(
+        "--emergency-software-render",
+        action="store_true",
+        help="deadline screener capture only: explicitly use Chromium SwiftShader instead of canonical Apple Metal",
+    )
     ap.add_argument("--quiet", dest="progress", action="store_false")
     ap.add_argument("--concat", action="store_true", help="stitch existing segments and exit")
     ap.add_argument("--check-concat", action="store_true", help="validate the planned segments and concatenated receipt")
@@ -1070,7 +1085,7 @@ def main() -> int:
             headless=True,
             width=320,
             height=240,
-            allow_software=args.portable_software_render,
+            render_context=browser_render_context(args),
         ) as page:
             page.goto(film_url(base, args), wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
