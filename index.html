@@ -211,7 +211,7 @@
     <p class="fallback-eyebrow">Static view · live motion unavailable</p>
     <h1 id="fallback-title">Danse Macabre</h1>
     <p class="fallback-deck">One dancer session, opened into a photographic room that never repeats.</p>
-    <p id="renderer-fallback-reason" role="status" aria-live="polite" aria-atomic="true">Live motion is unavailable in this browser. The project record, music, and accessible settings remain available.</p>
+    <p id="renderer-fallback-reason" role="status" aria-live="polite" aria-atomic="true">Live motion is unavailable in this browser. The project record and accessible settings remain available.</p>
     <div class="fallback-actions">
       <button class="danse-action" id="fallback-project" type="button" aria-haspopup="dialog" aria-controls="project-map">About the work</button>
       <button class="danse-action" id="fallback-controls" type="button">Settings &amp; accessibility</button>
@@ -574,18 +574,26 @@ try {
   canvas.hidden = true;
   document.body.dataset.renderer = "unavailable";
   el("renderer-fallback").hidden = false;
-  const rendererFallbackMessage = `Live motion could not start because ${rendererUnavailableReason}. The project record, music, and accessible settings remain available.`;
+  const fallbackAvailableCopy = scoreAudio
+    ? "The project record, music, and accessible settings remain available."
+    : "The project record and accessible settings remain available.";
+  const rendererFallbackMessage = `Live motion could not start because ${rendererUnavailableReason}. ${fallbackAvailableCopy}`;
   el("renderer-fallback-reason").textContent = rendererFallbackMessage;
   el("stage-description").textContent = rendererFallbackMessage;
   console.warn(`Danse visual renderer unavailable: ${rendererUnavailableReason}; controls remain available`, error);
 }
 veil.classList.add("gone");
 veil.setAttribute("aria-hidden", "true");
+const introRunningCopy = "A room that never repeats, composed from one dancer session in 2017. It changes on its own: watch, pause, or enter a different river.";
+function syncIntroMotionPreference(matches) {
+  const heldForPreference = Boolean(baseRenderer && matches);
+  el("intro-behavior").textContent = heldForPreference
+    ? "Motion is held for your reduced-motion preference. Resume it explicitly, or explore the work while it stays still."
+    : introRunningCopy;
+  el("intro-motion").hidden = !heldForPreference;
+}
 if (baseRenderer) {
-  if (reducedMotion.matches) {
-    el("intro-behavior").textContent = "Motion is held for your reduced-motion preference. Resume it explicitly, or explore the work while it stays still.";
-    el("intro-motion").hidden = false;
-  }
+  syncIntroMotionPreference(reducedMotion.matches);
   experienceIntro.hidden = false;
 }
 if (reducedMotion.matches) veil.hidden = true;
@@ -644,6 +652,7 @@ function reducedMotionChanged({ matches }) {
   if (matches && playback === "running") heldAt = Arrival.now(river);
   else if (!matches && playback === "held-reduced") heldAt = null;
   controlBus.actions.setReducedMotion(matches);
+  syncIntroMotionPreference(matches);
   renderInteraction(interaction.snapshot());
   flash(playback === "held-user" ? "manual hold preserved" : matches ? "reduced motion · frame held" : "motion resumed");
 }
@@ -1325,7 +1334,9 @@ if (!baseRenderer) {
   el("conductor-controls").hidden = true;
   el("interaction-controls").hidden = true;
   el("keyboard-instructions").hidden = true;
-  el("touch-instructions").textContent = "Live motion is unavailable here. Music, project information, and river links remain available.";
+  el("touch-instructions").textContent = scoreAudio
+    ? "Live motion is unavailable here. Music, project information, and river links remain available."
+    : "Live motion and music are unavailable here. Project information and river links remain available.";
 }
 if (projectSectionAtArrival) {
   commitRiverUrl(currentRiverUrl, { keepProjectOpen: true });

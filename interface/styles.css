@@ -14,8 +14,8 @@
 }
 #danse-dock button { position:relative; letter-spacing:.04em; }
 #danse-dock[data-mode="fallback"] { grid-template-columns:repeat(2,minmax(0,1fr)); }
-#danse-dock button:hover,.danse-action:hover,#danse-dock button[aria-pressed="true"],.danse-action[aria-pressed="true"] { background:#292930; color:#fff; border-color:var(--danse-line); }
-#danse-dock button[aria-pressed="true"]::after { content:""; position:absolute; left:14px; right:14px; bottom:4px; height:2px; background:var(--danse-accent); }
+#danse-dock button:hover,.danse-action:hover,#danse-dock button[aria-pressed="true"],#danse-dock button.is-selected,.danse-action[aria-pressed="true"] { background:#292930; color:#fff; border-color:var(--danse-line); }
+#danse-dock button[aria-pressed="true"]::after,#danse-dock button.is-selected::after { content:""; position:absolute; left:14px; right:14px; bottom:4px; height:2px; background:var(--danse-accent); }
 #danse-dock button:focus-visible,.danse-action:focus-visible,#project-map button:focus-visible,#project-map a:focus-visible { outline:2px solid var(--danse-ink); outline-offset:2px; }
 
 #surface-tray {

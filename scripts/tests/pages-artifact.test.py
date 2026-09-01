@@ -1914,9 +1914,12 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('el("interaction-controls").hidden = true;', self.script)
         self.assertIn('["hold", "movement", "toggleProgram", "toggleCutout"].includes(command.name)', self.script)
         self.assertIn("hudToggle.hidden = !experienceIntro.hidden;", self.script)
-        self.assertIn('el("intro-motion").hidden = false;', self.script)
+        self.assertIn('el("intro-motion").hidden = !heldForPreference;', self.script)
         self.assertIn("Motion is held for your reduced-motion preference.", self.script)
         self.assertIn('await controlBus.actions.hold();', self.script)
+        self.assertIn("function syncIntroMotionPreference(matches)", self.script)
+        self.assertGreaterEqual(self.script.count("syncIntroMotionPreference("), 3)
+        self.assertIn("const fallbackAvailableCopy = scoreAudio", self.script)
 
     def test_progressive_controls_disclose_state_and_have_explicit_close_paths(self) -> None:
         expandable = {
@@ -1933,6 +1936,7 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('const expanded = state.surface === `tray:${category}`', renderer)
         self.assertIn('button.setAttribute("aria-expanded", String(expanded))', renderer)
         self.assertIn('button.hasAttribute("aria-pressed")', renderer)
+        self.assertIn("#danse-dock button.is-selected", self.styles)
         self.assertIn('tray.querySelectorAll("[data-tray-close]")', self.script)
         self.assertIn("Settings &amp; accessibility", self.html)
         self.assertIn('id="river-share">Share river</button>', self.html)
@@ -2571,7 +2575,7 @@ console.log(JSON.stringify(cases));
         self.assertIn('touch_targets("#project-map", "Project")', browser)
         self.assertIn('touch_targets("#hud", "no-WebGL Details")', browser)
         fallback = browser.split("fallback_movement_variants =", 1)[1].split(
-            'page.click("#fallback-start")', 1
+            'page.press("#sheet-close", "Escape")', 1
         )[0]
         self.assertIn("danse.program.movements.findIndex", fallback)
         self.assertIn("movement[\"control\"] == movement[\"expected\"]", fallback)
@@ -2580,6 +2584,8 @@ console.log(JSON.stringify(cases));
         self.assertGreaterEqual(fallback.count("0x87654321"), 2)
         self.assertNotIn("danse.controlState.movement === 2", fallback)
         self.assertNotIn("danse.controlState.movement === 3", fallback)
+        self.assertIn('page.locator("#interaction-controls").is_hidden()', fallback)
+        self.assertNotIn('page.click("#fallback-start")', fallback)
 
     def test_controls_replay_exercises_the_shipped_score_audio_lifecycle(self) -> None:
         browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
