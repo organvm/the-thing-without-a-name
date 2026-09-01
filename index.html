@@ -346,9 +346,39 @@ import { renderControlSurface } from "./interface/render.js";
 //
 // There is no `t` variable in this file. Every navigation — hold, jump, cite —
 // is a freeze or an epoch shift, so the page has no clock of its own to drift.
-let river = Arrival.arrive(location.hash);
+const projectSectionAtArrival = projectSectionFor(location.hash);
+function projectRiverUrlAtArrival() {
+  if (!projectSectionAtArrival) return null;
+  const state = history.state;
+  const raw = state && typeof state === "object" ? state.danseRiverUrl : null;
+  if (typeof raw !== "string") return null;
+  let candidate;
+  try {
+    candidate = new URL(raw);
+  } catch {
+    return null;
+  }
+  const visible = new URL(location.href);
+  if (candidate.username || candidate.password || candidate.search !== visible.search) return null;
+  if (candidate.origin !== visible.origin || candidate.pathname !== visible.pathname) return null;
+  if (!candidate.hash || projectSectionFor(candidate.hash)) return null;
+  if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
+  const values = new URLSearchParams(candidate.hash.slice(1));
+  const citedTime = Number(values.get("t"));
+  return values.has("t")
+    && Number.isFinite(citedTime)
+    && citedTime >= 0
+    && !Arrival.hasCitedSeed(candidate.hash)
+    && Arrival.recall()
+    ? candidate.href
+    : null;
+}
+const projectRiverUrl = projectRiverUrlAtArrival();
+const projectRiverFragment = projectRiverUrl ? new URL(projectRiverUrl).hash : null;
+const initialRiverFragment = projectRiverFragment ?? location.hash;
+let river = Arrival.arrive(initialRiverFragment);
 let shifted = river.shifted;
-let program = Arrival.modeOf(location.hash) === "free" ? null : await Program.load();
+let program = Arrival.modeOf(initialRiverFragment) === "free" ? null : await Program.load();
 const query = new URLSearchParams(location.search);
 const scoreUrl = query.get("score") ?? "music/score.json";
 const choreographyUrl = query.get("choreography") ?? "render/choreography.json";
@@ -362,18 +392,23 @@ const musicalScore = scoreUrl
 let navigationGeneration = 0;
 let programGeneration = 0;
 let previousRiverUrl = null;
-let projectReturnRiverUrl = null;
-let currentRiverUrl = projectSectionFor(location.hash)
-  ? Arrival.href(river, { mode: program ? null : "free" })
-  : location.href;
+const initialCommittedUrl = new URL(projectRiverUrl ?? location.href);
+if (projectSectionAtArrival) {
+  initialCommittedUrl.hash = projectRiverFragment
+    ?? new URL(Arrival.href(river, { mode: program ? null : "free" })).hash;
+}
+let currentRiverUrl = initialCommittedUrl.href;
+let projectReturnRiverUrl = projectSectionAtArrival ? currentRiverUrl : null;
 
 function commitRiverUrl(url, { keepProjectOpen = false } = {}) {
   currentRiverUrl = String(url);
-  if (keepProjectOpen && projectMap.open && projectSectionFor(location.hash)) {
+  if (keepProjectOpen && projectSectionFor(location.hash)) {
+    currentRiverUrl = durableCurrentRiverUrl();
     projectReturnRiverUrl = currentRiverUrl;
     const visibleProjectUrl = new URL(location.href);
     visibleProjectUrl.search = new URL(currentRiverUrl).search;
-    history.replaceState(null, "", visibleProjectUrl);
+    const state = history.state && typeof history.state === "object" ? history.state : {};
+    history.replaceState({ ...state, danseRiverUrl: currentRiverUrl }, "", visibleProjectUrl);
     return currentRiverUrl;
   }
   history.replaceState(null, "", currentRiverUrl);
@@ -381,7 +416,36 @@ function commitRiverUrl(url, { keepProjectOpen = false } = {}) {
 }
 
 function riverControlUrl() {
-  return new URL(projectMap.open && projectSectionFor(location.hash) ? currentRiverUrl : location.href);
+  return new URL(currentRiverUrl);
+}
+
+function withCurrentQuery(url) {
+  const destination = new URL(url);
+  destination.search = new URL(currentRiverUrl).search;
+  return destination;
+}
+
+function riverHref(value, options = {}) {
+  const destination = withCurrentQuery(Arrival.href(value, options));
+  return destination.href;
+}
+
+function durableCurrentRiverUrl() {
+  const candidate = new URL(currentRiverUrl);
+  if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
+  const values = new URLSearchParams(candidate.hash.slice(1));
+  const citedTime = Number(values.get("t"));
+  const durableRememberedRiver = currentRememberedRiver
+    ? Arrival.rememberedRiverForUndo(currentRememberedRiver, "", Arrival.recall())
+    : null;
+  if (
+    values.has("t")
+    && Number.isFinite(citedTime)
+    && citedTime >= 0
+    && !Arrival.hasCitedSeed(candidate.hash)
+    && durableRememberedRiver
+  ) return candidate.href;
+  return riverHref(river, { mode: program ? null : "free" });
 }
 
 const canvas = document.getElementById("stage");
@@ -396,7 +460,7 @@ let previousRiver = null;
 let previousRememberedRiver = null;
 let currentRememberedRiver = Arrival.rememberedRiverForUndo(
   river,
-  location.hash,
+  initialRiverFragment,
   Arrival.recall(),
 );
 let controlBus = null;
@@ -570,7 +634,7 @@ requestAnimationFrame(frame);
 // all: a position reached for debugging must not overwrite the river you keep.
 setInterval(() => {
   if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;
-  commitRiverUrl(Arrival.href(river, { mode: program ? null : "free" }));
+  commitRiverUrl(riverHref(river, { mode: program ? null : "free" }));
 }, 1000);
 
 // Someone pasted a river into the address bar of a page that is already open.
@@ -583,6 +647,7 @@ addEventListener("hashchange", async (event) => {
   if (projectSection) {
     const oldFragment = new URL(event.oldURL).hash;
     if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = currentRiverUrl;
+    commitRiverUrl(projectReturnRiverUrl ?? currentRiverUrl, { keepProjectOpen: true });
     navigationGeneration += 1;
     programGeneration += 1;
     previousRiver = null;
@@ -855,15 +920,15 @@ function newRiver() {
     : projectFragment && carriedProjectUrl
       && Arrival.hasSelfContainedRiver(new URL(carriedProjectUrl).hash)
       ? carriedProjectUrl
-      : shifted && (freshRememberedRiver || Arrival.hasCitedSeed(location.hash))
-        ? location.href
-        : Arrival.href(river, { mode: program ? null : "free" });
+      : shifted && (freshRememberedRiver || Arrival.hasCitedSeed(new URL(currentRiverUrl).hash))
+        ? currentRiverUrl
+        : riverHref(river, { mode: program ? null : "free" });
   previousRememberedRiver = freshRememberedRiver;
   river = { ...Arrival.mint(), minted: true, shifted: false };
   currentRememberedRiver = river;
   projectReturnRiverUrl = null;
   shifted = false;
-  commitRiverUrl(Arrival.href(river, { mode: program ? null : "free" }));
+  commitRiverUrl(riverHref(river, { mode: program ? null : "free" }));
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;
@@ -881,10 +946,10 @@ function undoRiver() {
   currentRememberedRiver = previousRememberedRiver;
   previousRememberedRiver = null;
   shifted = Boolean(river.shifted);
-  const restoredUrl = previousRiverUrl ?? Arrival.href(river);
+  const restoredUrl = withCurrentQuery(previousRiverUrl ?? riverHref(river));
   commitRiverUrl(
     projectSectionFor(new URL(restoredUrl).hash)
-      ? Arrival.href(river, { mode: program ? null : "free" })
+      ? riverHref(river, { mode: program ? null : "free" })
       : Arrival.withMode(restoredUrl, program ? null : "free"),
   );
   previousRiverUrl = null;
@@ -898,7 +963,7 @@ function undoRiver() {
 async function shareRiver() {
   const sharedRiver = river;
   const presentation = sharePresentationState(controlBus.getState());
-  const link = sharePresentationUrl(Arrival.href(sharedRiver), presentation);
+  const link = sharePresentationUrl(riverHref(sharedRiver), presentation);
   const receipt = (message) => {
     if (river !== sharedRiver) return false;
     el("river-receipt").textContent = message;
@@ -1132,6 +1197,9 @@ dock.hidden = false;
 dock.removeAttribute("aria-hidden");
 hudToggle.hidden = false;
 hudToggle.removeAttribute("aria-hidden");
+if (projectSectionAtArrival) {
+  commitRiverUrl(currentRiverUrl, { keepProjectOpen: true });
+}
 void openProjectSection();
 
 addEventListener("pagehide", () => interaction.stop(at()));

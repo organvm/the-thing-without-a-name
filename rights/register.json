@@ -441,7 +441,7 @@
       "public_credit": {"state": "not-required", "label": null, "note": "No font bytes are distributed."},
       "private_evidence": {"state": "not-required", "custodian": null, "receipt": null},
       "provenance": [
-        {"path": "index.html", "sha256": "219a37f6d5240c2e09a75b4977d55d8136e0730035b06708d430a7dfa87c6023", "summary": "System-only CSS font stack in the live artwork."}
+        {"path": "index.html", "sha256": "59235d3c206b9fa31e54c55a1527fc83aba03ee9976bc3a2c457d4453832f37e", "summary": "System-only CSS font stack in the live artwork."}
       ],
       "uses": [
         {"id": "no-font-binary", "medium": "software-distribution", "required_for": [], "territory": "not-applicable", "term": "not-applicable", "expires": null, "promotion": "not-applicable", "archive": "not-applicable", "status": "excluded", "evidence": null, "note": "The exclusion is enforced by artifact inventory tests."}
