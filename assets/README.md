@@ -85,7 +85,10 @@ if a locator is unavailable or replaced.
 
 The production profile forbids direct HTTPS locators for private photographic
 and Vision inputs; the public lock therefore cannot contain presigned URLs or
-query credentials. Its restricted soundfont may use only the canonical upstream
+query credentials. A named GitHub Release source for one of those private inputs
+must name an explicit token environment, and hydration fails closed when that
+credential is unavailable or malformed; unauthenticated public-release fallback
+is not accepted. Its restricted soundfont may use only the canonical upstream
 URL recorded by `music/audio-toolchain.json`, a file checkout, or a named Release
 asset. The checkout must be at the exact Git top level, exact commit, and clean
 apart from locked targets and the content cache.

@@ -278,6 +278,28 @@ class AssetParityTest(unittest.TestCase):
         )
         self.assertEqual(outside.read_bytes(), b"outside")
 
+    def test_target_parent_swap_cannot_redirect_publication(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        target_parent = self.fixture.root / "pipeline/.work/raw"
+        target_parent.mkdir(parents=True)
+        held_parent = self.fixture.root / "pipeline/.work/raw-held"
+        outside = self.fixture.base / "outside-target"
+        outside.mkdir()
+        real_link = os.link
+
+        def swap_parent_then_link(source, target, **kwargs):
+            target_parent.rename(held_parent)
+            target_parent.symlink_to(outside, target_is_directory=True)
+            return real_link(source, target, **kwargs)
+
+        with mock.patch.object(ASSETS.os, "link", side_effect=swap_parent_then_link):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual((held_parent / "IMG_1570.JPG").read_bytes(), self.fixture.payload)
+
     def test_repository_commit_is_exact(self) -> None:
         self.fixture.write_lock(repository_commit="a" * 40)
         self.assertEqual(
@@ -380,7 +402,7 @@ class AssetParityTest(unittest.TestCase):
     def test_complete_production_contract_accepts_only_exact_categories(self) -> None:
         origin_sha256, soundfont_sha256, soundfont_url = ASSETS._canonical_production_pins()
         rows = []
-        for index, target in enumerate(sorted(ASSETS._production_targets())):
+        for target in sorted(ASSETS._production_targets()):
             digest = hashlib.sha256(target.encode()).hexdigest()
             rights_class = "private"
             source = {"kind": "file", "path": target}
@@ -399,7 +421,7 @@ class AssetParityTest(unittest.TestCase):
                 media_type = "application/json"
             rows.append(
                 {
-                    "id": f"asset-{index:04x}",
+                    "id": ASSETS._opaque_asset_id(digest, target),
                     "target": target,
                     "sha256": digest,
                     "bytes": 1,
@@ -431,8 +453,20 @@ class AssetParityTest(unittest.TestCase):
             "rights": lambda row: row.update(rights_class="public"),
             "media": lambda row: row.update(media_type="application/octet-stream"),
             "source": lambda row: row.update(sources=[{"kind": "https", "url": "https://example.com/raw"}]),
+            "unauthenticated release": lambda row: row.update(
+                sources=[
+                    {
+                        "kind": "github-release",
+                        "repository": "organvm/private-assets",
+                        "tag": "v1",
+                        "asset": "payload.bin",
+                    }
+                ]
+            ),
             "bytes": lambda row: row.update(bytes=0),
-            "opaque id": lambda row: row.update(id="img-1594"),
+            "opaque id": lambda row: row.update(
+                id="asset-0000000000000000-000000000000"
+            ),
             "canonical pin": lambda row: row.update(sha256="0" * 64),
         }
         origin_index = next(
@@ -454,7 +488,10 @@ class AssetParityTest(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value.read.side_effect = [metadata, b""]
         response.__exit__.return_value = False
-        with mock.patch.object(ASSETS, "_open_url", return_value=response):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(ASSETS, "_open_url", return_value=response),
+        ):
             url, headers = ASSETS._github_release_asset(
                 {
                     "kind": "github-release",
@@ -466,6 +503,72 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertEqual(url, "https://api.github.com/assets/1")
         self.assertEqual(headers["Accept"], "application/octet-stream")
+
+    def test_private_release_credentials_fail_closed_and_stay_redacted(self) -> None:
+        source = {
+            "kind": "github-release",
+            "repository": "organvm/private-assets",
+            "tag": "v1",
+            "asset": "payload.bin",
+            "token_env": "DANSE_PRIVATE_TOKEN",
+        }
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(ASSETS, "_open_url") as open_url,
+            self.assertRaisesRegex(ASSETS.AssetError, "credential is unavailable"),
+        ):
+            ASSETS._github_release_asset(source, 1.0)
+        open_url.assert_not_called()
+
+        secret = "secret\r\nX-Leak: exposed"
+        with (
+            mock.patch.dict(os.environ, {"DANSE_PRIVATE_TOKEN": secret}, clear=True),
+            self.assertRaises(ASSETS.AssetError) as caught,
+        ):
+            ASSETS._github_release_asset(source, 1.0)
+        self.assertNotIn(secret, str(caught.exception))
+
+        public_metadata = mock.MagicMock()
+        public_metadata.__enter__.return_value.read.side_effect = [
+            json.dumps({"private": False}).encode(),
+            b"",
+        ]
+        public_metadata.__exit__.return_value = False
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DANSE_PRIVATE_TOKEN": "printable-token"},
+                clear=True,
+            ),
+            mock.patch.object(
+                ASSETS,
+                "_open_url",
+                return_value=public_metadata,
+            ) as open_url,
+            self.assertRaisesRegex(ASSETS.AssetError, "private GitHub repository"),
+        ):
+            ASSETS._github_release_asset(source, 1.0)
+        open_url.assert_called_once()
+
+    def test_header_construction_errors_are_redacted_asset_errors(self) -> None:
+        leaked = "do-not-echo-this-header"
+        with (
+            mock.patch.object(ASSETS, "_assert_public_https_host"),
+            mock.patch.object(
+                ASSETS.urllib.request,
+                "Request",
+                side_effect=ValueError(leaked),
+            ),
+            self.assertRaises(ASSETS.AssetError) as caught,
+        ):
+            ASSETS._open_url(
+                "https://example.com/payload",
+                {"Authorization": "Bearer safe-token"},
+                1.0,
+            )
+        self.assertNotIn(leaked, str(caught.exception))
+        with self.assertRaisesRegex(ASSETS.AssetError, "invalid header value"):
+            ASSETS._validate_http_headers({"X-Danse": "unsafe\tvalue"})
 
     def test_github_release_redirect_allows_only_signed_asset_hosts(self) -> None:
         request = urllib.request.Request(

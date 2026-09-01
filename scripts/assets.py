@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -36,6 +37,7 @@ PROFILES = ("generic", "screendance-production")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
+OPAQUE_ASSET_ID = re.compile(r"^asset-[0-9a-f]{16}-[0-9a-f]{12}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 HOSTNAME = re.compile(
@@ -43,6 +45,7 @@ HOSTNAME = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
 MEDIA_TYPE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 RIGHTS_CLASSES = ("public", "restricted", "private")
 CHUNK = 1 << 20
 USER_AGENT = "danse-asset-parity/1"
@@ -71,6 +74,11 @@ class Lock:
     repository_commit: str
     assets: tuple[Asset, ...]
     sha256: str
+
+
+def _opaque_asset_id(digest: str, target: str) -> str:
+    path_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+    return f"asset-{digest[:16]}-{path_digest[:12]}"
 
 
 def _json_loads(raw: bytes, label: str) -> dict:
@@ -143,6 +151,31 @@ def _assert_public_https_host(url: str, *, allow_query: bool = False) -> None:
         raise AssetError("HTTPS source host cannot be resolved") from exc
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise AssetError("HTTPS source URL cannot target a non-public address")
+
+
+def _validate_http_headers(headers: dict[str, str]) -> None:
+    for name, value in headers.items():
+        if not isinstance(name, str) or not HTTP_HEADER_NAME.fullmatch(name):
+            raise AssetError("HTTPS request contains an invalid header name")
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+        ):
+            raise AssetError("HTTPS request contains an invalid header value")
+
+
+def _github_token(source: dict) -> str | None:
+    explicit = "token_env" in source
+    environment_name = source.get("token_env", "GITHUB_TOKEN")
+    token = os.environ.get(environment_name)
+    if explicit and not token:
+        raise AssetError("GitHub release credential is unavailable")
+    if token is not None and (
+        not token or any(ord(character) < 0x21 or ord(character) > 0x7E for character in token)
+    ):
+        raise AssetError("GitHub release credential contains invalid characters")
+    return token
 
 
 def _validate_source(source: object) -> dict:
@@ -353,16 +386,22 @@ def _validate_production_assets(assets: list[Asset]) -> None:
         if asset.media_type != expected_type:
             raise AssetError("production input media type disagrees with its target class")
         if asset.target.startswith("pipeline/.work/"):
-            if any(source["kind"] not in {"file", "github-release"} for source in asset.sources):
-                raise AssetError("private production inputs cannot use public HTTPS locators")
+            for source in asset.sources:
+                if source["kind"] not in {"file", "github-release"}:
+                    raise AssetError("private production inputs cannot use public HTTPS locators")
+                if source["kind"] == "github-release" and "token_env" not in source:
+                    raise AssetError(
+                        "private production GitHub releases require an explicit credential"
+                    )
         else:
             if asset.rights_class != "restricted":
                 raise AssetError("the licensed soundfont must remain a restricted input")
             for source in asset.sources:
                 if source["kind"] == "https" and source["url"] != soundfont_url:
                     raise AssetError("soundfont HTTPS source is not the canonical upstream locator")
-        if not asset.asset_id.startswith("asset-"):
-            raise AssetError("production input ids must be opaque")
+        expected_id = _opaque_asset_id(asset.sha256, asset.target)
+        if not OPAQUE_ASSET_ID.fullmatch(asset.asset_id) or asset.asset_id != expected_id:
+            raise AssetError("production input ids must use the deterministic opaque form")
 
 
 def _sha256(path: Path) -> tuple[int, str]:
@@ -416,6 +455,46 @@ def _path_under(root: Path, relative: str, *, create_parents: bool) -> Path:
     if final.is_symlink():
         raise AssetError("asset target is a symlink")
     return final
+
+
+def _parent_descriptor_under(
+    root: Path,
+    relative: str,
+    *,
+    create_parents: bool,
+) -> tuple[int, str] | None:
+    """Open the target parent one component at a time without following links."""
+
+    parts = PurePosixPath(relative).parts
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        current = os.open(root, directory_flags)
+    except OSError as exc:
+        raise AssetError("asset root cannot be opened safely") from exc
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, directory_flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create_parents:
+                    os.close(current)
+                    return None
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                child = os.open(part, directory_flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return current, parts[-1]
+    except OSError as exc:
+        os.close(current)
+        raise AssetError("asset target traverses a symlink or non-directory") from exc
 
 
 def _repository_head(root: Path, lock: Lock) -> str:
@@ -487,8 +566,11 @@ def _assert_locked_tree(root: Path, lock: Lock) -> None:
 
 
 def _cache_path(root: Path, asset: Asset, *, create: bool) -> Path:
-    relative = f".asset-cache/sha256/{asset.sha256[:2]}/{asset.sha256}"
-    return _path_under(root, relative, create_parents=create)
+    return _path_under(root, _cache_relative(asset), create_parents=create)
+
+
+def _cache_relative(asset: Asset) -> str:
+    return f".asset-cache/sha256/{asset.sha256[:2]}/{asset.sha256}"
 
 
 def _identity(path: Path, asset: Asset) -> str:
@@ -515,6 +597,46 @@ def _identity(path: Path, asset: Asset) -> str:
             after.st_mtime_ns,
         )
         return "verified" if stable and size == asset.size and digest == asset.sha256 else "mismatch"
+    finally:
+        os.close(descriptor)
+
+
+def _identity_at(parent: int, name: str, asset: Asset) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unsafe"
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != asset.size:
+            return "mismatch"
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            size, digest = _sha256_stream(handle)
+        after = os.fstat(descriptor)
+        stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        return "verified" if stable and size == asset.size and digest == asset.sha256 else "mismatch"
+    finally:
+        os.close(descriptor)
+
+
+def _identity_under(root: Path, relative: str, asset: Asset) -> str:
+    try:
+        parent = _parent_descriptor_under(root, relative, create_parents=False)
+    except AssetError:
+        return "unsafe"
+    if parent is None:
+        return "missing"
+    descriptor, name = parent
+    try:
+        return _identity_at(descriptor, name, asset)
     finally:
         os.close(descriptor)
 
@@ -556,16 +678,22 @@ def _open_url(
 ):
     url = _https_url(url)
     _assert_public_https_host(url)
-    request = urllib.request.Request(url, headers=headers)
+    _validate_http_headers(headers)
+    try:
+        request = urllib.request.Request(url, headers=headers)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise AssetError("HTTPS request headers could not be constructed") from exc
     handler = _SafeRedirect(allow_github_asset_redirect=allow_github_asset_redirect)
-    return urllib.request.build_opener(handler).open(request, timeout=timeout)
+    try:
+        return urllib.request.build_opener(handler).open(request, timeout=timeout)
+    except (TypeError, ValueError, UnicodeError, http.client.HTTPException) as exc:
+        raise AssetError("HTTPS request headers could not be constructed") from exc
 
 
 def _github_release_asset(source: dict, timeout: float) -> tuple[str, dict[str, str]]:
     repository = source["repository"]
     tag = urllib.parse.quote(source["tag"], safe="")
-    api = f"https://api.github.com/repos/{repository}/releases/tags/{tag}"
-    token = os.environ.get(source.get("token_env", "GITHUB_TOKEN"))
+    token = _github_token(source)
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": USER_AGENT,
@@ -573,6 +701,24 @@ def _github_release_asset(source: dict, timeout: float) -> tuple[str, dict[str, 
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if "token_env" in source:
+        repository_api = f"https://api.github.com/repos/{repository}"
+        try:
+            with _open_url(repository_api, headers, timeout) as response:
+                repository_raw = response.read(8 << 20)
+                if response.read(1):
+                    raise AssetError("GitHub repository metadata is too large")
+        except (OSError, urllib.error.URLError) as exc:
+            raise AssetError("private GitHub repository metadata could not be read") from exc
+        repository_metadata = _json_loads(
+            repository_raw,
+            "GitHub repository metadata",
+        )
+        if repository_metadata.get("private") is not True:
+            raise AssetError(
+                "private production source must use a private GitHub repository"
+            )
+    api = f"https://api.github.com/repos/{repository}/releases/tags/{tag}"
     try:
         with _open_url(api, headers, timeout) as response:
             raw = response.read(8 << 20)
@@ -716,20 +862,52 @@ def _cache_from_sources(
     raise AssetError(f"no source satisfied asset {asset.asset_id}: {detail}")
 
 
-def _publish_no_overwrite(cache: Path, target: Path, asset: Asset) -> None:
-    if os.path.lexists(target):
-        state = _identity(target, asset)
-        if state == "verified":
-            return
-        raise AssetError("existing asset target disagrees with the lock; refusing to overwrite")
+def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> None:
+    cache_parent = _parent_descriptor_under(
+        root,
+        _cache_relative(asset),
+        create_parents=False,
+    )
+    if cache_parent is None:
+        raise AssetError("asset publication parent is missing")
+    cache_descriptor, cache_name = cache_parent
     try:
-        os.link(cache, target)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise AssetError("asset target could not be published atomically") from exc
-    if _identity(target, asset) != "verified":
-        raise AssetError("published asset target disagrees with the lock")
+        target_parent = _parent_descriptor_under(
+            root,
+            target_relative,
+            create_parents=True,
+        )
+        if target_parent is None:
+            raise AssetError("asset publication parent is missing")
+        target_descriptor, target_name = target_parent
+        try:
+            if _identity_at(cache_descriptor, cache_name, asset) != "verified":
+                raise AssetError("content-addressed cache contains a corrupt object")
+            target_state = _identity_at(target_descriptor, target_name, asset)
+            if target_state == "verified":
+                return
+            if target_state != "missing":
+                raise AssetError(
+                    "existing asset target disagrees with the lock; refusing to overwrite"
+                )
+            try:
+                os.link(
+                    cache_name,
+                    target_name,
+                    src_dir_fd=cache_descriptor,
+                    dst_dir_fd=target_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise AssetError("asset target could not be published atomically") from exc
+            if _identity_at(target_descriptor, target_name, asset) != "verified":
+                raise AssetError("published asset target disagrees with the lock")
+        finally:
+            os.close(target_descriptor)
+    finally:
+        os.close(cache_descriptor)
 
 
 def _report(command: str, lock: Lock, rows: list[tuple[Asset, str, str]]) -> dict:
@@ -777,9 +955,13 @@ def inspect(command: str, lock: Lock, root: Path) -> dict:
     _assert_locked_tree(root, lock)
     rows = []
     for asset in lock.assets:
-        target = _path_under(root, asset.target, create_parents=False)
-        cache = _cache_path(root, asset, create=False)
-        rows.append((asset, _identity(target, asset), _identity(cache, asset)))
+        rows.append(
+            (
+                asset,
+                _identity_under(root, asset.target, asset),
+                _identity_under(root, _cache_relative(asset), asset),
+            )
+        )
     return _report(command, lock, rows)
 
 
@@ -796,20 +978,19 @@ def pull(
     _assert_locked_tree(root, lock)
     failures: list[str] = []
     for asset in lock.assets:
-        target = _path_under(root, asset.target, create_parents=True)
-        if _identity(target, asset) == "verified":
+        if _identity_under(root, asset.target, asset) == "verified":
             continue
         try:
-            cache = _cache_from_sources(
+            _cache_from_sources(
                 root,
                 asset,
                 allow_file=allow_file,
                 source_root=source_root,
                 timeout=timeout,
             )
-            _publish_no_overwrite(cache, target, asset)
+            _publish_no_overwrite(root, asset.target, asset)
         except AssetError:
-            if asset.required or os.path.lexists(target):
+            if asset.required or _identity_under(root, asset.target, asset) != "missing":
                 failures.append(asset.asset_id)
     report = inspect("pull", lock, root)
     if failures:
@@ -898,13 +1079,11 @@ def inventory(
         if profile == "screendance-production":
             effective_rights = "restricted" if relative == ".work/music/MuseScore_General.sf3" else "private"
         if effective_rights in {"private", "restricted"}:
-            path_digest = hashlib.sha256(relative.encode()).hexdigest()
-            asset_id = f"asset-{digest[:16]}-{path_digest[:12]}"
+            asset_id = _opaque_asset_id(digest, relative)
         else:
             asset_id = re.sub(r"[^a-z0-9._-]+", "-", relative.lower()).strip("-.")
             if not asset_id or len(asset_id) > 96 or asset_id in {row["id"] for row in rows}:
-                path_digest = hashlib.sha256(relative.encode()).hexdigest()
-                asset_id = f"asset-{digest[:16]}-{path_digest[:12]}"
+                asset_id = _opaque_asset_id(digest, relative)
         rows.append(
             {
                 "id": asset_id,
