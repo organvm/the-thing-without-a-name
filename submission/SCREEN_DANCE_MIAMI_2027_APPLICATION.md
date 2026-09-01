@@ -12,13 +12,13 @@ Use this packet for the live Submittable form. It separates facts already establ
 | Director(s) | Anthony J. Padavano | verify spelling before filing |
 | Camera / cinematographer(s) | Anthony J. Padavano | verify role wording before filing |
 | Editor(s) | Anthony J. Padavano | verify role wording before filing |
-| Featured performer(s) / dancer(s) | **REQUIRED — enter the performer's exact public credit; do not infer it from filenames or folders** | applicant-only fact |
-| Choreographer(s) | **REQUIRED — enter the exact credited person or people** | applicant-only fact |
-| Premiere status | **REQUIRED — choose the truthful live-form option** | applicant-only fact |
+| Featured performer(s) / dancer(s) | Uncredited performer | confirmed by applicant |
+| Choreographer(s) | Anthony J. Padavano | confirmed by applicant |
+| Premiere status | World Premiere | confirmed by applicant |
 | Film category | **REQUIRED — choose the live-form category that best describes this final film** | applicant choice |
-| Professional / student | **REQUIRED — choose truthful status; school is needed only if student** | applicant choice |
+| Professional / student | Professional | confirmed by applicant |
 | Contact email, confirmation, phone, address | **REQUIRED — enter current private contact information directly in Submittable** | never store in git |
-| Archive library | **REQUIRED — choose include or opt out** | applicant choice |
+| Archive library | Yes | confirmed by applicant |
 
 ## Film synopsis — 50 words maximum
 
@@ -30,7 +30,7 @@ Anthony J. Padavano is a multimedia artist, writer, educator and programmer whos
 
 ## Music / sound design
 
-“Valse lente” from *Sylvia* and “Valse” from *Coppélia*, composed by Léo Delibes. Source arrangements by Paul De Bra, adapted and re-orchestrated for Danse under CC BY 4.0. Sequenced performance, instrumentation, cue markers and mix by the Danse project. MuseScore General soundfont (MIT); no commercial recording is used.
+“Valse lente” from *Sylvia* and “Valse” from *Coppélia*, composed by Léo Delibes. Source arrangements by Paul De Bra, adapted and re-orchestrated for Danse under CC BY 4.0. Changes include instrumentation, sequencing, cue markers, and mix. MuseScore General soundfont (MIT); no commercial recording is used.
 
 ## Rights position for this filing
 
