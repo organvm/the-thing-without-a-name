@@ -2,20 +2,29 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 /absolute/output/directory" >&2
+  echo "usage: $0 /absolute/output/directory [/absolute/approved-first-30s.mp4]" >&2
   exit 2
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -ge 1 && $# -le 2 ]] || usage
 case "$1" in
   /*) ;;
   *) echo "output directory must be an absolute path" >&2; exit 2 ;;
 esac
+if [[ $# -eq 2 ]]; then
+  case "$2" in
+    /*) ;;
+    *) echo "approved first-30-second montage must be an absolute path" >&2; exit 2 ;;
+  esac
+  [[ -f "$2" ]] || { echo "missing approved first-30-second montage: $2" >&2; exit 1; }
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 DEST="$1"
 WORK="$DEST/render-work"
 PICTURE="$WORK/screener-default.mp4"
+OPENING_WORK="$WORK/opening-revision"
+REVISED_PICTURE="$WORK/screener-default-opening-revised.mp4"
 AUDIO="$ROOT/.work/music/competition/delibes-master.wav"
 FINAL="$DEST/THE_THING_WITHOUT_A_NAME_SCREENDANCE_MIAMI_2027.mp4"
 FONT="/System/Library/Fonts/Menlo.ttc"
@@ -46,14 +55,43 @@ python3 "$ROOT/render/render.py" \
 [[ -f "$PICTURE" ]] || { echo "missing rendered picture: $PICTURE" >&2; exit 1; }
 [[ -f "$AUDIO" ]] || { echo "missing rendered score: $AUDIO" >&2; exit 1; }
 
+OPENING_ARGS=(
+  --picture "$PICTURE"
+  --out "$OPENING_WORK"
+)
+if [[ $# -eq 2 ]]; then
+  OPENING_ARGS+=(--reuse-montage "$2")
+fi
+python3 "$ROOT/submission/revise_screendance_opening.py" "${OPENING_ARGS[@]}"
+
+[[ -f "$OPENING_WORK/first-minute-replacement.mp4" ]] || {
+  echo "missing phrase-native first-minute replacement" >&2
+  exit 1
+}
+
+# The replacement owns frames 0-1799. The canonical renderer resumes at frame
+# 1800, preserving every frame from 01:00 onward while avoiding timestamp or
+# keyframe drift at the splice.
 ffmpeg -hide_banner -loglevel error -y \
-  -i "$PICTURE" -i "$AUDIO" \
+  -i "$OPENING_WORK/first-minute-replacement.mp4" \
+  -i "$PICTURE" \
+  -filter_complex "[1:v]trim=start_frame=1800,setpts=PTS-STARTPTS,fps=30,scale=1280:720:flags=lanczos,setsar=1[tail];[0:v][tail]concat=n=2:v=1:a=0,setsar=1[v]" \
+  -map "[v]" \
+  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p \
+  -video_track_timescale 15360 -an "$REVISED_PICTURE"
+
+ffmpeg -hide_banner -loglevel error -y \
+  -i "$REVISED_PICTURE" -i "$AUDIO" \
   -map 0:v:0 -map 1:a:0 \
   -vf "drawbox=color=black:t=fill:enable='gte(t,346.896343125)',\
-drawtext=fontfile=$FONT:text='THE THING WITHOUT A NAME':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=350:enable='gte(t,346.896343125)',\
-drawtext=fontfile=$FONT:text='A FILM BY ANTHONY J. PADAVANO':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=470:enable='gte(t,346.896343125)',\
-drawtext=fontfile=$FONT:text='MUSIC BY LÉO DELIBES':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=540:enable='gte(t,346.896343125)',\
-drawtext=fontfile=$FONT:text='SOURCE ARRANGEMENTS · PAUL DE BRA · CC BY 4.0':fontcolor=white:fontsize=30:x=(w-text_w)/2:y=610:enable='gte(t,346.896343125)'" \
+drawtext=fontfile=$FONT:text='THE THING WITHOUT A NAME':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=250:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='PERFORMANCE · MADISON GARBER':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=350:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='PRIMARY CHOREOGRAPHY · MADISON GARBER':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=395:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='ANTHONY J. PADAVANO':fontcolor=white:fontsize=30:x=(w-text_w)/2:y=460:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='CONCEPT · DIRECTION · ADDITIONAL CHOREOGRAPHY · PHOTOGRAPHY · EDITING':fontcolor=white:fontsize=18:x=(w-text_w)/2:y=505:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='SOUND · SOFTWARE · ARCHIVE · PRODUCTION':fontcolor=white:fontsize=20:x=(w-text_w)/2:y=535:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='MUSIC · LÉO DELIBES':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=590:enable='gte(t,346.896343125)',\
+drawtext=fontfile=$FONT:text='SOURCE ARRANGEMENTS · PAUL DE BRA · CC BY 4.0':fontcolor=white:fontsize=21:x=(w-text_w)/2:y=630:enable='gte(t,346.896343125)'" \
   -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p \
   -c:a aac -b:a 320k -ar 48000 -ac 2 \
   -movflags +faststart -shortest "$FINAL"
@@ -94,4 +132,5 @@ if errors:
 print(f"READY: {video.get('width')}x{video.get('height')} H.264 + 48 kHz AAC, {duration:.3f}s")
 PY
 
+echo "Opening receipt: $OPENING_WORK/opening-revision-receipt.json"
 echo "Output: $FINAL"
