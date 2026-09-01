@@ -9,6 +9,7 @@ export const PRESENCE = Object.freeze(["off", "camera", "keyboard-touch", "repla
 export const CATEGORIES = Object.freeze(["hold", "river", "score", "presence", "map"]);
 
 const PROJECT_FRAGMENT_SECTIONS = Object.freeze({
+  content: "project-artwork",
   artwork: "project-artwork",
   film: "project-film",
   "ballet-score": "project-film",

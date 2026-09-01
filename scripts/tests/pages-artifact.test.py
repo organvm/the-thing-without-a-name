@@ -2081,6 +2081,18 @@ console.log(JSON.stringify(result.value));
         self.assertIn(guard, updater)
         self.assertLess(updater.index(guard), updater.index("history.replaceState"))
 
+    def test_new_river_replaces_a_legacy_project_fragment_immediately(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        capture = "const replacesProjectFragment = Boolean(projectSectionFor(location.hash));"
+        replacement = (
+            'history.replaceState(null, "", Arrival.href(river, '
+            '{ mode: program ? null : "free" }));'
+        )
+        self.assertIn(capture, new_river)
+        self.assertIn(replacement, new_river)
+        self.assertLess(new_river.index(capture), new_river.index("Arrival.mint()"))
+        self.assertLess(new_river.index("Arrival.mint()"), new_river.index(replacement))
+
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
         self.assertIn('playback === "running"', handler)

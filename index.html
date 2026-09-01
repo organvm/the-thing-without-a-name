@@ -801,12 +801,16 @@ function toggleHold() {
 
 function newRiver() {
   navigationGeneration += 1;
+  const replacesProjectFragment = Boolean(projectSectionFor(location.hash));
   previousRiver = river;
   previousRiverUrl = shifted ? location.href : null;
   const remembered = Arrival.recall();
   previousRememberedRiver = Arrival.rememberedRiverForUndo(river, location.hash, remembered);
   river = { ...Arrival.mint(), minted: true, shifted: false };
   shifted = false;
+  if (replacesProjectFragment) {
+    history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
+  }
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;

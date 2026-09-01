@@ -23,6 +23,7 @@ async function test(name, run) {
 
 await test("legacy Project fragments resolve narrowly and fail closed", () => {
   assert.equal(projectSectionFor("#evidence"), "project-evidence");
+  assert.equal(projectSectionFor("#content"), "project-artwork");
   assert.equal(projectSectionFor("#%65VIDENCE"), "project-evidence");
   assert.equal(projectSectionFor("#ballet-score"), "project-film");
   assert.equal(projectSectionFor("#cubism"), "project-readings");
