@@ -16,7 +16,7 @@ import unittest
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -2093,7 +2093,7 @@ console.log(JSON.stringify(result.value));
         updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
         guard = "if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;"
         self.assertIn(guard, updater)
-        self.assertLess(updater.index(guard), updater.index("history.replaceState"))
+        self.assertLess(updater.index(guard), updater.index("commitRiverUrl"))
 
     def test_closing_project_immediately_restores_a_mode_complete_river_url(self) -> None:
         close = self.script.split("function closeVisualSurfaces() {", 1)[1].split("\n}", 1)[0]
@@ -2102,13 +2102,12 @@ console.log(JSON.stringify(result.value));
             "&& Boolean(projectSectionFor(location.hash));"
         )
         canonical = (
-            'currentRiverUrl = Arrival.href(river, '
-            '{ mode: program ? null : "free" });'
+            'commitRiverUrl(Arrival.withMode(currentRiverUrl, '
+            'program ? null : "free"));'
         )
         self.assertIn(capture, close)
         self.assertIn("if (closedProjectFragment) {", close)
         self.assertIn(canonical, close)
-        self.assertIn('history.replaceState(null, "", currentRiverUrl);', close)
         self.assertIn("projectReturnRiverUrl = null;", close)
         self.assertLess(close.index(capture), close.index("projectMap.close()"))
         self.assertLess(close.index("projectMap.close()"), close.index(canonical))
@@ -2117,13 +2116,10 @@ console.log(JSON.stringify(result.value));
         persist = self.script.split("function persistProgramMode() {", 1)[1].split("\n}", 1)[0]
         set_program = self.script.split("async function setProgram(value) {", 1)[1].split("\n}", 1)[0]
         self.assertIn(
-            "projectSectionFor(location.hash) ? Arrival.href(river) : location.href",
+            'Arrival.withMode(riverControlUrl(), program ? null : "free")',
             persist,
         )
-        self.assertIn(
-            'Arrival.withMode(currentUrl, program ? null : "free")',
-            persist,
-        )
+        self.assertIn("{ keepProjectOpen: true }", persist)
         free = set_program.split('if (value === "free") {', 1)[1].split("}", 1)[0]
         score = set_program.split("const loaded =", 1)[1]
         self.assertLess(free.index("program = null;"), free.index("persistProgramMode();"))
@@ -2135,12 +2131,11 @@ console.log(JSON.stringify(result.value));
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
         capture = "const projectFragment = Boolean(projectSectionFor(location.hash));"
         replacement = (
-            'currentRiverUrl = Arrival.href(river, '
-            '{ mode: program ? null : "free" });'
+            'commitRiverUrl(Arrival.href(river, '
+            '{ mode: program ? null : "free" }));'
         )
         self.assertIn(capture, new_river)
         self.assertIn(replacement, new_river)
-        self.assertIn('history.replaceState(null, "", currentRiverUrl);', new_river)
         self.assertLess(new_river.index(capture), new_river.index("Arrival.mint()"))
         self.assertLess(new_river.index("Arrival.mint()"), new_river.index(replacement))
 
@@ -2153,10 +2148,10 @@ console.log(JSON.stringify(result.value));
         close = "if (projectMap.open) controlBus?.actions.close();"
         self.assertIn(close, hash_navigation)
         self.assertLess(hash_navigation.index(close), hash_navigation.index("Arrival.arrive(fragment)"))
-        canonical = 'currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });'
+        canonical = 'commitRiverUrl(Arrival.href(river, { mode: program ? null : "free" }));'
         self.assertIn(canonical, new_river)
         self.assertLess(new_river.index("Arrival.mint()"), new_river.index(canonical))
-        self.assertIn("history.replaceState(", undo_river)
+        self.assertIn("commitRiverUrl(", undo_river)
         self.assertIn(
             "const restoredUrl = previousRiverUrl ?? Arrival.href(river);",
             undo_river,
@@ -2181,7 +2176,99 @@ console.log(JSON.stringify(result.value));
         self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
         self.assertLess(handler.index("if (generation !== navigationGeneration) return;"), handler.index("Arrival.arrive(fragment)"))
         self.assertLess(handler.index("Arrival.arrive(fragment)"), handler.index("river = nextRiver;"))
-        self.assertLess(handler.index("river = nextRiver;"), handler.index("currentRiverUrl = location.href;"))
+        self.assertLess(handler.index("river = nextRiver;"), handler.index("const committedNavigationUrl = new URL(currentRiverUrl);"))
+        self.assertIn("committedNavigationUrl.hash = fragment;", handler)
+        self.assertLess(
+            handler.index("committedNavigationUrl.hash = fragment;"),
+            handler.index("commitRiverUrl(Arrival.withMode(committedNavigationUrl"),
+        )
+
+    def test_pending_navigation_combines_its_target_with_the_latest_control_query(self) -> None:
+        handler = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
+        self.assertLess(
+            handler.index("await Program.load()"),
+            handler.index("const committedNavigationUrl = new URL(currentRiverUrl);"),
+        )
+        self.assertIn("committedNavigationUrl.hash = fragment;", handler)
+        self.assertIn(
+            'Arrival.withMode(committedNavigationUrl, program ? null : "free")',
+            handler,
+        )
+        self.assertNotIn("currentRiverUrl = location.href", handler)
+
+    def test_query_only_controls_refresh_the_committed_river_url(self) -> None:
+        conductor = self.script.split("function persistConductor() {", 1)[1].split("\n}", 1)[0]
+        cutout = self.script.split("function toggleCutout() {", 1)[1].split("\n}", 1)[0]
+        for helper in (conductor, cutout):
+            self.assertIn("const url = riverControlUrl();", helper)
+            self.assertIn("commitRiverUrl(url, { keepProjectOpen: true });", helper)
+
+    def test_all_address_writes_update_the_committed_river_url_atomically(self) -> None:
+        helper = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
+        self.assertIn("currentRiverUrl = String(url);", helper)
+        self.assertIn('history.replaceState(null, "", currentRiverUrl);', helper)
+        self.assertLess(
+            helper.index("currentRiverUrl = String(url);"),
+            helper.index('history.replaceState(null, "", currentRiverUrl);'),
+        )
+        self.assertEqual(helper.count("history.replaceState("), 2)
+        before, after = self.script.split("function commitRiverUrl(url", 1)
+        after = after.split("\n}", 1)[1]
+        self.assertNotIn("history.replaceState(", before + after)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
+    def test_synthesized_river_urls_preserve_the_complete_query_identity(self) -> None:
+        source = (ROOT / "arrival.js").as_uri()
+        probe = f"""
+globalThis.location = {{
+  href: "https://danse.pages.dev/?score=music%2Fscore.json&choreography=render%2Fchoreography.json&cutout=1&conductor=compound&meter=6%2F8&bpm=132#evidence",
+}};
+const {{ href }} = await import({json.dumps(source)});
+console.log(href({{ seed: 42, epoch: 1000, stream: 7 }}, {{ mode: "free" }}));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "--eval", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        url = urlsplit(completed.stdout.strip())
+        query = parse_qs(url.query)
+        self.assertEqual(
+            query,
+            {
+                "score": ["music/score.json"],
+                "choreography": ["render/choreography.json"],
+                "cutout": ["1"],
+                "conductor": ["compound"],
+                "meter": ["6/8"],
+                "bpm": ["132"],
+            },
+        )
+        self.assertEqual(url.fragment, "s=42&e=1000&u=7&p=free")
+
+        updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("Arrival.href(river", updater)
+        self.assertIn("Arrival.href(river", new_river)
+        self.assertIn("Arrival.href(river", undo_river)
+
+    def test_project_local_controls_preserve_river_identity_and_all_query_state(self) -> None:
+        commit = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
+        source = self.script.split("function riverControlUrl() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("keepProjectOpen && projectMap.open && projectSectionFor(location.hash)", commit)
+        self.assertIn("projectReturnRiverUrl = currentRiverUrl;", commit)
+        self.assertIn("visibleProjectUrl.search = new URL(currentRiverUrl).search;", commit)
+        self.assertIn('history.replaceState(null, "", visibleProjectUrl);', commit)
+        self.assertIn(
+            "projectMap.open && projectSectionFor(location.hash) ? currentRiverUrl : location.href",
+            source,
+        )
 
     def test_undo_never_installs_a_closed_project_fragment(self) -> None:
         undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
@@ -2193,10 +2280,7 @@ console.log(JSON.stringify(result.value));
             project_branch,
         )
         self.assertNotIn("? restoredUrl", undo_river)
-        self.assertLess(
-            undo_river.index("history.replaceState("),
-            undo_river.index("currentRiverUrl = location.href;"),
-        )
+        self.assertIn("commitRiverUrl(", undo_river)
 
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]

@@ -367,6 +367,23 @@ let currentRiverUrl = projectSectionFor(location.hash)
   ? Arrival.href(river, { mode: program ? null : "free" })
   : location.href;
 
+function commitRiverUrl(url, { keepProjectOpen = false } = {}) {
+  currentRiverUrl = String(url);
+  if (keepProjectOpen && projectMap.open && projectSectionFor(location.hash)) {
+    projectReturnRiverUrl = currentRiverUrl;
+    const visibleProjectUrl = new URL(location.href);
+    visibleProjectUrl.search = new URL(currentRiverUrl).search;
+    history.replaceState(null, "", visibleProjectUrl);
+    return currentRiverUrl;
+  }
+  history.replaceState(null, "", currentRiverUrl);
+  return currentRiverUrl;
+}
+
+function riverControlUrl() {
+  return new URL(projectMap.open && projectSectionFor(location.hash) ? currentRiverUrl : location.href);
+}
+
 const canvas = document.getElementById("stage");
 const el = (id) => document.getElementById(id);
 const hud = el("hud");
@@ -553,8 +570,7 @@ requestAnimationFrame(frame);
 // all: a position reached for debugging must not overwrite the river you keep.
 setInterval(() => {
   if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;
-  currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
-  history.replaceState(null, "", currentRiverUrl);
+  commitRiverUrl(Arrival.href(river, { mode: program ? null : "free" }));
 }, 1000);
 
 // Someone pasted a river into the address bar of a page that is already open.
@@ -590,7 +606,9 @@ addEventListener("hashchange", async (event) => {
   if (generation !== navigationGeneration) return;
   const nextRiver = Arrival.arrive(fragment);
   river = nextRiver;
-  currentRiverUrl = location.href;
+  const committedNavigationUrl = new URL(currentRiverUrl);
+  committedNavigationUrl.hash = fragment;
+  commitRiverUrl(Arrival.withMode(committedNavigationUrl, program ? null : "free"));
   currentRememberedRiver = Arrival.rememberedRiverForUndo(
     nextRiver,
     fragment,
@@ -764,12 +782,12 @@ function describeConductor() {
     : `Visual ${conductor.model} conductor · ${meter} · ${tempo}. Audio remains score-native.`;
 }
 function persistConductor() {
-  const url = new URL(location.href);
+  const url = riverControlUrl();
   for (const key of ["conductor", "meter", "bpm"]) url.searchParams.delete(key);
   if (conductor.model !== "native") url.searchParams.set("conductor", conductor.model);
   if (conductor.meter) url.searchParams.set("meter", conductor.meter);
   if (conductor.tempo !== null) url.searchParams.set("bpm", String(conductor.tempo));
-  history.replaceState(null, "", url);
+  commitRiverUrl(url, { keepProjectOpen: true });
 }
 function setConductor() {
   conductor = Choreography.normalizeConductor({
@@ -845,8 +863,7 @@ function newRiver() {
   currentRememberedRiver = river;
   projectReturnRiverUrl = null;
   shifted = false;
-  currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
-  history.replaceState(null, "", currentRiverUrl);
+  commitRiverUrl(Arrival.href(river, { mode: program ? null : "free" }));
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;
@@ -865,14 +882,11 @@ function undoRiver() {
   previousRememberedRiver = null;
   shifted = Boolean(river.shifted);
   const restoredUrl = previousRiverUrl ?? Arrival.href(river);
-  history.replaceState(
-    null,
-    "",
+  commitRiverUrl(
     projectSectionFor(new URL(restoredUrl).hash)
       ? Arrival.href(river, { mode: program ? null : "free" })
       : Arrival.withMode(restoredUrl, program ? null : "free"),
   );
-  currentRiverUrl = location.href;
   previousRiverUrl = null;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
@@ -935,9 +949,10 @@ function jumpMovement(number) {
 }
 
 function persistProgramMode() {
-  const currentUrl = projectSectionFor(location.hash) ? Arrival.href(river) : location.href;
-  currentRiverUrl = Arrival.withMode(currentUrl, program ? null : "free");
-  history.replaceState(null, "", currentRiverUrl);
+  commitRiverUrl(
+    Arrival.withMode(riverControlUrl(), program ? null : "free"),
+    { keepProjectOpen: true },
+  );
 }
 
 async function setProgram(value) {
@@ -964,10 +979,10 @@ function describeProgram() {
 
 function toggleCutout() {
   matteK = matteK > 0 ? 0 : 1;
-  const url = new URL(location.href);
+  const url = riverControlUrl();
   if (matteK) url.searchParams.set("cutout", "1");
   else url.searchParams.delete("cutout");
-  history.replaceState(null, "", url);
+  commitRiverUrl(url, { keepProjectOpen: true });
   el("score-receipt").textContent = `Figure cutout ${matteK ? "on" : "off"}; rectangular fragments move toward the dancer's silhouette.`;
 }
 
@@ -991,8 +1006,7 @@ function closeVisualSurfaces() {
     projectMap.close();
   }
   if (closedProjectFragment) {
-    currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
-    history.replaceState(null, "", currentRiverUrl);
+    commitRiverUrl(Arrival.withMode(currentRiverUrl, program ? null : "free"));
     projectReturnRiverUrl = null;
   }
   if (!hud.hidden) setHudVisible(false);
