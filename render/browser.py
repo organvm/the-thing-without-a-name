@@ -806,10 +806,12 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
             f"pressed Score control at seed {fallback_seed:#010x}, t={fallback_time}: "
             f"{movement}",
         )
-    page.click("#fallback-start")
-    page.wait_for_function("() => document.getElementById('interaction-summary').textContent === 'fallback'")
-    want(page.locator("#interaction-summary").inner_text() == "fallback", "renderer fallback left Details interaction stale")
-    page.click("#interaction-stop")
+    want(page.locator("#conductor-controls").is_hidden(), "no-WebGL visit exposed invisible visual-conductor controls")
+    want(page.locator("#interaction-controls").is_hidden(), "no-WebGL visit exposed interaction controls that cannot affect a visible room")
+    want(page.locator('[data-category="hold"]').is_hidden(), "no-WebGL visit exposed the unavailable Pause control")
+    want(page.locator('[data-category="score"]').is_hidden(), "no-WebGL visit exposed invisible Score controls")
+    want(page.locator('[data-category="presence"]').is_hidden(), "no-WebGL visit exposed interaction controls in the dock")
+    want(page.locator("#interaction-summary").inner_text() == "off", "renderer fallback reported phantom interaction")
     page.press("#sheet-close", "Escape")
     want(page.locator("#hud").is_hidden(), "Escape did not close Details without WebGL")
     page.click('[data-category="map"]')

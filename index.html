@@ -22,7 +22,7 @@
   :root { color-scheme: dark; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; background: #0e0e10; overflow: hidden; }
-  body { font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace; color: #b9b9c4; }
+  body { font: 14px/1.55 ui-monospace, "SF Mono", Menlo, monospace; color: #c8c8d2; }
   main, canvas { display: block; width: 100%; height: 100%; }
   canvas { touch-action: none; }
 
@@ -42,12 +42,36 @@
   #bar { width: 260px; height: 1px; background: #26262e; margin: 0 auto; }
   #bar i { display: block; height: 100%; width: 0; background: #cfcfe0; transition: width .2s; }
   #renderer-fallback {
-    position: fixed; z-index: 1; inset: 0; display: grid; place-content: center;
-    gap: 14px; padding: 24px; background: #0e0e10; text-align: center;
+    position: fixed; z-index: 1; inset: 0; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, .65fr);
+    gap: 0; padding: 0; overflow-y: auto; background: #0e0e10;
   }
   #renderer-fallback[hidden] { display: none; }
-  #renderer-fallback h1 { font: 300 34px/1 ui-serif, Georgia, serif; letter-spacing: .32em; color: #e8e8ee; }
-  #renderer-fallback p { max-width: 56ch; color: #9292a0; letter-spacing: .06em; }
+  .fallback-plate { display: flex; min-height: 100dvh; flex-direction: column; justify-content: space-between; padding: clamp(34px, 5vw, 72px); border-right: 1px solid #34343d; background: #151519; }
+  .fallback-index, .fallback-count { color: #9999a6; font-size: .76rem; letter-spacing: .14em; text-transform: uppercase; }
+  .fallback-display { color: #ece9e3; font: 300 clamp(3.8rem, 9vw, 8.6rem)/.82 ui-serif, Georgia, serif; letter-spacing: -.045em; }
+  .fallback-count { max-width: 28ch; line-height: 1.8; }
+  .fallback-copy { display: flex; flex-direction: column; justify-content: center; gap: 16px; padding: 96px clamp(30px, 5vw, 72px) 112px clamp(28px, 4vw, 64px); }
+  .fallback-eyebrow { color: #d2a44b; font-size: .78rem; letter-spacing: .16em; text-transform: uppercase; }
+  #renderer-fallback h1 { max-width: 9ch; font: 300 clamp(2.7rem, 6vw, 5.4rem)/.94 ui-serif, Georgia, serif; letter-spacing: .08em; color: #f4f1ec; }
+  #renderer-fallback .fallback-deck { max-width: 30ch; color: #e8e8ee; font: 400 clamp(1.05rem, 2.1vw, 1.45rem)/1.35 ui-serif, Georgia, serif; }
+  #renderer-fallback-reason { max-width: 52ch; color: #b9b9c4; }
+  .fallback-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+  .fallback-actions .danse-action { min-height: 48px; padding-inline: 16px; }
+  .fallback-note { max-width: 48ch; color: #9292a0; font-size: .82rem; }
+
+  #experience-intro {
+    position: fixed; z-index: 2; left: max(20px, env(safe-area-inset-left)); bottom: max(22px, env(safe-area-inset-bottom));
+    width: min(380px, calc(100% - 40px)); padding: 20px; border: 1px solid rgba(232, 232, 238, .28); border-radius: 8px;
+    background: rgba(14, 14, 16, .9); box-shadow: 0 18px 56px rgba(0, 0, 0, .42); backdrop-filter: blur(14px);
+  }
+  #experience-intro[hidden] { display: none; }
+  #experience-intro .intro-kicker { color: #d2a44b; font-size: .75rem; letter-spacing: .14em; text-transform: uppercase; }
+  #experience-intro h1 { margin-top: 6px; color: #f4f1ec; font: 400 1.75rem/1.05 ui-serif, Georgia, serif; letter-spacing: .07em; }
+  #experience-intro > p:not(.intro-kicker) { margin-top: 10px; color: #c8c8d2; }
+  .intro-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  #intro-dismiss { position: absolute; top: 10px; right: 10px; min-width: 44px; min-height: 44px; border: 0; background: transparent; color: #b9b9c4; font: inherit; cursor: pointer; }
+  #intro-dismiss:hover { color: #fff; }
+  #intro-dismiss:focus-visible { outline: 2px solid #e8e8ee; outline-offset: 2px; }
 
   #hud {
     position: fixed; z-index: 2;
@@ -112,6 +136,7 @@
   }
   #hud-toggle:hover { background: rgba(38, 38, 46, .92); }
   #hud-toggle:focus-visible { outline: 2px solid #e8e8ee; outline-offset: 3px; }
+  #hud-toggle .wide-label::before { content: " · "; }
 
   #toast {
     position: fixed; z-index: 8; left: 50%; top: max(16px, env(safe-area-inset-top));
@@ -126,13 +151,24 @@
       top: max(12px, env(safe-area-inset-top));
       right: max(64px, calc(env(safe-area-inset-right) + 52px));
       max-height: calc(100dvh - max(24px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom)));
-      font-size: 11px;
+      font-size: 13px;
     }
     #state { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .fallback-grid { grid-template-columns: 1fr; }
     .control-row button, .file-control { flex: 1 1 132px; justify-content: center; }
     #hud-toggle { min-width: 48px; padding: 0 10px; }
-    #hud-toggle .wide-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+    #hud-toggle .shortcut-h { display: none; }
+    #hud-toggle .wide-label::before { content: ""; }
+  }
+
+  @media (max-width: 799px) {
+    #renderer-fallback { display: block; padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
+    #renderer-fallback[hidden] { display: none; }
+    .fallback-plate { min-height: 38dvh; padding: 52px 20px 26px; border-right: 0; border-bottom: 1px solid #34343d; }
+    .fallback-display { font-size: clamp(3.35rem, 20vw, 6rem); }
+    .fallback-copy { min-height: 50dvh; padding: 20px 20px 40px; }
+    #renderer-fallback h1 { max-width: none; }
+    #experience-intro { bottom: calc(78px + env(safe-area-inset-bottom)); }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -147,20 +183,47 @@
   <p id="stage-description" class="sr-only">Fragments from 161 registered raw photographs made during one dancer session and one archival composite share an evolving room. The arrangement changes deterministically with your river and time. Visitors who prefer reduced motion arrive on a held frame.</p>
 </main>
 
+<header id="experience-intro" hidden aria-labelledby="intro-title">
+  <button id="intro-dismiss" type="button" aria-label="Dismiss introduction">Close</button>
+  <p class="intro-kicker">Live generative artwork</p>
+  <h1 id="intro-title">Danse Macabre</h1>
+  <p id="intro-behavior">A room that never repeats, composed from one dancer session in 2017. It changes on its own: watch, pause, or enter a different river.</p>
+  <div class="intro-actions">
+    <button class="danse-action" id="intro-motion" type="button" hidden>Resume motion</button>
+    <button class="danse-action" id="intro-river" type="button">Explore a river</button>
+    <button class="danse-action" id="intro-project" type="button" aria-haspopup="dialog" aria-controls="project-map">About the work</button>
+  </div>
+</header>
+
 <div id="veil" role="status" aria-label="Loading Danse Macabre">
   <h1>Danse Macabre</h1>
   <p>161 registered raw photographs &middot; 1 archival composite</p>
   <div id="bar"><i></i></div>
 </div>
 
-<section id="renderer-fallback" hidden role="status" aria-live="polite" aria-atomic="true">
-  <h1>Danse Macabre</h1>
-  <p id="renderer-fallback-reason">Visual renderer unavailable in this browser. Danse Macabre requires WebGL2; controls, Project, and accessibility information remain available.</p>
+<section id="renderer-fallback" hidden role="region" aria-labelledby="fallback-title" aria-describedby="renderer-fallback-reason">
+  <div class="fallback-plate" aria-hidden="true">
+    <p class="fallback-index">2017 / continuous</p>
+    <p class="fallback-display">Danse<br>Macabre</p>
+    <p class="fallback-count">161 registered photographs<br>1 archival composite</p>
+  </div>
+  <div class="fallback-copy">
+    <p class="fallback-eyebrow">Static view · live motion unavailable</p>
+    <h1 id="fallback-title">Danse Macabre</h1>
+    <p class="fallback-deck">One dancer session, opened into a photographic room that never repeats.</p>
+    <p id="renderer-fallback-reason" role="status" aria-live="polite" aria-atomic="true">Live motion is unavailable in this browser. The project record and accessible settings remain available.</p>
+    <div class="fallback-actions">
+      <button class="danse-action" id="fallback-project" type="button" aria-haspopup="dialog" aria-controls="project-map">About the work</button>
+      <button class="danse-action" id="fallback-controls" type="button">Settings &amp; accessibility</button>
+      <button class="danse-action" id="fallback-retry" type="button">Try live motion again</button>
+    </div>
+    <p class="fallback-note">The live renderer draws from 161 registered photographs and one archival composite made on 25 July 2017.</p>
+  </div>
 </section>
 
 <section id="hud" hidden aria-hidden="true" aria-label="Danse controls and current state">
-  <header class="sheet-header"><h2>Details</h2><button class="danse-action" id="sheet-close" type="button">Close</button></header>
-  <details open><summary>Technical state</summary><div id="state">
+  <header class="sheet-header"><h2>Settings &amp; accessibility</h2><button class="danse-action" id="sheet-close" type="button">Close</button></header>
+  <details><summary>Technical state</summary><div id="state">
     <span>River <b id="river">—</b> <span id="passage"></span></span>
     <span>River time <b id="clock">0:00</b></span>
     <span>Cut <b id="cut">—</b></span>
@@ -223,16 +286,16 @@
   </fieldset>
 </section>
 <nav id="danse-dock" hidden aria-hidden="true" aria-label="Danse control categories">
-  <button type="button" data-category="hold" aria-pressed="false" aria-label="Hold motion" aria-keyshortcuts="Space">Hold</button>
-  <button type="button" data-category="river" aria-pressed="false" aria-controls="surface-tray">River</button>
-  <button type="button" data-category="score" aria-pressed="false" aria-controls="surface-tray">Score</button>
-  <button type="button" data-category="presence" aria-pressed="false" aria-controls="surface-tray">Presence</button>
-  <button type="button" data-category="map" aria-pressed="false" aria-controls="project-map">Project</button>
+  <button type="button" data-category="hold" aria-pressed="false" aria-label="Pause motion" aria-keyshortcuts="Space">Pause</button>
+  <button type="button" data-category="river" aria-expanded="false" aria-controls="surface-tray">River</button>
+  <button type="button" data-category="score" aria-expanded="false" aria-controls="surface-tray">Score</button>
+  <button type="button" data-category="presence" aria-label="Interact with the room" aria-expanded="false" aria-controls="surface-tray">Input</button>
+  <button type="button" data-category="map" aria-haspopup="dialog" aria-expanded="false" aria-controls="project-map">About</button>
 </nav>
 <section id="surface-tray" hidden aria-label="Danse controls tray">
-  <div class="tray-content" data-tray="river"><div class="tray-heading"><div><h2>River</h2><p>New river, sharing, seed, and river time.</p></div></div><p id="river-seed">Current river: loading</p><div class="tray-actions"><button class="danse-action" type="button" id="river-new">New river</button><button class="danse-action" type="button" id="river-undo" disabled>Undo</button><button class="danse-action" type="button" id="river-share">Share</button></div><p class="tray-status" id="river-receipt" role="status" aria-live="polite">Current river is ready to share.</p></div>
-  <div class="tray-content" data-tray="score"><div class="tray-heading"><div><h2>Score</h2><p>Seven movements, program, Figure cutout, and music.</p></div></div><div class="movement-grid" aria-label="Movement"><button class="danse-action" type="button" data-movement="1" aria-pressed="false">1</button><button class="danse-action" type="button" data-movement="2" aria-pressed="false">2</button><button class="danse-action" type="button" data-movement="3" aria-pressed="false">3</button><button class="danse-action" type="button" data-movement="4" aria-pressed="false">4</button><button class="danse-action" type="button" data-movement="5" aria-pressed="false">5</button><button class="danse-action" type="button" data-movement="6" aria-pressed="false">6</button><button class="danse-action" type="button" data-movement="7" aria-pressed="false">7</button></div><div class="tray-actions"><button class="danse-action" type="button" id="program-score" aria-pressed="true">Score-led</button><button class="danse-action" type="button" id="program-free" aria-pressed="false">Free</button><button class="danse-action" type="button" id="cutout-toggle" aria-pressed="false">Figure cutout: off</button><button class="danse-action" type="button" id="music-tray">Music: stopped</button><button class="danse-action" type="button" id="score-details">Visual audition details</button></div><p class="tray-status" id="score-receipt" role="status" aria-live="polite">Score-led visual program.</p></div>
-  <div class="tray-content" data-tray="presence"><div class="tray-heading"><div><h2>Presence</h2><p>Optional local influence. Sliders never activate Presence.</p></div></div><div class="tray-actions"><button class="danse-action" type="button" id="presence-off" aria-pressed="true">Off</button><button class="danse-action" type="button" id="presence-camera" aria-pressed="false">Camera</button><button class="danse-action" type="button" id="presence-touch" aria-pressed="false">Keyboard-touch</button><button class="danse-action" type="button" id="presence-replay" aria-pressed="false">Replay</button></div><p class="tray-status" id="presence-receipt" role="status" aria-live="polite">Interaction is off.</p><button class="danse-action" type="button" id="presence-details">Presence details and receipts</button></div>
+  <div class="tray-content" data-tray="river"><div class="tray-heading"><div><h2>Choose a river</h2><p>Each river is a reproducible version of the artwork. Start another or share this one’s link.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close river controls">Close</button></div><p id="river-seed">Current river: loading</p><div class="tray-actions"><button class="danse-action" type="button" id="river-new">New river</button><button class="danse-action" type="button" id="river-undo" disabled>Undo</button><button class="danse-action" type="button" id="river-share">Share river</button></div><p class="tray-status" id="river-receipt" role="status" aria-live="polite">This river is ready to share.</p></div>
+  <div class="tray-content" data-tray="score"><div class="tray-heading"><div><h2>Shape the score</h2><p>Move through seven authored visual movements, start the music, or let the score lead.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close score controls">Close</button></div><div class="movement-grid" aria-label="Visual movement"><button class="danse-action" type="button" data-movement="1" aria-label="Movement 1: one photograph, whole" aria-pressed="false">I</button><button class="danse-action" type="button" data-movement="2" aria-label="Movement 2: the 2017 composite" aria-pressed="false">II</button><button class="danse-action" type="button" data-movement="3" aria-label="Movement 3: the composite comes apart" aria-pressed="false">III</button><button class="danse-action" type="button" data-movement="4" aria-label="Movement 4: the engine, countable" aria-pressed="false">IV</button><button class="danse-action" type="button" data-movement="5" aria-label="Movement 5: a body that never existed" aria-pressed="false">V</button><button class="danse-action" type="button" data-movement="6" aria-label="Movement 6: again, and again, faster" aria-pressed="false">VI</button><button class="danse-action" type="button" data-movement="7" aria-label="Movement 7: the only name it has" aria-pressed="false">VII</button></div><div class="tray-actions"><button class="danse-action" type="button" id="program-score" aria-pressed="true">Follow score</button><button class="danse-action" type="button" id="program-free" aria-pressed="false">Free movement</button><button class="danse-action" type="button" id="cutout-toggle" aria-pressed="false">Figure cutout: off</button><button class="danse-action" type="button" id="music-tray">Music: stopped</button><button class="danse-action" type="button" id="score-details">Advanced timing</button></div><p class="tray-status" id="score-receipt" role="status" aria-live="polite">The visual sequence is following the score.</p></div>
+  <div class="tray-content" data-tray="presence"><div class="tray-heading"><div><h2>Interact with the room</h2><p>Optional and off by default. Camera processing stays on this device; sliders are the camera-free path.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close interaction controls">Close</button></div><div class="tray-actions"><button class="danse-action" type="button" id="presence-off" aria-pressed="true">Off</button><button class="danse-action" type="button" id="presence-camera" aria-pressed="false">Use camera</button><button class="danse-action" type="button" id="presence-touch" aria-pressed="false">Use sliders</button><button class="danse-action" type="button" id="presence-replay" aria-pressed="false">Replay receipt</button></div><p class="tray-status" id="presence-receipt" role="status" aria-live="polite">Interaction is off. The artwork is complete without it.</p><button class="danse-action" type="button" id="presence-details">Privacy, accessibility &amp; receipts</button></div>
 </section>
 <dialog id="project-map" aria-labelledby="project-map-title">
   <article class="map-shell">
@@ -241,21 +304,28 @@
         <p class="project-kicker">Canonical project surface · status reviewed 1 September 2026</p>
         <h2 id="project-map-title">Danse Macabre</h2>
         <p id="project-map-status" role="status">The live artwork, film record, readings, and evidence now share this one public address.</p>
+        <ul class="project-pulse" aria-label="Current project status">
+          <li><span>Live artwork</span><strong>Available now</strong></li>
+          <li><span>Finite film</span><strong>In progress</strong></li>
+          <li><span>Last reviewed</span><strong>1 September 2026</strong></li>
+        </ul>
       </div>
-      <button class="danse-action" type="button" id="map-close">Return to artwork</button>
     </header>
 
     <nav class="project-nav" aria-label="Project sections">
-      <button class="danse-action" type="button" data-project-section="project-artwork">Artwork</button>
-      <button class="danse-action" type="button" data-project-section="project-film">Film</button>
-      <button class="danse-action" type="button" data-project-section="project-status">Status</button>
-      <button class="danse-action" type="button" data-project-section="project-readings">Readings</button>
-      <button class="danse-action" type="button" data-project-section="project-evidence">Evidence</button>
+      <div class="project-nav-links">
+        <button class="danse-action" type="button" data-project-section="project-artwork" aria-current="location">Overview</button>
+        <button class="danse-action" type="button" data-project-section="project-film">Film</button>
+        <button class="danse-action" type="button" data-project-section="project-status">Current status</button>
+        <button class="danse-action" type="button" data-project-section="project-readings">Readings</button>
+        <button class="danse-action" type="button" data-project-section="project-evidence">Evidence</button>
+      </div>
+      <button class="danse-action" type="button" id="map-close" aria-label="Close project information and return to artwork">Back to artwork</button>
     </nav>
 
-    <section class="project-section project-lede" id="project-artwork" tabindex="-1">
+    <section class="project-section project-lede" id="project-artwork">
       <p class="project-eyebrow">Artwork · implemented</p>
-      <h3>A finite photographic record, opened into time</h3>
+      <h3 tabindex="-1">A finite photographic record, opened into time</h3>
       <p>Danse Macabre is a seeded, browser-based photographic artwork by Anthony J. Padavano. It turns one dancer session from 20 June 2017 and a hand-cut composite from 25 July 2017 into an unbounded, reproducible room of moving image and sound.</p>
       <dl class="project-facts">
         <div><dt>Source corpus</dt><dd>161 registered raw photographs + 1 archival composite</dd></div>
@@ -265,9 +335,9 @@
       </dl>
     </section>
 
-    <section class="project-section" id="project-film" tabindex="-1">
+    <section class="project-section" id="project-film">
       <p class="project-eyebrow">Finite film · in progress</p>
-      <h3>Target passage: <time datetime="PT5M50.896S">05:50.896</time> <small>(05:51 displayed)</small></h3>
+      <h3 tabindex="-1">Target passage: <time datetime="PT5M50.896S">05:50.896</time> <small>(05:51 displayed)</small></h3>
       <p>The target score uses two Léo Delibes waltzes at native tempo and ends with a four-second black signature. Application copy is prepared; a final approved render is not evidenced.</p>
       <div class="opening-score" aria-label="Requested opening revision">
         <div><time datetime="PT0S">00:00</time>–<time datetime="PT30S">00:30</time><p>Cycle all 161 raw originals at the music’s cadence.</p></div>
@@ -277,20 +347,20 @@
       <p class="project-notice"><strong>Current truth:</strong> this revised opening has been requested but is not yet encoded or rendered. The current choreography contract still uses the earlier opening.</p>
     </section>
 
-    <section class="project-section" id="project-status" tabindex="-1">
+    <section class="project-section" id="project-status">
       <p class="project-eyebrow">Delivery ledger</p>
-      <h3>What exists, and what does not yet</h3>
+      <h3 tabindex="-1">What exists, and what does not yet</h3>
       <div class="status-grid">
-        <section data-status="implemented"><h4>Implemented</h4><ul><li>Seed + time generative engine</li><li>161 + 1 registered photographic corpus</li><li>Hold, river sharing, score, conductor, and optional local Presence controls</li><li>Score, MIDI, choreography, capture, provenance, and verification contracts</li></ul></section>
+        <section data-status="implemented"><h4>Implemented</h4><ul><li>Seed + time generative engine</li><li>161 registered photographs + 1 archival composite</li><li>Hold, river sharing, score, conductor, and optional local Presence controls</li><li>Score, MIDI, choreography, capture, provenance, and verification contracts</li></ul></section>
         <section data-status="prepared"><h4>Prepared</h4><ul><li>ScreenDance application copy, synopsis, biography, technical note, and rights declaration</li><li>Mac and Linux finishing rails</li><li>General, technical, humanities, presenter, evaluator, and evidence editions</li></ul></section>
         <section data-status="pending"><h4>Pending</h4><ul><li>Encode and render the revised first minute</li><li>Final render, full watch, and artist approval</li><li>Password-protected downloadable Vimeo upload and test</li><li>Exact-film rights/music warranty and Submittable filing receipt</li></ul></section>
         <section data-status="proposed"><h4>Proposed</h4><ul><li>Physical installation remains a reference design and simulator</li><li>No venue, hardware, calibration, recovery, or restore receipt exists</li></ul></section>
       </div>
     </section>
 
-    <section class="project-section" id="project-readings" tabindex="-1">
+    <section class="project-section" id="project-readings">
       <p class="project-eyebrow">Reader editions</p>
-      <h3>One work, five ways in</h3>
+      <h3 tabindex="-1">One work, five ways in</h3>
       <div class="reading-grid">
         <details><summary>General</summary><p>What the work is, how a visitor enters a river, and why a reproducible state is not a loop.</p></details>
         <details><summary>Technical</summary><p>The pure <code>frame = f(seed, absolute_time)</code> engine, projective-texture renderer, local interaction boundary, and fail-closed release system.</p></details>
@@ -300,9 +370,9 @@
       </div>
     </section>
 
-    <section class="project-section" id="project-evidence" tabindex="-1">
+    <section class="project-section" id="project-evidence">
       <p class="project-eyebrow">Evidence + rights</p>
-      <h3>Claims stay attached to receipts</h3>
+      <h3 tabindex="-1">Claims stay attached to receipts</h3>
       <p>Artist’s current attestation: performer permission was granted when the photographs were made; pictured posters are incidental objects in the photographed environment. Music sources are documented. Formal exact-film, publicity, rendered-mix, upload, and submission warranties remain pending until their receipts exist.</p>
       <p>No final-render receipt, Vimeo upload receipt, download test, or Submittable confirmation is currently recorded. The physical installation remains a proposal.</p>
       <div class="project-links">
@@ -314,7 +384,7 @@
   </article>
 </dialog>
 <button id="hud-toggle" type="button" hidden aria-hidden="true" aria-controls="hud" aria-expanded="false" aria-label="Show Danse controls" aria-keyshortcuts="H">
-  <span aria-hidden="true">H</span><span class="wide-label"> &middot; Controls</span>
+  <span class="shortcut-h" aria-hidden="true">H</span><span class="wide-label">Settings</span>
 </button>
 <div id="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 <video id="pose-video" autoplay playsinline muted hidden aria-hidden="true"></video>
@@ -443,6 +513,7 @@ const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 const dock = document.getElementById("danse-dock");
 const tray = document.getElementById("surface-tray");
 const projectMap = document.getElementById("project-map");
+const experienceIntro = el("experience-intro");
 let previousRiver = null;
 let previousRememberedRiver = null;
 let currentRememberedRiver = Arrival.rememberedRiverForUndo(
@@ -458,7 +529,15 @@ function setHudVisible(visible) {
   hud.setAttribute("aria-hidden", String(!visible));
   hudToggle.setAttribute("aria-expanded", String(visible));
   hudToggle.setAttribute("aria-label", `${visible ? "Hide" : "Show"} Danse controls`);
-  hudToggle.querySelector(".wide-label").textContent = visible ? " · Hide controls" : " · Controls";
+  hudToggle.querySelector(".wide-label").textContent = visible ? "Hide settings" : "Settings";
+}
+
+function dismissIntro() {
+  experienceIntro.hidden = true;
+  if (!dock.hidden) {
+    hudToggle.hidden = false;
+    hudToggle.removeAttribute("aria-hidden");
+  }
 }
 
 setHudVisible(false);
@@ -493,14 +572,30 @@ try {
     ? "a required corpus image or texture could not be prepared"
     : "WebGL2 could not initialize";
   canvas.hidden = true;
+  document.body.dataset.renderer = "unavailable";
   el("renderer-fallback").hidden = false;
-  const rendererFallbackMessage = `The Danse Macabre visual renderer is unavailable because ${rendererUnavailableReason}. Controls, Project, and accessibility information remain available.`;
+  const fallbackAvailableCopy = scoreAudio
+    ? "The project record, music, and accessible settings remain available."
+    : "The project record and accessible settings remain available.";
+  const rendererFallbackMessage = `Live motion could not start because ${rendererUnavailableReason}. ${fallbackAvailableCopy}`;
   el("renderer-fallback-reason").textContent = rendererFallbackMessage;
   el("stage-description").textContent = rendererFallbackMessage;
   console.warn(`Danse visual renderer unavailable: ${rendererUnavailableReason}; controls remain available`, error);
 }
 veil.classList.add("gone");
 veil.setAttribute("aria-hidden", "true");
+const introRunningCopy = "A room that never repeats, composed from one dancer session in 2017. It changes on its own: watch, pause, or enter a different river.";
+function syncIntroMotionPreference(matches) {
+  const heldForPreference = Boolean(baseRenderer && matches);
+  el("intro-behavior").textContent = heldForPreference
+    ? "Motion is held for your reduced-motion preference. Resume it explicitly, or explore the work while it stays still."
+    : introRunningCopy;
+  el("intro-motion").hidden = !heldForPreference;
+}
+if (baseRenderer) {
+  syncIntroMotionPreference(reducedMotion.matches);
+  experienceIntro.hidden = false;
+}
 if (reducedMotion.matches) veil.hidden = true;
 else setTimeout(() => { veil.hidden = true; }, 800);
 
@@ -508,7 +603,7 @@ else setTimeout(() => { veil.hidden = true; }, 800);
 // river kept flowing while you looked, so it snaps forward to now. The pause is
 // yours, not the river's. A reduced-motion visit begins held; Space is still an
 // explicit opt-in to motion, and an OS preference change takes effect at once.
-let heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+let heldAt = baseRenderer && reducedMotion.matches ? Arrival.now(river) : null;
 let matteK = query.get("cutout") === "1" ? 1 : 0;
 
 // Pose is an adapter around the pure engine, never an input to it. The adapter
@@ -548,10 +643,16 @@ function scoreSecondAt(t) {
 }
 
 function reducedMotionChanged({ matches }) {
+  if (!baseRenderer) {
+    heldAt = null;
+    controlBus.actions.setReducedMotion(false);
+    return;
+  }
   const playback = controlBus.getState().playback;
   if (matches && playback === "running") heldAt = Arrival.now(river);
   else if (!matches && playback === "held-reduced") heldAt = null;
   controlBus.actions.setReducedMotion(matches);
+  syncIntroMotionPreference(matches);
   renderInteraction(interaction.snapshot());
   flash(playback === "held-user" ? "manual hold preserved" : matches ? "reduced motion · frame held" : "motion resumed");
 }
@@ -673,11 +774,11 @@ addEventListener("hashchange", async (event) => {
   el("river-undo").disabled = true;
   el("river-receipt").textContent = `River ${hex(river.seed)} arrived from this link. Undo is unavailable.`;
   shifted = nextRiver.shifted;
-  heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  heldAt = baseRenderer && reducedMotion.matches ? Arrival.now(river) : null;
   if (programIntent === programGeneration) {
     controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM, value: program ? "score-led" : "free" });
   }
-  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: reducedMotion.matches });
+  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: Boolean(baseRenderer && reducedMotion.matches) });
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   describeProgram();
 });
@@ -686,9 +787,9 @@ addEventListener("hashchange", async (event) => {
 function jump(to) {
   river = { ...Arrival.shiftTo(river, to), minted: false, shifted: true };
   shifted = true;
-  heldAt = reducedMotion.matches ? to : null;
+  heldAt = baseRenderer && reducedMotion.matches ? to : null;
   scoreAudio?.seek(0);
-  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: reducedMotion.matches });
+  controlBus?.actions.sync({ type: ACTIONS.RESET_RIVER, reducedMotion: Boolean(baseRenderer && reducedMotion.matches) });
 }
 
 /** Announce temporary feedback without replacing the controls or live state. */
@@ -916,12 +1017,12 @@ function newRiver() {
   projectReturnRiverUrl = null;
   shifted = false;
   commitRiverUrl(riverHref(river, { mode: program ? null : "free" }));
-  heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  heldAt = baseRenderer && reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;
   el("river-receipt").textContent = `New river ${hex(river.seed)} created. Undo is available.`;
   flash(`new river · ${hex(river.seed)}`);
-  return { ...river, reducedMotion: reducedMotion.matches };
+  return { ...river, reducedMotion: Boolean(baseRenderer && reducedMotion.matches) };
 }
 
 function undoRiver() {
@@ -940,11 +1041,11 @@ function undoRiver() {
       : Arrival.withMode(restoredUrl, program ? null : "free"),
   );
   previousRiverUrl = null;
-  heldAt = reducedMotion.matches ? Arrival.now(river) : null;
+  heldAt = baseRenderer && reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = true;
   el("river-receipt").textContent = "Returned to the previous river.";
-  return { ...river, reducedMotion: reducedMotion.matches };
+  return { ...river, reducedMotion: Boolean(baseRenderer && reducedMotion.matches) };
 }
 
 async function shareRiver() {
@@ -1068,6 +1169,7 @@ function closeVisualSurfaces() {
 }
 
 function openDetails(section, trigger = null) {
+  dismissIntro();
   surfaceTrigger = ["score", "presence"].includes(section)
     ? dock.querySelector(`[data-category="${section}"]`)
     : trigger ?? document.activeElement;
@@ -1085,14 +1187,22 @@ function toggleControls() {
 }
 
 function openTray(category, trigger) {
+  const introduced = trigger && experienceIntro.contains(trigger);
+  const returnTrigger = introduced ? dock.querySelector(`[data-category="${category}"]`) : trigger;
+  dismissIntro();
   if (!hud.hidden) setHudVisible(false);
-  surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;
+  surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : returnTrigger;
   controlBus.actions.openTray(category);
+  if (introduced) queueMicrotask(() => tray.querySelector(`[data-tray="${category}"] [data-tray-close]`)?.focus());
 }
 
 async function openMap(trigger) {
+  const returnTrigger = trigger && experienceIntro.contains(trigger)
+    ? dock.querySelector('[data-category="map"]')
+    : trigger;
+  dismissIntro();
   if (!hud.hidden) setHudVisible(false);
-  surfaceTrigger = trigger;
+  surfaceTrigger = returnTrigger;
   controlBus.actions.openMap();
   if (!projectMap.open) projectMap.showModal();
   el("map-close").focus();
@@ -1101,10 +1211,18 @@ async function openMap(trigger) {
 async function openProjectSection(section = projectSectionFor(location.hash)) {
   if (!section || !controlBus) return false;
   await openMap(dock.querySelector('[data-category="map"]'));
+  setProjectSectionCurrent(section);
   const target = el(section);
   target?.scrollIntoView({ block: "start" });
-  target?.focus({ preventScroll: true });
+  target?.querySelector("h3")?.focus({ preventScroll: true });
   return Boolean(target);
+}
+
+function setProjectSectionCurrent(section) {
+  for (const button of projectMap.querySelectorAll("[data-project-section]")) {
+    if (button.dataset.projectSection === section) button.setAttribute("aria-current", "location");
+    else button.removeAttribute("aria-current");
+  }
 }
 
 controlBus = createControlActions({
@@ -1120,7 +1238,7 @@ controlBus = createControlActions({
   presence: setPresence,
   close: closeVisualSurfaces,
   reportError: (name, error) => flash(`${name} unavailable — ${error.message}`, 5000),
-}, { reducedMotion: reducedMotion.matches, scoreAvailable: Boolean(scoreAudio) });
+}, { reducedMotion: Boolean(baseRenderer && reducedMotion.matches), scoreAvailable: Boolean(scoreAudio) });
 
 if (!program) controlBus.actions.sync({ type: ACTIONS.SET_PROGRAM, value: "free" });
 if (matteK) controlBus.actions.sync({ type: ACTIONS.TOGGLE_CUTOUT });
@@ -1142,9 +1260,24 @@ controlBus.subscribe((state) => {
 
 reducedMotion.addEventListener("change", reducedMotionChanged);
 hudToggle.addEventListener("click", toggleControls);
+el("intro-dismiss").addEventListener("click", () => {
+  dismissIntro();
+  dock.querySelector('[data-category="hold"]').focus();
+});
+el("intro-motion").addEventListener("click", async () => {
+  dismissIntro();
+  await controlBus.actions.hold();
+  dock.querySelector('[data-category="hold"]').focus();
+});
+el("intro-river").addEventListener("click", (event) => openTray("river", event.currentTarget));
+el("intro-project").addEventListener("click", (event) => { void openMap(event.currentTarget); });
+el("fallback-project").addEventListener("click", (event) => { void openMap(event.currentTarget); });
+el("fallback-controls").addEventListener("click", (event) => openDetails("details", event.currentTarget));
+el("fallback-retry").addEventListener("click", () => location.reload());
 dock.querySelector('[data-category="hold"]').addEventListener("click", () => { void controlBus.actions.hold(); });
 for (const category of ["river", "score", "presence"]) dock.querySelector(`[data-category="${category}"]`).addEventListener("click", (event) => openTray(category, event.currentTarget));
 dock.querySelector('[data-category="map"]').addEventListener("click", (event) => { void openMap(event.currentTarget); });
+for (const button of tray.querySelectorAll("[data-tray-close]")) button.addEventListener("click", () => controlBus.actions.close());
 el("river-new").addEventListener("click", () => { void controlBus.actions.newRiver(); });
 el("river-undo").addEventListener("click", () => { void controlBus.actions.undoRiver(); });
 el("river-share").addEventListener("click", () => { void controlBus.actions.share(); });
@@ -1155,7 +1288,11 @@ el("cutout-toggle").addEventListener("click", () => { void controlBus.actions.to
 el("music-tray").addEventListener("click", () => { void controlBus.actions.music(); });
 el("presence-off").addEventListener("click", () => { void controlBus.actions.presence("off"); });
 el("presence-camera").addEventListener("click", () => { void controlBus.actions.presence("camera"); });
-el("presence-touch").addEventListener("click", () => { void controlBus.actions.presence("keyboard-touch"); });
+el("presence-touch").addEventListener("click", async (event) => {
+  await controlBus.actions.presence("keyboard-touch");
+  openDetails("presence", event.currentTarget);
+  queueMicrotask(() => el("fallback-x").focus());
+});
 el("presence-replay").addEventListener("click", () => { void controlBus.actions.presence("replay"); });
 el("presence-details").addEventListener("click", (event) => openDetails("presence", event.currentTarget));
 el("score-details").addEventListener("click", (event) => openDetails("score", event.currentTarget));
@@ -1164,8 +1301,9 @@ el("map-close").addEventListener("click", () => controlBus.actions.close());
 for (const button of projectMap.querySelectorAll("[data-project-section]")) {
   button.addEventListener("click", () => {
     const section = document.getElementById(button.dataset.projectSection);
+    setProjectSectionCurrent(button.dataset.projectSection);
     section?.scrollIntoView({ block: "start" });
-    section?.focus({ preventScroll: true });
+    section?.querySelector("h3")?.focus({ preventScroll: true });
   });
 }
 projectMap.addEventListener("cancel", (event) => { event.preventDefault(); controlBus.actions.close(); });
@@ -1173,6 +1311,7 @@ projectMap.addEventListener("cancel", (event) => { event.preventDefault(); contr
 addEventListener("keydown", (event) => {
   const command = shortcutAction(event);
   if (!command) return;
+  if (!baseRenderer && ["hold", "movement", "toggleProgram", "toggleCutout"].includes(command.name)) return;
   event.preventDefault();
   if (command.name === "toggleControls") toggleControls();
   else if (command.name === "close") controlBus.actions.close();
@@ -1182,8 +1321,23 @@ addEventListener("keydown", (event) => {
 
 dock.hidden = false;
 dock.removeAttribute("aria-hidden");
-hudToggle.hidden = false;
-hudToggle.removeAttribute("aria-hidden");
+hudToggle.hidden = !experienceIntro.hidden;
+if (hudToggle.hidden) hudToggle.setAttribute("aria-hidden", "true");
+else hudToggle.removeAttribute("aria-hidden");
+if (!baseRenderer) {
+  dock.dataset.mode = "fallback";
+  for (const category of ["hold", "score", "presence"]) {
+    const button = dock.querySelector(`[data-category="${category}"]`);
+    button.hidden = true;
+    button.disabled = true;
+  }
+  el("conductor-controls").hidden = true;
+  el("interaction-controls").hidden = true;
+  el("keyboard-instructions").hidden = true;
+  el("touch-instructions").textContent = scoreAudio
+    ? "Live motion is unavailable here. Music, project information, and river links remain available."
+    : "Live motion and music are unavailable here. Project information and river links remain available.";
+}
 if (projectSectionAtArrival) {
   commitRiverUrl(currentRiverUrl, { keepProjectOpen: true });
 }
