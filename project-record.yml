@@ -28,7 +28,7 @@ authorship:
   role: artist named in the tracked project identity; implementation attribution remains evidence-bounded
   contributions:
     - artistic identity, concept, and direction recorded in release/manifest.json
-    - additional choreography, image-making, editing, sound, software, archive, and production
+    - additional choreography, photography, editing, sound, software, archive, and production
     - canonical repository custody and migration lineage
   collaborators:
     - "Madison Garber — performer and primary choreographer"
@@ -185,4 +185,4 @@ links:
   deployment: https://danse.pages.dev/
   evidence: docs/evidence/README.md
 generated_at: "2026-08-31T22:44:39Z"
-verified_at: "2026-09-01T13:19:41Z"
+verified_at: "2026-09-01T14:03:00Z"
