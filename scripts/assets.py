@@ -1096,6 +1096,25 @@ def _write_stream_verified(stream, output: BinaryIO, asset: Asset) -> None:
         raise AssetError("asset source disagrees with its locked identity")
 
 
+def _fsync_asset_directory(descriptor: int, label: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise AssetError(f"{label} could not be durably synchronized") from exc
+
+
+def _remove_published_link(descriptor: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=descriptor)
+    except FileNotFoundError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        # The caller still fails closed and therefore cannot publish a receipt.
+        pass
+
+
 def _cache_from_sources(
     root: Path,
     asset: Asset,
@@ -1113,6 +1132,9 @@ def _cache_from_sources(
     try:
         state = _identity_at(cache_descriptor, cache_name, asset)
         if state == "verified":
+            _fsync_asset_directory(cache_descriptor, "content-addressed cache parent")
+            if not _parent_descriptor_matches(root, relative, cache_descriptor):
+                raise AssetError("content-addressed cache parent changed during hydration")
             return root / relative
         if state != "missing":
             raise AssetError("content-addressed cache contains a corrupt object")
@@ -1137,6 +1159,7 @@ def _cache_from_sources(
                         output.flush()
                         os.fsync(output.fileno())
                         os.fchmod(output.fileno(), 0o444)
+                        os.fsync(output.fileno())
                     try:
                         os.link(
                             temporary_name,
@@ -1164,7 +1187,20 @@ def _cache_from_sources(
                     continue
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
-                        os.unlink(cache_name, dir_fd=cache_descriptor)
+                        _remove_published_link(cache_descriptor, cache_name)
+                    raise AssetError("content-addressed cache parent changed during hydration")
+                try:
+                    _fsync_asset_directory(
+                        cache_descriptor,
+                        "content-addressed cache parent",
+                    )
+                except AssetError:
+                    if published:
+                        _remove_published_link(cache_descriptor, cache_name)
+                    raise
+                if not _parent_descriptor_matches(root, relative, cache_descriptor):
+                    if published:
+                        _remove_published_link(cache_descriptor, cache_name)
                     raise AssetError("content-addressed cache parent changed during hydration")
                 return root / relative
             finally:
@@ -1206,6 +1242,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target parent changed before publication")
             target_state = _identity_at(target_descriptor, target_name, asset)
             if target_state == "verified":
+                _fsync_asset_directory(target_descriptor, "asset target parent")
                 if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                     raise AssetError("asset target parent changed during verification")
                 return
@@ -1241,11 +1278,18 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target parent changed during final verification")
             if final_state != "verified":
                 if published:
-                    try:
-                        os.unlink(target_name, dir_fd=target_descriptor)
-                    except FileNotFoundError:
-                        pass
+                    _remove_published_link(target_descriptor, target_name)
                 raise AssetError("published asset target disagrees with the lock")
+            try:
+                _fsync_asset_directory(target_descriptor, "asset target parent")
+            except AssetError:
+                if published:
+                    _remove_published_link(target_descriptor, target_name)
+                raise
+            if not _parent_descriptor_matches(root, target_relative, target_descriptor):
+                if published:
+                    _remove_published_link(target_descriptor, target_name)
+                raise AssetError("asset target parent changed during durable publication")
         finally:
             os.close(target_descriptor)
     finally:

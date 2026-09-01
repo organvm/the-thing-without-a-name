@@ -134,6 +134,128 @@ class AssetParityTest(unittest.TestCase):
         self.assertTrue(json.loads(receipt)["ok"])
         self.assertEqual(ASSETS.main(["verify", "--lock", str(self.fixture.lock), "--root", str(self.fixture.root)]), 0)
 
+    def test_pull_syncs_mode_cache_and_target_before_receipt(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache_parent = ASSETS._cache_path(self.fixture.root, asset, create=False).parent
+        target_parent = (self.fixture.root / asset.target).parent
+        events = []
+        real_fchmod = os.fchmod
+        real_fsync = os.fsync
+        real_atomic_json = ASSETS._atomic_json
+
+        def record_mode(descriptor, mode):
+            events.append("mode")
+            return real_fchmod(descriptor, mode)
+
+        def record_sync(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                events.append("file")
+            elif descriptor_matches_path(descriptor, cache_parent):
+                events.append("cache-directory")
+            elif descriptor_matches_path(descriptor, target_parent):
+                events.append("target-directory")
+            return real_fsync(descriptor)
+
+        def record_receipt(*args, **kwargs):
+            events.append("receipt")
+            return real_atomic_json(*args, **kwargs)
+
+        with (
+            mock.patch.object(ASSETS.os, "fchmod", side_effect=record_mode),
+            mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync),
+            mock.patch.object(ASSETS, "_atomic_json", side_effect=record_receipt),
+        ):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 0)
+        mode_index = events.index("mode")
+        self.assertEqual(events[mode_index - 1 : mode_index + 2], ["file", "mode", "file"])
+        self.assertLess(events.index("cache-directory"), events.index("target-directory"))
+        self.assertLess(events.index("target-directory"), events.index("receipt"))
+        self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_cache_directory_sync_failure_cleans_link_and_blocks_receipt(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=False)
+        target = self.fixture.root / asset.target
+        real_fsync = os.fsync
+        rejected = False
+
+        def reject_cache_directory_once(descriptor):
+            nonlocal rejected
+            if not rejected and descriptor_matches_path(descriptor, cache.parent):
+                rejected = True
+                raise OSError("injected cache directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=reject_cache_directory_once):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(rejected)
+        self.assertEqual(code, 1)
+        self.assertFalse(cache.exists())
+        self.assertFalse(target.exists())
+        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_target_directory_sync_failure_cleans_link_and_blocks_receipt(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=False)
+        target = self.fixture.root / asset.target
+        real_fsync = os.fsync
+        rejected = False
+
+        def reject_target_directory_once(descriptor):
+            nonlocal rejected
+            if not rejected and descriptor_matches_path(descriptor, target.parent):
+                rejected = True
+                raise OSError("injected target directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=reject_target_directory_once):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(rejected)
+        self.assertEqual(code, 1)
+        self.assertTrue(cache.exists())
+        self.assertFalse(target.exists())
+        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
     def test_missing_required_asset_fails_closed(self) -> None:
         code = ASSETS.main(
             ["audit", "--lock", str(self.fixture.lock), "--root", str(self.fixture.root), "--receipt", str(self.fixture.receipt)]
@@ -1269,6 +1391,15 @@ def stat_mode(path: Path) -> int:
 
 def stat_mode_descriptor(descriptor: int) -> str:
     return "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+
+
+def descriptor_matches_path(descriptor: int, path: Path) -> bool:
+    try:
+        opened = os.fstat(descriptor)
+        current = path.stat()
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
 
 
 if __name__ == "__main__":
