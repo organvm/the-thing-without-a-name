@@ -187,8 +187,9 @@
   <button id="intro-dismiss" type="button" aria-label="Dismiss introduction">Close</button>
   <p class="intro-kicker">Live generative artwork</p>
   <h1 id="intro-title">Danse Macabre</h1>
-  <p>A room that never repeats, composed from one dancer session in 2017. It changes on its own: watch, pause, or enter a different river.</p>
+  <p id="intro-behavior">A room that never repeats, composed from one dancer session in 2017. It changes on its own: watch, pause, or enter a different river.</p>
   <div class="intro-actions">
+    <button class="danse-action" id="intro-motion" type="button" hidden>Resume motion</button>
     <button class="danse-action" id="intro-river" type="button">Explore a river</button>
     <button class="danse-action" id="intro-project" type="button" aria-haspopup="dialog" aria-controls="project-map">About the work</button>
   </div>
@@ -292,7 +293,7 @@
   <button type="button" data-category="map" aria-haspopup="dialog" aria-expanded="false" aria-controls="project-map">About</button>
 </nav>
 <section id="surface-tray" hidden aria-label="Danse controls tray">
-  <div class="tray-content" data-tray="river"><div class="tray-heading"><div><h2>Choose a river</h2><p>Each river is a reproducible version of the artwork. Start another or copy this one’s link.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close river controls">Close</button></div><p id="river-seed">Current river: loading</p><div class="tray-actions"><button class="danse-action" type="button" id="river-new">New river</button><button class="danse-action" type="button" id="river-undo" disabled>Undo</button><button class="danse-action" type="button" id="river-share">Copy link</button></div><p class="tray-status" id="river-receipt" role="status" aria-live="polite">This river is ready to share.</p></div>
+  <div class="tray-content" data-tray="river"><div class="tray-heading"><div><h2>Choose a river</h2><p>Each river is a reproducible version of the artwork. Start another or share this one’s link.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close river controls">Close</button></div><p id="river-seed">Current river: loading</p><div class="tray-actions"><button class="danse-action" type="button" id="river-new">New river</button><button class="danse-action" type="button" id="river-undo" disabled>Undo</button><button class="danse-action" type="button" id="river-share">Share river</button></div><p class="tray-status" id="river-receipt" role="status" aria-live="polite">This river is ready to share.</p></div>
   <div class="tray-content" data-tray="score"><div class="tray-heading"><div><h2>Shape the score</h2><p>Move through seven authored visual movements, start the music, or let the score lead.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close score controls">Close</button></div><div class="movement-grid" aria-label="Visual movement"><button class="danse-action" type="button" data-movement="1" aria-label="Movement 1: one photograph, whole" aria-pressed="false">I</button><button class="danse-action" type="button" data-movement="2" aria-label="Movement 2: the 2017 composite" aria-pressed="false">II</button><button class="danse-action" type="button" data-movement="3" aria-label="Movement 3: the composite comes apart" aria-pressed="false">III</button><button class="danse-action" type="button" data-movement="4" aria-label="Movement 4: the engine, countable" aria-pressed="false">IV</button><button class="danse-action" type="button" data-movement="5" aria-label="Movement 5: a body that never existed" aria-pressed="false">V</button><button class="danse-action" type="button" data-movement="6" aria-label="Movement 6: again, and again, faster" aria-pressed="false">VI</button><button class="danse-action" type="button" data-movement="7" aria-label="Movement 7: the only name it has" aria-pressed="false">VII</button></div><div class="tray-actions"><button class="danse-action" type="button" id="program-score" aria-pressed="true">Follow score</button><button class="danse-action" type="button" id="program-free" aria-pressed="false">Free movement</button><button class="danse-action" type="button" id="cutout-toggle" aria-pressed="false">Figure cutout: off</button><button class="danse-action" type="button" id="music-tray">Music: stopped</button><button class="danse-action" type="button" id="score-details">Advanced timing</button></div><p class="tray-status" id="score-receipt" role="status" aria-live="polite">The visual sequence is following the score.</p></div>
   <div class="tray-content" data-tray="presence"><div class="tray-heading"><div><h2>Interact with the room</h2><p>Optional and off by default. Camera processing stays on this device; sliders are the camera-free path.</p></div><button class="danse-action" type="button" data-tray-close aria-label="Close interaction controls">Close</button></div><div class="tray-actions"><button class="danse-action" type="button" id="presence-off" aria-pressed="true">Off</button><button class="danse-action" type="button" id="presence-camera" aria-pressed="false">Use camera</button><button class="danse-action" type="button" id="presence-touch" aria-pressed="false">Use sliders</button><button class="danse-action" type="button" id="presence-replay" aria-pressed="false">Replay receipt</button></div><p class="tray-status" id="presence-receipt" role="status" aria-live="polite">Interaction is off. The artwork is complete without it.</p><button class="danse-action" type="button" id="presence-details">Privacy, accessibility &amp; receipts</button></div>
 </section>
@@ -580,7 +581,13 @@ try {
 }
 veil.classList.add("gone");
 veil.setAttribute("aria-hidden", "true");
-if (baseRenderer) experienceIntro.hidden = false;
+if (baseRenderer) {
+  if (reducedMotion.matches) {
+    el("intro-behavior").textContent = "Motion is held for your reduced-motion preference. Resume it explicitly, or explore the work while it stays still.";
+    el("intro-motion").hidden = false;
+  }
+  experienceIntro.hidden = false;
+}
 if (reducedMotion.matches) veil.hidden = true;
 else setTimeout(() => { veil.hidden = true; }, 800);
 
@@ -1248,6 +1255,11 @@ el("intro-dismiss").addEventListener("click", () => {
   dismissIntro();
   dock.querySelector('[data-category="hold"]').focus();
 });
+el("intro-motion").addEventListener("click", async () => {
+  dismissIntro();
+  await controlBus.actions.hold();
+  dock.querySelector('[data-category="hold"]').focus();
+});
 el("intro-river").addEventListener("click", (event) => openTray("river", event.currentTarget));
 el("intro-project").addEventListener("click", (event) => { void openMap(event.currentTarget); });
 el("fallback-project").addEventListener("click", (event) => { void openMap(event.currentTarget); });
@@ -1267,7 +1279,11 @@ el("cutout-toggle").addEventListener("click", () => { void controlBus.actions.to
 el("music-tray").addEventListener("click", () => { void controlBus.actions.music(); });
 el("presence-off").addEventListener("click", () => { void controlBus.actions.presence("off"); });
 el("presence-camera").addEventListener("click", () => { void controlBus.actions.presence("camera"); });
-el("presence-touch").addEventListener("click", () => { void controlBus.actions.presence("keyboard-touch"); });
+el("presence-touch").addEventListener("click", async (event) => {
+  await controlBus.actions.presence("keyboard-touch");
+  openDetails("presence", event.currentTarget);
+  queueMicrotask(() => el("fallback-x").focus());
+});
 el("presence-replay").addEventListener("click", () => { void controlBus.actions.presence("replay"); });
 el("presence-details").addEventListener("click", (event) => openDetails("presence", event.currentTarget));
 el("score-details").addEventListener("click", (event) => openDetails("score", event.currentTarget));

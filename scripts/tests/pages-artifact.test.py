@@ -1893,6 +1893,7 @@ class InterfaceContractTest(unittest.TestCase):
         for element_id in (
             "experience-intro",
             "intro-dismiss",
+            "intro-motion",
             "intro-river",
             "intro-project",
             "fallback-project",
@@ -1913,6 +1914,9 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('el("interaction-controls").hidden = true;', self.script)
         self.assertIn('["hold", "movement", "toggleProgram", "toggleCutout"].includes(command.name)', self.script)
         self.assertIn("hudToggle.hidden = !experienceIntro.hidden;", self.script)
+        self.assertIn('el("intro-motion").hidden = false;', self.script)
+        self.assertIn("Motion is held for your reduced-motion preference.", self.script)
+        self.assertIn('await controlBus.actions.hold();', self.script)
 
     def test_progressive_controls_disclose_state_and_have_explicit_close_paths(self) -> None:
         expandable = {
@@ -1931,6 +1935,10 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('button.hasAttribute("aria-pressed")', renderer)
         self.assertIn('tray.querySelectorAll("[data-tray-close]")', self.script)
         self.assertIn("Settings &amp; accessibility", self.html)
+        self.assertIn('id="river-share">Share river</button>', self.html)
+        slider_handler = self.script.split('el("presence-touch").addEventListener', 1)[1].split("});", 1)[0]
+        self.assertIn('openDetails("presence", event.currentTarget)', slider_handler)
+        self.assertIn('el("fallback-x").focus()', slider_handler)
 
     def test_project_keeps_current_truth_and_return_action_in_the_sticky_header(self) -> None:
         self.assertIn("project-pulse", self.html)
