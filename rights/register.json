@@ -66,7 +66,7 @@
       "id": "synopsis-short-text",
       "source": {
         "path": "submission/text/synopsis_short.txt",
-        "sha256": "f90c7d47959f2d99892c67f202024cdecc8f934468bd1fb696090dbfa5496a30",
+        "sha256": "34a7db79d301c492a30cc7ec9dd4220b729b042735cf7e99f56867ca9dc69f67",
         "summary": "Tracked short synopsis copied byte-for-byte into a staged package."
       },
       "destination": "text/synopsis_short.txt",
@@ -76,7 +76,7 @@
       "id": "synopsis-long-text",
       "source": {
         "path": "submission/text/synopsis_long.txt",
-        "sha256": "900591f164306fae6d2534c2bd08f8e3050f1e6b86b37be3f9cb1da28993e393",
+        "sha256": "453b8efc60dfe11a52d4938b2846a30070f8f932cce66ea38e198e7a05972487",
         "summary": "Tracked long synopsis copied byte-for-byte into a staged package."
       },
       "destination": "text/synopsis_long.txt",
@@ -86,7 +86,7 @@
       "id": "artist-statement-text",
       "source": {
         "path": "submission/text/artist_statement.txt",
-        "sha256": "6a89bcdba7e75a2ec4f4af0c03c8e57569e98393ea2c9f1396cab9fa13c16b53",
+        "sha256": "27063af3330ab7ed21db607f0faee6a49be7e3dfc335b017fe8d39ce86795068",
         "summary": "Tracked artist statement copied byte-for-byte into a staged package."
       },
       "destination": "text/artist_statement.txt",
