@@ -18,7 +18,7 @@ The publication claim is deliberately narrow and factual:
 - the work was sent by email to ScreenDance Miami on 30 August 2026 for possible 2027 consideration;
 - no portal receipt, acceptance, official selection, or festival outcome is claimed;
 - Madison Garber is credited for performance and primary choreography;
-- Anthony J. Padavano is credited for direction, concept, additional choreography, image-making, editing, sound, software, archive, and production.
+- Anthony J. Padavano is credited for direction, concept, additional choreography, photography, editing, sound, software, archive, and production.
 
 ## Preferred LinkedIn post
 
@@ -26,16 +26,14 @@ I built a dance film out of photographs.
 
 Not to imitate continuous movement, but to ask what happens when the edit becomes a choreographer.
 
-**The Thing Without a Name** is a 4:21 screendance work in which rhythm, repetition, duration, and cut organize the body across still images. The film sits inside **Danse Macabre**: a public system of film, score, archive, and instrument.
+**The Thing Without a Name** is a 4:21 screendance work in which rhythm, repetition, duration, and cut organize the body across still images. It is the finite film inside **Danse Macabre**: a larger public work spanning film, score, archive, and instrument.
 
 **Performance & primary choreography — Madison Garber**  
-**Direction, concept, additional choreography, image, editing, sound, software, archive & production — Anthony J. Padavano**
+**Direction, concept, additional choreography, photography, editing, sound, software, archive & production — Anthony J. Padavano**
 
-On August 30, I sent the work to ScreenDance Miami for possible 2027 consideration. No selection has been announced; I’m sharing the work itself, not claiming an outcome.
+On August 30, I sent the film to ScreenDance Miami for possible 2027 consideration. While that process unfolds, I’m sharing the larger work and looking to connect with choreographers, filmmakers, curators, and researchers working where embodied performance meets code, image systems, and archival form.
 
 Film and project links are in the first comment.
-
-I’m looking to connect with choreographers, filmmakers, curators, and researchers working where embodied performance meets code, image systems, and archival form.
 
 #Screendance #DanceFilm #Choreography #MediaArt #CreativeCoding
 
@@ -53,6 +51,19 @@ The film is not a slideshow standing in for movement. It treats still images as 
 
 The public project extends that proposition beyond one finite film. The same photographic corpus becomes an inspectable archive, an executable score, and a browser-based instrument.
 
+## Third comment — field context and references
+
+Two texts helped me locate this question within the screendance field:
+
+Douglas Rosenberg’s *Screendance: Inscribing the Ephemeral Image* treats framing and editing as ways meaning is constructed rather than as neutral documentation.
+
+Erin Brannigan’s *Dancefilm: Choreography and the Moving Image* examines the exchange between choreographic and cinematic orders.
+
+My variation begins from still photographs: the cut, hold, repetition, and interval have to carry nearly all of the movement.
+
+Rosenberg: https://doi.org/10.1093/acprof:oso/9780199772612.001.0001  
+Brannigan: https://doi.org/10.1093/acprof:oso/9780195367232.001.0001
+
 ## Alternate post A — shorter and more field-facing
 
 What happens when the edit becomes a choreographer?
@@ -62,9 +73,9 @@ What happens when the edit becomes a choreographer?
 The film sits inside **Danse Macabre**, a larger public work spanning film, software, archive, and instrument.
 
 **Performance & primary choreography — Madison Garber**  
-**All other direction and production — Anthony J. Padavano**
+**Direction, concept, additional choreography, photography, editing, sound, software, archive & production — Anthony J. Padavano**
 
-I sent the film to ScreenDance Miami for possible 2027 consideration on August 30. No selection has been announced.
+I sent the film to ScreenDance Miami for possible 2027 consideration on August 30. While that process unfolds, I’m sharing the work and connecting with the wider screendance field.
 
 Film and project links in the first comment.
 
@@ -79,13 +90,19 @@ For **The Thing Without a Name**, I worked from one dancer session and treated e
 That finite 4:21 film now opens into **Danse Macabre**: film / score / archive / instrument.
 
 **Performance & primary choreography — Madison Garber**  
-**Direction, concept, additional choreography, image, editing, sound, software, archive & production — Anthony J. Padavano**
+**Direction, concept, additional choreography, photography, editing, sound, software, archive & production — Anthony J. Padavano**
 
 The work was sent to ScreenDance Miami for possible 2027 consideration. This is a publication of the work, not an acceptance announcement.
 
 Links in the first comment.
 
 #Screendance #DanceFilm #CreativeCoding #DigitalArchive #MediaArt
+
+## Visual
+
+Use [`linkedin_visual_scoremap.svg`](linkedin_visual_scoremap.svg), exported to a 1200 × 627 PNG. The visual is derived from the project’s actual 256-region provenance map; it contains no generated dancer imagery and makes no festival claim.
+
+Exact alt text is recorded in [`linkedin_visual_brief.md`](linkedin_visual_brief.md).
 
 ## Tagging
 
@@ -97,11 +114,12 @@ Links in the first comment.
 
 ## Recommended publishing sequence
 
-1. Publish the preferred post with one production-derived visual.
+1. Publish the preferred post with the score-map visual.
 2. Add the link comment immediately.
 3. Add the method comment after the post is stable.
-4. Send individualized connection requests; never paste one group message.
-5. Reply to substantive comments with project-specific answers rather than generic thanks.
+4. Add the field-context comment only after the first exchange of substantive engagement; it should deepen the post rather than bury the work beneath references.
+5. Follow the staged outreach plan in [`linkedin_networking_plan.md`](linkedin_networking_plan.md).
+6. Reply to substantive comments with project-specific answers rather than generic thanks.
 
 ## Final copy audit
 
@@ -113,3 +131,5 @@ Links in the first comment.
 - [x] Submission route described as “sent” rather than portal-confirmed
 - [x] Main thesis is the work, not the administrative submission story
 - [x] Networking invitation addresses the wider field rather than pressuring reviewers
+- [x] Optional field references resolve to publisher-recorded books
+- [x] Ready visual is repository-derived rather than generated
