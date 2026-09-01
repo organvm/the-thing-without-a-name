@@ -48,7 +48,13 @@ APP = HERE.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(APP / "pipeline"))
 sys.path.insert(0, str(APP / "sound"))
-from browser import browser, serve  # noqa: E402
+from browser import (  # noqa: E402
+    CANONICAL_RENDER_CONTEXT,
+    EMERGENCY_SOFTWARE_CAPTURE_CONTEXT,
+    browser,
+    renderer_matches_context,
+    serve,
+)
 from choreography import validate as validate_choreography  # noqa: E402
 from corpus_contract import authorize_render_tier  # noqa: E402
 from media_identity import (  # noqa: E402
@@ -281,6 +287,87 @@ def film_url(base: str, args) -> str:
     return f"{base}/film.html?{urlencode(params)}"
 
 
+def browser_render_context(args) -> str:
+    """Select software rendering only for an explicit emergency capture."""
+    if getattr(args, "emergency_software_render", False):
+        return EMERGENCY_SOFTWARE_CAPTURE_CONTEXT
+    return CANONICAL_RENDER_CONTEXT
+
+
+def emergency_source_identity(args) -> dict[str, object] | None:
+    """Bind emergency receipts to clean Git sources and exact Chromium bytes."""
+    if browser_render_context(args) == CANONICAL_RENDER_CONTEXT:
+        return None
+    cached = getattr(args, "_emergency_source_identity", None)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode or status.stdout.strip():
+        raise SystemExit("emergency capture requires a clean tracked Git worktree")
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{tree}"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if (
+        len(head) not in {40, 64}
+        or len(tree) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in head + tree)
+    ):
+        raise SystemExit("cannot bind emergency capture to an exact Git commit and tree")
+    executable_value = os.environ.get("DANSE_CHROME_EXECUTABLE")
+    if not executable_value:
+        raise SystemExit("emergency capture requires DANSE_CHROME_EXECUTABLE")
+    executable = Path(executable_value)
+    if executable.is_symlink():
+        raise SystemExit("emergency Chromium executable must not be a symlink")
+    try:
+        executable = executable.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit("emergency Chromium executable is missing") from exc
+    if not executable.is_file():
+        raise SystemExit("emergency Chromium executable is not a regular file")
+    version = subprocess.run(
+        [str(executable), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    version_line = (version.stdout or version.stderr).strip().splitlines()
+    if version.returncode or not version_line:
+        raise SystemExit("cannot identify emergency Chromium executable")
+    program = json.loads((APP / "render/program.json").read_text())
+    effective_seed = args.seed if args.seed is not None else program.get("seed")
+    identity: dict[str, object] = {
+        "repository_head": head,
+        "repository_tree": tree,
+        "effective_seed": effective_seed,
+        "browser_toolchain": {
+            "executable": str(executable),
+            "executable_sha256": file_sha256(executable),
+            "version": version_line[0],
+        },
+    }
+    if cached is not None and identity != cached:
+        raise SystemExit("emergency source identity changed during capture")
+    args._emergency_source_identity = identity
+    return identity
+
+
 def segment_identity(args, segment: int, frames: int) -> dict:
     payload = {
         "schema": "danse.render.segment.v1",
@@ -313,6 +400,10 @@ def segment_identity(args, segment: int, frames: int) -> dict:
             "mode": "fixed-passage",
             "seconds": timing_score["duration_seconds"],
         }
+    render_context = browser_render_context(args)
+    payload["inputs"]["browser_render_context"] = render_context
+    if render_context != CANONICAL_RENDER_CONTEXT:
+        payload["inputs"].update(emergency_source_identity(args) or {})
     return payload
 
 
@@ -320,8 +411,13 @@ def output_stem(args) -> Path:
     """Keep canonical A/B producers disjoint without renaming legacy delivery output."""
     stem_seed = args.seed if args.seed is not None else "default"
     stream_suffix = f"-stream-{args.stream}" if args.stream else ""
+    renderer_suffix = (
+        "-emergency-swiftshader"
+        if browser_render_context(args) == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT
+        else ""
+    )
     control_suffix = "-control" if timing_score_identity(args) else ""
-    return args.out / f"{args.window}-{stem_seed}{stream_suffix}{control_suffix}"
+    return args.out / f"{args.window}-{stem_seed}{stream_suffix}{renderer_suffix}{control_suffix}"
 
 
 def segment_receipt_path(dest: Path) -> Path:
@@ -459,9 +555,10 @@ def write_segment_receipt(
             }
         except KeyError as exc:
             raise SystemExit(f"renderer capture result is incomplete: {exc.args[0]}") from exc
+        render_context = payload["inputs"]["browser_render_context"]
         if (
             not isinstance(capture_receipt["renderer"], str)
-            or not capture_receipt["renderer"]
+            or not renderer_matches_context(capture_receipt["renderer"], render_context)
             or not isinstance(capture_receipt["raw_rgba_sha256"], str)
             or len(capture_receipt["raw_rgba_sha256"]) != 64
             or any(character not in "0123456789abcdef" for character in capture_receipt["raw_rgba_sha256"])
@@ -657,12 +754,18 @@ class _Slot:
 
 def render_segment(args, segment: int, dest: Path) -> dict:
     """One segment, start to finish, in its own browser process."""
+    emergency_source_identity(args)
     slot = _Slot()
     with serve(sink=slot) as base:
         # The window's format unless overridden; the page is asked for exactly
         # this size so the drawing buffer IS the delivery format.
         page_url = film_url(base, args)
-        with browser(headless=not args.headed, width=320, height=240) as page:
+        with browser(
+            headless=not args.headed,
+            width=320,
+            height=240,
+            render_context=browser_render_context(args),
+        ) as page:
             page.goto(page_url, wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
             renderer = str(page.gl_renderer)
@@ -736,6 +839,7 @@ def render_segment(args, segment: int, dest: Path) -> dict:
             if written[0] != count:
                 raise SystemExit(f"segment {segment}: sank {written[0]} frames, rendered {count}")
 
+            emergency_source_identity(args)
             return {
                 "frames": count,
                 "missing": missing,
@@ -788,10 +892,11 @@ def complete(dest: Path, want: int, expected: dict) -> bool:
     if receipt.get("file_sha256") != file_sha256(dest):
         return False
     capture = receipt.get("capture")
-    if capture is not None and (
+    render_context = expected["inputs"].get("browser_render_context")
+    if (
         not isinstance(capture, dict)
         or not isinstance(capture.get("renderer"), str)
-        or not capture.get("renderer")
+        or not renderer_matches_context(capture.get("renderer", ""), render_context)
         or not isinstance(capture.get("raw_rgba_sha256"), str)
         or len(capture["raw_rgba_sha256"]) != 64
         or any(character not in "0123456789abcdef" for character in capture["raw_rgba_sha256"])
@@ -857,13 +962,18 @@ def concat_receipt_path(dest: Path) -> Path:
 
 
 def concat_identity(args, parts: list[Path]) -> dict:
-    return {
+    render_context = browser_render_context(args)
+    payload = {
         "schema": "danse.render.concat.v1",
         "codec": args.codec,
+        "browser_render_context": render_context,
         "segments": [
             {"name": part.name, "receipt_sha256": file_sha256(segment_receipt_path(part))} for part in parts
         ],
     }
+    if render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
+        payload["emergency_source_identity"] = emergency_source_identity(args)
+    return payload
 
 
 def planned_frame_count(parts: list[Path]) -> int:
@@ -989,6 +1099,11 @@ def main() -> int:
     ap.add_argument("--segment-frames", type=int, default=600)
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument(
+        "--emergency-software-render",
+        action="store_true",
+        help="deadline screener capture only: explicitly use Chromium SwiftShader instead of canonical Apple Metal",
+    )
     ap.add_argument("--quiet", dest="progress", action="store_false")
     ap.add_argument("--concat", action="store_true", help="stitch existing segments and exit")
     ap.add_argument("--check-concat", action="store_true", help="validate the planned segments and concatenated receipt")
@@ -1055,7 +1170,12 @@ def main() -> int:
     total = None
     if segments is None:
         # Ask the page for the window length rather than assuming it here.
-        with serve() as base, browser(headless=True, width=320, height=240) as page:
+        with serve() as base, browser(
+            headless=True,
+            width=320,
+            height=240,
+            render_context=browser_render_context(args),
+        ) as page:
             page.goto(film_url(base, args), wait_until="load")
             page.wait_for_function("() => window.danseFilmReady === true", timeout=300_000)
             w = page.evaluate("() => ({ ...window.danseFilm.window, passage: window.danseFilm.passage })")

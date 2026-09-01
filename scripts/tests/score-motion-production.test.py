@@ -250,7 +250,7 @@ class EvidenceFixture:
                         "width": AB.PRODUCTION_WIDTH,
                         "height": AB.PRODUCTION_HEIGHT,
                         "fps": AB.PRODUCTION_FPS,
-                        "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                        "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
                         **AB.capture_contract_identity(ROOT),
                     },
                     "contact_sheet": reference(sheet, self.base),
@@ -378,7 +378,7 @@ class EvidenceFixture:
                         "frames": 30,
                         "inputs": inputs,
                         "capture": {
-                            "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                            "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
                             "raw_rgba_sha256": (
                                 "5" if mode == "with_score" else "6"
                             )

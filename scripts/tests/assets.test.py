@@ -330,6 +330,38 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(list(held_parent.iterdir()), [])
 
+    def test_target_parent_swap_after_final_identity_removes_publication(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        target_parent = self.fixture.root / "pipeline/.work/raw"
+        target_parent.mkdir(parents=True)
+        held_parent = self.fixture.root / "pipeline/.work/raw-held"
+        outside = self.fixture.base / "outside-target-final"
+        outside.mkdir()
+        real_identity_at = ASSETS._identity_at
+        swapped = False
+
+        def swap_parent_after_final_identity(parent_descriptor, name, expected):
+            nonlocal swapped
+            state = real_identity_at(parent_descriptor, name, expected)
+            if not swapped and name == Path(asset.target).name and state == "verified":
+                target_parent.rename(held_parent)
+                target_parent.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return state
+
+        with mock.patch.object(
+            ASSETS,
+            "_identity_at",
+            side_effect=swap_parent_after_final_identity,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(held_parent.iterdir()), [])
+
     def test_writable_preverified_target_is_rejected(self) -> None:
         target = self.fixture.root / "pipeline/.work/raw/IMG_1570.JPG"
         target.parent.mkdir(parents=True)
@@ -802,6 +834,42 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertFalse(output.exists())
 
+    def test_generic_inventory_rejects_unsafe_targets_before_write(self) -> None:
+        for index, relative in enumerate((r"bad\name.bin", ".GIT/config")):
+            with self.subTest(relative=relative):
+                source = self.fixture.base / f"unsafe-source-{index}"
+                target = source / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(b"unsafe")
+                output = self.fixture.base / f"unsafe-lock-{index}.json"
+                with self.assertRaises(ASSETS.AssetError):
+                    ASSETS.inventory(
+                        source,
+                        output,
+                        lock_id="unsafe-assets",
+                        profile="generic",
+                        repository_commit=self.fixture.head,
+                        rights_class="private",
+                    )
+                self.assertFalse(output.exists())
+
+    def test_generic_inventory_rejects_case_colliding_targets_before_write(self) -> None:
+        source = self.fixture.base / "case-colliding-source"
+        source.mkdir()
+        (source / "Asset.bin").write_bytes(b"first")
+        (source / "asset.bin").write_bytes(b"second")
+        output = self.fixture.base / "case-colliding-lock.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="case-colliding-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
     def test_production_inventory_requires_exact_clean_script_checkout(self) -> None:
         output = self.fixture.base / "production-lock.json"
         with (
@@ -1106,6 +1174,7 @@ class AssetParityTest(unittest.TestCase):
         for path in (
             "corpus/**",
             "music/**",
+            "interaction-test.html",
             "index.html",
             "verify.html",
             "probe.html",
@@ -1114,11 +1183,10 @@ class AssetParityTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertEqual(workflow.count(f'      - "{path}"'), 2)
-        self.assertIn(
-            "python render/browser.py --check --verify --arrival --probe --interaction",
-            workflow,
-        )
-        self.assertNotIn("--controls", workflow)
+        self.assertIn("args=(--check --verify --arrival --probe --interaction)", workflow)
+        self.assertIn("grep -q -- '--controls'", workflow)
+        self.assertIn("args+=(--controls)", workflow)
+        self.assertIn('python render/browser.py "${args[@]}"', workflow)
 
     @unittest.skipIf(jsonschema is None, "jsonschema is not installed")
     def test_lock_and_redacted_receipt_match_tracked_schemas(self) -> None:

@@ -1231,7 +1231,20 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 if published:
                     os.unlink(target_name, dir_fd=target_descriptor)
                 raise AssetError("asset target parent changed during publication")
-            if _identity_at(target_descriptor, target_name, asset) != "verified":
+            final_state = _identity_at(target_descriptor, target_name, asset)
+            if not _parent_descriptor_matches(root, target_relative, target_descriptor):
+                if published:
+                    try:
+                        os.unlink(target_name, dir_fd=target_descriptor)
+                    except FileNotFoundError:
+                        pass
+                raise AssetError("asset target parent changed during final verification")
+            if final_state != "verified":
+                if published:
+                    try:
+                        os.unlink(target_name, dir_fd=target_descriptor)
+                    except FileNotFoundError:
+                        pass
                 raise AssetError("published asset target disagrees with the lock")
         finally:
             os.close(target_descriptor)
@@ -1534,15 +1547,25 @@ def inventory(
         raise AssetError("production inventory does not bind the exact clean script checkout")
     expected = _production_targets(ROOT, repository_commit) if production else None
     snapshot = _inventory_snapshot(root)
-    actual = {entry.relative for entry in snapshot if entry.kind == "file"}
+    files = [entry for entry in snapshot if entry.kind == "file"]
+    targets: set[str] = set()
+    casefolded_targets: set[str] = set()
+    for entry in files:
+        target = _safe_relative(entry.relative, "inventory target")
+        if target in targets:
+            raise AssetError("inventory repeats an asset target")
+        targets.add(target)
+        casefolded_target = target.casefold()
+        if casefolded_target in casefolded_targets:
+            raise AssetError("inventory contains case-colliding asset targets")
+        casefolded_targets.add(casefolded_target)
+    actual = targets
     if not actual:
         raise AssetError("inventory source must contain at least one regular file")
     if expected is not None and actual != expected:
         raise AssetError("production inventory source does not contain the exact 487-object target census")
-    for entry in snapshot:
-        if entry.kind != "file":
-            continue
-        relative = entry.relative
+    for entry in files:
+        relative = _safe_relative(entry.relative, "inventory target")
         if entry.size is None or entry.sha256 is None:
             raise AssetError("inventory source proof is incomplete")
         size, digest = entry.size, entry.sha256

@@ -1,0 +1,13 @@
+{
+  "schema": "danse.map.v1",
+  "title": "Danse project map",
+  "version": 1,
+  "nodes": [
+    {"id": "live", "label": "Live artwork", "product_id": null, "route": "./", "fragment": null, "href": "./", "status": "admitted", "availability": "available"},
+    {"id": "study", "label": "Study", "product_id": "project-page-copy", "route": "./project/", "fragment": null, "href": null, "status": "gated", "availability": "unavailable until public admission"},
+    {"id": "cubism", "label": "Cubism", "product_id": "project-page-copy", "route": "./project/", "fragment": "cubism", "href": null, "status": "gated", "availability": "unavailable until public admission"},
+    {"id": "glitch", "label": "Glitch?", "product_id": "project-page-copy", "route": "./project/", "fragment": "glitch", "href": null, "status": "gated", "availability": "unavailable until public admission"},
+    {"id": "ballet-score", "label": "Ballet / Score", "product_id": "project-page-copy", "route": "./project/", "fragment": "ballet-score", "href": null, "status": "gated", "availability": "unavailable until public admission"},
+    {"id": "evidence", "label": "Evidence", "product_id": "project-page-copy", "route": "./project/", "fragment": "evidence", "href": null, "status": "gated", "availability": "unavailable until public admission"}
+  ]
+}

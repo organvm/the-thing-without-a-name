@@ -48,6 +48,8 @@ def _load_release_contract():
             "HEX64",
             "MANIFEST",
             "PHASES",
+            "PROGRESSIVE_CONTROLS_EVIDENCE_PATH",
+            "PROGRESSIVE_CONTROLS_SCHEMA_PATH",
             "ROOT",
             "SCHEMA",
             "ReleaseError",
@@ -82,6 +84,8 @@ GENERATED_PRODUCT_PATHS = _RELEASE_CONTRACT.GENERATED_PRODUCT_PATHS
 HEX64 = _RELEASE_CONTRACT.HEX64
 MANIFEST = _RELEASE_CONTRACT.MANIFEST
 PHASES = _RELEASE_CONTRACT.PHASES
+PROGRESSIVE_CONTROLS_EVIDENCE_PATH = _RELEASE_CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+PROGRESSIVE_CONTROLS_SCHEMA_PATH = _RELEASE_CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
 ROOT = _RELEASE_CONTRACT.ROOT
 SCHEMA = _RELEASE_CONTRACT.SCHEMA
 ReleaseError = _RELEASE_CONTRACT.ReleaseError
@@ -587,9 +591,9 @@ def _project_html_v1(manifest: dict, phase: str, commit: str) -> bytes:
       </nav>
     </header>
     <main id="content">
-      <section aria-labelledby="concept-title"><div class="grid"><div><p class="kicker">Concept</p><h2 id="concept-title">One camera. Many instants. A room in depth.</h2><p>{_h(copy['concept'])}</p></div><aside class="panel"><h3>Installation premise</h3><p>{_h(copy['installation_concept'])}</p></aside></div></section>
-      <section aria-labelledby="system-title"><div class="grid"><div><p class="kicker">System</p><h2 id="system-title">One contract across every form</h2><p>{_h(copy['technical_summary'])}</p></div><ol class="flow" aria-label="System flow">{''.join(flow)}</ol></div></section>
-      <section aria-labelledby="room-title"><div class="grid"><div><p class="kicker">Room</p><h2 id="room-title">Spatial requirements</h2><ul class="clean">{''.join(requirements)}</ul></div><div><h3>Interaction model</h3><ul>{interaction}</ul></div></div></section>
+      <section id="cubism" aria-labelledby="concept-title"><div class="grid"><div><p class="kicker">Concept / Cubism</p><h2 id="concept-title">One camera. Many instants. A room in depth.</h2><p>{_h(copy['concept'])}</p></div><aside class="panel"><h3>Installation premise</h3><p>{_h(copy['installation_concept'])}</p></aside></div></section>
+      <section id="glitch" aria-labelledby="system-title"><div class="grid"><div><p class="kicker">System / Glitch</p><h2 id="system-title">One contract across every form</h2><p>{_h(copy['technical_summary'])}</p></div><ol class="flow" aria-label="System flow">{''.join(flow)}</ol></div></section>
+      <section id="ballet-score" aria-labelledby="room-title"><div class="grid"><div><p class="kicker">Ballet / Score / Room</p><h2 id="room-title">Spatial requirements</h2><ul class="clean">{''.join(requirements)}</ul></div><div><h3>Interaction model</h3><ul>{interaction}</ul></div></div></section>
       <section aria-labelledby="rider-title"><p class="kicker">Technical rider</p><h2 id="rider-title">Designed for validation, not guesswork</h2><ul class="clean">{''.join(rider)}</ul></section>
       <section id="installation-contract" aria-labelledby="installation-contract-title"><div class="grid"><div><p class="kicker">Reference contract</p><h2 id="installation-contract-title">A measured room is still required</h2><p>The release binds reference simulation <strong>{_h(reference['spec_id'])}</strong> at contract digest <code>{_h(reference['spec_contract_sha256'])}</code>. It is a deterministic design input, not evidence that a venue, hardware path, calibration, runtime recovery, or restore rehearsal has passed.</p><p><a href="{_h(twin_url)}">Inspect the exact digital twin</a> · <a href="{_h(gates_url)}">Inspect the exact gate ledger</a></p></div><aside class="panel"><h3>Physical predicates</h3><p>{len(reference['blocked_gates'])} gates remain blocked in the bound reference ledger; issue 14 cannot close from this simulation.</p><ul>{physical_gates}</ul></aside></div></section>
       <section id="access" aria-labelledby="access-title"><div class="grid"><div><p class="kicker">Accessibility</p><h2 id="access-title">A complete work with or without camera, motion, or sound</h2><p><strong>Visual description.</strong> {_h(accessibility['alt_text'])}</p><p><strong>Motion.</strong> {_h(accessibility['motion_note'])}</p><p><strong>Audio.</strong> {_h(accessibility['audio_note'])}</p></div><aside class="panel"><h3>Fallbacks</h3><p>{_h(accessibility['reduced_motion'])}</p><p>{_h(accessibility['silent_fallback'])}</p><p>Captions: {_h(accessibility['captions']['status'])}. Transcript: {_h(accessibility['transcript']['status'])}.</p></aside></div></section>
@@ -1763,6 +1767,21 @@ def validate_source_commit_release(
             "opportunities/opportunity.schema.json",
             "submission/screendance-2027.yaml",
         }
+        progressive_evidence = next(
+            (
+                gate.get("evidence")
+                for gate in manifest.get("gates", [])
+                if isinstance(gate, dict)
+                and gate.get("id") == "progressive-controls-replay"
+            ),
+            None,
+        )
+        if (
+            isinstance(progressive_evidence, dict)
+            and progressive_evidence.get("path")
+            == PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+        ):
+            support_paths.add(PROGRESSIVE_CONTROLS_SCHEMA_PATH)
         for relative in sorted(evidence_paths | support_paths):
             if relative not in {MANIFEST.as_posix(), SCHEMA.as_posix()}:
                 materialize(relative, f"source validation file {relative}")
@@ -1794,6 +1813,8 @@ def validate_source_commit_release(
             snapshot,
             phase=phase,
             checker_root=ROOT,
+            provenance_root=root,
+            provenance_commit=commit,
         )
         if validated != manifest:
             raise ReleaseError(

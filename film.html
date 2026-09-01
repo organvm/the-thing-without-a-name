@@ -91,7 +91,7 @@ const canvas = document.getElementById("stage");
 canvas.style.width = `${width}px`;
 canvas.style.height = `${height}px`;
 
-const corpus = await Corpus.load();
+const corpus = await Corpus.load("corpus/", { local: true });
 const choreography = choreographyUrl !== null
   ? await Choreography.load(choreographyUrl, { score: musicalScore, corpus })
   : null;

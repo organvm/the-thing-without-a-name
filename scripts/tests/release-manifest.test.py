@@ -31,6 +31,7 @@ FIXTURE_FILES = (
     "release/manifest.json",
     "release/manifest.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
+    "release/progressive-controls-replay.schema.json",
     "opportunities/omega-20260829.json",
     "opportunities/omega-20260829.receipt.json",
     "opportunities/source-evidence-20260826.json",
@@ -218,7 +219,6 @@ def complete_manifest(root: Path) -> dict:
         "sha256": CONTRACT.sha256(evidence_path),
         "summary": "Synthetic public-safe evidence fixture.",
     }
-
     for claim in manifest["claims"]:
         claim["status"] = "verified"
         claim["evidence"] = copy.deepcopy(evidence)
@@ -246,9 +246,14 @@ def complete_manifest(root: Path) -> dict:
     for product in manifest["products"]:
         product["status"] = "ready"
     for gate in manifest["gates"]:
-        gate["state"] = "satisfied"
-        if gate["id"] != "live-interaction-replay":
+        if gate["id"] == "progressive-controls-replay":
+            gate["state"] = "pending"
+            gate["evidence"] = None
+        elif gate["id"] != "live-interaction-replay":
+            gate["state"] = "satisfied"
             gate["evidence"] = copy.deepcopy(evidence)
+        else:
+            gate["state"] = "satisfied"
     for section in ("spatial_requirements", "technical_rider"):
         for requirement in manifest["installation"][section]:
             requirement["status"] = "verified"
@@ -276,8 +281,141 @@ def complete_manifest(root: Path) -> dict:
         "text": "No spoken dialogue. Ambient sound and image events are described in the caption track.",
         "reason": None,
     }
+    # The exact browser head contains every completed artifact except the
+    # progressive-controls receipt and its single manifest gate transition.
+    write_manifest(root, manifest)
+    if not (root / ".git").exists():
+        progressive_head = initialize_git_fixture(root)
+    else:
+        subprocess.run(
+            ["git", "-C", str(root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Danse Test",
+                "-c",
+                "user.email=danse-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "progressive controls reviewed source",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        progressive_head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    progressive_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    progressive_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    progressive_path.write_bytes(CONTRACT.canonical_json({
+        "schema": "danse.progressive-controls-replay.v1",
+        "gate_id": "progressive-controls-replay",
+        "result": "satisfied",
+        "observed_at": "2026-08-30T20:00:00Z",
+        "source": {
+            "repository": "organvm/the-thing-without-a-name",
+            "pull_request": 43,
+            "exact_head": progressive_head,
+            "tree": progressive_tree,
+        },
+        "runtime": {
+            "platform": "darwin",
+            "browser": {"name": "Google Chrome", "version": "fixture"},
+            "graphics_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+        },
+        "checks": [
+            {"id": check_id, "result": "passed", "observation": f"Synthetic {check_id} observation."}
+            for check_id in CONTRACT.PROGRESSIVE_CONTROLS_CHECKS
+        ],
+        "non_actions": [
+            "No deployment, upload, submission, or publication action was performed by this receipt.",
+            "No rights, biography, final-cut, or archive-participation claim was made.",
+            "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness.",
+        ],
+    }))
+    progressive_gate = next(
+        gate for gate in manifest["gates"] if gate["id"] == "progressive-controls-replay"
+    )
+    progressive_gate["state"] = "satisfied"
+    progressive_gate["evidence"] = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(progressive_path),
+        "summary": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
+    }
     write_manifest(root, manifest)
     return manifest
+
+
+def rebind_progressive_receipt(root: Path, manifest: dict) -> None:
+    """Issue a synthetic replay after a test intentionally changes reviewed source."""
+    receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_path.unlink()
+    gate = next(
+        item for item in manifest["gates"] if item["id"] == "progressive-controls-replay"
+    )
+    gate["state"] = "pending"
+    gate["evidence"] = None
+    write_manifest(root, manifest)
+    subprocess.run(
+        ["git", "-C", str(root), "add", "-A"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Danse Test",
+            "-c",
+            "user.email=danse-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "rebind synthetic progressive replay",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    receipt["source"]["exact_head"] = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    receipt["source"]["tree"] = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+    gate["state"] = "satisfied"
+    gate["evidence"] = {
+        "path": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": CONTRACT.sha256(receipt_path),
+        "summary": CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
+    }
+    write_manifest(root, manifest)
 
 
 class ProductionManifestTest(unittest.TestCase):
@@ -398,6 +536,29 @@ class ProductionManifestTest(unittest.TestCase):
         )
         self.assertEqual(publication["state"], "pending")
         self.assertIsNone(publication["evidence"])
+
+    def test_progressive_controls_gate_has_a_distinct_fail_closed_receipt_contract(self) -> None:
+        gate = next(
+            gate
+            for gate in self.manifest["gates"]
+            if gate["id"] == "progressive-controls-replay"
+        )
+        self.assertEqual(gate["state"], "pending")
+        self.assertIsNone(gate["evidence"])
+        self.assertFalse((ROOT / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH).exists())
+        schema = CONTRACT.load_json(
+            ROOT / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH,
+            "progressive controls replay schema",
+        )
+        CONTRACT.jsonschema.Draft202012Validator.check_schema(schema)
+        self.assertEqual(
+            schema["properties"]["gate_id"]["const"],
+            "progressive-controls-replay",
+        )
+        self.assertEqual(
+            schema["properties"]["checks"]["minItems"],
+            len(CONTRACT.PROGRESSIVE_CONTROLS_CHECKS),
+        )
 
     def test_tracked_manifest_is_honest_draft_but_public_and_release_fail_closed(self) -> None:
         public = CONTRACT.phase_blockers(self.manifest, "public")
@@ -556,6 +717,74 @@ class ProductionManifestTest(unittest.TestCase):
 
 
 class DeterminismAndCompletedPhaseTest(unittest.TestCase):
+    def test_source_snapshot_does_not_require_progressive_schema_for_pending_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = read_manifest(root)
+            progressive_gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            self.assertEqual(progressive_gate["state"], "pending")
+            self.assertIsNone(progressive_gate["evidence"])
+            (root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH).unlink()
+            commit = initialize_git_fixture(root)
+
+            validated = BUILD.validate_source_commit_release(
+                root,
+                commit,
+                manifest,
+                "draft",
+            )
+
+            self.assertEqual(validated, manifest)
+
+    def test_source_snapshot_uses_original_checkout_for_progressive_git_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            commit = initialize_git_fixture(root)
+
+            validated = BUILD.validate_source_commit_release(
+                root,
+                commit,
+                manifest,
+                "release",
+            )
+
+            self.assertEqual(validated, manifest)
+
+    def test_source_snapshot_authenticates_the_declared_commit_not_checkout_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            checkout_head = initialize_git_fixture(root)
+
+            schema_path = root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            schema["$comment"] = "unreviewed declared-commit schema"
+            schema_path.write_bytes(CONTRACT.canonical_json(schema))
+            declared_commit = initialize_git_fixture(root)
+            subprocess.run(
+                ["git", "-C", str(root), "checkout", "-q", "--detach", checkout_head],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "reviewed source includes non-receipt changes: "
+                "release/progressive-controls-replay.schema.json",
+            ):
+                BUILD.validate_source_commit_release(
+                    root,
+                    declared_commit,
+                    manifest,
+                    "release",
+                )
+
     def test_two_draft_builds_are_byte_identical(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -650,6 +879,7 @@ class DeterminismAndCompletedPhaseTest(unittest.TestCase):
                 if gate["required_for"] == ["release"]:
                     manifest["gates"][index] = copy.deepcopy(original_gates[gate["id"]])
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
 
             CONTRACT.validate_release(root, phase="public")
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "release phase blocked"):
@@ -1203,6 +1433,581 @@ class AdversarialManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "check inventory drifted"):
                 CONTRACT.validate_release(root)
 
+    def test_progressive_controls_gate_rejects_a_generic_digested_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            generic = root / "release/evidence/public-receipt.json"
+            gate["evidence"] = {
+                "path": "release/evidence/public-receipt.json",
+                "sha256": CONTRACT.sha256(generic),
+                "summary": "A matching digest without the gate-specific contract.",
+            }
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "names the wrong evidence receipt"):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_gate_rejects_a_claiming_evidence_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["summary"] = (
+                "All final-cut, rights, package, upload, and submission gates are approved."
+            )
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "manifest gate evidence is not canonical"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_rehashed_progressive_controls_receipt_with_missing_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["checks"].pop()
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
+                CONTRACT.validate_release(root)
+
+    def test_rehashed_progressive_controls_receipt_with_blank_observation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["checks"][0]["observation"] = " \t\n"
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(CONTRACT.ReleaseError, "violates schema"):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_requires_canonical_apple_metal_identity(self) -> None:
+        impostors = (
+            "not Apple and not Metal",
+            "Apple software renderer without Metal",
+            "ANGLE (Apple, ANGLE Metal Renderer: software rasterizer, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, SwiftShader software rasterizer)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, not a driver)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)\n",
+        )
+        for renderer in impostors:
+            with self.subTest(renderer=renderer), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["runtime"]["graphics_renderer"] = renderer
+                receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+                gate = next(
+                    gate
+                    for gate in manifest["gates"]
+                    if gate["id"] == "progressive-controls-replay"
+                )
+                gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "violates schema|not authenticated as Apple Metal",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_requires_a_real_exact_head_and_tree(self) -> None:
+        for mutation, message in (
+            (("exact_head", "f" * 40), "exact head is not a repository commit"),
+            (("tree", "f" * 40), "tree does not belong to its exact head"),
+        ):
+            with (
+                self.subTest(field=mutation[0]),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["source"][mutation[0]] = mutation[1]
+                receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+                gate = next(
+                    gate
+                    for gate in manifest["gates"]
+                    if gate["id"] == "progressive-controls-replay"
+                )
+                gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(CONTRACT.ReleaseError, message):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_ignores_local_git_replacements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            exact_head = receipt["source"]["exact_head"]
+            exact_tree = receipt["source"]["tree"]
+
+            # Build an alternate commit without touching the fixture checkout,
+            # then install it as a local replacement for the reviewed head.
+            # With replacement refs enabled, rev-parse/show/diff can all see
+            # this alternate object graph while HEAD still names exact_head.
+            alternate_index = root / ".git/pr43-replacement-index"
+            replacement_environment = os.environ.copy()
+            replacement_environment["GIT_INDEX_FILE"] = str(alternate_index)
+            subprocess.run(
+                ["git", "-C", str(root), "read-tree", exact_head],
+                check=True,
+                capture_output=True,
+                env=replacement_environment,
+            )
+            replacement_blob = subprocess.run(
+                ["git", "-C", str(root), "hash-object", "-w", "--stdin"],
+                input=b"# replacement-only reviewed source\n",
+                check=True,
+                capture_output=True,
+            ).stdout.decode("ascii").strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{replacement_blob},.gitignore",
+                ],
+                check=True,
+                capture_output=True,
+                env=replacement_environment,
+            )
+            replacement_tree = subprocess.run(
+                ["git", "-C", str(root), "write-tree"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=replacement_environment,
+            ).stdout.strip()
+            replacement_commit = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "commit-tree",
+                    replacement_tree,
+                    "-p",
+                    exact_head,
+                ],
+                input="replacement-only source\n",
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            alternate_index.unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "replace", exact_head, replacement_commit],
+                check=True,
+                capture_output=True,
+            )
+
+            ambient_tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"{exact_head}^{{tree}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            no_replace_environment = os.environ.copy()
+            no_replace_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+            stored_tree = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", f"{exact_head}^{{tree}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=no_replace_environment,
+            ).stdout.strip()
+            self.assertEqual(ambient_tree, replacement_tree)
+            self.assertEqual(stored_tree, exact_tree)
+
+            receipt["source"]["tree"] = replacement_tree
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "tree does not belong to its exact head"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_git_environment_redirects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = fixture_root(base)
+            complete_manifest(root)
+            decoy = base / "clean-decoy"
+            shutil.copytree(root, decoy)
+            (root / ".gitignore").write_text(
+                "# dirty source hidden by a decoy Git worktree\n", encoding="utf-8"
+            )
+            redirect = {
+                "GIT_DIR": str(decoy / ".git"),
+                "GIT_WORK_TREE": str(decoy),
+            }
+            redirected_environment = os.environ.copy()
+            redirected_environment.update(redirect)
+            redirected_root = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=redirected_environment,
+            ).stdout.strip()
+            self.assertEqual(Path(redirected_root), decoy)
+
+            with mock.patch.dict(os.environ, redirect, clear=False):
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "reviewed source includes non-receipt changes: .gitignore",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_a_different_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            (root / "reviewed-tree-drift.txt").write_text(
+                "different source tree\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "reviewed-tree-drift.txt"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "different reviewed tree",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "reviewed source includes non-receipt changes"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_a_deleted_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            (root / ".gitignore").unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-u", ".gitignore"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "delete reviewed source",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            receipt_path.write_bytes(CONTRACT.canonical_json(receipt))
+            gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            gate["evidence"]["sha256"] = CONTRACT.sha256(receipt_path)
+            write_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError, "reviewed source includes non-receipt changes"
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_allows_committed_completion_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            write_manifest(root, manifest)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "add",
+                    "release/manifest.json",
+                    CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "record progressive controls completion",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_dirty_reviewed_source(self) -> None:
+        def modify_tracked(root: Path) -> None:
+            (root / ".gitignore").write_text("# changed after replay\n", encoding="utf-8")
+
+        def delete_staged(root: Path) -> None:
+            (root / ".gitignore").unlink()
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-u", ".gitignore"],
+                check=True,
+                capture_output=True,
+            )
+
+        def modify_schema(root: Path) -> None:
+            path = root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
+            path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+        def add_untracked_ui(root: Path) -> None:
+            path = root / "interface/injected.js"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("throw new Error('unreviewed');\n", encoding="utf-8")
+
+        def add_untracked_schema(root: Path) -> None:
+            path = root / "release/alternate.schema.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def add_unbound_evidence(root: Path) -> None:
+            path = root / "release/evidence/unbound.json"
+            path.write_text("{}\n", encoding="utf-8")
+
+        def add_unbound_media(root: Path) -> None:
+            path = root / "release/media/unbound.bin"
+            path.write_bytes(b"not digest-bound\n")
+
+        for label, mutate in (
+            ("modified tracked path", modify_tracked),
+            ("staged deletion", delete_staged),
+            ("modified renderer schema", modify_schema),
+            ("untracked interface source", add_untracked_ui),
+            ("untracked release schema", add_untracked_schema),
+            ("unbound release evidence", add_unbound_evidence),
+            ("unbound release media", add_unbound_media),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                complete_manifest(root)
+                mutate(root)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "reviewed source includes non-receipt changes",
+                ):
+                    CONTRACT.validate_release(root)
+
+    def test_progressive_controls_receipt_rejects_renamed_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = complete_manifest(root)
+            receipt_path = root / CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+            reviewed_copy = root / "reviewed-progressive-controls-replay.json"
+            reviewed_copy.write_bytes(receipt_path.read_bytes())
+            rebind_progressive_receipt(root, manifest)
+
+            receipt = receipt_path.read_bytes()
+            receipt_path.unlink()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "mv",
+                    reviewed_copy.name,
+                    CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            receipt_path.write_bytes(receipt)
+            subprocess.run(
+                ["git", "-C", str(root), "add", "-A"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Danse Test",
+                    "-c",
+                    "user.email=danse-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "rename reviewed source into completion envelope",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            exact_head = json.loads(receipt.decode("utf-8"))["source"]["exact_head"]
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "diff",
+                    "--name-status",
+                    "--find-renames",
+                    exact_head,
+                    "HEAD",
+                    "--",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertRegex(status, r"(?m)^R\d+\s+reviewed-progressive-controls-replay\.json")
+            with self.assertRaisesRegex(
+                CONTRACT.ReleaseError,
+                "reviewed source includes non-receipt changes: "
+                "reviewed-progressive-controls-replay.json",
+            ):
+                CONTRACT.validate_release(root)
+
+    def test_progressive_controls_manifest_cannot_self_authorize_post_review_drift(self) -> None:
+        def change_copy(root: Path, manifest: dict) -> None:
+            manifest["press"]["synopsis_short"] += " Additional unreviewed copy."
+
+        def add_claim(root: Path, manifest: dict) -> None:
+            claim = copy.deepcopy(manifest["claims"][0])
+            claim["id"] = "post-review-claim"
+            manifest["claims"].append(claim)
+
+        def add_media(root: Path, manifest: dict) -> None:
+            source_path = root / "release/media/post-review.bin"
+            source_path.write_bytes(b"post-review media\n")
+            medium = copy.deepcopy(manifest["media"][0])
+            medium["id"] = "post-review-media"
+            medium["label"] = "Post-review media"
+            medium["source"] = {
+                "path": source_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(source_path),
+                "bytes": source_path.stat().st_size,
+                "destination": "media/assets/post-review.bin",
+            }
+            manifest["media"].append(medium)
+
+        def self_authorize_evidence(root: Path, manifest: dict) -> None:
+            evidence_path = root / "release/evidence/self-authorized.json"
+            evidence_path.write_text(
+                '{"schema":"danse.release-evidence.v1","result":"satisfied"}\n',
+                encoding="utf-8",
+            )
+            manifest["claims"][0]["evidence"] = {
+                "path": evidence_path.relative_to(root).as_posix(),
+                "sha256": CONTRACT.sha256(evidence_path),
+                "summary": "Manifest-authored evidence after the browser replay.",
+            }
+
+        for label, mutate in (
+            ("copy", change_copy),
+            ("claim", add_claim),
+            ("media", add_media),
+            ("self-authorized evidence", self_authorize_evidence),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = fixture_root(Path(temporary))
+                manifest = complete_manifest(root)
+                mutate(root, manifest)
+                write_manifest(root, manifest)
+                with self.assertRaisesRegex(
+                    CONTRACT.ReleaseError,
+                    "manifest changed outside the canonical replay gate transition",
+                ):
+                    CONTRACT.validate_release(root)
+
     def test_duplicate_ids_fail(self) -> None:
         def change(manifest):
             manifest["media"][1]["id"] = manifest["media"][0]["id"]
@@ -1243,6 +2048,7 @@ class AdversarialManifestTest(unittest.TestCase):
             manifest = complete_manifest(root)
             manifest["accessibility"]["captions"]["cues"] = []
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "approved caption track contains no cues"):
                 CONTRACT.validate_release(root, phase="public")
 
@@ -1252,6 +2058,7 @@ class AdversarialManifestTest(unittest.TestCase):
             manifest = complete_manifest(root)
             manifest["accessibility"]["captions"]["cues"][0]["end"] = "00:00:00.000"
             write_manifest(root, manifest)
+            rebind_progressive_receipt(root, manifest)
             with self.assertRaisesRegex(CONTRACT.ReleaseError, "must end after it starts"):
                 CONTRACT.validate_release(root, phase="public")
 
@@ -1325,6 +2132,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         manifest = complete_manifest(root)
         manifest["status"] = "public-approved"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         valid_commit = initialize_git_fixture(root)
         output = self.base / "committed-evidence-artifact"
         BUILD.build(
@@ -1340,37 +2148,8 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         medium["source"]["sha256"] = "0" * 64
         write_manifest(root, manifest)
-        subprocess.run(
-            ["git", "-C", str(root), "add", "release/manifest.json"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(root),
-                "-c",
-                "user.name=Danse Test",
-                "-c",
-                "user.email=danse-test@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-qm",
-                "forge ready media evidence",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        forged_commit = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        rebind_progressive_receipt(root, manifest)
+        forged_commit = initialize_git_fixture(root)
         committed_manifest = subprocess.run(
             ["git", "-C", str(root), "show", f"{forged_commit}:release/manifest.json"],
             check=True,
@@ -1408,6 +2187,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         )
         (root / "installation/contract.py").write_text(payload, encoding="utf-8")
         (root / "scripts/check-opportunities.py").write_text(payload, encoding="utf-8")
+        rebind_progressive_receipt(root, manifest)
         commit = initialize_git_fixture(root)
 
         validated = BUILD.validate_source_commit_release(
@@ -1466,6 +2246,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         manifest = complete_manifest(root)
         manifest["status"] = "public-approved"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         output = self.base / "public-artifact"
         BUILD.build(root, output, "public", TEST_COMMIT)
 
@@ -1512,6 +2293,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         manifest = complete_manifest(root)
         manifest["status"] = "public-approved"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         output = self.base / "required-artifact"
         BUILD.build(root, output, "public", TEST_COMMIT)
 
@@ -1536,11 +2318,13 @@ class AdversarialArtifactTest(unittest.TestCase):
         manifest = complete_manifest(root)
         manifest["status"] = "public-approved"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         output = self.base / "phase-artifact"
         BUILD.build(root, output, "public", TEST_COMMIT)
 
         manifest["status"] = "draft"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         receipt_path = output / BUILD.ARTIFACT_MANIFEST
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         receipt["release"]["manifest"]["sha256"] = CONTRACT.sha256(
@@ -1896,6 +2680,7 @@ class AdversarialArtifactTest(unittest.TestCase):
         manifest = complete_manifest(root)
         manifest["status"] = "public-approved"
         write_manifest(root, manifest)
+        rebind_progressive_receipt(root, manifest)
         output = self.base / "social-artifact"
         BUILD.build(root, output, "public", TEST_COMMIT)
 

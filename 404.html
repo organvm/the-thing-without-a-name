@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Danse Macabre — one public address</title>
+<link rel="canonical" href="https://danse.pages.dev/">
+<style>html{color-scheme:dark}body{display:grid;min-height:100vh;margin:0;place-content:center;padding:24px;background:#0e0e10;color:#e8e8ee;font:16px/1.6 ui-monospace,"SF Mono",Menlo,monospace}main{max-width:42rem}a{color:inherit}</style>
+</head>
+<body>
+<main>
+  <h1>Danse Macabre has one public address.</h1>
+  <p>The former project route has moved into the live artwork.</p>
+  <p><a href="https://danse.pages.dev/">Enter Danse Macabre</a></p>
+</main>
+<script>
+if (/^\/(?:[A-Za-z0-9._~-]+\/)?project(?:\/index\.html)?\/?$/.test(location.pathname)) {
+  location.replace(`https://danse.pages.dev/${location.search}${location.hash}`);
+}
+</script>
+</body>
+</html>

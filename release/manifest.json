@@ -242,7 +242,7 @@
       "status": "verified",
       "evidence": {
         "path": "scripts/check-danse.py",
-        "sha256": "810efbcc89b9daab64ef80f754cda03cb42cdc6763ba4fa9f8a7f098890ec8a2",
+        "sha256": "f0a541770ebd2e50ce98125538dbdce0e60912eebe8bdf26ce8799df302f3ad9",
         "summary": "Executable invariant source bound by digest; the release receipt must record its passing run."
       }
     },
@@ -544,6 +544,15 @@
         "sha256": "86a6fd406030dae27ce8c8a3a59e599592b8c29c7f3eb10005974ab974f89699",
         "summary": "Issue 17 records touch, Escape, and H disclosure with synchronized hidden and ARIA state and zero console errors against deployed Pages source f19244afbce94015e78b7f746b07d267ed9e67ae."
       }
+    },
+    {
+      "id": "progressive-controls-replay",
+      "owner": "Issue 17 and Anthony",
+      "issue": 17,
+      "required_for": ["public", "release"],
+      "state": "pending",
+      "action": "Replay the progressive controls against the exact PR head, including responsive layouts, keyboard focus, reduced motion, receipts, Map gating, and zero console errors; the historical HUD receipt cannot satisfy this gate.",
+      "evidence": null
     },
     {
       "id": "publication-approval",

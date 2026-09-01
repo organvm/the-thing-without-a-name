@@ -81,7 +81,7 @@ RUN: list[tuple[str, str | None]] = []
 # So conditional checks are declared, counted separately, and named when they are
 # absent. Raise FLOOR when you add a portable check; raise the group's count when
 # you add a conditional one. Never lower either to make a machine agree.
-FLOOR = 52
+FLOOR = 60
 CONDITIONAL = {"grain bank": 3}
 
 GROUP: str | None = None
@@ -133,6 +133,17 @@ def check_rights_contract() -> None:
         lines = [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
         detail = lines[-1] if lines else f"exit {done.returncode}"
     check("rights and attribution fail closed on every uncleared use", done.returncode == 0, detail)
+
+
+def check_interface_contract() -> None:
+    """Run pure progressive-control state, shortcut, and action-bus checks."""
+    test = ROOT / "scripts/tests/interface-controls.test.mjs"
+    done = subprocess.run(["node", str(test)], cwd=ROOT, capture_output=True, text=True, check=False)
+    detail = "shared named actions, typed states, editable-control shortcuts, and share-state boundary"
+    if done.returncode != 0:
+        lines = [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
+        detail = lines[-1] if lines else f"exit {done.returncode}"
+    check("progressive controls share one typed action contract", done.returncode == 0, detail)
 
 
 def check_room_event_contract() -> None:
@@ -487,7 +498,7 @@ ARRIVAL = APP / "arrival.js"
 # and can be held to the same standard as the engine.
 ARRIVAL_PROBE = """
 import { readFileSync } from "node:fs";
-import { arrive, href, mint, modeOf, now, platform, riverOf, streamOf } from "%(arrival)s";
+import { arrive, hasCitedSeed, hasSelfContainedRiver, href, mint, modeOf, now, platform, recall, remember, rememberedRiverForUndo, riverOf, streamOf, withMode } from "%(arrival)s";
 import { passageAt } from "%(program)s";
 import { state } from "%(clock)s";
 
@@ -497,6 +508,11 @@ let CLOCK = 1780000000000;
 let NEXT = 0;
 platform.now = () => CLOCK;
 platform.draw = () => NEXT;
+const stored = new Map();
+globalThis.localStorage = {
+  getItem: (key) => stored.get(key) ?? null,
+  setItem: (key, value) => stored.set(key, value),
+};
 
 // ── the precedence table, exactly as arrival.js documents it ──────────────────
 NEXT = 0xabcdef01;
@@ -515,6 +531,117 @@ const links =
   fresh.minted && fresh.seed === riverOf(0xabcdef01, CLOCK) &&
   citedFresh.stream === fresh.stream && citedSerialized === citedAt && Math.abs(now(citedFresh) - citedAt) < 1e-6 &&
   modeOf(href(fresh, {mode: "free"})) === "free";
+
+// ── a t-only undo restores the backing river, not just the visible URL ────────
+const backing = { seed: 0x10203040, stream: 0x50607080, epoch: CLOCK - 90000 };
+remember(backing);
+const tOnly = arrive("#t=30");
+const undoBacking = rememberedRiverForUndo(tOnly, "#t=30", recall());
+NEXT = 0x99887766;
+mint();
+if (undoBacking) remember(undoBacking);
+const tOnlyReloaded = arrive("#t=30");
+const tOnlyUndoDurable =
+  undoBacking?.epoch === backing.epoch &&
+  tOnlyReloaded.seed === tOnly.seed &&
+  tOnlyReloaded.stream === tOnly.stream &&
+  Math.abs(now(tOnlyReloaded) - 30) < 1e-9 &&
+  rememberedRiverForUndo(tOnly, "#s=1&t=30", backing) === null &&
+  rememberedRiverForUndo(tOnly, "#s=not-a-seed&t=30", backing) === backing &&
+  rememberedRiverForUndo({...tOnly, seed: tOnly.seed + 1}, "#t=30", backing) === null;
+
+const rememberedMatrix = [
+  ["bare/recalled", backing, "", backing, backing],
+  ["s-only/recalled", backing, "#s=270544960", backing, backing],
+  ["wrong epoch", {...backing, epoch: backing.epoch + 1}, "", backing, null],
+  ["t-only", tOnly, "#t=30", backing, backing],
+  ["cited s+t", tOnly, "#s=270544960&t=30", backing, null],
+  ["malformed s+t", tOnly, "#s=not-a-seed&t=30", backing, backing],
+  ["Project without carried provenance", tOnly, "#evidence", backing, null],
+  ["foreign river", {...tOnly, stream: tOnly.stream + 1}, "#t=30", backing, null],
+  ["no remembered river", tOnly, "#t=30", null, null],
+];
+const rememberedMatrixPasses = rememberedMatrix.every(
+  ([, candidate, fragment, storedRiver, expected]) =>
+    rememberedRiverForUndo(candidate, fragment, storedRiver) === expected,
+);
+
+// A Project-only hash navigation keeps the already-proven backing in UI state.
+// After New/Undo restores that stored value, reloading the Project fragment must
+// still open the pre-mint river rather than the minted replacement.
+const backingAcrossProject = rememberedRiverForUndo(tOnly, "#t=30", backing);
+NEXT = 0xaabbccdd;
+mint();
+if (backingAcrossProject) remember(backingAcrossProject);
+const projectReload = arrive("#evidence");
+const projectUndoDurable =
+  backingAcrossProject === backing &&
+  projectReload.seed === backing.seed &&
+  projectReload.stream === backing.stream &&
+  projectReload.epoch === backing.epoch &&
+  !projectReload.shifted;
+
+// A cited/shared river is self-contained even after a Project-only fragment
+// temporarily hides its hash. Preserve that old cited URL for Undo/reload.
+const foreignFragment = "#s=324508639&t=30&u=610839776";
+const foreign = arrive(foreignFragment);
+NEXT = 0x13579bdf;
+mint();
+const foreignReload = arrive(foreignFragment);
+const foreignProjectDurable =
+  hasCitedSeed(foreignFragment) &&
+  hasSelfContainedRiver(foreignFragment) &&
+  hasSelfContainedRiver("#s=42&e=1780000000000") &&
+  !hasSelfContainedRiver("#s=42") &&
+  !hasSelfContainedRiver("#s=42&e=not-an-epoch") &&
+  !hasSelfContainedRiver("#s=42&e=") &&
+  !hasSelfContainedRiver("#s=42&e=+++") &&
+  !hasSelfContainedRiver("#s=42&t=") &&
+  !hasSelfContainedRiver("#s=42&t=+++") &&
+  !hasCitedSeed("#s=&e=1780000000000") &&
+  !hasCitedSeed("#s=+++&e=1780000000000") &&
+  !hasCitedSeed("#s=not-a-seed&t=30") &&
+  !hasCitedSeed("#evidence") &&
+  foreignReload.seed === foreign.seed &&
+  foreignReload.stream === foreign.stream &&
+  Math.abs(now(foreignReload) - 30) < 1e-9;
+
+// An s-only URL names a seed but not a stable epoch. Once Project navigation
+// hides it, Undo must synthesize an s+e URL from the live river rather than
+// reusing the incomplete old fragment.
+const sOnly = arrive("#s=42");
+const sOnlyExplicit = href(sOnly);
+NEXT = 0x2468ace0;
+mint();
+const sOnlyReload = arrive(sOnlyExplicit.split("#")[1]);
+const sOnlyProjectDurable =
+  !hasSelfContainedRiver("#s=42") &&
+  sOnlyReload.seed === sOnly.seed &&
+  sOnlyReload.stream === sOnly.stream &&
+  sOnlyReload.epoch === sOnly.epoch;
+
+const restoredScoreUrl = withMode(
+  "https://danse.pages.dev/#s=42&t=30&u=7&p=free",
+  "program",
+);
+const restoredFreeUrl = withMode(restoredScoreUrl, "free");
+const undoModeDurable =
+  modeOf(restoredScoreUrl.split("#")[1]) === "program" &&
+  modeOf(restoredFreeUrl.split("#")[1]) === "free" &&
+  new URLSearchParams(restoredFreeUrl.split("#")[1]).get("t") === "30";
+
+// A carried backing is a claim about current local storage, not a lease. If
+// another tab changes storage, reject the stale carry and use an explicit href.
+remember(backing);
+const carriedBeforeStorageChange = rememberedRiverForUndo(tOnly, "#t=30", recall());
+remember({seed: 9, stream: 10, epoch: 11});
+const staleCarry = rememberedRiverForUndo(carriedBeforeStorageChange, "", recall());
+const explicitReload = arrive(href(tOnly).split("#")[1]);
+const staleBackingRejected =
+  staleCarry === null &&
+  explicitReload.seed === tOnly.seed &&
+  explicitReload.stream === tOnly.stream &&
+  explicitReload.epoch === tOnly.epoch;
 
 // ── a named river ─────────────────────────────────────────────────────────────
 // `#name=` is the cheap slice of "put yourself into it": the seed comes from
@@ -606,7 +733,9 @@ const aged = passageAt(program, decade.seed, now(decade));
 const agedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
 console.log(JSON.stringify({
-  links, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
+  links, tOnlyUndoDurable, rememberedMatrixPasses, projectUndoDurable, foreignProjectDurable,
+  sOnlyProjectDurable, undoModeDurable,
+  staleBackingRejected, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
   visitors: V, distinct, disambiguated, backwards, rewound, synced, agedMs,
   agedPassage: aged.index, samples: 2001,
 }));
@@ -645,6 +774,41 @@ def check_arrival() -> None:
         probe.unlink(missing_ok=True)
 
     check("a link resolves to the river it names", r["links"], "#s&e joins · #s&t cites · #s starts · bare mints")
+    check(
+        "a t-only undo restores its recalled backing river",
+        r["tOnlyUndoDurable"],
+        "undo/reload preserves seed, stream, and the 30-second shifted position",
+    )
+    check(
+        "remembered-river provenance covers every fragment class",
+        r["rememberedMatrixPasses"],
+        "bare, s-only, t-only, cited, malformed, Project-only, foreign, and absent storage",
+    )
+    check(
+        "Project navigation retains a t-only river's proven backing",
+        r["projectUndoDurable"],
+        "Project enter → New → Undo → reload returns to the pre-mint backing river",
+    )
+    check(
+        "Project navigation retains a foreign cited river's explicit address",
+        r["foreignProjectDurable"],
+        "cited s+t+u survives Project enter → New → Undo → reload without local storage",
+    )
+    check(
+        "Project navigation canonicalizes an s-only river",
+        r["sOnlyProjectDurable"],
+        "s-only enter → Project → New → Undo → reload preserves the synthesized epoch",
+    )
+    check(
+        "Undo reconciles a shifted River URL with the current program mode",
+        r["undoModeDurable"],
+        "t-only/free → New → score-led → Undo removes stale p=free without changing t",
+    )
+    check(
+        "a cross-tab storage change invalidates carried backing",
+        r["staleBackingRejected"],
+        "stale carry is rejected and an explicit synthesized href remains reloadable",
+    )
     check("arrival is deterministic in its inputs", r["deterministic"], "same draw and epoch, same river")
     check(
         "a named river is yours, not the name's",
@@ -1238,6 +1402,8 @@ def main() -> int:
     check_opportunities()
     print("\n the public face is phase-gated from one release manifest")
     check_release_contract()
+    print("\n the progressive controls are one interface")
+    check_interface_contract()
     print("\n the corpus is deliverable")
     check_delivery(score, manifest)
     print("\n the sound is the same film")

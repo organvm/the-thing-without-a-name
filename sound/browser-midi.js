@@ -45,7 +45,12 @@ export class ScoreAudio {
     }
     await this.context.resume();
     this.playing = true;
-    this.seek(sourceSecond, true);
+    try {
+      this.seek(sourceSecond, true);
+    } catch (error) {
+      this.stop();
+      throw error;
+    }
   }
 
   stop() {
@@ -58,6 +63,10 @@ export class ScoreAudio {
       try { node.stop(); } catch { /* already finished */ }
     }
     this.nodes.clear();
+    // Every node through the old scheduling horizon has just been discarded.
+    // Invalidate that horizon so a short hold/resume can refill it even when
+    // seek() correctly decides the score clock itself is already synchronized.
+    this.scheduledThrough = Number.NEGATIVE_INFINITY;
   }
 
   seek(sourceSecond = 0, force = false) {

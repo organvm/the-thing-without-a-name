@@ -13,6 +13,7 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "interaction-test.html"
       - "index.html"
       - "verify.html"
       - "probe.html"
@@ -32,6 +33,7 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "interaction-test.html"
       - "index.html"
       - "verify.html"
       - "probe.html"
@@ -66,4 +68,8 @@ jobs:
       - name: Require system Chrome and Apple Metal
         run: |
           test -d '/Applications/Google Chrome.app'
-          python render/browser.py --check --verify --arrival --probe --interaction
+          args=(--check --verify --arrival --probe --interaction)
+          if python render/browser.py --help | grep -q -- '--controls'; then
+            args+=(--controls)
+          fi
+          python render/browser.py "${args[@]}"

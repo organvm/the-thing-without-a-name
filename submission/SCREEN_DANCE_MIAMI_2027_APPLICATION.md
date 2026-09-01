@@ -8,21 +8,21 @@ Use this packet for the live Submittable form. It separates facts already establ
 |---|---|---|
 | Film title | THE THING WITHOUT A NAME | verified |
 | Year of production | 2026 | verified in `render/program.json` |
-| Film length | 00:05:51 | enter only after the final probe reports approximately 350.896 seconds |
+| Film length | 00:05:51 | verified: score/audio duration 350.896 seconds |
 | Director(s) | Anthony J. Padavano | verify spelling before filing |
 | Camera / cinematographer(s) | Anthony J. Padavano | verify role wording before filing |
 | Editor(s) | Anthony J. Padavano | verify role wording before filing |
-| Featured performer(s) / dancer(s) | **REQUIRED — enter the performer's exact public credit; do not infer it from filenames or folders** | applicant-only fact |
-| Choreographer(s) | **REQUIRED — enter the exact credited person or people** | applicant-only fact |
-| Premiere status | **REQUIRED — choose the truthful live-form option** | applicant-only fact |
+| Featured performer(s) / dancer(s) | Uncredited performer | confirmed by applicant |
+| Choreographer(s) | Anthony J. Padavano | confirmed by applicant |
+| Premiere status | World Premiere | confirmed by applicant |
 | Film category | **REQUIRED — choose the live-form category that best describes this final film** | applicant choice |
-| Professional / student | **REQUIRED — choose truthful status; school is needed only if student** | applicant choice |
+| Professional / student | Professional | confirmed by applicant |
 | Contact email, confirmation, phone, address | **REQUIRED — enter current private contact information directly in Submittable** | never store in git |
-| Archive library | **REQUIRED — choose include or opt out** | applicant choice |
+| Archive library | Yes | confirmed by applicant |
 
 ## Film synopsis — 50 words maximum
 
-In 2017, a dancer moved through a Florida apartment while the camera remained still. THE THING WITHOUT A NAME draws on 161 registered photographs and one archival composite, returning poses and translucent fragments to a shared room as two Delibes waltzes lead recognition, division, repetition, stillness, and a black signature.
+In 2017, a dancer moved through a Florida apartment while the camera remained still. THE THING WITHOUT A NAME draws on 161 registered photographs and one archival composite, returning poses and translucent fragments to a shared room as two Delibes waltzes lead recognition, division, repetition, stillness, and closing credits.
 
 ## Biography
 
@@ -30,7 +30,7 @@ Anthony J. Padavano is a multimedia artist, writer, educator and programmer whos
 
 ## Music / sound design
 
-“Valse lente” from *Sylvia* and “Valse” from *Coppélia*, composed by Léo Delibes. Source arrangements by Paul De Bra, adapted and re-orchestrated for Danse under CC BY 4.0. Sequenced performance, instrumentation, cue markers and mix by the Danse project. MuseScore General soundfont (MIT); no commercial recording is used.
+“Valse lente” from *Sylvia* and “Valse” from *Coppélia*, composed by Léo Delibes. Source arrangements by Paul De Bra, adapted and re-orchestrated for Danse under CC BY 4.0. Changes include instrumentation, sequencing, cue markers, and mix. MuseScore General soundfont (MIT); no commercial recording is used.
 
 ## Rights position for this filing
 
@@ -38,12 +38,10 @@ Applicant attestation supplied 31 August 2026: permission from the dancer was gr
 
 ## What is required today
 
-1. Check out the exact submission commit on the Mac and ensure Chrome, Playwright, ffmpeg 9.0.1, FluidSynth 2.6.0, and the digest-bound MuseScore General SF3 are present.
-2. Run `bash submission/prepare-screendance-macos.sh /absolute/new/output-directory`. It renders the intended native-tempo 5:50.896 Delibes cut, muxes 320 kbps AAC, extracts three film stills, and rejects the result if the basic media identity is wrong.
-3. Watch the entire MP4 with sound. Confirm title/end credits, no black or corrupt frames except the intentional closing card, intelligible score, and acceptable choreography. This is the final-cut decision.
-4. Upload that MP4 to Vimeo. Set a password and enable downloads. Test both password playback and download while logged out or in a private window.
-5. Enter the applicant-only fields above, paste the synopsis, biography and music credit, upload one to three generated stills, choose the archive option, and accept the legal checkboxes only if true for the exact upload.
-6. Submit before the portal closes and save the Submittable confirmation/receipt outside git.
+1. Watch the complete revised submission MP4 with sound. Confirm the 161-image forward/backward opening, the edited-V1 movement at 00:30, the transition into the existing film at 01:00, and the closing title/credit card. This is the final-cut decision.
+2. Upload that exact MP4 to Vimeo. Set a password and enable downloads. Test both password playback and download while logged out or in a private window.
+3. Enter the applicant-only fields above, paste the synopsis, biography and music credit, upload one to three generated stills, choose the archive option, and accept the legal checkboxes only if true for the exact upload.
+4. Submit before the portal closes and save the Submittable confirmation/receipt outside git.
 
 ## Later exhibition work — not a valid-submission blocker
 
