@@ -21,7 +21,7 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F])(?!/)(?!\\.[Gg][Ii][Tt](?:/|$))(?!\\.[Aa][Ss][Ss][Ee][Tt]-[Cc][Aa][Cc][Hh][Ee](?:/|$))(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\).+$",
+      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F\\uD800-\\uDFFF])(?!/)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*//)(?!.*\\/\\.\\.?(?:/|$))(?!.*\\/$)(?!\\.[Gg][Ii][Tt](?:/|$))(?!\\.[Aa][Ss][Ss][Ee][Tt]-[Cc][Aa][Cc][Hh][Ee](?:/|$))(?!.*\\\\).+$",
       "$comment": "Unicode normalization is enforced as exact NFC by scripts/assets.py; JSON Schema patterns cannot express canonical normalization."
     },
     "httpsSource": {
@@ -32,7 +32,7 @@
         "kind": {"const": "https"},
         "url": {
           "type": "string",
-          "pattern": "^https://(?=[^/:?#]{1,253}(?::443)?(?:/|$))(?![Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](?::|/|$))(?![^/:?#]*\\.[Ll][Oo][Cc][Aa][Ll](?::|/|$))(?![^/:?#]*\\.[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](?::|/|$))(?![0-9.]+(?:[:/]|$))(?![^/?#@]*@)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::443)?(?:/[^?#]*)?$"
+          "pattern": "^https://(?=[^/:?#]{1,253}(?::443)?(?:/|$))(?![Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](?::|/|$))(?![^/:?#]*\\.[Ll][Oo][Cc][Aa][Ll](?::|/|$))(?![^/:?#]*\\.[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt](?::|/|$))(?![0-9.]+(?:[:/]|$))(?![^/?#@]*@)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::443)?(?:/(?!.*%(?![0-9A-Fa-f]{2}))[A-Za-z0-9!$&'()*+,;=:@%._~/-]*)?$"
         }
       }
     },
@@ -52,8 +52,8 @@
       "properties": {
         "kind": {"const": "github-release"},
         "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
-        "tag": {"type": "string", "pattern": "^[^\\r\\n\\u0000]+$"},
-        "asset": {"type": "string", "pattern": "^[^/\\\\\\r\\n\\u0000]+$"},
+        "tag": {"type": "string", "pattern": "^(?!.*[\\uD800-\\uDFFF])[^\\r\\n\\u0000]+$"},
+        "asset": {"type": "string", "pattern": "^(?!.*[\\uD800-\\uDFFF])[^/\\\\\\r\\n\\u0000]+$"},
         "token_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}
       }
     },

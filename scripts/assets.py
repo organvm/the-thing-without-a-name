@@ -10,6 +10,8 @@ are then published to their target with an atomic, no-overwrite hard link.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -53,8 +55,22 @@ CHUNK = 1 << 20
 USER_AGENT = "danse-asset-parity/1"
 
 
+def _git_environment() -> dict[str, str]:
+    """Return a path-independent Git environment with replacements disabled."""
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
 class AssetError(RuntimeError):
     """The asset contract, source policy, or byte identity failed."""
+
+
+class CleanupDurabilityError(AssetError):
+    """A failed transaction cannot safely emit even a blocked receipt."""
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,287 @@ class Lock:
     sha256: str
 
 
+@dataclass
+class OperationLease:
+    root: Path
+    root_descriptor: int
+    git_directory: Path
+    git_descriptor: int
+    operation_descriptor: int
+    operation_name: str
+    operation_proof: tuple[int, int, int, int, int, int]
+    index_parent_descriptor: int
+    index_descriptor: int
+    index_name: str
+    index_proof: tuple[int, int, int, int, int, int]
+    ref_parent_descriptor: int
+    ref_descriptor: int
+    ref_name: str
+    ref_proof: tuple[int, int, int, int, int, int]
+    ref_lock_path: Path
+    head_commit: str
+    index_path: Path
+    index_base_proof: tuple[int, int, int, int, int, int] | None
+    root_proof: tuple[int, int]
+
+    def validate_administrative_paths(self) -> None:
+        _assert_root_binding(self.root, self.root_proof)
+        root_opened = os.fstat(self.root_descriptor)
+        if (root_opened.st_dev, root_opened.st_ino) != self.root_proof:
+            raise CleanupDurabilityError(
+                "asset root descriptor changed during the operation; no receipt was written"
+            )
+        current_git_directory = _git_absolute_path(
+            self.root, "--absolute-git-dir"
+        ).resolve(strict=True)
+        current_index_path = _git_absolute_path(self.root, "--git-path", "index")
+        current_ref_lock_path = _git_reference_lock_path(self.root)
+        if (
+            current_git_directory != self.git_directory
+            or current_index_path != self.index_path
+            or current_ref_lock_path != self.ref_lock_path
+            or not _directory_descriptor_matches(current_git_directory, self.git_descriptor)
+            or not _directory_descriptor_matches(
+                current_index_path.parent.resolve(strict=True),
+                self.index_parent_descriptor,
+            )
+            or not _directory_descriptor_matches(
+                current_ref_lock_path.parent.resolve(strict=True),
+                self.ref_parent_descriptor,
+            )
+        ):
+            raise CleanupDurabilityError(
+                "Git administrative paths changed during the asset operation; no receipt was written"
+            )
+
+    def validate_checkout_identity(self) -> None:
+        if _git_head_commit(self.root) != self.head_commit:
+            raise CleanupDurabilityError(
+                "Git HEAD changed during the asset operation; no receipt was written"
+            )
+        try:
+            index = self.index_path.stat()
+        except FileNotFoundError:
+            index_proof = None
+        except OSError as exc:
+            raise CleanupDurabilityError(
+                "Git index identity cannot be authenticated; no receipt was written"
+            ) from exc
+        else:
+            index_proof = _stat_identity(index)
+        if index_proof != self.index_base_proof:
+            raise CleanupDurabilityError(
+                "Git index changed during the asset operation; no receipt was written"
+            )
+
+    def validate(self) -> None:
+        self.validate_administrative_paths()
+        try:
+            root = self.root.stat()
+            operation = os.stat(
+                self.operation_name,
+                dir_fd=self.git_descriptor,
+                follow_symlinks=False,
+            )
+            index = os.stat(
+                self.index_name,
+                dir_fd=self.index_parent_descriptor,
+                follow_symlinks=False,
+            )
+            ref = os.stat(
+                self.ref_name,
+                dir_fd=self.ref_parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise CleanupDurabilityError(
+                "asset operation lease changed; no receipt was written"
+            ) from exc
+        if (
+            (root.st_dev, root.st_ino) != self.root_proof
+            or _stat_identity(operation) != self.operation_proof
+            or _stat_identity(index) != self.index_proof
+            or _stat_identity(ref) != self.ref_proof
+        ):
+            raise CleanupDurabilityError(
+                "asset operation lease identity changed; no receipt was written"
+            )
+        self.validate_checkout_identity()
+
+    def close(self) -> None:
+        error: AssetError | None = None
+        try:
+            self.validate()
+            _retire_lease_link(
+                self.git_descriptor,
+                self.operation_name,
+                self.operation_proof,
+                "asset operation lease",
+            )
+            self.validate_administrative_paths()
+            self.validate_checkout_identity()
+            _retire_lease_link(
+                self.ref_parent_descriptor,
+                self.ref_name,
+                self.ref_proof,
+                "Git reference operation lease",
+            )
+            self.validate_administrative_paths()
+            self.validate_checkout_identity()
+            # Keep Git's real index lock until every other retirement step is
+            # complete.  No cooperative Git writer can enter a handoff gap.
+            _retire_lease_link(
+                self.index_parent_descriptor,
+                self.index_name,
+                self.index_proof,
+                "Git index operation lease",
+            )
+            self.validate_administrative_paths()
+            self.validate_checkout_identity()
+        except AssetError as exc:
+            error = CleanupDurabilityError(
+                "asset operation lease could not be released safely; verify no asset or Git "
+                "operation remains, then remove the reported stale lock manually"
+            )
+            error.__cause__ = exc
+        finally:
+            os.close(self.index_descriptor)
+            os.close(self.index_parent_descriptor)
+            os.close(self.ref_descriptor)
+            os.close(self.ref_parent_descriptor)
+            os.close(self.operation_descriptor)
+            os.close(self.git_descriptor)
+            os.close(self.root_descriptor)
+        if error is not None:
+            raise error
+
+
+@dataclass
+class StagedJson:
+    parent_path: Path
+    parent_descriptor: int
+    descriptor: int
+    name: str
+    proof: tuple[int, int, int, int, int, int]
+    expected_size: int
+    expected_sha256: str
+
+    def payload(self) -> bytes:
+        try:
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(self.descriptor, CHUNK)
+                if not block:
+                    break
+                chunks.append(block)
+        except OSError as exc:
+            raise AssetError("staged receipt could not be reread") from exc
+        payload = b"".join(chunks)
+        if (
+            len(payload) != self.expected_size
+            or hashlib.sha256(payload).hexdigest() != self.expected_sha256
+        ):
+            raise AssetError("staged receipt changed before publication")
+        return payload
+
+    def publish(
+        self,
+        path: Path,
+        *,
+        forbidden_root: Path | None = None,
+        source_guard: InventorySourceGuard | None = None,
+    ) -> None:
+        _validate_output_path(path)
+        if source_guard is not None:
+            source_guard.validate()
+        try:
+            parent_path = path.parent.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise AssetError("output parent could not be prepared safely") from exc
+        path = parent_path / path.name
+        if forbidden_root is not None:
+            _receipt_outside_checkout(path, forbidden_root)
+        if (
+            parent_path != self.parent_path
+            or not _directory_descriptor_matches(parent_path, self.parent_descriptor)
+        ):
+            raise AssetError("staged receipt parent changed before publication")
+        self.payload()
+        if source_guard is not None:
+            source_guard.validate_snapshot()
+        published = False
+        published_proof: tuple[int, int, int, int, int, int] | None = None
+        try:
+            # The create-only rename publishes the exact guarded staging inode
+            # without leaving a second random hardlink in the output directory.
+            # A concurrent destination is never overwritten; a concurrent
+            # source substitution is caught by the guarded identity proof below.
+            _rename_noreplace_at(
+                self.parent_descriptor,
+                self.name,
+                path.name,
+            )
+            self.name = ""
+            published = True
+            published_proof = _guarded_identity_at(
+                self.parent_descriptor,
+                path.name,
+                self.descriptor,
+                "published receipt",
+            )
+            if source_guard is not None:
+                source_guard.validate()
+            _durably_sync_published_inode_at(
+                self.parent_descriptor,
+                path.name,
+                published_proof,
+                "published receipt",
+                expected_size=self.expected_size,
+                expected_sha256=self.expected_sha256,
+            )
+            if not _directory_descriptor_matches(parent_path, self.parent_descriptor):
+                raise AssetError("staged receipt parent changed during publication")
+            if source_guard is not None:
+                source_guard.validate_snapshot()
+        except FileExistsError as exc:
+            raise AssetError("output already exists; refusing to overwrite") from exc
+        except AssetError:
+            if published:
+                _retain_published_name(
+                    self.parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
+            raise
+        except OSError as exc:
+            if published:
+                _retain_published_name(
+                    self.parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
+            raise AssetError("staged receipt could not be published atomically") from exc
+
+    def close(self) -> None:
+        try:
+            if self.name.startswith(".receipt-stage-"):
+                retired_name = _retire_named_link(
+                    self.parent_descriptor,
+                    self.name,
+                    self.proof,
+                    "staged receipt",
+                    missing_ok=True,
+                )
+                if retired_name is not None:
+                    self.name = retired_name
+        finally:
+            os.close(self.descriptor)
+            os.close(self.parent_descriptor)
+
+
 @dataclass(frozen=True)
 class InventoryEntry:
     relative: str
@@ -85,6 +382,51 @@ class InventoryEntry:
     identity: tuple[int, int, int, int, int, int]
     size: int | None = None
     sha256: str | None = None
+
+
+@dataclass
+class InventorySourceGuard:
+    path: Path
+    descriptor: int
+    proof: tuple[int, int, int, int, int, int]
+    snapshot: tuple[InventoryEntry, ...] | None = None
+
+    def validate(self) -> None:
+        try:
+            guarded = os.fstat(self.descriptor)
+            linked = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise AssetError(
+                "inventory source root moved or was replaced after its completed scan"
+            ) from exc
+        if (
+            not stat.S_ISDIR(guarded.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or _stat_identity(guarded) != self.proof
+            or _stat_identity(linked) != self.proof
+        ):
+            raise AssetError(
+                "inventory source root moved or was replaced after its completed scan"
+            )
+
+    def bind_snapshot(self, snapshot: tuple[InventoryEntry, ...]) -> None:
+        self.validate()
+        if self.snapshot is not None and self.snapshot != snapshot:
+            raise AssetError("inventory source changed during its completed scan")
+        self.snapshot = snapshot
+
+    def validate_snapshot(self) -> None:
+        self.validate()
+        if self.snapshot is None:
+            raise AssetError("inventory source completed scan proof is missing")
+        # Rehash the held tree: root identity alone does not expose a write or
+        # nested entry replacement after _inventory_value completed.
+        if _inventory_snapshot(self.path, source_guard=self) != self.snapshot:
+            raise AssetError("inventory source changed after its completed scan")
+        self.validate()
+
+    def close(self) -> None:
+        os.close(self.descriptor)
 
 
 def _opaque_asset_id(digest: str, target: str) -> str:
@@ -101,18 +443,48 @@ def _json_loads(raw: bytes, label: str) -> dict:
             value[key] = item
         return value
 
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=unique,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise AssetError(f"{label} is not valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise AssetError(f"{label} must be a JSON object")
     return value
 
 
+def _valid_unicode(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _validate_output_path(path: Path) -> None:
+    value = os.fspath(path)
+    name = path.name
+    if (
+        not _valid_unicode(value)
+        or "\x00" in value
+        or not name
+        or name in {".", ".."}
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
+    ):
+        raise AssetError("output path is invalid")
+
+
 def _safe_relative(value: object, label: str) -> str:
     if (
-        not isinstance(value, str)
+        not _valid_unicode(value)
         or not value
         or "\\" in value
         or "\x00" in value
@@ -121,7 +493,12 @@ def _safe_relative(value: object, label: str) -> str:
     ):
         raise AssetError(f"{label} must be a safe POSIX-relative path")
     pure = PurePosixPath(value)
-    if not pure.parts or pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+    if (
+        not pure.parts
+        or pure.is_absolute()
+        or value != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
         raise AssetError(f"{label} must be a safe POSIX-relative path")
     if pure.parts[0].casefold() in {".asset-cache", ".git"}:
         raise AssetError(f"{label} collides with repository control data")
@@ -149,16 +526,32 @@ def _register_portable_target(
 
 
 def _https_url(value: object, *, allow_query: bool = False) -> str:
-    if not isinstance(value, str):
+    if not _valid_unicode(value):
         raise AssetError("HTTPS source URL must be a string")
-    parsed = urllib.parse.urlsplit(value)
+    if any(ord(character) < 0x21 or ord(character) > 0x7E for character in value):
+        raise AssetError("HTTPS source URL must use visible ASCII with percent-encoded path bytes")
+    if (
+        not value.startswith("https://")
+        or "#" in value
+        or ("?" in value and not allow_query)
+        or value[8:].split("/", 1)[0].endswith(":")
+    ):
+        raise AssetError("HTTPS source URL violates the source policy")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = parsed.hostname
+    except ValueError as exc:
+        raise AssetError("HTTPS source URL is malformed") from exc
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
+        or not host
         or parsed.username is not None
         or parsed.password is not None
         or (parsed.query and not allow_query)
         or parsed.fragment
+        or "\\" in parsed.path
+        or re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path) is not None
+        or re.search(r"%(?![0-9A-Fa-f]{2})", parsed.query) is not None
     ):
         raise AssetError("HTTPS source URL violates the source policy")
     try:
@@ -166,7 +559,7 @@ def _https_url(value: object, *, allow_query: bool = False) -> str:
             raise AssetError("HTTPS source URL must use the default TLS port")
     except ValueError as exc:
         raise AssetError("HTTPS source URL has an invalid port") from exc
-    host = parsed.hostname.lower()
+    host = host.lower()
     if not HOSTNAME.fullmatch(host):
         raise AssetError("HTTPS source URL must use a canonical DNS hostname")
     if re.fullmatch(r"[0-9.]+", host):
@@ -246,7 +639,7 @@ def _validate_source(source: object) -> dict:
         for key in ("tag", "asset"):
             value = source[key]
             if (
-                not isinstance(value, str)
+                not _valid_unicode(value)
                 or not value
                 or any(char in value for char in "\r\n\x00")
             ):
@@ -352,7 +745,7 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
 
 
 def _tracked_bytes(root: Path, commit: str, relative: str) -> bytes:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment = _git_environment()
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "cat-file", "blob", f"{commit}:{relative}"],
@@ -587,7 +980,11 @@ def _inventory_directory(descriptor: int, prefix: str) -> list[InventoryEntry]:
     return snapshot
 
 
-def _inventory_snapshot(root: Path) -> tuple[InventoryEntry, ...]:
+def _inventory_snapshot(
+    root: Path,
+    *,
+    source_guard: InventorySourceGuard | None = None,
+) -> tuple[InventoryEntry, ...]:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -595,11 +992,21 @@ def _inventory_snapshot(root: Path) -> tuple[InventoryEntry, ...]:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(root, flags)
+        if source_guard is not None:
+            source_guard.validate()
+            # Opening "." relative to the held directory creates a fresh file
+            # description for each census without returning to the pathname.
+            descriptor = os.open(".", flags, dir_fd=source_guard.descriptor)
+        else:
+            descriptor = os.open(root, flags)
     except OSError as exc:
         raise AssetError("inventory source root could not be opened safely") from exc
     try:
         opened = os.fstat(descriptor)
+        if source_guard is not None:
+            guarded = os.fstat(source_guard.descriptor)
+            if (opened.st_dev, opened.st_ino) != (guarded.st_dev, guarded.st_ino):
+                raise AssetError("inventory source root changed before traversal")
         snapshot = _inventory_directory(descriptor, "")
         traversed = os.fstat(descriptor)
         try:
@@ -614,9 +1021,32 @@ def _inventory_snapshot(root: Path) -> tuple[InventoryEntry, ...]:
             traversed
         ) != _stat_identity(final):
             raise AssetError("inventory source root changed during traversal")
+        if source_guard is not None:
+            source_guard.validate()
         return tuple(sorted(snapshot, key=lambda entry: entry.relative))
     finally:
         os.close(descriptor)
+
+
+def _open_inventory_source_guard(root: Path) -> InventorySourceGuard:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        raise AssetError("inventory source root could not be held safely") from exc
+    proof = _stat_identity(os.fstat(descriptor))
+    guard = InventorySourceGuard(root, descriptor, proof)
+    try:
+        guard.validate()
+    except AssetError:
+        guard.close()
+        raise
+    return guard
 
 
 def _root(path: Path, *, create: bool) -> Path:
@@ -701,7 +1131,7 @@ def _parent_descriptor_under(
                 except (AssetError, OSError) as exc:
                     try:
                         if created:
-                            _remove_created_directory_at(
+                            _retain_created_directory_at(
                                 current,
                                 part,
                                 child,
@@ -723,7 +1153,7 @@ def _parent_descriptor_under(
         raise AssetError("asset target traverses a symlink or non-directory") from exc
 
 
-def _remove_created_directory_at(
+def _retain_created_directory_at(
     parent: int,
     name: str,
     child: int,
@@ -733,22 +1163,23 @@ def _remove_created_directory_at(
     try:
         linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
-        _fsync_asset_directory(parent, f"{label} cleanup parent")
-        return
+        _fsync_asset_directory(parent, f"{label} retained parent")
+        raise CleanupDurabilityError(
+            f"{label} disappeared after creation; no receipt was written"
+        ) from None
     except OSError as exc:
         raise AssetError(f"{label} could not be authenticated before cleanup") from exc
     if (
         not stat.S_ISDIR(linked.st_mode)
         or (guarded.st_dev, guarded.st_ino) != (linked.st_dev, linked.st_ino)
     ):
-        raise AssetError(f"{label} changed before cleanup; refusing destructive rollback")
-    try:
-        os.rmdir(name, dir_fd=parent)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise AssetError(f"{label} could not be removed safely") from exc
-    _fsync_asset_directory(parent, f"{label} cleanup parent")
+        raise CleanupDurabilityError(
+            f"{label} changed after creation and was retained; no receipt was written"
+        )
+    _fsync_asset_directory(parent, f"{label} retained parent")
+    raise CleanupDurabilityError(
+        f"{label} was retained after a failed transaction; no receipt was written"
+    )
 
 
 def _temporary_file_at(parent: int, *, prefix: str = ".asset-") -> tuple[int, str]:
@@ -770,6 +1201,149 @@ def _temporary_file_at(parent: int, *, prefix: str = ".asset-") -> tuple[int, st
     raise AssetError("temporary output object name space is exhausted")
 
 
+def _write_all(descriptor: int, payload: bytes, label: str) -> None:
+    view = memoryview(payload)
+    offset = 0
+    try:
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise OSError("write made no progress")
+            offset += written
+    except OSError as exc:
+        raise AssetError(f"{label} could not be written completely") from exc
+
+
+def _retire_lease_link(
+    descriptor: int,
+    name: str,
+    proof: tuple[int, int, int, int, int, int],
+    label: str,
+) -> str:
+    """Atomically move a fixed lease name to a retained capability name.
+
+    POSIX has no unlink-if-inode operation.  Renaming first means a concurrent
+    replacement is retained for manual recovery rather than deleted.  Retired
+    names deliberately remain under the resolved Git directory; removing them
+    would recreate the same destructive race this helper is designed to avoid.
+    """
+    retired_name = _retire_named_link(
+        descriptor,
+        name,
+        proof,
+        label,
+        missing_ok=False,
+    )
+    assert retired_name is not None
+    return retired_name
+
+
+def _retire_named_link(
+    descriptor: int,
+    name: str,
+    proof: tuple[int, int, int, int, int, int] | None,
+    label: str,
+    *,
+    missing_ok: bool,
+) -> str | None:
+    """Atomically move an owned name to non-destructive retained storage."""
+    for _ in range(128):
+        retired_name = f".danse-assets-retired-{secrets.token_hex(16)}"
+        try:
+            _rename_noreplace_at(descriptor, name, retired_name)
+            break
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                _fsync_asset_directory(descriptor, f"{label} retirement parent")
+                if missing_ok:
+                    return None
+                raise CleanupDurabilityError(
+                    f"{label} disappeared during retirement; manual recovery is required"
+                ) from None
+            raise CleanupDurabilityError(f"{label} could not be retired safely") from exc
+    else:
+        raise CleanupDurabilityError(f"{label} retirement namespace is exhausted")
+    _fsync_asset_directory(descriptor, f"{label} retirement parent")
+    try:
+        retired = os.stat(retired_name, dir_fd=descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise CleanupDurabilityError(
+            f"{label} retired object disappeared; manual recovery is required"
+        ) from exc
+    try:
+        os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        current_absent = True
+    except OSError as exc:
+        raise CleanupDurabilityError(
+            f"{label} retirement could not be authenticated"
+        ) from exc
+    else:
+        current_absent = False
+    # Renaming updates ctime on otherwise unchanged inodes.  Bind the stable
+    # inode, mode, size, and mtime fields while allowing only that kernel-owned
+    # retirement timestamp transition.
+    if proof is None or _inode_identity(retired)[:5] != proof[:5] or not current_absent:
+        raise CleanupDurabilityError(
+            f"{label} changed during retirement; retained object {retired_name} requires "
+            "manual recovery"
+        )
+    return retired_name
+
+
+def _rename_noreplace_at(descriptor: int, source: str, destination: str) -> None:
+    """Create-only rename within one directory, or fail closed if unavailable."""
+
+    for name in (source, destination):
+        if (
+            not _valid_unicode(name)
+            or not name
+            or "\x00" in name
+            or "/" in name
+            or name in {".", ".."}
+        ):
+            raise OSError(errno.EINVAL, "create-only rename name is invalid")
+    source_bytes = source.encode("utf-8")
+    destination_bytes = destination.encode("utf-8")
+    try:
+        system = os.uname().sysname
+    except (AttributeError, OSError) as exc:
+        raise OSError(95, "create-only rename is unavailable") from exc
+    library = ctypes.CDLL(None, use_errno=True)
+    if system == "Linux":
+        function = getattr(library, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+    elif system == "Darwin":
+        function = getattr(library, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    else:
+        function = None
+        flag = 0
+    if function is None:
+        raise OSError(95, "create-only rename is unavailable")
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        descriptor,
+        source_bytes,
+        descriptor,
+        destination_bytes,
+        flag,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source, destination)
+
+
 def _parent_descriptor_matches(root: Path, relative: str, expected: int) -> bool:
     try:
         current = _parent_descriptor_under(root, relative, create_parents=False)
@@ -789,8 +1363,321 @@ def _parent_descriptor_matches(root: Path, relative: str, expected: int) -> bool
         os.close(descriptor)
 
 
+def _git_absolute_path(root: Path, *arguments: str) -> Path:
+    environment = _git_environment()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        raise AssetError("git is required to establish the asset operation lease") from exc
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value or "\n" in value:
+        raise AssetError("Git operation lease path could not be resolved")
+    path = Path(value)
+    if not path.is_absolute():
+        raise AssetError("Git operation lease path is not absolute")
+    return path
+
+
+def _process_start_identity() -> str:
+    """Return a path-free cross-platform process-start identity.
+
+    The lease never uses this value to auto-recover a lock: an absent,
+    malformed, or unverifiable owner always requires manual recovery.  The
+    digest only helps an operator distinguish PID reuse without relying on
+    Linux-only process files.
+    """
+    environment = _git_environment()
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(os.getpid())],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2.0,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unverifiable"
+    value = " ".join(result.stdout.split())
+    if result.returncode != 0 or not value:
+        return "unverifiable"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _git_head_commit(root: Path) -> str:
+    environment = _git_environment()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        raise AssetError("Git HEAD cannot be authenticated") from exc
+    value = result.stdout.strip()
+    if result.returncode != 0 or not GIT_SHA.fullmatch(value):
+        raise AssetError("Git HEAD cannot be authenticated")
+    return value
+
+
+def _git_reference_lock_path(root: Path) -> Path:
+    environment = _git_environment()
+    try:
+        symbolic = subprocess.run(
+            ["git", "-C", str(root), "symbolic-ref", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        ref_format = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-ref-format"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        raise AssetError("Git reference lease path cannot be resolved") from exc
+    reference = symbolic.stdout.strip()
+    if symbolic.returncode == 0:
+        if not reference.startswith("refs/") or ".." in PurePosixPath(reference).parts:
+            raise AssetError("Git symbolic HEAD is invalid")
+        storage = ref_format.stdout.strip() if ref_format.returncode == 0 else "files"
+        if storage == "reftable":
+            ref_path = _git_absolute_path(root, "--git-path", "reftable/tables.list")
+        elif storage in {"", "files"}:
+            ref_path = _git_absolute_path(root, "--git-path", reference)
+        else:
+            raise AssetError("Git reference storage format is unsupported")
+    elif symbolic.returncode == 1:
+        ref_path = _git_absolute_path(root, "--git-path", "HEAD")
+    else:
+        raise AssetError("Git symbolic HEAD cannot be authenticated")
+    return Path(f"{ref_path}.lock")
+
+
+def _assert_root_binding(root: Path, proof: tuple[int, int]) -> None:
+    try:
+        current = root.stat()
+    except OSError as exc:
+        raise AssetError("asset root changed during operation lease establishment") from exc
+    if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != proof:
+        raise AssetError("asset root changed during operation lease establishment")
+    top = _git_absolute_path(root, "--show-toplevel").resolve(strict=True)
+    if top != root:
+        raise AssetError("asset root is not the exact Git checkout root")
+    linked = top.stat()
+    if (linked.st_dev, linked.st_ino) != proof:
+        raise AssetError("Git checkout root changed during lease establishment")
+
+
+def _create_operation_lease(root: Path) -> OperationLease:
+    root = root.resolve(strict=True)
+    initial_root = root.stat()
+    if not stat.S_ISDIR(initial_root.st_mode):
+        raise AssetError("asset root is not a directory")
+    root_proof = (initial_root.st_dev, initial_root.st_ino)
+    root_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_descriptor = os.open(root, root_flags)
+    try:
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AssetError("another asset operation holds the checkout root lease") from exc
+        if (os.fstat(root_descriptor).st_dev, os.fstat(root_descriptor).st_ino) != root_proof:
+            raise AssetError("asset root changed before lease establishment")
+        _assert_root_binding(root, root_proof)
+        git_directory = _git_absolute_path(root, "--absolute-git-dir").resolve(strict=True)
+        _assert_root_binding(root, root_proof)
+        index_path = _git_absolute_path(root, "--git-path", "index")
+        index_parent = index_path.parent.resolve(strict=True)
+        _assert_root_binding(root, root_proof)
+        ref_lock_path = _git_reference_lock_path(root)
+        ref_parent = ref_lock_path.parent.resolve(strict=True)
+        _assert_root_binding(root, root_proof)
+        git_directory_proof = _stat_identity(git_directory.stat())
+        index_parent_proof = _stat_identity(index_parent.stat())
+        ref_parent_proof = _stat_identity(ref_parent.stat())
+    except Exception:
+        os.close(root_descriptor)
+        raise
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    operation_name = "danse-assets-operation.lock"
+    index_name = f"{index_path.name}.lock"
+    ref_name = ref_lock_path.name
+    try:
+        git_descriptor = os.open(git_directory, directory_flags)
+    except Exception:
+        os.close(root_descriptor)
+        raise
+    index_parent_descriptor = -1
+    ref_parent_descriptor = -1
+    operation_descriptor = -1
+    index_descriptor = -1
+    ref_descriptor = -1
+    try:
+        if _stat_identity(os.fstat(git_descriptor)) != git_directory_proof:
+            raise AssetError("Git directory changed during lease establishment")
+        _assert_root_binding(root, root_proof)
+        index_parent_descriptor = os.open(index_parent, directory_flags)
+        ref_parent_descriptor = os.open(ref_parent, directory_flags)
+        if (
+            _stat_identity(os.fstat(index_parent_descriptor)) != index_parent_proof
+            or _stat_identity(os.fstat(ref_parent_descriptor)) != ref_parent_proof
+        ):
+            raise AssetError("Git lease parent changed during establishment")
+        _assert_root_binding(root, root_proof)
+        try:
+            operation_descriptor = os.open(operation_name, flags, 0o600, dir_fd=git_descriptor)
+        except FileExistsError as exc:
+            raise AssetError(
+                f"stale or active asset operation lease at {git_directory / operation_name}; "
+                "verify no operation remains and remove it manually"
+            ) from exc
+        try:
+            fcntl.flock(operation_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AssetError("another asset operation holds the repository lease") from exc
+        try:
+            index_descriptor = os.open(index_name, flags, 0o600, dir_fd=index_parent_descriptor)
+        except FileExistsError as exc:
+            raise AssetError(
+                f"active or crash-stale Git index lease at {index_path}.lock; verify no Git "
+                "operation remains and remove it manually"
+            ) from exc
+        try:
+            ref_descriptor = os.open(ref_name, flags, 0o600, dir_fd=ref_parent_descriptor)
+        except FileExistsError as exc:
+            raise AssetError(
+                f"active or crash-stale Git reference lease at {ref_lock_path}; verify no Git "
+                "operation remains and remove it manually"
+            ) from exc
+        try:
+            index_base_proof = _stat_identity(index_path.stat())
+        except FileNotFoundError:
+            index_base_proof = None
+        except OSError as exc:
+            raise AssetError("Git index identity cannot be authenticated") from exc
+        head_commit = _git_head_commit(root)
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "process_start_id": _process_start_identity(),
+                "token": secrets.token_hex(16),
+            },
+            sort_keys=True,
+        ).encode() + b"\n"
+        for descriptor, label in (
+            (operation_descriptor, "asset operation lease"),
+            (index_descriptor, "Git index operation lease"),
+            (ref_descriptor, "Git reference operation lease"),
+        ):
+            _write_all(descriptor, payload, label)
+            _fsync_asset_file(descriptor, label)
+        _fsync_asset_directory(git_descriptor, "Git directory")
+        if index_parent != git_directory:
+            _fsync_asset_directory(index_parent_descriptor, "Git index parent")
+        if ref_parent not in {git_directory, index_parent}:
+            _fsync_asset_directory(ref_parent_descriptor, "Git reference parent")
+        _assert_root_binding(root, root_proof)
+        lease = OperationLease(
+            root=root,
+            root_descriptor=root_descriptor,
+            git_directory=git_directory,
+            git_descriptor=git_descriptor,
+            operation_descriptor=operation_descriptor,
+            operation_name=operation_name,
+            operation_proof=_stat_identity(os.fstat(operation_descriptor)),
+            index_parent_descriptor=index_parent_descriptor,
+            index_descriptor=index_descriptor,
+            index_name=index_name,
+            index_proof=_stat_identity(os.fstat(index_descriptor)),
+            ref_parent_descriptor=ref_parent_descriptor,
+            ref_descriptor=ref_descriptor,
+            ref_name=ref_name,
+            ref_proof=_stat_identity(os.fstat(ref_descriptor)),
+            ref_lock_path=ref_lock_path,
+            head_commit=head_commit,
+            index_path=index_path,
+            index_base_proof=index_base_proof,
+            root_proof=root_proof,
+        )
+        lease.validate()
+        return lease
+    except Exception as exc:
+        cleanup_error: AssetError | None = None
+        try:
+            if ref_descriptor >= 0:
+                _retire_lease_link(
+                    ref_parent_descriptor,
+                    ref_name,
+                    _stat_identity(os.fstat(ref_descriptor)),
+                    "Git reference operation lease",
+                )
+            if index_descriptor >= 0:
+                _retire_lease_link(
+                    index_parent_descriptor,
+                    index_name,
+                    _stat_identity(os.fstat(index_descriptor)),
+                    "Git index operation lease",
+                )
+            if operation_descriptor >= 0:
+                _retire_lease_link(
+                    git_descriptor,
+                    operation_name,
+                    _stat_identity(os.fstat(operation_descriptor)),
+                    "asset operation lease",
+                )
+        except AssetError as cleanup_exc:
+            cleanup_error = cleanup_exc
+        finally:
+            if index_descriptor >= 0:
+                os.close(index_descriptor)
+            if ref_descriptor >= 0:
+                os.close(ref_descriptor)
+            if operation_descriptor >= 0:
+                os.close(operation_descriptor)
+            if index_parent_descriptor >= 0:
+                os.close(index_parent_descriptor)
+            if ref_parent_descriptor >= 0:
+                os.close(ref_parent_descriptor)
+            os.close(git_descriptor)
+            os.close(root_descriptor)
+        if cleanup_error is not None:
+            raise CleanupDurabilityError(
+                "failed asset operation lease could not be released safely; manual recovery is required"
+            ) from cleanup_error
+        raise exc
+
+
 def _repository_head(root: Path, lock: Lock | None = None) -> str:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment = _git_environment()
     try:
         identity = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
@@ -1306,32 +2193,48 @@ def _guarded_identity_at(
     return _stat_identity(linked)
 
 
-def _remove_published_link(
+def _remove_temporary_link(
     descriptor: int,
     name: str,
     proof: tuple[int, int, int, int, int, int] | None,
     label: str,
-) -> bool:
+) -> str | None:
     if proof is None:
         raise AssetError(f"{label} has no authenticated cleanup identity")
+    return _retire_named_link(
+        descriptor,
+        name,
+        proof,
+        label,
+        missing_ok=True,
+    )
+
+
+def _retain_published_name(
+    descriptor: int,
+    name: str,
+    proof: tuple[int, int, int, int, int, int] | None,
+    label: str,
+) -> None:
     try:
         current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
     except FileNotFoundError:
-        _fsync_asset_directory(descriptor, f"{label} cleanup parent")
-        return False
+        _fsync_asset_directory(descriptor, f"{label} retained parent")
+        raise CleanupDurabilityError(
+            f"{label} disappeared after publication; no receipt was written"
+        ) from None
     except OSError as exc:
-        raise AssetError(f"{label} could not be authenticated before cleanup") from exc
-    if _inode_identity(current) != proof:
-        raise AssetError(f"{label} changed before cleanup; refusing destructive rollback")
-    try:
-        os.unlink(name, dir_fd=descriptor)
-    except FileNotFoundError:
-        _fsync_asset_directory(descriptor, f"{label} cleanup parent")
-        return False
-    except OSError as exc:
-        raise AssetError(f"{label} could not be removed safely") from exc
-    _fsync_asset_directory(descriptor, f"{label} cleanup parent")
-    return True
+        raise CleanupDurabilityError(
+            f"{label} is ambiguous after publication; no receipt was written"
+        ) from exc
+    _fsync_asset_directory(descriptor, f"{label} retained parent")
+    if proof is None or _inode_identity(current) != proof:
+        raise CleanupDurabilityError(
+            f"{label} changed after publication and was retained; no receipt was written"
+        )
+    raise CleanupDurabilityError(
+        f"{label} was retained after a failed transaction; no receipt was written"
+    )
 
 
 def _durably_sync_verified_asset_at(
@@ -1372,16 +2275,32 @@ def _durably_sync_published_inode_at(
             raise AssetError(f"{label} content changed before durable synchronization")
         _fsync_asset_file(opened, label)
         after = os.fstat(opened)
-        linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if (
-            _stat_identity(after) != _stat_identity(before)
-            or _stat_identity(linked) != _stat_identity(after)
-            or _inode_identity(linked) != proof
-        ):
+        if _stat_identity(after) != _stat_identity(before):
             raise AssetError(f"{label} changed during durable synchronization")
     finally:
         os.close(opened)
     _fsync_asset_directory(descriptor, f"{label} parent")
+    try:
+        final_descriptor = os.open(name, flags, dir_fd=descriptor)
+    except OSError as exc:
+        raise AssetError(f"{label} changed after its final directory barrier") from exc
+    try:
+        before = os.fstat(final_descriptor)
+        if _inode_identity(before) != proof or not stat.S_ISREG(before.st_mode):
+            raise AssetError(f"{label} changed after its final directory barrier")
+        with os.fdopen(final_descriptor, "rb", closefd=False) as handle:
+            size, digest = _sha256_stream(handle)
+        after = os.fstat(final_descriptor)
+        linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            size != expected_size
+            or digest != expected_sha256
+            or _stat_identity(after) != _stat_identity(before)
+            or _stat_identity(linked) != _stat_identity(after)
+        ):
+            raise AssetError(f"{label} changed after its final directory barrier")
+    finally:
+        os.close(final_descriptor)
 
 
 def _fsync_verified_under(root: Path, relative: str, asset: Asset, label: str) -> None:
@@ -1458,31 +2377,32 @@ def _cache_from_sources(
                         os.fchmod(output.fileno(), 0o444)
                         _fsync_asset_file(output.fileno(), "temporary asset file")
                     try:
-                        os.link(
+                        _rename_noreplace_at(
+                            cache_descriptor,
                             temporary_name,
                             cache_name,
-                            src_dir_fd=cache_descriptor,
-                            dst_dir_fd=cache_descriptor,
-                            follow_symlinks=False,
                         )
-                        published_proof = _inode_identity_at(
+                        temporary_name = None
+                        published = True
+                        published_proof = _guarded_identity_at(
                             cache_descriptor,
                             cache_name,
+                            temporary_guard,
                             "published cache object",
                         )
-                        published = True
                     except FileExistsError:
                         pass
-                    if temporary_proof is None:
-                        raise AssetError("temporary cache object proof is missing")
-                    temporary_proof = _inode_identity(os.fstat(temporary_guard))
-                    _remove_published_link(
-                        cache_descriptor,
-                        temporary_name,
-                        temporary_proof,
-                        "temporary cache object",
-                    )
-                    temporary_name = None
+                    if temporary_name is not None:
+                        if temporary_proof is None:
+                            raise AssetError("temporary cache object proof is missing")
+                        temporary_proof = _inode_identity(os.fstat(temporary_guard))
+                        _remove_temporary_link(
+                            cache_descriptor,
+                            temporary_name,
+                            temporary_proof,
+                            "temporary cache object",
+                        )
+                        temporary_name = None
                     if published:
                         published_proof = _guarded_identity_at(
                             cache_descriptor,
@@ -1492,6 +2412,10 @@ def _cache_from_sources(
                         )
                     os.close(temporary_guard)
                     temporary_guard = -1
+                except (
+                    CleanupDurabilityError,
+                ):
+                    raise
                 except (
                     AssetError,
                     OSError,
@@ -1506,7 +2430,7 @@ def _cache_from_sources(
                                 temporary_guard,
                                 "published cache object",
                             )
-                        _remove_published_link(
+                        _retain_published_name(
                             cache_descriptor,
                             cache_name,
                             published_proof,
@@ -1517,7 +2441,7 @@ def _cache_from_sources(
                     continue
                 if _identity_at(cache_descriptor, cache_name, asset) != "verified":
                     if published:
-                        _remove_published_link(
+                        _retain_published_name(
                             cache_descriptor,
                             cache_name,
                             published_proof,
@@ -1533,7 +2457,7 @@ def _cache_from_sources(
                     raise AssetError("published cache object proof is missing")
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
-                        _remove_published_link(
+                        _retain_published_name(
                             cache_descriptor,
                             cache_name,
                             published_proof,
@@ -1549,7 +2473,7 @@ def _cache_from_sources(
                     )
                 except AssetError:
                     if published:
-                        _remove_published_link(
+                        _retain_published_name(
                             cache_descriptor,
                             cache_name,
                             published_proof,
@@ -1558,7 +2482,7 @@ def _cache_from_sources(
                     raise
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
-                        _remove_published_link(
+                        _retain_published_name(
                             cache_descriptor,
                             cache_name,
                             published_proof,
@@ -1574,7 +2498,7 @@ def _cache_from_sources(
                         if temporary_guard < 0:
                             raise AssetError("temporary cache object proof is missing")
                         temporary_proof = _inode_identity(os.fstat(temporary_guard))
-                        _remove_published_link(
+                        _remove_temporary_link(
                             cache_descriptor,
                             temporary_name,
                             temporary_proof,
@@ -1637,19 +2561,28 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                     dst_dir_fd=target_descriptor,
                     follow_symlinks=False,
                 )
+                published = True
                 published_proof = _inode_identity_at(
                     target_descriptor,
                     target_name,
                     "published asset target",
                 )
-                published = True
             except FileExistsError:
                 pass
+            except AssetError:
+                if published:
+                    _retain_published_name(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
+                raise
             except OSError as exc:
                 raise AssetError("asset target could not be published atomically") from exc
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(
+                    _retain_published_name(
                         target_descriptor,
                         target_name,
                         published_proof,
@@ -1659,7 +2592,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
             final_state = _identity_at(target_descriptor, target_name, asset)
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(
+                    _retain_published_name(
                         target_descriptor,
                         target_name,
                         published_proof,
@@ -1668,7 +2601,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target parent changed during final verification")
             if final_state != "verified":
                 if published:
-                    _remove_published_link(
+                    _retain_published_name(
                         target_descriptor,
                         target_name,
                         published_proof,
@@ -1684,7 +2617,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 )
             except AssetError:
                 if published:
-                    _remove_published_link(
+                    _retain_published_name(
                         target_descriptor,
                         target_name,
                         published_proof,
@@ -1693,7 +2626,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(
+                    _retain_published_name(
                         target_descriptor,
                         target_name,
                         published_proof,
@@ -1811,6 +2744,8 @@ def pull(
                 ),
             )
             _publish_no_overwrite(root, asset.target, asset)
+        except CleanupDurabilityError:
+            raise
         except AssetError:
             if asset.required or _identity_under(root, asset.target, asset) != "missing":
                 failures.append(asset.asset_id)
@@ -1848,7 +2783,10 @@ def _open_durable_output_directory(path: Path) -> int:
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    absolute = path.resolve(strict=False)
+    try:
+        absolute = path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AssetError("output parent cannot be resolved safely") from exc
     anchor = Path(absolute.anchor)
     try:
         current = os.open(anchor, directory_flags)
@@ -1879,7 +2817,7 @@ def _open_durable_output_directory(path: Path) -> int:
             except (AssetError, OSError) as exc:
                 try:
                     if created:
-                        _remove_created_directory_at(
+                        _retain_created_directory_at(
                             current,
                             part,
                             child,
@@ -1901,22 +2839,102 @@ def _open_durable_output_directory(path: Path) -> int:
         raise AssetError("output parent traverses a symlink or non-directory") from exc
 
 
+def _canonical_json_bytes(value: dict) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _stage_json(
+    path: Path,
+    value: dict,
+    *,
+    forbidden_root: Path | None = None,
+) -> StagedJson:
+    """Create a guarded, fully synchronized receipt snapshot.
+
+    The guarded descriptor and capability name survive operation-lease release.
+    The requested receipt name remains absent until that release succeeds.
+    """
+    _validate_output_path(path)
+    try:
+        parent_path = path.parent.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AssetError("output parent could not be prepared safely") from exc
+    path = parent_path / path.name
+    if forbidden_root is not None:
+        _receipt_outside_checkout(path, forbidden_root)
+    parent_descriptor = _open_durable_output_directory(parent_path)
+    descriptor = -1
+    reader = -1
+    name: str | None = None
+    proof: tuple[int, int, int, int, int, int] | None = None
+    payload = _canonical_json_bytes(value)
+    try:
+        if not _directory_descriptor_matches(parent_path, parent_descriptor):
+            raise AssetError("output parent changed before receipt staging")
+        descriptor, name = _temporary_file_at(parent_descriptor, prefix=".receipt-stage-")
+        _write_all(descriptor, payload, "staged receipt")
+        _fsync_asset_file(descriptor, "staged receipt")
+        os.fchmod(descriptor, 0o400)
+        _fsync_asset_file(descriptor, "staged receipt")
+        proof = _inode_identity(os.fstat(descriptor))
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        reader = os.open(name, flags, dir_fd=parent_descriptor)
+        if _inode_identity(os.fstat(reader)) != proof:
+            raise AssetError("staged receipt changed while guarded")
+        _fsync_asset_directory(parent_descriptor, "staged receipt parent")
+        if not _directory_descriptor_matches(parent_path, parent_descriptor):
+            raise AssetError("output parent changed during receipt staging")
+        assert name is not None and proof is not None
+        staged = StagedJson(
+            parent_path=parent_path,
+            parent_descriptor=parent_descriptor,
+            descriptor=reader,
+            name=name,
+            proof=proof,
+            expected_size=len(payload),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        if staged.payload() != payload:
+            raise AssetError("staged receipt content proof failed")
+        reader = -1
+        parent_descriptor = -1
+        name = None
+        return staged
+    finally:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if reader >= 0:
+                os.close(reader)
+            if name is not None:
+                if proof is None:
+                    proof = _inode_identity_at(parent_descriptor, name, "staged receipt")
+                _remove_temporary_link(parent_descriptor, name, proof, "staged receipt")
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+
+
 def _atomic_json(
     path: Path,
     value: dict,
     *,
     no_overwrite: bool,
     forbidden_root: Path | None = None,
-) -> None:
+    source_guard: InventorySourceGuard | None = None,
+) -> tuple[int, int, int, int, int, int]:
+    _validate_output_path(path)
+    if source_guard is not None:
+        source_guard.validate()
     try:
         parent_path = path.parent.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise AssetError("output parent could not be prepared safely") from exc
     path = parent_path / path.name
     if forbidden_root is not None:
         _receipt_outside_checkout(path, forbidden_root)
     parent_descriptor = _open_durable_output_directory(parent_path)
-    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    payload = _canonical_json_bytes(value)
     payload_sha256 = hashlib.sha256(payload).hexdigest()
     temporary_descriptor = -1
     temporary_guard = -1
@@ -1955,23 +2973,34 @@ def _atomic_json(
             _fsync_asset_file(handle.fileno(), "receipt file")
         if not parent_is_valid():
             raise AssetError("output parent changed before publication")
+        if source_guard is not None:
+            source_guard.validate_snapshot()
         if no_overwrite:
             try:
-                os.link(
+                _rename_noreplace_at(
+                    parent_descriptor,
                     temporary_name,
                     path.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
                 )
-                published_proof = _inode_identity_at(
+                temporary_name = None
+                published = True
+                published_proof = _guarded_identity_at(
                     parent_descriptor,
                     path.name,
+                    temporary_guard,
                     "published receipt",
                 )
-                published = True
             except FileExistsError as exc:
                 raise AssetError("output already exists; refusing to overwrite") from exc
+            except AssetError:
+                if published:
+                    _retain_published_name(
+                        parent_descriptor,
+                        path.name,
+                        published_proof,
+                        "published receipt",
+                    )
+                raise
             except OSError as exc:
                 raise AssetError("output could not be published atomically") from exc
         else:
@@ -1985,15 +3014,24 @@ def _atomic_json(
             except OSError as exc:
                 raise AssetError("output could not be published atomically") from exc
             temporary_name = None
-            published_proof = _inode_identity_at(
-                parent_descriptor,
-                path.name,
-                "published receipt",
-            )
             published = True
+            try:
+                published_proof = _inode_identity_at(
+                    parent_descriptor,
+                    path.name,
+                    "published receipt",
+                )
+            except AssetError:
+                _retain_published_name(
+                    parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
+                raise
         if not parent_is_valid():
             if published:
-                _remove_published_link(
+                _retain_published_name(
                     parent_descriptor,
                     path.name,
                     published_proof,
@@ -2001,10 +3039,23 @@ def _atomic_json(
                 )
                 published = False
             raise AssetError("output parent changed during publication")
+        if source_guard is not None:
+            try:
+                source_guard.validate()
+            except AssetError:
+                if published:
+                    _retain_published_name(
+                        parent_descriptor,
+                        path.name,
+                        published_proof,
+                        "published receipt",
+                    )
+                    published = False
+                raise
         try:
             if temporary_name is not None:
                 temporary_proof = _inode_identity(os.fstat(temporary_guard))
-                _remove_published_link(
+                _remove_temporary_link(
                     parent_descriptor,
                     temporary_name,
                     temporary_proof,
@@ -2032,14 +3083,7 @@ def _atomic_json(
             )
         except AssetError:
             if published:
-                if temporary_guard >= 0:
-                    published_proof = _guarded_identity_at(
-                        parent_descriptor,
-                        path.name,
-                        temporary_guard,
-                        "published receipt",
-                    )
-                _remove_published_link(
+                _retain_published_name(
                     parent_descriptor,
                     path.name,
                     published_proof,
@@ -2049,7 +3093,7 @@ def _atomic_json(
             raise
         if not parent_is_valid():
             if published:
-                _remove_published_link(
+                _retain_published_name(
                     parent_descriptor,
                     path.name,
                     published_proof,
@@ -2057,6 +3101,22 @@ def _atomic_json(
                 )
                 published = False
             raise AssetError("output parent changed during durable publication")
+        if source_guard is not None:
+            try:
+                source_guard.validate_snapshot()
+            except AssetError:
+                if published:
+                    _retain_published_name(
+                        parent_descriptor,
+                        path.name,
+                        published_proof,
+                        "published receipt",
+                    )
+                    published = False
+                raise
+        if published_proof is None:
+            raise AssetError("published receipt proof is missing")
+        return published_proof
     finally:
         try:
             try:
@@ -2066,7 +3126,7 @@ def _atomic_json(
                     if temporary_guard < 0:
                         raise AssetError("temporary receipt object proof is missing")
                     temporary_proof = _inode_identity(os.fstat(temporary_guard))
-                    _remove_published_link(
+                    _remove_temporary_link(
                         parent_descriptor,
                         temporary_name,
                         temporary_proof,
@@ -2080,9 +3140,10 @@ def _atomic_json(
 
 
 def _receipt_outside_checkout(path: Path, root: Path) -> Path:
+    _validate_output_path(path)
     try:
         resolved = path.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise AssetError("receipt path cannot be resolved safely") from exc
     try:
         resolved.relative_to(root)
@@ -2091,14 +3152,14 @@ def _receipt_outside_checkout(path: Path, root: Path) -> Path:
     raise AssetError("receipt output must remain outside the verified checkout")
 
 
-def inventory(
+def _inventory_value(
     source_root: Path,
-    output: Path,
     *,
     lock_id: str,
     profile: str,
     repository_commit: str,
     rights_class: str,
+    source_guard: InventorySourceGuard | None = None,
 ) -> dict:
     root = _root(source_root, create=False)
     if not IDENTIFIER.fullmatch(lock_id) or not GIT_SHA.fullmatch(repository_commit):
@@ -2112,7 +3173,9 @@ def inventory(
     if production and _repository_head(ROOT) != repository_commit:
         raise AssetError("production inventory does not bind the exact clean script checkout")
     expected = _production_targets(ROOT, repository_commit) if production else None
-    snapshot = _inventory_snapshot(root)
+    snapshot = _inventory_snapshot(root, source_guard=source_guard)
+    if source_guard is not None:
+        source_guard.bind_snapshot(snapshot)
     files = [entry for entry in snapshot if entry.kind == "file"]
     targets: set[str] = set()
     portable_targets: set[tuple[str, ...]] = set()
@@ -2193,12 +3256,89 @@ def inventory(
             repository_root=ROOT,
             repository_commit=repository_commit,
         )
-    if _inventory_snapshot(root) != snapshot:
+    if _inventory_snapshot(root, source_guard=source_guard) != snapshot:
         raise AssetError("inventory source changed during its completed scan")
     if production and _repository_head(ROOT) != repository_commit:
         raise AssetError("production inventory lost its exact clean script checkout binding")
-    _atomic_json(output, value, no_overwrite=True)
     return value
+
+
+def inventory(
+    source_root: Path,
+    output: Path,
+    *,
+    lock_id: str,
+    profile: str,
+    repository_commit: str,
+    rights_class: str,
+) -> dict:
+    _validate_output_path(output)
+    resolved_source = _root(source_root, create=False)
+    try:
+        resolved_output = output.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AssetError("inventory output cannot be resolved safely") from exc
+    try:
+        resolved_output.relative_to(resolved_source)
+    except ValueError:
+        pass
+    else:
+        raise AssetError("inventory output must remain outside the inventoried source root")
+    source_guard = _open_inventory_source_guard(resolved_source)
+    production = profile == "screendance-production"
+    lease: OperationLease | None = None
+    lease_close_attempted = False
+    staged_output: StagedJson | None = None
+    try:
+        lease = _create_operation_lease(ROOT.resolve()) if production else None
+        value = _inventory_value(
+            resolved_source,
+            lock_id=lock_id,
+            profile=profile,
+            repository_commit=repository_commit,
+            rights_class=rights_class,
+            source_guard=source_guard,
+        )
+        source_guard.validate()
+        if lease is not None:
+            lease.validate()
+            if _repository_head(ROOT) != repository_commit:
+                raise AssetError("production inventory lost its exact clean script checkout binding")
+            staged_output = _stage_json(
+                resolved_output,
+                value,
+                forbidden_root=resolved_source,
+            )
+            source_guard.validate()
+            lease.validate()
+            lease_close_attempted = True
+            lease.close()
+            if staged_output.payload() != _canonical_json_bytes(value):
+                raise AssetError("staged production inventory changed after lease release")
+            staged_output.publish(
+                resolved_output,
+                forbidden_root=resolved_source,
+                source_guard=source_guard,
+            )
+        else:
+            _atomic_json(
+                resolved_output,
+                value,
+                no_overwrite=True,
+                forbidden_root=resolved_source,
+                source_guard=source_guard,
+            )
+        return value
+    finally:
+        try:
+            if lease is not None and not lease_close_attempted:
+                lease.close()
+        finally:
+            try:
+                if staged_output is not None:
+                    staged_output.close()
+            finally:
+                source_guard.close()
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -2242,33 +3382,64 @@ def main(argv: list[str] | None = None) -> int:
             print(f"assets: inventoried {len(value['assets'])} assets", flush=True)
             return 0
         root = _root(args.root, create=args.command == "pull")
-        lock = load_lock(args.lock, repository_root=root)
-        receipt = _receipt_outside_checkout(args.receipt, root) if args.receipt else None
-        if args.command == "pull":
-            if args.timeout <= 0:
-                raise AssetError("timeout must be positive")
-            report = pull(
-                lock,
-                root,
-                allow_file=args.allow_file,
-                source_root=args.file_source_root,
-                timeout=args.timeout,
+        lease = _create_operation_lease(root)
+        lease_close_attempted = False
+        staged_receipt: StagedJson | None = None
+        try:
+            lock = load_lock(args.lock, repository_root=root)
+            receipt = _receipt_outside_checkout(args.receipt, root) if args.receipt else None
+            if args.command == "pull":
+                if args.timeout <= 0:
+                    raise AssetError("timeout must be positive")
+                report = pull(
+                    lock,
+                    root,
+                    allow_file=args.allow_file,
+                    source_root=args.file_source_root,
+                    timeout=args.timeout,
+                )
+            else:
+                report = inspect(args.command, lock, root)
+            _assert_repository_binding(root, lock)
+            lease.validate()
+            if receipt:
+                staged_receipt = _stage_json(
+                    _receipt_outside_checkout(receipt, root),
+                    report,
+                    forbidden_root=root,
+                )
+                if inspect(args.command, lock, root) != report:
+                    raise AssetError("asset snapshot changed after receipt staging")
+            _assert_repository_binding(root, lock)
+            lease.validate()
+            # The anonymous staged bytes are bound to the exact repository and
+            # asset snapshot above.  Release both cooperative locks before the
+            # requested receipt name can become visible, so an uncertain lease
+            # cleanup can never coexist with an outward receipt.
+            lease_close_attempted = True
+            lease.close()
+            if receipt:
+                assert staged_receipt is not None
+                if staged_receipt.payload() != _canonical_json_bytes(report):
+                    raise AssetError("staged receipt changed after lease release")
+                staged_receipt.publish(
+                    _receipt_outside_checkout(receipt, root),
+                    forbidden_root=root,
+                )
+            print(
+                f"assets: {args.command} {'OK' if report['ok'] else 'BLOCKED'} "
+                f"({report['counts']['verified']}/{report['counts']['declared']} verified)",
+                flush=True,
             )
-        else:
-            report = inspect(args.command, lock, root)
-        if receipt:
-            _atomic_json(
-                _receipt_outside_checkout(receipt, root),
-                report,
-                no_overwrite=True,
-                forbidden_root=root,
-            )
-        print(
-            f"assets: {args.command} {'OK' if report['ok'] else 'BLOCKED'} "
-            f"({report['counts']['verified']}/{report['counts']['declared']} verified)",
-            flush=True,
-        )
-        return 0 if report["ok"] else 1
+            result = 0 if report["ok"] else 1
+        finally:
+            try:
+                if not lease_close_attempted:
+                    lease.close()
+            finally:
+                if staged_receipt is not None:
+                    staged_receipt.close()
+        return result
     except AssetError as exc:
         print(f"assets: BLOCKED — {exc}", file=sys.stderr)
         return 1

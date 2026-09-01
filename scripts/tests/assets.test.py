@@ -124,6 +124,7 @@ class AssetParityTest(unittest.TestCase):
         cache = self.fixture.root / f".asset-cache/sha256/{digest[:2]}/{digest}"
         self.assertEqual(target.read_bytes(), self.fixture.payload)
         self.assertEqual(cache.read_bytes(), self.fixture.payload)
+        self.assertEqual(list(cache.parent.glob(".danse-assets-retired-*")), [])
         self.assertEqual(target.stat().st_ino, cache.stat().st_ino)
         self.assertEqual(stat_mode(target), 0o444)
         receipt = self.fixture.receipt.read_text(encoding="utf-8")
@@ -150,7 +151,7 @@ class AssetParityTest(unittest.TestCase):
         events = []
         real_fchmod = os.fchmod
         real_fsync = os.fsync
-        real_atomic_json = ASSETS._atomic_json
+        real_publish = ASSETS.StagedJson.publish
 
         def record_mode(descriptor, mode):
             events.append("mode")
@@ -170,14 +171,14 @@ class AssetParityTest(unittest.TestCase):
                         break
             return real_fsync(descriptor)
 
-        def record_receipt(*args, **kwargs):
+        def record_receipt(staged, *args, **kwargs):
             events.append("receipt")
-            return real_atomic_json(*args, **kwargs)
+            return real_publish(staged, *args, **kwargs)
 
         with (
             mock.patch.object(ASSETS.os, "fchmod", side_effect=record_mode),
             mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync),
-            mock.patch.object(ASSETS, "_atomic_json", side_effect=record_receipt),
+            mock.patch.object(ASSETS.StagedJson, "publish", new=record_receipt),
         ):
             code = ASSETS.main(
                 [
@@ -335,7 +336,7 @@ class AssetParityTest(unittest.TestCase):
         target = self.fixture.root / asset.target
         events = []
         real_fsync = os.fsync
-        real_atomic_json = ASSETS._atomic_json
+        real_publish = ASSETS.StagedJson.publish
 
         def record_sync(descriptor):
             if descriptor_matches_path(descriptor, cache):
@@ -346,13 +347,13 @@ class AssetParityTest(unittest.TestCase):
                 events.append("target-directory")
             return real_fsync(descriptor)
 
-        def record_receipt(*args, **kwargs):
+        def record_receipt(staged, *args, **kwargs):
             events.append("receipt")
-            return real_atomic_json(*args, **kwargs)
+            return real_publish(staged, *args, **kwargs)
 
         with (
             mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync),
-            mock.patch.object(ASSETS, "_atomic_json", side_effect=record_receipt),
+            mock.patch.object(ASSETS.StagedJson, "publish", new=record_receipt),
         ):
             code = ASSETS.main(
                 [
@@ -389,12 +390,18 @@ class AssetParityTest(unittest.TestCase):
             ),
             0,
         )
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=False)
+        target = self.fixture.root / asset.target
         real_fsync = os.fsync
         rejected = False
 
         def reject_verified_file_once(descriptor):
             nonlocal rejected
-            if not rejected and stat.S_ISREG(os.fstat(descriptor).st_mode):
+            if not rejected and (
+                descriptor_matches_path(descriptor, cache)
+                or descriptor_matches_path(descriptor, target)
+            ):
                 rejected = True
                 raise OSError("injected verified file fsync failure")
             return real_fsync(descriptor)
@@ -415,7 +422,7 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(self.fixture.receipt.exists())
 
-    def test_ancestor_directory_sync_failure_cleans_creation_and_blocks_pull(self) -> None:
+    def test_ancestor_directory_sync_failure_retains_creation_without_receipt(self) -> None:
         real_fsync = os.fsync
         rejected = False
 
@@ -443,9 +450,8 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertTrue(rejected)
         self.assertEqual(code, 1)
-        self.assertFalse((self.fixture.root / ".asset-cache").exists())
-        self.assertFalse((self.fixture.root / "pipeline").exists())
-        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+        self.assertTrue((self.fixture.root / ".asset-cache").exists())
+        self.assertFalse(self.fixture.receipt.exists())
 
     def test_cache_directory_sync_failure_cleans_link_and_blocks_receipt(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -478,9 +484,9 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertTrue(rejected)
         self.assertEqual(code, 1)
-        self.assertFalse(cache.exists())
+        self.assertTrue(cache.exists())
         self.assertFalse(target.exists())
-        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+        self.assertFalse(self.fixture.receipt.exists())
 
     def test_target_directory_sync_failure_cleans_link_and_blocks_receipt(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -514,8 +520,8 @@ class AssetParityTest(unittest.TestCase):
         self.assertTrue(rejected)
         self.assertEqual(code, 1)
         self.assertTrue(cache.exists())
-        self.assertFalse(target.exists())
-        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+        self.assertTrue(target.exists())
+        self.assertFalse(self.fixture.receipt.exists())
 
     def test_missing_required_asset_fails_closed(self) -> None:
         code = ASSETS.main(
@@ -661,6 +667,83 @@ class AssetParityTest(unittest.TestCase):
             ASSETS.load_lock(self.fixture.lock)
         self.fixture.write_lock()
 
+    def test_surrogate_and_malformed_source_locators_fail_as_controlled_asset_errors(self) -> None:
+        invalid_sources = (
+            {"kind": "https", "url": "https://example.com/\udcff"},
+            {"kind": "https", "url": "https://[bad"},
+            {"kind": "https", "url": "https://example.com/raw space"},
+            {"kind": "https", "url": "https://example.com/raw\tcontrol"},
+            {"kind": "https", "url": "https://example.com/raw-é"},
+            {"kind": "https", "url": "https://example.com/back\\slash"},
+            {"kind": "https", "url": "https://example.com/bad%escape"},
+            {
+                "kind": "github-release",
+                "repository": "organvm/example",
+                "tag": "v1-\udcff",
+                "asset": "asset.bin",
+            },
+            {
+                "kind": "github-release",
+                "repository": "organvm/example",
+                "tag": "v1",
+                "asset": "asset-\udcff.bin",
+            },
+        )
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                self.fixture.write_lock(asset={"sources": [source]})
+                with self.assertRaises(ASSETS.AssetError):
+                    ASSETS.load_lock(self.fixture.lock)
+                self.assertEqual(
+                    ASSETS.main(
+                        [
+                            "audit",
+                            "--lock",
+                            str(self.fixture.lock),
+                            "--root",
+                            str(self.fixture.root),
+                            "--receipt",
+                            str(self.fixture.receipt),
+                        ]
+                    ),
+                    1,
+                )
+                self.assertFalse(self.fixture.receipt.exists())
+        self.fixture.write_lock()
+        canonical = "https://example.com/caf%C3%A9/file%20name"
+        self.assertEqual(ASSETS._https_url(canonical), canonical)
+        self.assertEqual(urllib.request.Request(canonical).full_url, canonical)
+
+    def test_pathological_json_is_controlled_blocked_without_receipt(self) -> None:
+        depth = 10_000
+        invalid_values = (
+            '{"a":' * depth + "0" + "}" * depth,
+            '{"a":' + "9" * 5_000 + "}",
+            '{"a":NaN}',
+            '{"a":Infinity}',
+            '{"a":-Infinity}',
+        )
+        for raw in invalid_values:
+            with self.subTest(prefix=raw[:20]):
+                self.fixture.lock.write_text(raw, encoding="utf-8")
+                with self.assertRaises(ASSETS.AssetError):
+                    ASSETS.load_lock(self.fixture.lock)
+                self.assertEqual(
+                    ASSETS.main(
+                        [
+                            "audit",
+                            "--lock",
+                            str(self.fixture.lock),
+                            "--root",
+                            str(self.fixture.root),
+                            "--receipt",
+                            str(self.fixture.receipt),
+                        ]
+                    ),
+                    1,
+                )
+                self.assertFalse(self.fixture.receipt.exists())
+
     def test_missing_parent_path_preserves_every_component(self) -> None:
         target = ASSETS._path_under(
             self.fixture.root,
@@ -745,10 +828,10 @@ class AssetParityTest(unittest.TestCase):
             ASSETS.os,
             "link",
             side_effect=swap_parent_then_link,
-        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+        ), self.assertRaisesRegex(ASSETS.AssetError, "retained"):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertEqual(list(held_parent.iterdir()), [])
+        self.assertEqual([path.name for path in held_parent.iterdir()], [Path(asset.target).name])
 
     def test_vanished_publication_during_parent_swap_is_controlled_blocked(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -774,7 +857,7 @@ class AssetParityTest(unittest.TestCase):
                 "_parent_descriptor_matches",
                 side_effect=remove_after_publication,
             ),
-            self.assertRaisesRegex(ASSETS.AssetError, "parent changed during publication"),
+            self.assertRaisesRegex(ASSETS.AssetError, "disappeared after publication"),
         ):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertFalse(target.exists())
@@ -804,7 +887,7 @@ class AssetParityTest(unittest.TestCase):
                 "_parent_descriptor_matches",
                 side_effect=replace_after_publication,
             ),
-            self.assertRaisesRegex(ASSETS.AssetError, "refusing destructive rollback"),
+            self.assertRaisesRegex(ASSETS.AssetError, "changed after publication.*retained"),
         ):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertEqual(target.read_bytes(), b"concurrent replacement")
@@ -835,11 +918,11 @@ class AssetParityTest(unittest.TestCase):
             ASSETS,
             "_identity_at",
             side_effect=swap_parent_after_final_identity,
-        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+        ), self.assertRaisesRegex(ASSETS.AssetError, "retained"):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertTrue(swapped)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertEqual(list(held_parent.iterdir()), [])
+        self.assertEqual([path.name for path in held_parent.iterdir()], [Path(asset.target).name])
 
     def test_writable_preverified_target_is_rejected(self) -> None:
         target = self.fixture.root / "pipeline/.work/raw/IMG_1570.JPG"
@@ -883,7 +966,7 @@ class AssetParityTest(unittest.TestCase):
             ASSETS,
             "_temporary_file_at",
             side_effect=swap_parent_then_create,
-        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+        ), self.assertRaisesRegex(ASSETS.AssetError, "retained"):
             ASSETS._cache_from_sources(
                 self.fixture.root,
                 asset,
@@ -893,7 +976,9 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertTrue(swapped)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertEqual(list(held_parent.iterdir()), [])
+        held_names = {path.name for path in held_parent.iterdir()}
+        self.assertIn(asset.sha256, held_names)
+        self.assertFalse(any(name.startswith(".danse-assets-retired-") for name in held_names))
 
     def test_midstream_http_failure_uses_fallback_and_writes_receipt(self) -> None:
         sources = [
@@ -927,19 +1012,19 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(source_stream.call_count, 2)
         self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
 
-    def test_vanished_cache_temp_is_missing_tolerant(self) -> None:
+    def test_vanished_cache_temp_blocks_without_cache_or_target(self) -> None:
+        real_rename = ASSETS._rename_noreplace_at
         real_unlink = os.unlink
         vanished = False
 
-        def vanish_then_report_missing(name, *args, **kwargs):
+        def vanish_then_report_missing(descriptor, source, destination):
             nonlocal vanished
-            if not vanished and str(name).startswith(".asset-"):
+            if not vanished and str(source).startswith(".asset-"):
                 vanished = True
-                real_unlink(name, *args, **kwargs)
-                raise FileNotFoundError(name)
-            return real_unlink(name, *args, **kwargs)
+                real_unlink(source, dir_fd=descriptor)
+            return real_rename(descriptor, source, destination)
 
-        with mock.patch.object(ASSETS.os, "unlink", side_effect=vanish_then_report_missing):
+        with mock.patch.object(ASSETS, "_rename_noreplace_at", side_effect=vanish_then_report_missing):
             code = ASSETS.main(
                 [
                     "pull",
@@ -953,7 +1038,10 @@ class AssetParityTest(unittest.TestCase):
                 ]
             )
         self.assertTrue(vanished)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        self.assertFalse(ASSETS._cache_path(self.fixture.root, asset, create=False).exists())
+        self.assertFalse((self.fixture.root / asset.target).exists())
 
     def test_repository_commit_is_exact(self) -> None:
         self.fixture.write_lock(repository_commit="a" * 40)
@@ -1108,6 +1196,585 @@ class AssetParityTest(unittest.TestCase):
             ASSETS._repository_head(self.fixture.root)
         self.assertTrue(mutated)
 
+    def test_git_identity_commands_disable_all_object_replacements(self) -> None:
+        real_run = subprocess.run
+        git_environments = []
+
+        def capture_environment(command, *args, **kwargs):
+            if command and command[0] == "git":
+                git_environments.append(dict(kwargs.get("env", {})))
+            return real_run(command, *args, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_REPLACE_REF_BASE": "refs/replace-attacker",
+                    "GIT_OBJECT_DIRECTORY": "/untrusted/object-store",
+                },
+            ),
+            mock.patch.object(ASSETS.subprocess, "run", side_effect=capture_environment),
+        ):
+            self.assertEqual(ASSETS._repository_head(self.fixture.root), self.fixture.head)
+            self.assertEqual(ASSETS._git_head_commit(self.fixture.root), self.fixture.head)
+            ASSETS._git_absolute_path(self.fixture.root, "--absolute-git-dir")
+            ASSETS._git_reference_lock_path(self.fixture.root)
+            self.assertEqual(
+                ASSETS._tracked_bytes(self.fixture.root, self.fixture.head, "README.md"),
+                (self.fixture.root / "README.md").read_bytes(),
+            )
+        self.assertTrue(git_environments)
+        for environment in git_environments:
+            self.assertEqual(environment.get("GIT_NO_REPLACE_OBJECTS"), "1")
+            self.assertNotIn("GIT_REPLACE_REF_BASE", environment)
+            self.assertNotIn("GIT_OBJECT_DIRECTORY", environment)
+
+    def test_operation_lease_resolves_linked_worktree_gitdir_and_index(self) -> None:
+        worktree = self.fixture.base / "linked-worktree"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.fixture.root),
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(worktree),
+                "HEAD",
+            ],
+            check=True,
+        )
+        lease = None
+        try:
+            self.assertTrue((worktree / ".git").is_file())
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(
+                    ASSETS,
+                    "_fsync_asset_file",
+                    side_effect=lambda descriptor, _label: os.fsync(descriptor),
+                ),
+            ):
+                lease = ASSETS._create_operation_lease(worktree.resolve())
+            self.assertNotEqual(lease.git_directory, worktree / ".git")
+            index = ASSETS._git_absolute_path(worktree, "--git-path", "index")
+            self.assertEqual(lease.index_name, f"{index.name}.lock")
+            self.assertTrue(descriptor_matches_path(lease.index_parent_descriptor, index.parent))
+            owner = json.loads(
+                (lease.git_directory / lease.operation_name).read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(owner), {"pid", "process_start_id", "token"})
+            self.assertRegex(owner["process_start_id"], r"^(?:[0-9a-f]{64}|unverifiable)$")
+            self.assertNotIn("/", json.dumps(owner))
+            lease.validate()
+        finally:
+            if lease is not None:
+                lease.close()
+            subprocess.run(
+                ["git", "-C", str(self.fixture.root), "worktree", "remove", "--force", str(worktree)],
+                check=True,
+            )
+
+    def test_operation_lease_rejects_root_swap_during_establishment(self) -> None:
+        root = self.fixture.root.resolve()
+        replacement = self.fixture.base / "replacement-repo"
+        held = self.fixture.base / "held-repo"
+        subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(root), str(replacement)],
+            check=True,
+        )
+        real_sync = ASSETS._fsync_asset_directory
+        swapped = False
+
+        def swap_after_git_directory_sync(descriptor, label):
+            nonlocal swapped
+            result = real_sync(descriptor, label)
+            if label == "Git directory" and not swapped:
+                root.rename(held)
+                replacement.rename(root)
+                swapped = True
+            return result
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_fsync_asset_directory",
+                side_effect=swap_after_git_directory_sync,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "root changed|lease establishment"),
+        ):
+            ASSETS._create_operation_lease(root)
+        self.assertTrue(swapped)
+        second = ASSETS._create_operation_lease(root)
+        second.close()
+
+    def test_operation_lease_rejects_git_directory_swap(self) -> None:
+        root = self.fixture.root.resolve()
+        alternate = self.fixture.base / "alternate-repo"
+        held_git = root / ".git-held"
+        subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(root), str(alternate)],
+            check=True,
+        )
+        lease = ASSETS._create_operation_lease(root)
+        (root / ".git").rename(held_git)
+        (alternate / ".git").rename(root / ".git")
+        with self.assertRaisesRegex(ASSETS.AssetError, "administrative paths changed"):
+            lease.validate()
+        with self.assertRaisesRegex(ASSETS.AssetError, "released safely"):
+            lease.close()
+        second = ASSETS._create_operation_lease(root)
+        second.close()
+
+    def test_linked_worktree_pointer_swap_cannot_create_two_root_leases(self) -> None:
+        first = self.fixture.base / "linked-first"
+        second = self.fixture.base / "linked-second"
+        for path in (first, second):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.fixture.root),
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    str(path),
+                    "HEAD",
+                ],
+                check=True,
+            )
+        original_pointer = (first / ".git").read_text(encoding="utf-8")
+        lease = ASSETS._create_operation_lease(first.resolve())
+        (first / ".git").write_text((second / ".git").read_text(encoding="utf-8"), encoding="utf-8")
+        with self.assertRaisesRegex(ASSETS.AssetError, "exact Git checkout root|administrative"):
+            lease.validate()
+        # The directory-descriptor flock belongs to the visible checkout root,
+        # not whichever administrative directory the mutable .git pointer names.
+        # A second acquisition must therefore remain blocked while the original
+        # (now invalid) lease is still live.
+        with self.assertRaisesRegex(ASSETS.AssetError, "checkout root lease"):
+            ASSETS._create_operation_lease(first.resolve())
+        with self.assertRaisesRegex(ASSETS.AssetError, "released safely"):
+            lease.close()
+        (first / ".git").write_text(original_pointer, encoding="utf-8")
+
+    def test_operation_lease_fails_closed_on_preexisting_or_crash_stale_locks(self) -> None:
+        root = self.fixture.root.resolve()
+        git_directory = ASSETS._git_absolute_path(root, "--absolute-git-dir").resolve()
+        index = ASSETS._git_absolute_path(root, "--git-path", "index")
+        index_lock = Path(f"{index}.lock")
+        operation_lock = git_directory / "danse-assets-operation.lock"
+
+        index_lock.write_text("active Git owner\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(ASSETS.AssetError, "manual|remove it manually"):
+                ASSETS._create_operation_lease(root)
+            self.assertTrue(index_lock.exists())
+            self.assertFalse(operation_lock.exists())
+        finally:
+            index_lock.unlink(missing_ok=True)
+
+        operation_lock.write_text('{"pid":999999,"started_ns":1,"token":"stale"}\n', encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(ASSETS.AssetError, "stale|remove it manually"):
+                ASSETS._create_operation_lease(root)
+            self.assertTrue(operation_lock.exists())
+        finally:
+            operation_lock.unlink(missing_ok=True)
+
+    def test_operation_lease_cleanup_never_deletes_replacement(self) -> None:
+        root = self.fixture.root.resolve()
+        lease = ASSETS._create_operation_lease(root)
+        operation = lease.git_directory / lease.operation_name
+        index_lock = ASSETS._git_absolute_path(root, "--git-path", "index")
+        index_lock = Path(f"{index_lock}.lock")
+        operation.unlink()
+        replacement = b"replacement lease owner\n"
+        operation.write_bytes(replacement)
+        try:
+            with self.assertRaisesRegex(ASSETS.AssetError, "manual recovery|released safely"):
+                lease.close()
+            self.assertEqual(operation.read_bytes(), replacement)
+            self.assertTrue(index_lock.exists())
+        finally:
+            operation.unlink(missing_ok=True)
+            index_lock.unlink(missing_ok=True)
+
+    def test_operation_lease_retirement_retains_post_validation_replacement(self) -> None:
+        root = self.fixture.root.resolve()
+        lease = ASSETS._create_operation_lease(root)
+        operation = lease.git_directory / lease.operation_name
+        replacement = b"post-validation replacement owner\n"
+        real_rename = ASSETS._rename_noreplace_at
+        replaced = False
+
+        def replace_at_retirement(descriptor, source, destination):
+            nonlocal replaced
+            if source == lease.operation_name and not replaced:
+                operation.unlink()
+                operation.write_bytes(replacement)
+                replaced = True
+            return real_rename(descriptor, source, destination)
+
+        with (
+            mock.patch.object(ASSETS, "_rename_noreplace_at", side_effect=replace_at_retirement),
+            self.assertRaisesRegex(ASSETS.AssetError, "manual recovery|released safely"),
+        ):
+            lease.close()
+        self.assertTrue(replaced)
+        self.assertFalse(operation.exists())
+        retired = list(lease.git_directory.glob(".danse-assets-retired-*"))
+        self.assertIn(replacement, [path.read_bytes() for path in retired])
+
+    def test_git_remains_blocked_after_first_lease_retirement(self) -> None:
+        root = self.fixture.root.resolve()
+        lease = ASSETS._create_operation_lease(root)
+        original = (root / "README.md").read_bytes()
+        real_retire = ASSETS._retire_lease_link
+        attempts: list[tuple[int, int]] = []
+
+        def mutate_after_operation_retirement(descriptor, name, proof, label):
+            retired = real_retire(descriptor, name, proof, label)
+            if label == "asset operation lease":
+                (root / "README.md").write_text("mutation in lease handoff\n", encoding="utf-8")
+                add = subprocess.run(
+                    ["git", "-C", str(root), "add", "README.md"],
+                    capture_output=True,
+                    check=False,
+                )
+                commit = subprocess.run(
+                    ["git", "-C", str(root), "commit", "-m", "forbidden handoff mutation"],
+                    capture_output=True,
+                    check=False,
+                )
+                attempts.append((add.returncode, commit.returncode))
+                (root / "README.md").write_bytes(original)
+            return retired
+
+        with mock.patch.object(
+            ASSETS,
+            "_retire_lease_link",
+            side_effect=mutate_after_operation_retirement,
+        ):
+            lease.close()
+        self.assertEqual(len(attempts), 1)
+        self.assertNotEqual(attempts[0][0], 0)
+        self.assertNotEqual(attempts[0][1], 0)
+
+    def test_reference_lease_blocks_real_update_ref(self) -> None:
+        root = self.fixture.root.resolve()
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Asset Test",
+            "GIT_AUTHOR_EMAIL": "asset@example.invalid",
+            "GIT_COMMITTER_NAME": "Asset Test",
+            "GIT_COMMITTER_EMAIL": "asset@example.invalid",
+        }
+        tree = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        alternate = subprocess.run(
+            ["git", "-C", str(root), "commit-tree", tree],
+            input="alternate commit\n",
+            capture_output=True,
+            text=True,
+            check=True,
+            env=environment,
+        ).stdout.strip()
+        original = self.fixture.head
+        lease = ASSETS._create_operation_lease(root)
+        try:
+            update = subprocess.run(
+                ["git", "-C", str(root), "update-ref", "HEAD", alternate],
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(update.returncode, 0)
+            self.assertEqual(ASSETS._git_head_commit(root), original)
+        finally:
+            lease.close()
+
+    def test_operation_lease_writes_complete_owner_after_short_writes(self) -> None:
+        root = self.fixture.root.resolve()
+        real_write = os.write
+        writes = 0
+
+        def short_write(descriptor, payload):
+            nonlocal writes
+            writes += 1
+            return real_write(descriptor, payload[: max(1, len(payload) // 3)])
+
+        with mock.patch.object(ASSETS.os, "write", side_effect=short_write):
+            lease = ASSETS._create_operation_lease(root)
+        try:
+            operation = json.loads(
+                (lease.git_directory / lease.operation_name).read_text(encoding="utf-8")
+            )
+            index_path = ASSETS._git_absolute_path(root, "--git-path", "index")
+            index = json.loads(Path(f"{index_path}.lock").read_text(encoding="utf-8"))
+            self.assertEqual(operation, index)
+            self.assertEqual(set(operation), {"pid", "process_start_id", "token"})
+            self.assertGreater(writes, 2)
+        finally:
+            lease.close()
+
+    def test_lease_close_failure_after_staging_never_publishes_receipt(self) -> None:
+        real_retire = ASSETS._retire_lease_link
+
+        def reject_lease_release(descriptor, name, proof, label):
+            if label == "Git index operation lease":
+                raise ASSETS.CleanupDurabilityError("injected lease cleanup failure")
+            return real_retire(descriptor, name, proof, label)
+
+        with mock.patch.object(
+            ASSETS,
+            "_retire_lease_link",
+            side_effect=reject_lease_release,
+        ):
+            code = ASSETS.main(
+                [
+                    "audit",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(self.fixture.receipt.exists())
+        self.assertEqual(list(self.fixture.base.glob(".receipt-stage-*")), [])
+        git_directory = ASSETS._git_absolute_path(
+            self.fixture.root.resolve(), "--absolute-git-dir"
+        )
+        index_path = ASSETS._git_absolute_path(
+            self.fixture.root.resolve(), "--git-path", "index"
+        )
+        (git_directory / "danse-assets-operation.lock").unlink(missing_ok=True)
+        Path(f"{index_path}.lock").unlink(missing_ok=True)
+
+    def test_git_index_mutation_is_blocked_during_receipt_window(self) -> None:
+        original = (self.fixture.root / "README.md").read_bytes()
+        real_stage = ASSETS._stage_json
+        attempted = False
+
+        def attempt_git_mutation(*args, **kwargs):
+            nonlocal attempted
+            (self.fixture.root / "README.md").write_text("mutated during receipt\n", encoding="utf-8")
+            result = subprocess.run(
+                ["git", "-C", str(self.fixture.root), "add", "README.md"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            attempted = True
+            self.assertNotEqual(result.returncode, 0)
+            (self.fixture.root / "README.md").write_bytes(original)
+            return real_stage(*args, **kwargs)
+
+        with mock.patch.object(ASSETS, "_stage_json", side_effect=attempt_git_mutation):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(attempted)
+        self.assertEqual(code, 0)
+
+    def test_staged_receipt_is_published_without_unlocked_reserialization(self) -> None:
+        retained_before = set(self.fixture.base.glob(".danse-assets-retired-*"))
+        with mock.patch.object(
+            ASSETS,
+            "_atomic_json",
+            side_effect=AssertionError("receipt payload was regenerated after lease release"),
+        ):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+        self.assertEqual(
+            set(self.fixture.base.glob(".danse-assets-retired-*")),
+            retained_before,
+        )
+
+    def test_staged_publication_retains_unproved_source_substitution(self) -> None:
+        output = self.fixture.base / "staged-source-substitution.json"
+        staged = ASSETS._stage_json(output, {"ok": True})
+        attacker = b'{"attacker":true}\n'
+        real_rename = ASSETS._rename_noreplace_at
+        substituted = False
+
+        def replace_stage_before_rename(descriptor, source, destination):
+            nonlocal substituted
+            if source == staged.name and not substituted:
+                os.unlink(source, dir_fd=descriptor)
+                replacement = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o400,
+                    dir_fd=descriptor,
+                )
+                try:
+                    os.write(replacement, attacker)
+                finally:
+                    os.close(replacement)
+                substituted = True
+            return real_rename(descriptor, source, destination)
+
+        try:
+            with (
+                mock.patch.object(
+                    ASSETS,
+                    "_rename_noreplace_at",
+                    side_effect=replace_stage_before_rename,
+                ),
+                self.assertRaisesRegex(ASSETS.AssetError, "invalidated|retained"),
+            ):
+                staged.publish(output)
+            self.assertTrue(substituted)
+            self.assertEqual(output.read_bytes(), attacker)
+        finally:
+            staged.close()
+
+    def test_staged_publication_never_moves_caller_final_name_substitution(self) -> None:
+        output = self.fixture.base / "staged-final-substitution.json"
+        staged = ASSETS._stage_json(output, {"ok": True})
+        attacker = b'{"caller":true}\n'
+        real_rename = ASSETS._rename_noreplace_at
+        substituted = False
+
+        def replace_final_after_rename(descriptor, source, destination):
+            nonlocal substituted
+            result = real_rename(descriptor, source, destination)
+            if destination == output.name and not substituted:
+                output.unlink()
+                output.write_bytes(attacker)
+                output.chmod(0o444)
+                substituted = True
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    ASSETS,
+                    "_rename_noreplace_at",
+                    side_effect=replace_final_after_rename,
+                ),
+                self.assertRaisesRegex(ASSETS.AssetError, "retained|changed after publication"),
+            ):
+                staged.publish(output)
+            self.assertTrue(substituted)
+            self.assertEqual(output.read_bytes(), attacker)
+        finally:
+            staged.close()
+
+    def test_staged_publication_never_moves_late_final_substitution(self) -> None:
+        output = self.fixture.base / "staged-late-final-substitution.json"
+        staged = ASSETS._stage_json(output, {"ok": True})
+        attacker = b'{"caller":"late"}\n'
+        real_sync = ASSETS._durably_sync_published_inode_at
+        substituted = False
+
+        def substitute_during_durable_sync(*args, **kwargs):
+            nonlocal substituted
+            if not substituted:
+                output.unlink()
+                output.write_bytes(attacker)
+                output.chmod(0o444)
+                substituted = True
+            raise ASSETS.AssetError("injected late durability failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    ASSETS,
+                    "_durably_sync_published_inode_at",
+                    side_effect=substitute_during_durable_sync,
+                ),
+                self.assertRaisesRegex(
+                    ASSETS.CleanupDurabilityError,
+                    "changed after publication and was retained",
+                ),
+            ):
+                staged.publish(output)
+            self.assertTrue(substituted)
+            self.assertEqual(output.read_bytes(), attacker)
+        finally:
+            staged.close()
+
+    def test_asset_mutation_during_receipt_staging_blocks_snapshot_commit(self) -> None:
+        self.assertEqual(
+            ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                ]
+            ),
+            0,
+        )
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        target = self.fixture.root / asset.target
+        real_stage = ASSETS._stage_json
+        mutated = False
+
+        def mutate_after_staging(*args, **kwargs):
+            nonlocal mutated
+            staged = real_stage(*args, **kwargs)
+            target.chmod(0o644)
+            target.write_bytes(b"x" * len(self.fixture.payload))
+            target.chmod(0o444)
+            mutated = True
+            return staged
+
+        with mock.patch.object(ASSETS, "_stage_json", side_effect=mutate_after_staging):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(mutated)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.fixture.receipt.exists())
+
     def test_complete_target_set_is_stable_before_report_construction(self) -> None:
         lock = ASSETS.load_lock(self.fixture.lock)
         asset = lock.assets[0]
@@ -1231,17 +1898,21 @@ class AssetParityTest(unittest.TestCase):
         held_parent = self.fixture.base / "external-receipts-held"
         checkout_destination = self.fixture.root / ".asset-cache/redirected-receipts"
         checkout_destination.mkdir(parents=True)
-        real_link = os.link
+        real_rename = ASSETS._rename_noreplace_at
+        swapped = False
 
-        def publish_then_swap(source, destination, **kwargs):
-            result = real_link(source, destination, **kwargs)
-            receipt_parent.rename(held_parent)
-            receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+        def publish_then_swap(descriptor, source, destination):
+            nonlocal swapped
+            result = real_rename(descriptor, source, destination)
+            if not swapped:
+                receipt_parent.rename(held_parent)
+                receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+                swapped = True
             return result
 
         with (
-            mock.patch.object(ASSETS.os, "link", side_effect=publish_then_swap),
-            self.assertRaisesRegex(ASSETS.AssetError, "parent changed during publication"),
+            mock.patch.object(ASSETS, "_rename_noreplace_at", side_effect=publish_then_swap),
+            self.assertRaisesRegex(ASSETS.AssetError, "retained"),
         ):
             ASSETS._atomic_json(
                 receipt,
@@ -1250,7 +1921,12 @@ class AssetParityTest(unittest.TestCase):
                 forbidden_root=self.fixture.root,
             )
         self.assertFalse((checkout_destination / receipt.name).exists())
-        self.assertEqual(list(held_parent.iterdir()), [])
+        held_names = {path.name for path in held_parent.iterdir()}
+        self.assertEqual(held_names, {receipt.name})
+        self.assertEqual(
+            json.loads((held_parent / receipt.name).read_text(encoding="utf-8")),
+            {"ok": True},
+        )
 
     def test_atomic_json_fsyncs_parent_after_temporary_cleanup(self) -> None:
         output = self.fixture.base / "durable-output.json"
@@ -1265,7 +1941,7 @@ class AssetParityTest(unittest.TestCase):
             ASSETS._atomic_json(output, {"durable": True}, no_overwrite=True)
         self.assertEqual(
             synced_directories,
-            ["file", "file", "directory", "directory", "file", "directory"],
+            ["file", "file", "directory", "file", "directory"],
         )
         self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"durable": True})
 
@@ -1281,7 +1957,10 @@ class AssetParityTest(unittest.TestCase):
             self.assertRaisesRegex(ASSETS.AssetError, "durably synchronized"),
         ):
             ASSETS._atomic_json(blocked, {"durable": False}, no_overwrite=True)
-        self.assertFalse(blocked.exists())
+        self.assertEqual(
+            json.loads(blocked.read_text(encoding="utf-8")),
+            {"durable": False},
+        )
 
     def test_exact_cleanup_surfaces_barrier_failure_and_preserves_replacement(self) -> None:
         parent = self.fixture.base / "cleanup-parent"
@@ -1299,73 +1978,248 @@ class AssetParityTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(ASSETS.AssetError, "cleanup barrier failed"),
             ):
-                ASSETS._remove_published_link(descriptor, original.name, proof, "test object")
+                ASSETS._remove_temporary_link(descriptor, original.name, proof, "test object")
             self.assertFalse(original.exists())
 
             original.write_bytes(b"first")
             stale_proof = ASSETS._inode_identity(original.stat())
-            original.unlink()
-            original.write_bytes(b"replacement")
-            with self.assertRaisesRegex(ASSETS.AssetError, "refusing destructive rollback"):
-                ASSETS._remove_published_link(
+            real_rename = ASSETS._rename_noreplace_at
+            replacement = b"replacement"
+
+            def replace_at_retirement(retirement_descriptor, source, destination):
+                if source == original.name:
+                    original.unlink()
+                    original.write_bytes(replacement)
+                return real_rename(retirement_descriptor, source, destination)
+
+            with (
+                mock.patch.object(
+                    ASSETS,
+                    "_rename_noreplace_at",
+                    side_effect=replace_at_retirement,
+                ),
+                self.assertRaisesRegex(ASSETS.AssetError, "changed during retirement"),
+            ):
+                ASSETS._remove_temporary_link(
                     descriptor,
                     original.name,
                     stale_proof,
                     "test object",
                 )
-            self.assertEqual(original.read_bytes(), b"replacement")
+            self.assertFalse(original.exists())
+            retired = list(parent.glob(".danse-assets-retired-*"))
+            self.assertIn(replacement, [path.read_bytes() for path in retired])
         finally:
             os.close(descriptor)
 
-    def test_vanished_receipt_temp_is_missing_tolerant(self) -> None:
+    def test_retirement_never_overwrites_a_concurrent_quarantine_collision(self) -> None:
+        parent = self.fixture.base / "retirement-collision"
+        parent.mkdir()
+        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        source = parent / "owned"
+        source.write_bytes(b"owned bytes")
+        proof = ASSETS._inode_identity(source.stat())
+        collision = b"somebody else's quarantine bytes"
+        real_rename = ASSETS._rename_noreplace_at
+        injected_name = None
+
+        def collide_at_create_only_rename(retirement_descriptor, name, destination):
+            nonlocal injected_name
+            if injected_name is None:
+                injected_name = destination
+                (parent / destination).write_bytes(collision)
+            return real_rename(retirement_descriptor, name, destination)
+
+        try:
+            with mock.patch.object(
+                ASSETS,
+                "_rename_noreplace_at",
+                side_effect=collide_at_create_only_rename,
+            ):
+                retired_name = ASSETS._retire_named_link(
+                    descriptor,
+                    source.name,
+                    proof,
+                    "collision probe",
+                    missing_ok=False,
+                )
+            self.assertIsNotNone(injected_name)
+            self.assertNotEqual(retired_name, injected_name)
+            self.assertEqual((parent / injected_name).read_bytes(), collision)
+            self.assertEqual((parent / retired_name).read_bytes(), b"owned bytes")
+            self.assertFalse(source.exists())
+        finally:
+            os.close(descriptor)
+
+    def test_create_only_rename_rejects_nul_names_before_syscall(self) -> None:
+        parent = self.fixture.base / "nul-rename"
+        parent.mkdir()
+        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        (parent / "source").write_bytes(b"source")
+        try:
+            with self.assertRaises(OSError):
+                ASSETS._rename_noreplace_at(descriptor, "source", "actual.json\x00suffix")
+            self.assertEqual((parent / "source").read_bytes(), b"source")
+            self.assertFalse((parent / "actual.json").exists())
+        finally:
+            os.close(descriptor)
+
+    def test_vanished_receipt_temp_blocks_without_authoritative_output(self) -> None:
         output = self.fixture.base / "vanished-temp-receipt.json"
+        real_rename = ASSETS._rename_noreplace_at
         real_unlink = os.unlink
         vanished = False
 
-        def vanish_then_report_missing(name, *args, **kwargs):
+        def vanish_then_report_missing(descriptor, source, destination):
             nonlocal vanished
-            if not vanished and str(name).startswith(".receipt-"):
+            if not vanished and str(source).startswith(".receipt-"):
                 vanished = True
-                real_unlink(name, *args, **kwargs)
-                raise FileNotFoundError(name)
-            return real_unlink(name, *args, **kwargs)
-
-        with mock.patch.object(ASSETS.os, "unlink", side_effect=vanish_then_report_missing):
-            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
-        self.assertTrue(vanished)
-        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"ok": True})
-
-    def test_atomic_json_rejects_final_name_substitution_without_deleting_it(self) -> None:
-        output = self.fixture.base / "substituted-receipt.json"
-        attacker = b'{"attacker":true}\n'
-        real_sync = ASSETS._durably_sync_published_inode_at
-        substituted = False
-
-        def substitute(parent, name, proof, label, **kwargs):
-            nonlocal substituted
-            os.unlink(name, dir_fd=parent)
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444, dir_fd=parent)
-            try:
-                os.write(descriptor, attacker)
-            finally:
-                os.close(descriptor)
-            substituted = True
-            return real_sync(parent, name, proof, label, **kwargs)
+                real_unlink(source, dir_fd=descriptor)
+            return real_rename(descriptor, source, destination)
 
         with (
             mock.patch.object(
                 ASSETS,
-                "_durably_sync_published_inode_at",
-                side_effect=substitute,
+                "_rename_noreplace_at",
+                side_effect=vanish_then_report_missing,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "published atomically"),
+        ):
+            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
+        self.assertTrue(vanished)
+        self.assertFalse(output.exists())
+
+    def test_atomic_json_rejects_final_name_substitution_without_deleting_it(self) -> None:
+        output = self.fixture.base / "substituted-receipt.json"
+        attacker = b'{"attacker":true}\n'
+        real_rename = ASSETS._rename_noreplace_at
+        substituted = False
+
+        def substitute_after_create_only_rename(descriptor, source, destination):
+            nonlocal substituted
+            result = real_rename(descriptor, source, destination)
+            if destination == output.name and not substituted:
+                output.unlink()
+                output.write_bytes(attacker)
+                output.chmod(0o444)
+                substituted = True
+            return result
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_rename_noreplace_at",
+                side_effect=substitute_after_create_only_rename,
             ),
             self.assertRaisesRegex(
                 ASSETS.AssetError,
-                "changed before durable synchronization|refusing destructive rollback",
+                "retained|changed after publication",
             ),
         ):
             ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
         self.assertTrue(substituted)
         self.assertEqual(output.read_bytes(), attacker)
+
+    def test_atomic_json_never_moves_late_final_substitution(self) -> None:
+        output = self.fixture.base / "atomic-late-final-substitution.json"
+        attacker = b'{"caller":"late"}\n'
+        substituted = False
+
+        def substitute_during_durable_sync(*args, **kwargs):
+            nonlocal substituted
+            if not substituted:
+                output.unlink()
+                output.write_bytes(attacker)
+                output.chmod(0o444)
+                substituted = True
+            raise ASSETS.AssetError("injected late durability failure")
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_durably_sync_published_inode_at",
+                side_effect=substitute_during_durable_sync,
+            ),
+            self.assertRaisesRegex(
+                ASSETS.CleanupDurabilityError,
+                "changed after publication and was retained",
+            ),
+        ):
+            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
+        self.assertTrue(substituted)
+        self.assertEqual(output.read_bytes(), attacker)
+
+    def test_cache_proof_failure_after_link_retains_published_inode(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        real_identity = ASSETS._guarded_identity_at
+
+        def reject_published_cache(descriptor, name, guard, label):
+            if label == "published cache object":
+                raise ASSETS.AssetError("injected post-link proof failure")
+            return real_identity(descriptor, name, guard, label)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_guarded_identity_at",
+                side_effect=reject_published_cache,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "injected post-link proof failure"),
+        ):
+            ASSETS._cache_from_sources(
+                self.fixture.root,
+                asset,
+                allow_file=True,
+                source_root=self.fixture.source,
+                timeout=1.0,
+            )
+        self.assertEqual(
+            ASSETS._cache_path(self.fixture.root, asset, create=False).read_bytes(),
+            self.fixture.payload,
+        )
+
+    def test_target_proof_failure_after_link_retains_published_inode(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        real_identity = ASSETS._inode_identity_at
+
+        def reject_published_target(descriptor, name, label):
+            if label == "published asset target":
+                raise ASSETS.AssetError("injected post-link proof failure")
+            return real_identity(descriptor, name, label)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_inode_identity_at",
+                side_effect=reject_published_target,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "retained"),
+        ):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertEqual((self.fixture.root / asset.target).read_bytes(), self.fixture.payload)
+
+    def test_receipt_proof_failure_after_link_retains_published_inode(self) -> None:
+        output = self.fixture.base / "post-link-proof-failure.json"
+        real_identity = ASSETS._guarded_identity_at
+
+        def reject_published_receipt(descriptor, name, guard, label):
+            if label == "published receipt":
+                raise ASSETS.AssetError("injected post-link proof failure")
+            return real_identity(descriptor, name, guard, label)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_guarded_identity_at",
+                side_effect=reject_published_receipt,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "retained"),
+        ):
+            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"ok": True})
 
     def test_atomic_json_persists_every_new_output_ancestor(self) -> None:
         output = self.fixture.base / "external/a/b/proof.json"
@@ -1411,14 +2265,14 @@ class AssetParityTest(unittest.TestCase):
 
         with (
             mock.patch.object(ASSETS.os, "fsync", side_effect=reject_base_once),
-            self.assertRaisesRegex(ASSETS.AssetError, "durably synchronized"),
+            self.assertRaisesRegex(ASSETS.AssetError, "retained"),
         ):
             ASSETS._atomic_json(output, {"durable": False}, no_overwrite=True)
         self.assertTrue(rejected)
-        self.assertFalse((self.fixture.base / "blocked-parent").exists())
+        self.assertTrue((self.fixture.base / "blocked-parent").exists())
         self.assertFalse(output.exists())
 
-    def test_receipt_parent_swap_during_directory_sync_removes_published_link(self) -> None:
+    def test_receipt_parent_swap_during_directory_sync_retains_published_link(self) -> None:
         receipt_parent = self.fixture.base / "late-swap-receipts"
         receipt_parent.mkdir()
         receipt = receipt_parent / "proof.json"
@@ -1439,7 +2293,7 @@ class AssetParityTest(unittest.TestCase):
 
         with (
             mock.patch.object(ASSETS.os, "fsync", side_effect=sync_then_swap),
-            self.assertRaisesRegex(ASSETS.AssetError, "durable publication"),
+            self.assertRaisesRegex(ASSETS.AssetError, "retained"),
         ):
             ASSETS._atomic_json(
                 receipt,
@@ -1449,7 +2303,12 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertTrue(swapped)
         self.assertFalse((checkout_destination / receipt.name).exists())
-        self.assertEqual(list(held_parent.iterdir()), [])
+        held_names = {path.name for path in held_parent.iterdir()}
+        self.assertEqual(held_names, {receipt.name})
+        self.assertEqual(
+            json.loads((held_parent / receipt.name).read_text(encoding="utf-8")),
+            {"ok": True},
+        )
 
     def test_inventory_is_deterministic_closed_and_no_overwrite(self) -> None:
         duplicate = self.fixture.source / "other/duplicate.JPG"
@@ -1469,6 +2328,8 @@ class AssetParityTest(unittest.TestCase):
         self.assertTrue(all(row["id"].startswith("asset-") for row in value["assets"]))
         self.assertTrue(all("pipeline" not in row["id"] for row in value["assets"]))
         self.assertEqual(value["assets"][0]["sources"][0]["kind"], "file")
+        self.assertEqual(list(self.fixture.base.glob(".receipt-*")), [])
+        self.assertEqual(list(self.fixture.base.glob(".danse-assets-retired-*")), [])
         with self.assertRaisesRegex(ASSETS.AssetError, "already exists"):
             ASSETS.inventory(
                 self.fixture.source,
@@ -1479,15 +2340,197 @@ class AssetParityTest(unittest.TestCase):
                 rights_class="private",
             )
 
+    def test_inventory_rejects_output_overlap_before_generic_or_production_writes(self) -> None:
+        git_directory = ASSETS._git_absolute_path(
+            self.fixture.root.resolve(), "--absolute-git-dir"
+        )
+        index_path = ASSETS._git_absolute_path(self.fixture.root.resolve(), "--git-path", "index")
+        outputs = (
+            self.fixture.source,
+            self.fixture.source / "generated-lock.json",
+            self.fixture.source / "nested/generated-lock.json",
+        )
+        for profile in ("generic", "screendance-production"):
+            for output in outputs:
+                with self.subTest(profile=profile, output=output):
+                    with (
+                        mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+                        self.assertRaisesRegex(ASSETS.AssetError, "outside.*source root"),
+                    ):
+                        ASSETS.inventory(
+                            self.fixture.source,
+                            output,
+                            lock_id="overlap-assets",
+                            profile=profile,
+                            repository_commit=self.fixture.head,
+                            rights_class="private",
+                        )
+                    self.assertFalse((self.fixture.source / "nested").exists())
+                    self.assertFalse((git_directory / "danse-assets-operation.lock").exists())
+                    self.assertFalse(Path(f"{index_path}.lock").exists())
+
+    def test_inventory_rejects_nul_output_before_generic_or_production_writes(self) -> None:
+        truncated = self.fixture.base / "actual-lock.json"
+        output = Path(f"{truncated}\x00suffix")
+        for profile in ("generic", "screendance-production"):
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(ASSETS.AssetError, "output path is invalid"):
+                    ASSETS.inventory(
+                        self.fixture.source,
+                        output,
+                        lock_id="nul-output-assets",
+                        profile=profile,
+                        repository_commit=self.fixture.head,
+                        rights_class="private",
+                    )
+                self.assertFalse(truncated.exists())
+        self.assertEqual(
+            ASSETS.main(
+                [
+                    "inventory",
+                    "--source-root",
+                    str(self.fixture.source),
+                    "--output",
+                    str(output),
+                    "--lock-id",
+                    "nul-output-assets",
+                    "--repository-commit",
+                    self.fixture.head,
+                ]
+            ),
+            1,
+        )
+        self.assertFalse(truncated.exists())
+
+    def test_looped_output_and_receipt_parents_fail_without_visible_output(self) -> None:
+        first = self.fixture.base / "loop-a"
+        second = self.fixture.base / "loop-b"
+        first.symlink_to(second, target_is_directory=True)
+        second.symlink_to(first, target_is_directory=True)
+        inventory_output = first / "inventory.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "resolved safely"):
+            ASSETS.inventory(
+                self.fixture.source,
+                inventory_output,
+                lock_id="loop-output-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse((self.fixture.base / "inventory.json").exists())
+
+        receipt = first / "receipt.json"
+        self.assertEqual(
+            ASSETS.main(
+                [
+                    "audit",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(receipt),
+                ]
+            ),
+            1,
+        )
+        self.assertFalse((self.fixture.base / "receipt.json").exists())
+
+    def test_inventory_allows_source_below_a_nonoverlapping_output_parent(self) -> None:
+        container = self.fixture.base / "inventory-container"
+        source = container / "source"
+        source.mkdir(parents=True)
+        (source / "asset.bin").write_bytes(b"asset")
+        output = container / "lock.json"
+        value = ASSETS.inventory(
+            source,
+            output,
+            lock_id="nested-source-assets",
+            profile="generic",
+            repository_commit=self.fixture.head,
+            rights_class="private",
+        )
+        self.assertEqual(len(value["assets"]), 1)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), value)
+        self.assertEqual(list(container.glob(".danse-assets-retired-*")), [])
+
+    def test_inventory_parent_symlink_repoint_cannot_redirect_output_into_source(self) -> None:
+        relative = "pipeline/raw/IMG_1570.JPG"
+        real_inventory_value = ASSETS._inventory_value
+        for profile in ("generic", "screendance-production"):
+            with self.subTest(profile=profile):
+                outside = self.fixture.base / f"outside-{profile}"
+                outside.mkdir()
+                alias = self.fixture.base / f"output-alias-{profile}"
+                alias.symlink_to(outside, target_is_directory=True)
+                output_name = f"{profile}-lock.json"
+                output = alias / output_name
+                repointed = False
+
+                def repoint_after_inventory(*args, **kwargs):
+                    nonlocal repointed
+                    value = real_inventory_value(*args, **kwargs)
+                    alias.unlink()
+                    alias.symlink_to(self.fixture.source, target_is_directory=True)
+                    repointed = True
+                    return value
+
+                with (
+                    mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+                    mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+                    mock.patch.object(ASSETS, "_validate_production_assets"),
+                    mock.patch.object(
+                        ASSETS,
+                        "_inventory_value",
+                        side_effect=repoint_after_inventory,
+                    ),
+                ):
+                    value = ASSETS.inventory(
+                        self.fixture.source,
+                        output,
+                        lock_id=f"{profile}-assets",
+                        profile=profile,
+                        repository_commit=self.fixture.head,
+                        rights_class="private",
+                    )
+                self.assertTrue(repointed)
+                self.assertEqual(
+                    json.loads((outside / output_name).read_text(encoding="utf-8")),
+                    value,
+                )
+                self.assertFalse((self.fixture.source / output_name).exists())
+
+    @unittest.skipUnless(os.name == "posix", "byte-name fixture requires POSIX")
+    def test_inventory_rejects_non_utf8_source_name_without_output_or_traceback(self) -> None:
+        source = self.fixture.base / "non-utf8-source"
+        source.mkdir()
+        byte_path = os.fsencode(source) + b"/asset-\xff.bin"
+        descriptor = os.open(byte_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, b"private bytes")
+        finally:
+            os.close(descriptor)
+        output = self.fixture.base / "non-utf8-lock.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="non-utf8-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
     def test_inventory_rejects_content_mutation_before_publication(self) -> None:
         output = self.fixture.base / "mutable-lock.json"
         source = self.fixture.source / "pipeline/raw/IMG_1570.JPG"
         real_snapshot = ASSETS._inventory_snapshot
         calls = 0
 
-        def mutate_after_first_snapshot(root):
+        def mutate_after_first_snapshot(root, *args, **kwargs):
             nonlocal calls
-            proof = real_snapshot(root)
+            proof = real_snapshot(root, *args, **kwargs)
             calls += 1
             if calls == 1:
                 source.write_bytes(b"x" * len(self.fixture.payload))
@@ -1514,9 +2557,9 @@ class AssetParityTest(unittest.TestCase):
         real_snapshot = ASSETS._inventory_snapshot
         calls = 0
 
-        def add_file_after_first_snapshot(root):
+        def add_file_after_first_snapshot(root, *args, **kwargs):
             nonlocal calls
-            proof = real_snapshot(root)
+            proof = real_snapshot(root, *args, **kwargs)
             calls += 1
             if calls == 1:
                 late = self.fixture.source / "late/private.bin"
@@ -1537,7 +2580,212 @@ class AssetParityTest(unittest.TestCase):
                 repository_commit=self.fixture.head,
                 rights_class="private",
             )
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
+        self.assertFalse(output.exists())
+
+    def test_inventory_rejects_source_root_replacement_after_completed_scan(self) -> None:
+        relative = "pipeline/raw/IMG_1570.JPG"
+        real_inventory_value = ASSETS._inventory_value
+        for profile in ("generic", "screendance-production"):
+            for replacement_kind in ("symlink", "directory"):
+                with self.subTest(profile=profile, replacement=replacement_kind):
+                    source = self.fixture.base / f"source-{profile}-{replacement_kind}"
+                    asset = source / relative
+                    asset.parent.mkdir(parents=True)
+                    asset.write_bytes(self.fixture.payload)
+                    held = self.fixture.base / f"held-{profile}-{replacement_kind}"
+                    sibling = self.fixture.base / f"replacement-{profile}-{replacement_kind}"
+                    if replacement_kind == "symlink":
+                        sibling.symlink_to(held, target_is_directory=True)
+                    else:
+                        replacement_asset = sibling / relative
+                        replacement_asset.parent.mkdir(parents=True)
+                        replacement_asset.write_bytes(self.fixture.payload)
+                    output = self.fixture.base / f"lock-{profile}-{replacement_kind}.json"
+                    replaced = False
+
+                    def replace_after_scan(*args, **kwargs):
+                        nonlocal replaced
+                        value = real_inventory_value(*args, **kwargs)
+                        source.rename(held)
+                        sibling.rename(source)
+                        replaced = True
+                        return value
+
+                    with (
+                        mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+                        mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+                        mock.patch.object(ASSETS, "_validate_production_assets"),
+                        mock.patch.object(
+                            ASSETS,
+                            "_inventory_value",
+                            side_effect=replace_after_scan,
+                        ),
+                        self.assertRaisesRegex(ASSETS.AssetError, "source root moved|replaced"),
+                    ):
+                        ASSETS.inventory(
+                            source,
+                            output,
+                            lock_id=f"{profile}-{replacement_kind}-assets",
+                            profile=profile,
+                            repository_commit=self.fixture.head,
+                            rights_class="private",
+                        )
+                    self.assertTrue(replaced)
+                    self.assertFalse(output.exists())
+
+    def test_inventory_census_is_bound_to_the_held_source_root(self) -> None:
+        source = self.fixture.base / "held-census-source"
+        source.mkdir()
+        (source / "asset.bin").write_bytes(b"selected source")
+        held = self.fixture.base / "held-census-original"
+        sibling = self.fixture.base / "held-census-sibling"
+        sibling.mkdir()
+        (sibling / "asset.bin").write_bytes(b"replacement source")
+        output = self.fixture.base / "held-census-lock.json"
+        real_snapshot = ASSETS._inventory_snapshot
+        swapped = False
+
+        def scan_replacement_then_restore(root, *args, **kwargs):
+            nonlocal swapped
+            source.rename(held)
+            sibling.rename(source)
+            swapped = True
+            try:
+                return real_snapshot(root, *args, **kwargs)
+            finally:
+                source.rename(sibling)
+                held.rename(source)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_inventory_snapshot",
+                side_effect=scan_replacement_then_restore,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "source root moved|replaced"),
+        ):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="held-census-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertTrue(swapped)
+        self.assertEqual((source / "asset.bin").read_bytes(), b"selected source")
+        self.assertFalse(output.exists())
+
+    def test_generic_inventory_rechecks_source_after_output_staging(self) -> None:
+        source = self.fixture.base / "generic-staging-source"
+        asset = source / "asset.bin"
+        asset.parent.mkdir()
+        asset.write_bytes(b"source")
+        output = self.fixture.base / "generic-staging-lock.json"
+        real_fsync = ASSETS.os.fsync
+        mutated = False
+
+        def mutate_during_file_sync(descriptor):
+            nonlocal mutated
+            result = real_fsync(descriptor)
+            if not mutated and stat.S_ISREG(os.fstat(descriptor).st_mode):
+                asset.write_bytes(b"change")
+                mutated = True
+            return result
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=mutate_during_file_sync),
+            self.assertRaisesRegex(ASSETS.AssetError, "source changed"),
+        ):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="generic-staging-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertTrue(mutated)
+        self.assertFalse(output.exists())
+
+    def test_inventory_fails_closed_on_source_mutation_during_durable_publication(self) -> None:
+        source = self.fixture.base / "durable-publication-source"
+        asset = source / "asset.bin"
+        asset.parent.mkdir()
+        asset.write_bytes(b"source")
+        output = self.fixture.base / "durable-publication-lock.json"
+        real_sync = ASSETS._durably_sync_published_inode_at
+        mutated = False
+
+        def mutate_after_output_sync(*args, **kwargs):
+            nonlocal mutated
+            result = real_sync(*args, **kwargs)
+            asset.write_bytes(b"change")
+            mutated = True
+            return result
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_durably_sync_published_inode_at",
+                side_effect=mutate_after_output_sync,
+            ),
+            self.assertRaisesRegex(ASSETS.CleanupDurabilityError, "retained"),
+        ):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="durable-publication-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertTrue(mutated)
+        self.assertTrue(output.exists())
+
+    def test_production_inventory_rechecks_source_after_staged_payload_read(self) -> None:
+        source = self.fixture.base / "production-publish-source"
+        relative = "pipeline/raw/IMG_1570.JPG"
+        asset = source / relative
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(self.fixture.payload)
+        output = self.fixture.base / "production-publish-lock.json"
+        real_payload = ASSETS.StagedJson.payload
+        payload_reads = 0
+        mutated = False
+
+        def mutate_during_final_payload_read(staged):
+            nonlocal payload_reads, mutated
+            payload = real_payload(staged)
+            payload_reads += 1
+            if payload_reads == 3:
+                asset.write_bytes(b"x" * len(self.fixture.payload))
+                mutated = True
+            return payload
+
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+            mock.patch.object(ASSETS, "_validate_production_assets"),
+            mock.patch.object(
+                ASSETS.StagedJson,
+                "payload",
+                autospec=True,
+                side_effect=mutate_during_final_payload_read,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "source changed"),
+        ):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="production-publish-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(payload_reads, 3)
+        self.assertTrue(mutated)
         self.assertFalse(output.exists())
 
     def test_inventory_opens_files_relative_to_held_parent_descriptors(self) -> None:
@@ -1712,6 +2960,161 @@ class AssetParityTest(unittest.TestCase):
                 rights_class="private",
             )
         self.assertFalse(output.exists())
+
+    def test_production_inventory_blocks_git_mutation_during_atomic_handoff(self) -> None:
+        output = self.fixture.base / "production-handoff-lock.json"
+        relative = "pipeline/raw/IMG_1570.JPG"
+        original = (self.fixture.root / "README.md").read_bytes()
+        real_stage = ASSETS._stage_json
+        attempts: list[tuple[int, int]] = []
+
+        def attempt_commit_during_handoff(*args, **kwargs):
+            (self.fixture.root / "README.md").write_text(
+                "production handoff mutation\n",
+                encoding="utf-8",
+            )
+            add = subprocess.run(
+                ["git", "-C", str(self.fixture.root), "add", "README.md"],
+                capture_output=True,
+                check=False,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(self.fixture.root), "commit", "-m", "forbidden inventory mutation"],
+                capture_output=True,
+                check=False,
+            )
+            attempts.append((add.returncode, commit.returncode))
+            (self.fixture.root / "README.md").write_bytes(original)
+            return real_stage(*args, **kwargs)
+
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+            mock.patch.object(ASSETS, "_validate_production_assets"),
+            mock.patch.object(ASSETS, "_stage_json", side_effect=attempt_commit_during_handoff),
+        ):
+            value = ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(value["repository_commit"], self.fixture.head)
+        self.assertEqual(len(attempts), 1)
+        self.assertNotEqual(attempts[0][0], 0)
+        self.assertNotEqual(attempts[0][1], 0)
+        self.assertTrue(output.exists())
+
+    def test_production_inventory_publishes_only_the_guarded_staged_inode(self) -> None:
+        output = self.fixture.base / "production-exact-proof-lock.json"
+        relative = "pipeline/raw/IMG_1570.JPG"
+
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+            mock.patch.object(ASSETS, "_validate_production_assets"),
+            mock.patch.object(
+                ASSETS,
+                "_atomic_json",
+                side_effect=AssertionError("production inventory reserialized after staging"),
+            ),
+        ):
+            value = ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(value["repository_commit"], self.fixture.head)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), value)
+
+    def test_production_inventory_close_failure_cannot_move_foreign_parent_output(self) -> None:
+        output_parent = self.fixture.base / "production-output"
+        output_parent.mkdir()
+        output = output_parent / "lock.json"
+        held_parent = self.fixture.base / "production-output-held"
+        relative = "pipeline/raw/IMG_1570.JPG"
+        foreign = b'{"foreign":true}\n'
+        real_close = ASSETS.OperationLease.close
+        swapped = False
+
+        def swap_parent_then_report_close_failure(lease):
+            nonlocal swapped
+            output_parent.rename(held_parent)
+            output_parent.mkdir()
+            output.write_bytes(foreign)
+            swapped = True
+            real_close(lease)
+            raise ASSETS.AssetError("injected lease close failure")
+
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+            mock.patch.object(ASSETS, "_validate_production_assets"),
+            mock.patch.object(
+                ASSETS.OperationLease,
+                "close",
+                autospec=True,
+                side_effect=swap_parent_then_report_close_failure,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "injected lease close failure"),
+        ):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertTrue(swapped)
+        self.assertEqual(output.read_bytes(), foreign)
+        held_names = {path.name for path in held_parent.iterdir()}
+        self.assertNotIn(output.name, held_names)
+        self.assertTrue(any(name.startswith(".danse-assets-retired-") for name in held_names))
+
+    def test_production_inventory_success_leaves_only_the_requested_checkout_output(self) -> None:
+        assets_directory = self.fixture.root / "assets"
+        assets_directory.mkdir()
+        output = assets_directory / "lock.v1.json"
+        relative = "pipeline/raw/IMG_1570.JPG"
+
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            mock.patch.object(ASSETS, "_production_targets", return_value={relative}),
+            mock.patch.object(ASSETS, "_validate_production_assets"),
+        ):
+            value = ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), value)
+        self.assertEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.fixture.root),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines(),
+            ["?? assets/lock.v1.json"],
+        )
+        self.assertEqual(list(assets_directory.glob(".receipt-stage-*")), [])
+        self.assertEqual(list(assets_directory.glob(".danse-assets-retired-*")), [])
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixtures require POSIX")
     def test_inventory_rejects_special_files(self) -> None:
@@ -2007,10 +3410,19 @@ class AssetParityTest(unittest.TestCase):
         lock_schema = json.loads((ROOT / "assets/lock.schema.json").read_text(encoding="utf-8"))
         jsonschema.Draft202012Validator(lock_schema).validate(lock_value)
         for url in (
+            "HTTPS://example.com/private",
             "https://user@example.com/private",
             "https://example.com/private?signature=secret",
+            "https://example.com/private?",
             "https://example.com/private#fragment",
+            "https://example.com/private#",
+            "https://example.com:/private",
             "https://example.com:444/private",
+            "https://example.com/raw space",
+            "https://example.com/raw\tcontrol",
+            "https://example.com/raw-é",
+            "https://example.com/back\\slash",
+            "https://example.com/bad%escape",
             "https://-bad.example/private",
             "https://example..com/private",
             "https://localhost/private",
@@ -2024,6 +3436,8 @@ class AssetParityTest(unittest.TestCase):
             unsafe["assets"][0]["sources"] = [{"kind": "https", "url": url}]
             with self.subTest(schema_url=url), self.assertRaises(jsonschema.ValidationError):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe)
+            with self.subTest(runtime_url=url), self.assertRaises(ASSETS.AssetError):
+                ASSETS._https_url(url)
         unsafe_path = copy.deepcopy(lock_value)
         unsafe_path["assets"][0]["target"] = ".git/refs/heads/main"
         with self.assertRaises(jsonschema.ValidationError):
@@ -2035,6 +3449,18 @@ class AssetParityTest(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for target in ("a/./b", "./a", "a/.", "a//b", "a/", ".", ".."):
+            unsafe_path = copy.deepcopy(lock_value)
+            unsafe_path["assets"][0]["target"] = target
+            with self.subTest(schema_noncanonical_path=target), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+            with self.subTest(runtime_noncanonical_path=target), self.assertRaisesRegex(
+                ASSETS.AssetError,
+                "safe POSIX-relative",
+            ):
+                ASSETS._safe_relative(target, "test path")
         for field in ("target", "file source"):
             nfc_path = copy.deepcopy(lock_value)
             if field == "target":
@@ -2099,6 +3525,27 @@ class AssetParityTest(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for field in ("target", "file source", "github tag", "github asset"):
+            unsafe = copy.deepcopy(lock_value)
+            if field == "target":
+                unsafe["assets"][0]["target"] = "bad-\udcff.bin"
+            elif field == "file source":
+                unsafe["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "bad-\udcff.bin"}
+                ]
+            else:
+                unsafe["assets"][0]["sources"] = [
+                    {
+                        "kind": "github-release",
+                        "repository": "organvm/example",
+                        "tag": "bad-\udcff" if field == "github tag" else "v1",
+                        "asset": "bad-\udcff.bin" if field == "github asset" else "asset.bin",
+                    }
+                ]
+            with self.subTest(schema_surrogate_field=field), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe)
         self.assertEqual(
             ASSETS.main(
                 [
