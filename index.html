@@ -926,17 +926,24 @@ function jumpMovement(number) {
   return true;
 }
 
+function persistProgramMode() {
+  const currentUrl = projectSectionFor(location.hash) ? Arrival.href(river) : location.href;
+  history.replaceState(null, "", Arrival.withMode(currentUrl, program ? null : "free"));
+}
+
 async function setProgram(value) {
   const generation = ++programGeneration;
   if (value === "free") {
     program = null;
     describeProgram();
+    persistProgramMode();
     return true;
   }
   const loaded = program ?? await Program.load();
   if (generation !== programGeneration) return false;
   program = loaded;
   describeProgram();
+  persistProgramMode();
   return true;
 }
 

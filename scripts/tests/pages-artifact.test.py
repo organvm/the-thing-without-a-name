@@ -2113,6 +2113,23 @@ console.log(JSON.stringify(result.value));
         self.assertLess(close.index("projectMap.close()"), close.index(canonical))
         self.assertLess(close.index(canonical), close.index("projectReturnRiverUrl = null;"))
 
+        persist = self.script.split("function persistProgramMode() {", 1)[1].split("\n}", 1)[0]
+        set_program = self.script.split("async function setProgram(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            "projectSectionFor(location.hash) ? Arrival.href(river) : location.href",
+            persist,
+        )
+        self.assertIn(
+            'Arrival.withMode(currentUrl, program ? null : "free")',
+            persist,
+        )
+        free = set_program.split('if (value === "free") {', 1)[1].split("}", 1)[0]
+        score = set_program.split("const loaded =", 1)[1]
+        self.assertLess(free.index("program = null;"), free.index("persistProgramMode();"))
+        self.assertLess(free.index("persistProgramMode();"), free.index("return true;"))
+        self.assertLess(score.index("program = loaded;"), score.index("persistProgramMode();"))
+        self.assertLess(score.index("persistProgramMode();"), score.index("return true;"))
+
     def test_new_river_replaces_a_legacy_project_fragment_immediately(self) -> None:
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
         capture = "const projectFragment = Boolean(projectSectionFor(location.hash));"
