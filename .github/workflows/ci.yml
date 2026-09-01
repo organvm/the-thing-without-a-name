@@ -27,9 +27,11 @@ jobs:
       - run: python scripts/tests/release-manifest.test.py
       - run: python scripts/tests/rights.test.py
       - run: python scripts/tests/danse-delivery.test.py
+      - run: python scripts/tests/opening-revision.test.py
       - run: python release/frames/test_score_motion_contract.py
       - run: node scripts/tests/interaction.test.mjs
       - run: node scripts/tests/interface-controls.test.mjs
+      - run: node scripts/tests/public-credits.test.mjs
       - run: python -m py_compile render/*.py pipeline/*.py sound/*.py submission/*.py scripts/*.py
       - run: node --check interaction/adapter.js && node --check interaction/camera.js && node --check interaction/controller.js && node --check interaction/session.js
       - run: node --check interface/actions.js && node --check interface/render.js && node --check interface/state.js
