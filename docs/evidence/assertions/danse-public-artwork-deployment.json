@@ -1,0 +1,18 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-public-artwork-deployment",
+  "assertion_class": "historical_record",
+  "statement": "A public GitHub Pages artwork was exercised at source commit f19244afbce94015e78b7f746b07d267ed9e67ae with the recorded interaction checks passing.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-live-interaction-replay",
+      "independence_group": "danse-deployment-observation",
+      "evidence_type": "fresh_verifier_receipt",
+      "reference": "release/evidence/live-interaction-replay-20260804.json",
+      "body_hash": "sha256:86a6fd406030dae27ce8c8a3a59e599592b8c29c7f3eb10005974ab974f89699",
+      "observed_at": "2026-08-04T08:58:18Z"
+    }
+  ]
+}

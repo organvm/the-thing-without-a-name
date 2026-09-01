@@ -1,0 +1,42 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-attribution-boundaries",
+  "assertion_class": "historical_record",
+  "statement": "In the 2026-08-31 audited tree, the tracked project identity named Anthony J. Padavano as artist and separately recorded performer, music, runtime, and rights boundaries that were not all approved for public use.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-release-identity",
+      "independence_group": "danse-release-record",
+      "evidence_type": "owner_record",
+      "reference": "release/manifest.json",
+      "body_hash": "sha256:d5dc71e49d0d9923595c15f1526345d3016f82fb3f6ce06fe6b1f3fa376e9a05",
+      "observed_at": "2026-08-31T22:44:39Z"
+    },
+    {
+      "evidence_id": "danse-rights-boundaries",
+      "independence_group": "danse-rights-record",
+      "evidence_type": "artifact",
+      "reference": "rights/register.json",
+      "body_hash": "sha256:d40daafc0de378f460d096c700f28451fc7367e695bc446e8e93285d8609ae68",
+      "observed_at": "2026-08-31T22:44:39Z"
+    },
+    {
+      "evidence_id": "danse-music-repertoire",
+      "independence_group": "danse-music-record",
+      "evidence_type": "artifact",
+      "reference": "music/repertoire.yaml",
+      "body_hash": "sha256:5fb4cb1faf283b50464d6e095b2918cb49d03e8227c8070d17e2e0eea69c9e10",
+      "observed_at": "2026-08-31T22:44:39Z"
+    },
+    {
+      "evidence_id": "danse-mediapipe-vendor-manifest",
+      "independence_group": "danse-vendor-record",
+      "evidence_type": "artifact",
+      "reference": "interaction/vendor/mediapipe/manifest.json",
+      "body_hash": "sha256:d9165f2c604d3fb721bcb4571df9468b8b25adbf00ba792271ef3b1b8454bc29",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

@@ -42,7 +42,7 @@ export const TIERS = ["browse", "screen"];
  *  composition rather than the reproduction can filter on `sliver`. */
 export const SLIVER_PX = 4;
 
-export async function load(base = "corpus/") {
+export async function load(base = "corpus/", { local: includeLocal = false } = {}) {
   const manifestSource = await fetch(`${base}manifest.json`).then((r) => {
     if (!r.ok) throw new Error(`corpus manifest ${r.status} at ${base}manifest.json`);
     return r.text();
@@ -52,9 +52,9 @@ export async function load(base = "corpus/") {
   // master needs. Absent on every fresh checkout, and that is correct: a shipped
   // manifest advertising plates that are not in the repo would send every visitor
   // looking for 404s. Present only on the machine that built them.
-  const local = await fetch(`${base}manifest.local.json`)
-    .then((r) => (r.ok ? r.json() : null))
-    .catch(() => null);
+  const local = includeLocal
+    ? await fetch(`${base}manifest.local.json`).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+    : null;
   if (local?.tiers) Object.assign(manifest.tiers, local.tiers);
 
   const scoreSource = manifest.score

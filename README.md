@@ -1,6 +1,56 @@
 # THE THING WITHOUT A NAME
 
-The canonical Danse source repository.
+> **Danse** is a seeded, browser-based photographic artwork that turns one 2017
+> dancer session and a hand-cut composite into an unbounded, reproducible room
+> of moving image and sound.
+
+[Enter the public artwork](https://danse.pages.dev/)
+· [Start without technical background](docs/audiences/general.md)
+· [Inspect the production system](docs/audiences/technical.md)
+· [Read the humanities interpretation](docs/audiences/humanities.md)
+· [Review evidence and limits](docs/evidence/README.md)
+
+## What am I looking at?
+
+This is the canonical source repository and project record for Danse. A
+repository is an organized collection of the artwork's code, publishable image
+corpus, production contracts, tests, documentation, and revision history. It is
+both a place from which the browser work can run and a record against which its
+technical and publication claims can be checked.
+
+The public Pages artwork is evidenced at source commit `f19244a`. The broader
+public project package remains **draft**: film approval, rights, installation,
+accessibility, custody, and publication gates are still open. A working browser
+artwork is not evidence of a finished festival package or a tested physical
+installation.
+
+## Choose your reading path
+
+| I am reading as... | Begin with... |
+|---|---|
+| A general reader or first-time GitHub visitor | [What Danse is and what happens when you enter it](docs/audiences/general.md) |
+| An engineer or media technologist | [Architecture, execution, tests, privacy, and failure boundaries](docs/audiences/technical.md) |
+| A humanities scholar, artist, critic, or educator | [Time, photographic history, simultaneity, and computational form](docs/audiences/humanities.md) |
+| A curator, presenter, or production partner | [Presentation forms, requirements, readiness, and unresolved gates](docs/audiences/business.md) |
+| An evaluator, collaborator, or hiring reader | [Contribution boundaries and inspection paths](docs/audiences/evaluator.md) |
+
+## Project at a glance
+
+| | |
+|---|---|
+| **What it is** | A deterministic generative image engine, a living browser artwork, and production tooling for finite captures and a proposed room installation. |
+| **Source material** | 161 registered photographs from one 20 June 2017 session plus one unregistered archival composite. |
+| **What a visitor receives** | A locally stored river identity and an evolving view whose exact moments can be cited by seed and time. |
+| **Implementation state** | Active source and test system; public Pages artwork evidenced at an earlier source commit. |
+| **Release state** | Draft. The public project package, festival package, and physical installation remain gated. |
+| **Tracked project identity** | Anthony J. Padavano is named as the artist. Performer credit and several authorship/rights approvals remain pending. |
+| **Evidence** | [Claim ledger](docs/evidence/README.md), source, tests, manifests, release gates, rights register, and lineage record. |
+| **Machine-readable facts** | [`project-record.yml`](project-record.yml) |
+
+## Canonical long-form project record
+
+The remainder of this README preserves the project's existing full explanation,
+technical argument, and production instructions.
 
 A room that never repeats, built from one afternoon.
 

@@ -81,7 +81,7 @@ RUN: list[tuple[str, str | None]] = []
 # So conditional checks are declared, counted separately, and named when they are
 # absent. Raise FLOOR when you add a portable check; raise the group's count when
 # you add a conditional one. Never lower either to make a machine agree.
-FLOOR = 52
+FLOOR = 53
 CONDITIONAL = {"grain bank": 3}
 
 GROUP: str | None = None
@@ -133,6 +133,17 @@ def check_rights_contract() -> None:
         lines = [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
         detail = lines[-1] if lines else f"exit {done.returncode}"
     check("rights and attribution fail closed on every uncleared use", done.returncode == 0, detail)
+
+
+def check_interface_contract() -> None:
+    """Run pure progressive-control state, shortcut, and action-bus checks."""
+    test = ROOT / "scripts/tests/interface-controls.test.mjs"
+    done = subprocess.run(["node", str(test)], cwd=ROOT, capture_output=True, text=True, check=False)
+    detail = "shared named actions, typed states, editable-control shortcuts, and share-state boundary"
+    if done.returncode != 0:
+        lines = [line for line in (done.stdout + done.stderr).splitlines() if line.strip()]
+        detail = lines[-1] if lines else f"exit {done.returncode}"
+    check("progressive controls share one typed action contract", done.returncode == 0, detail)
 
 
 def check_room_event_contract() -> None:
@@ -1238,6 +1249,8 @@ def main() -> int:
     check_opportunities()
     print("\n the public face is phase-gated from one release manifest")
     check_release_contract()
+    print("\n the progressive controls are one interface")
+    check_interface_contract()
     print("\n the corpus is deliverable")
     check_delivery(score, manifest)
     print("\n the sound is the same film")
