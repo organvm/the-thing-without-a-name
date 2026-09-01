@@ -13,35 +13,35 @@ The publicly available 2027 materials identify **Pioneer Winter as ScreenDance M
 
 A Pérez Art Museum Miami event page names the **2026 selection panel** as Amadeus McCaskill, Florencia Portieri, Vivian Marthell, Lisa Kusanagi, and Pioneer Winter. Those names are useful for field research and relationship-building, but the four prior-cycle panelists must not be presented as members of the 2027 panel.
 
-The correct strategy is therefore to network with:
+The correct strategy is therefore to separate public field-building from decision-adjacent outreach:
 
-1. the confirmed festival director;
-2. relevant Miami Light Project staff;
-3. confirmed prior-cycle panelists as members of the wider screendance field;
-4. the 2027 panel only if and when Miami Light Project publishes it.
+1. publish the work and follow the institution now;
+2. connect now with staff whose public roles concern communications, programs, production, or development, without asking about adjudication;
+3. treat the festival director and any later-published 2027 panelists as decision-adjacent and hold direct outreach until the notification cycle has concluded, unless they initiate contact;
+4. approach confirmed prior-cycle panelists only as members of the wider screendance field.
 
-This is relationship-building around shared work, not a request to influence adjudication.
+This avoids making the new relationship look like an attempt to influence an active review while still establishing a visible, substantive presence in the field.
 
 ## Priority ledger
 
 | Priority | Person | Publicly verified relationship | 2027 review status | LinkedIn lookup | Action |
 |---:|---|---|---|---|---|
-| 1 | Pioneer Winter | ScreenDance Miami festival director | Festival director; full panel roster not public | Profile match: https://www.linkedin.com/in/pioneerwinter | Follow, then connect with the tailored note below |
+| 1 | Pioneer Winter | ScreenDance Miami festival director | Festival director; full panel roster not public | Profile match: https://www.linkedin.com/in/pioneerwinter | Follow now; hold the connection note until notifications conclude or Pioneer engages first |
 | 2 | Terrence Brunn | Miami Light Project Marketing & Communications Manager; author of the 2027 call announcement | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/tbrunn/ | Connect around communication and audience-building |
-| 3 | Elizabeth “Beth” Boone | Miami Light Project Artistic & Executive Director | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/elizabeth-boone-0323bb35/ | Connect around institutional support for hybrid performance |
+| 3 | Elizabeth “Beth” Boone | Miami Light Project Artistic & Executive Director | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/elizabeth-boone-0323bb35/ | Connect around institutional support for hybrid performance; make no review reference |
 | 4 | Kristina Villaverde | Miami Light Project Special Projects Manager | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/kristina-villaverde-37569084/ | Connect around programs and hybrid-media production |
 | 5 | Eventz Paul | Miami Light Project Production Manager & Technical Director | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/eventz-paul-937739156/ | Connect around technical presentation and production systems |
 | 6 | Regina Moore | Miami Light Project Director of Planning & Development | No review role publicly confirmed | Profile match: https://www.linkedin.com/in/regina-goldie-moore-7b10013/ | Lower-priority institutional connection |
-| Field | Amadeus McCaskill | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify before connecting |
-| Field | Florencia Portieri | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify before connecting |
-| Field | Vivian Marthell | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify before connecting |
-| Field | Lisa Kusanagi | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify before connecting |
+| Field | Amadeus McCaskill | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify and engage with current work before connecting |
+| Field | Florencia Portieri | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify and engage with current work before connecting |
+| Field | Vivian Marthell | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify and engage with current work before connecting |
+| Field | Lisa Kusanagi | Confirmed 2026 selection panelist | Not identified for 2027 | No reliable match returned by LinkedIn lookup | Do not guess a profile; verify and engage with current work before connecting |
 
 ## Connection notes
 
-Each note is under LinkedIn’s standard 300-character connection-note ceiling.
+Each note is under LinkedIn’s standard 300-character connection-note ceiling. The Pioneer note is explicitly post-notification unless Pioneer initiates contact first.
 
-### Pioneer Winter
+### Pioneer Winter — hold until after notification
 
 > Pioneer — I’ve been following ScreenDance Miami’s work at the meeting point of movement and film. I recently completed The Thing Without a Name, a photographic screendance and software/archive project, and would value staying connected to the wider field.
 
@@ -67,23 +67,25 @@ Each note is under LinkedIn’s standard 300-character connection-note ceiling.
 
 ## Sequence
 
-### Wave 1 — directly relevant
+### Wave 1 — publish and establish public presence now
 
-1. Publish the corrected LinkedIn post.
-2. Follow Pioneer Winter and Miami Light Project.
-3. Send the Pioneer and Terrence requests individually.
-4. Send the Beth and Kristina requests individually.
+1. Publish the corrected LinkedIn post with the repository-derived score-map visual.
+2. Add the film/project link comment immediately and the method comment after the post settles.
+3. Follow Miami Light Project and Pioneer Winter.
+4. Engage substantively with one relevant recent institutional or festival post; do not mention adjudication.
 
-### Wave 2 — production and institutional network
+### Wave 2 — non-review staff connections now
 
-5. Send the Eventz request if the browser/installation and technical-production face of Danse is ready to discuss.
-6. Send the Regina request only as an institutional relationship, not as a festival-review contact.
+5. Send the Terrence and Kristina requests individually.
+6. Send the Beth request without referring to application status.
+7. Send the Eventz request if the browser/installation and technical-production face of Danse is ready to discuss.
+8. Send the Regina request only as an institutional relationship, not as a festival-review contact.
 
-### Wave 3 — wider screendance field
+### Wave 3 — after the notification cycle
 
-7. Locate prior-cycle panelists only through confirmed profiles.
-8. Read one current piece of work by each person before contacting them.
-9. Mention that work in a new individualized note; do not lead with the submission.
+9. Send Pioneer the held note after notifications conclude, unless Pioneer engages first.
+10. If the 2027 panel is publicly named, verify exact identities and wait until the cycle is closed before direct outreach.
+11. Approach prior-cycle panelists only after reading one current piece of work by each person; mention that work rather than leading with the submission.
 
 ## Interaction rules
 
@@ -93,6 +95,7 @@ Each note is under LinkedIn’s standard 300-character connection-note ceiling.
 - Do not call staff members “committee members” without a public source.
 - Do not call the 2026 panel the 2027 panel.
 - Do not attach the film unsolicited in a connection request; let the public post carry it.
+- Do not directly message the festival director or an active reviewer during the review cycle unless they initiate contact.
 - After a connection accepts, engage with actual work before proposing a call or collaboration.
 
 ## Public source record
