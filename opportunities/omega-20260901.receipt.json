@@ -1,10 +1,10 @@
 {
   "schema": "danse.opportunity-receipt.v1",
-  "issued_at": "2026-09-01T02:40:41Z",
+  "issued_at": "2026-09-01T04:17:08Z",
   "snapshot": {
     "path": "opportunities/omega-20260901.json",
-    "sha256": "4e003cf1e05d400d06da9a852bcb130a1faf6d138622c026c4298835afbfdfb3",
-    "bytes": 51542,
+    "sha256": "74cdb8da3b574f0e19655c00c44278a5318c514dc4dcacfbb0438ef08ee27777",
+    "bytes": 51151,
     "snapshot_id": "omega-20260901",
     "frozen_at": "2026-09-01T02:40:40Z"
   },
@@ -13,14 +13,9 @@
   "ranked_action_count": 5,
   "consumers": [
     {
-      "issue": 2,
-      "binding": "submission/screendance-2027.yaml",
-      "status": "verified"
-    },
-    {
-      "issue": 12,
-      "binding": "release/manifest.json",
-      "status": "pending"
+      "issue": 22,
+      "binding": "https://github.com/organvm/the-thing-without-a-name/issues/22",
+      "status": "maintenance"
     }
   ]
 }

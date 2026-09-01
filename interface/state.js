@@ -8,6 +8,34 @@ export const AUDITION = Object.freeze(["follow-score", "override-active", "overr
 export const PRESENCE = Object.freeze(["off", "camera", "keyboard-touch", "replay"]);
 export const CATEGORIES = Object.freeze(["hold", "river", "score", "presence", "map"]);
 
+const PROJECT_FRAGMENT_SECTIONS = Object.freeze({
+  content: "project-artwork",
+  artwork: "project-artwork",
+  film: "project-film",
+  "ballet-score": "project-film",
+  status: "project-status",
+  readings: "project-readings",
+  cubism: "project-readings",
+  glitch: "project-readings",
+  evidence: "project-evidence",
+  access: "project-artwork",
+  resources: "project-evidence",
+  "installation-contract": "project-evidence",
+});
+
+/** Resolve only declared legacy Project fragments into the live dialog. */
+export function projectSectionFor(fragment = "") {
+  let key;
+  try {
+    key = decodeURIComponent(String(fragment).replace(/^#/, "")).toLowerCase();
+  } catch {
+    return null;
+  }
+  return Object.hasOwn(PROJECT_FRAGMENT_SECTIONS, key)
+    ? PROJECT_FRAGMENT_SECTIONS[key]
+    : null;
+}
+
 export const ACTIONS = Object.freeze({
   TOGGLE_HOLD: "toggle-hold",
   RESET_RIVER: "reset-river",

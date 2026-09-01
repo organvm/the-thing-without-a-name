@@ -7,9 +7,11 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,10 +35,10 @@ class RegistryFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "repo"
-        self.snapshot = self.root / "opportunities/omega-20260901.json"
+        self.snapshot = self.root / "opportunities/omega-20260829.json"
         self.schema = self.root / "opportunities/opportunity.schema.json"
-        self.receipt = self.root / "opportunities/omega-20260901.receipt.json"
-        self.evidence = self.root / "opportunities/source-evidence-20260901.json"
+        self.receipt = self.root / "opportunities/omega-20260829.receipt.json"
+        self.evidence = self.root / "opportunities/source-evidence-20260826.json"
         self.consumer = self.root / "submission/screendance-2027.yaml"
         for source, target in (
             (CHECK.SNAPSHOT, self.snapshot),
@@ -59,6 +61,15 @@ class RegistryFixture:
 
 
 class ProductionRegistryTest(unittest.TestCase):
+    @staticmethod
+    def maintenance() -> dict:
+        return CHECK.validate_registry(
+            CHECK.MAINTENANCE_SNAPSHOT,
+            CHECK.SCHEMA,
+            root=ROOT,
+            evidence_path=CHECK.MAINTENANCE_EVIDENCE,
+        )
+
     def test_issue_22_successor_is_current_without_rewriting_its_predecessors(self) -> None:
         successor = CHECK.validate_registry(
             ROOT / "opportunities/omega-20260901.json",
@@ -68,8 +79,19 @@ class ProductionRegistryTest(unittest.TestCase):
         )
         by_id = {entry["id"]: entry for entry in successor["opportunities"]}
         self.assertEqual(successor["owner_issue"], 22)
+        self.assertEqual(
+            successor["release_consumers"],
+            [
+                {
+                    "issue": 22,
+                    "role": "post-release opportunity maintenance",
+                    "status": "maintenance",
+                }
+            ],
+        )
         self.assertEqual(len(successor["ranked_actions"]), 5)
         self.assertEqual(by_id["screendance-miami-2027"]["disposition"], "closed")
+        self.assertNotIn("consumer_contract", by_id["screendance-miami-2027"])
         self.assertEqual(
             by_id["wavemaker-grants-2027-watch"]["deadline_at"],
             "2027-04-01T00:00:00-04:00",
@@ -78,6 +100,117 @@ class ProductionRegistryTest(unittest.TestCase):
             successor,
             datetime.fromisoformat("2026-09-01T02:40:40+00:00"),
         )
+        self.assertEqual(by_id["mignolo-screendance-2026"]["owner_issue"], 22)
+        self.assertEqual(by_id["miami-dade-tdc-2026-q2"]["owner_issue"], 22)
+
+    def test_maintenance_current_respects_explicit_paths_and_fails_closed(self) -> None:
+        missing = ROOT / "opportunities/does-not-exist.json"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/check-opportunities.py"),
+                "--maintenance-current",
+                "--snapshot",
+                str(missing),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("cannot read pinned maintenance snapshot", completed.stderr)
+
+    def test_co_mutating_maintenance_snapshot_and_receipt_cannot_refresh_the_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            snapshot = root / "opportunities/omega-20260901.json"
+            schema = root / "opportunities/opportunity.schema.json"
+            receipt = root / "opportunities/omega-20260901.receipt.json"
+            evidence = root / "opportunities/source-evidence-20260901.json"
+            for source, target in (
+                (CHECK.MAINTENANCE_SNAPSHOT, snapshot),
+                (CHECK.SCHEMA, schema),
+                (CHECK.MAINTENANCE_RECEIPT, receipt),
+                (CHECK.MAINTENANCE_EVIDENCE, evidence),
+            ):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+            snapshot_data = json.loads(snapshot.read_text(encoding="utf-8"))
+            snapshot_data["ranked_actions"][0]["action"] += " Tampered."
+            snapshot.write_text(json.dumps(snapshot_data, indent=2) + "\n", encoding="utf-8")
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_data["snapshot"]["sha256"] = CHECK.digest(snapshot)
+            receipt_data["snapshot"]["bytes"] = snapshot.stat().st_size
+            receipt.write_text(json.dumps(receipt_data, indent=2) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                CHECK.RegistryError,
+                "maintenance snapshot does not match its pinned current digest",
+            ):
+                CHECK.validate_maintenance(
+                    snapshot_path=snapshot,
+                    schema_path=schema,
+                    receipt_path=receipt,
+                    evidence_path=evidence,
+                    root=root,
+                )
+
+    def test_maintenance_receipt_cannot_claim_pre_correction_issuance(self) -> None:
+        receipt = json.loads(CHECK.MAINTENANCE_RECEIPT.read_text(encoding="utf-8"))
+        receipt["issued_at"] = "2026-09-01T02:40:41Z"
+        with self.assertRaisesRegex(
+            CHECK.RegistryError,
+            "maintenance receipt predates its corrected snapshot binding",
+        ):
+            CHECK.validate_maintenance_receipt_provenance(receipt)
+
+    def test_maintenance_current_rejects_active_work_owned_by_closed_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            snapshot = root / "opportunities/omega-20260901.json"
+            schema = root / "opportunities/opportunity.schema.json"
+            evidence = root / "opportunities/source-evidence-20260901.json"
+            for source, target in (
+                (CHECK.MAINTENANCE_SNAPSHOT, snapshot),
+                (CHECK.SCHEMA, schema),
+                (CHECK.MAINTENANCE_EVIDENCE, evidence),
+            ):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+            snapshot_data = json.loads(snapshot.read_text(encoding="utf-8"))
+            target = next(
+                row
+                for row in snapshot_data["opportunities"]
+                if row["id"] == "mignolo-screendance-2026"
+            )
+            target["owner_issue"] = 15
+            snapshot.write_text(json.dumps(snapshot_data, indent=2) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                CHECK.RegistryError,
+                "maintenance current work still points at closed predecessor issue #15",
+            ):
+                CHECK.validate_registry(
+                    snapshot,
+                    schema,
+                    root=root,
+                    evidence_path=evidence,
+                )
+
+    def test_maintenance_snapshot_cannot_replace_the_release_consumer(self) -> None:
+        successor = self.maintenance()
+        with self.assertRaisesRegex(
+            CHECK.RegistryError,
+            "maintenance snapshot cannot replace a frozen release consumer",
+        ):
+            CHECK.validate_binding(
+                successor,
+                snapshot_path=CHECK.MAINTENANCE_SNAPSHOT,
+                receipt_path=CHECK.MAINTENANCE_RECEIPT,
+            )
 
     def test_original_august_4_freeze_remains_byte_for_byte_historical_evidence(self) -> None:
         self.assertEqual(
@@ -127,14 +260,21 @@ class ProductionRegistryTest(unittest.TestCase):
             "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c026693258cd6c974bc8",
         )
 
-    def test_exact_production_snapshot_and_consumers_validate(self) -> None:
-        snapshot, receipt = CHECK.validate_all()
-        self.assertEqual(len(snapshot["opportunities"]), 17)
-        self.assertEqual(len(snapshot["ranked_actions"]), 5)
-        self.assertEqual(receipt["snapshot"]["sha256"], CHECK.digest(CHECK.SNAPSHOT))
+    def test_release_freeze_and_maintenance_successor_validate_independently(self) -> None:
+        release, release_receipt = CHECK.validate_all()
+        maintenance, maintenance_receipt = CHECK.validate_maintenance()
+        self.assertEqual(len(release["opportunities"]), 17)
+        self.assertEqual(len(release["ranked_actions"]), 6)
+        self.assertEqual(release_receipt["snapshot"]["sha256"], CHECK.digest(CHECK.SNAPSHOT))
+        self.assertEqual(maintenance["owner_issue"], 22)
+        self.assertEqual(len(maintenance["ranked_actions"]), 5)
+        self.assertEqual(
+            maintenance_receipt["snapshot"]["sha256"],
+            CHECK.digest(CHECK.MAINTENANCE_SNAPSHOT),
+        )
 
     def test_every_plan_target_has_one_explicit_disposition(self) -> None:
-        snapshot = CHECK.validate_registry()
+        snapshot = self.maintenance()
         by_id = {entry["id"]: entry for entry in snapshot["opportunities"]}
         self.assertEqual(set(by_id), CHECK.EXPECTED_TARGETS)
         self.assertEqual(by_id["bakehouse-studio-residency-2026"]["disposition"], "closed")
@@ -144,7 +284,7 @@ class ProductionRegistryTest(unittest.TestCase):
         self.assertEqual(by_id["screendance-miami-2027"]["disposition"], "closed")
 
     def test_elapsed_oolite_extension_is_preserved_without_a_live_queue_claim(self) -> None:
-        snapshot = CHECK.validate_registry()
+        snapshot = self.maintenance()
         by_id = {entry["id"]: entry for entry in snapshot["opportunities"]}
         for entry_id in ("oolite-ellies-creator-2027", "oolite-studio-residency-2027"):
             entry = by_id[entry_id]
@@ -154,7 +294,7 @@ class ProductionRegistryTest(unittest.TestCase):
             self.assertTrue(all(gate["status"] == "required" for gate in entry["human_gates"]))
 
     def test_date_only_cinedans_calls_use_start_of_day_boundaries(self) -> None:
-        snapshot = CHECK.validate_registry()
+        snapshot = self.maintenance()
         by_id = {entry["id"]: entry for entry in snapshot["opportunities"]}
         self.assertEqual(
             by_id["cinedans-fest-2027-installation"]["deadline_at"],
@@ -166,7 +306,7 @@ class ProductionRegistryTest(unittest.TestCase):
         )
 
     def test_ranked_view_contains_no_closed_watch_or_historical_target(self) -> None:
-        snapshot = CHECK.validate_registry()
+        snapshot = self.maintenance()
         by_id = {entry["id"]: entry for entry in snapshot["opportunities"]}
         for action in snapshot["ranked_actions"]:
             self.assertIn(by_id[action["opportunity_id"]]["disposition"], CHECK.ACTIVE_DISPOSITIONS)
@@ -323,9 +463,13 @@ class RegistryFailureTest(unittest.TestCase):
 
     def test_live_queue_expires_without_mutating_frozen_snapshot(self) -> None:
         snapshot = self.validate_registry()
-        CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-14T21:59:00+00:00"))
+        expiry = CHECK.parse_time(
+            snapshot["operational_queue"]["expires_at"],
+            "operational queue expiry",
+        )
+        CHECK.validate_operational(snapshot, expiry - timedelta(microseconds=1))
         with self.assertRaisesRegex(CHECK.RegistryError, "issue #22 must publish a successor"):
-            CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-14T22:00:00+00:00"))
+            CHECK.validate_operational(snapshot, expiry)
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_receipt_path_cannot_follow_a_symlink(self) -> None:
@@ -336,7 +480,7 @@ class RegistryFailureTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECK.RegistryError, "traverses a symlink"):
             CHECK.safe_file(
                 self.fixture.root,
-                "opportunities/omega-20260901.json",
+                "opportunities/omega-20260829.json",
                 "receipt snapshot path",
             )
 

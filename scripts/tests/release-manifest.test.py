@@ -32,9 +32,9 @@ FIXTURE_FILES = (
     "release/manifest.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
     "release/progressive-controls-replay.schema.json",
-    "opportunities/omega-20260901.json",
-    "opportunities/omega-20260901.receipt.json",
-    "opportunities/source-evidence-20260901.json",
+    "opportunities/omega-20260829.json",
+    "opportunities/omega-20260829.receipt.json",
+    "opportunities/source-evidence-20260826.json",
     "opportunities/opportunity.schema.json",
     "scripts/check-opportunities.py",
     "submission/screendance-2027.yaml",
@@ -459,7 +459,7 @@ class ProductionManifestTest(unittest.TestCase):
     def test_snapshot_binding_uses_final_merged_freeze_and_source_evidence(self) -> None:
         binding = self.manifest["opportunity_snapshot"]
         self.assertEqual(binding["sha256"], CONTRACT.EXPECTED_OPPORTUNITY_SHA256)
-        self.assertEqual(binding["snapshot_id"], "omega-20260901")
+        self.assertEqual(binding["snapshot_id"], "omega-20260829")
         self.assertEqual(binding["frozen_at"], CONTRACT.EXPECTED_OPPORTUNITY_FROZEN_AT)
         self.assertEqual(
             binding["source_evidence_sha256"],
@@ -582,7 +582,7 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertEqual(self.receipt["release"]["manifest"]["path"], "release/manifest.json")
         self.assertEqual(
             self.receipt["release"]["opportunity_snapshot"]["path"],
-            "opportunities/omega-20260901.json",
+            "opportunities/omega-20260829.json",
         )
         self.assertEqual(
             self.receipt["release"]["source_evidence"]["sha256"],
@@ -717,6 +717,29 @@ class ProductionManifestTest(unittest.TestCase):
 
 
 class DeterminismAndCompletedPhaseTest(unittest.TestCase):
+    def test_source_snapshot_does_not_require_progressive_schema_for_pending_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = read_manifest(root)
+            progressive_gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            self.assertEqual(progressive_gate["state"], "pending")
+            self.assertIsNone(progressive_gate["evidence"])
+            (root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH).unlink()
+            commit = initialize_git_fixture(root)
+
+            validated = BUILD.validate_source_commit_release(
+                root,
+                commit,
+                manifest,
+                "draft",
+            )
+
+            self.assertEqual(validated, manifest)
+
     def test_source_snapshot_uses_original_checkout_for_progressive_git_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = fixture_root(Path(temporary))

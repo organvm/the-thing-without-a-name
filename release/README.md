@@ -3,14 +3,13 @@
 `manifest.json` is the single source for the project page, installation pitch,
 accessibility materials, captions/transcript, press copy, credits, posting plan,
 and release-media inventory. It consumes frozen opportunity snapshot
-`omega-20260901` at SHA-256
-`4e003cf1e05d400d06da9a852bcb130a1faf6d138622c026c4298835afbfdfb3`,
-frozen at `2026-09-01T02:40:40Z`, and binds its source-evidence manifest at
-`220e184ddc36a4bc2c95744be06cacc7abe4919cff0fd18fbc4db15f55804150`.
+`omega-20260829` at SHA-256
+`c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294`,
+frozen at `2026-08-29T22:12:19Z`, and binds its source-evidence manifest at
+`7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c026693258cd6c974bc8`.
 The snapshot also binds the complete ScreenDance YAML consumer contract; a release
-build never fetches changing call terms. Its August 29 and August 26 predecessors,
-`omega-20260829`, `omega-20260826`, and `omega-20260826-2`, remain byte-for-byte
-historical evidence.
+build never fetches changing call terms. Its August 26 predecessors,
+`omega-20260826` and `omega-20260826-2`, remain byte-for-byte historical evidence.
 
 The installation section consumes the exact reference digital twin and its
 eight-gate ledger by path, byte count, raw SHA-256, and embedded installation

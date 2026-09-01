@@ -79,7 +79,7 @@
     },
     "release_consumers": {
       "type": "array",
-      "minItems": 2,
+      "minItems": 1,
       "items": { "$ref": "#/$defs/consumer" }
     },
     "ranked_actions": {
@@ -100,7 +100,7 @@
       "properties": {
         "issue": { "type": "integer" },
         "role": { "type": "string", "minLength": 1 },
-        "status": { "enum": ["bound", "pending"] }
+        "status": { "enum": ["bound", "pending", "maintenance"] }
       }
     },
     "action": {

@@ -34,14 +34,9 @@
   },
   "release_consumers": [
     {
-      "issue": 2,
-      "role": "ScreenDance filing register",
-      "status": "bound"
-    },
-    {
-      "issue": 12,
-      "role": "canonical Omega release manifest",
-      "status": "pending"
+      "issue": 22,
+      "role": "post-release opportunity maintenance",
+      "status": "maintenance"
     }
   ],
   "ranked_actions": [
@@ -473,7 +468,7 @@
       "organization": "Miami-Dade County Department of Cultural Affairs",
       "disposition": "blocked",
       "fit": "grant",
-      "owner_issue": 15,
+      "owner_issue": 22,
       "deadline_at": "2026-10-13T23:59:00-04:00",
       "sources": [
         {
@@ -579,7 +574,7 @@
       "organization": "Mignolo Arts",
       "disposition": "conflicted",
       "fit": "film",
-      "owner_issue": 15,
+      "owner_issue": 22,
       "deadline_at": "2026-10-13T23:59:00-05:00",
       "sources": [
         {
@@ -913,14 +908,6 @@
       "fit": "film",
       "owner_issue": 2,
       "deadline_at": "2026-08-31T22:00:00-04:00",
-      "consumer_contract": {
-        "path": "submission/screendance-2027.yaml",
-        "excluded_fields": [
-          "opportunity_snapshot"
-        ],
-        "schema": "danse.submission.v2",
-        "canonical_sha256": "0c99bad6604b7061b3a404a02980e81df66422147ee51ac768dbe5fc2f3d0a14"
-      },
       "sources": [
         {
           "url": "https://miamilightproject.submittable.com/submit",

@@ -48,6 +48,7 @@ def _load_release_contract():
             "HEX64",
             "MANIFEST",
             "PHASES",
+            "PROGRESSIVE_CONTROLS_EVIDENCE_PATH",
             "PROGRESSIVE_CONTROLS_SCHEMA_PATH",
             "ROOT",
             "SCHEMA",
@@ -83,6 +84,7 @@ GENERATED_PRODUCT_PATHS = _RELEASE_CONTRACT.GENERATED_PRODUCT_PATHS
 HEX64 = _RELEASE_CONTRACT.HEX64
 MANIFEST = _RELEASE_CONTRACT.MANIFEST
 PHASES = _RELEASE_CONTRACT.PHASES
+PROGRESSIVE_CONTROLS_EVIDENCE_PATH = _RELEASE_CONTRACT.PROGRESSIVE_CONTROLS_EVIDENCE_PATH
 PROGRESSIVE_CONTROLS_SCHEMA_PATH = _RELEASE_CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH
 ROOT = _RELEASE_CONTRACT.ROOT
 SCHEMA = _RELEASE_CONTRACT.SCHEMA
@@ -1763,9 +1765,23 @@ def validate_source_commit_release(
         evidence_paths = _manifest_evidence_paths(manifest)
         support_paths = {
             "opportunities/opportunity.schema.json",
-            PROGRESSIVE_CONTROLS_SCHEMA_PATH,
             "submission/screendance-2027.yaml",
         }
+        progressive_evidence = next(
+            (
+                gate.get("evidence")
+                for gate in manifest.get("gates", [])
+                if isinstance(gate, dict)
+                and gate.get("id") == "progressive-controls-replay"
+            ),
+            None,
+        )
+        if (
+            isinstance(progressive_evidence, dict)
+            and progressive_evidence.get("path")
+            == PROGRESSIVE_CONTROLS_EVIDENCE_PATH
+        ):
+            support_paths.add(PROGRESSIVE_CONTROLS_SCHEMA_PATH)
         for relative in sorted(evidence_paths | support_paths):
             if relative not in {MANIFEST.as_posix(), SCHEMA.as_posix()}:
                 materialize(relative, f"source validation file {relative}")
@@ -1955,11 +1971,11 @@ def verify_artifact(
         raise ReleaseError(
             "release artifact installation binding drifted from its source manifest"
         )
-    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260901.json":
+    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260829.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity snapshot")
-    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260901.receipt.json":
+    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260829.receipt.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity receipt")
-    if release["source_evidence"]["path"] != "opportunities/source-evidence-20260901.json":
+    if release["source_evidence"]["path"] != "opportunities/source-evidence-20260826.json":
         raise ReleaseError("release artifact points at a non-canonical source-evidence manifest")
     if (
         release["opportunity_snapshot"]["sha256"] != EXPECTED_OPPORTUNITY_SHA256

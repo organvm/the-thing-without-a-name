@@ -8,14 +8,14 @@
     "release_payload": "danse.release-payload.v1"
   },
   "opportunity_snapshot": {
-    "path": "opportunities/omega-20260901.json",
-    "snapshot_id": "omega-20260901",
-    "frozen_at": "2026-09-01T02:40:40Z",
-    "sha256": "4e003cf1e05d400d06da9a852bcb130a1faf6d138622c026c4298835afbfdfb3",
-    "receipt_path": "opportunities/omega-20260901.receipt.json",
-    "receipt_sha256": "f4d4117d91b6159f83f98feeab7884c3d8809c37fe4f2fd6a57ebe2e9cfed2cb",
-    "source_evidence_path": "opportunities/source-evidence-20260901.json",
-    "source_evidence_sha256": "220e184ddc36a4bc2c95744be06cacc7abe4919cff0fd18fbc4db15f55804150"
+    "path": "opportunities/omega-20260829.json",
+    "snapshot_id": "omega-20260829",
+    "frozen_at": "2026-08-29T22:12:19Z",
+    "sha256": "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294",
+    "receipt_path": "opportunities/omega-20260829.receipt.json",
+    "receipt_sha256": "d53752f1a9232a5af06637b54cb110d8460780dbc8c81910a14bb11d31e8eeae",
+    "source_evidence_path": "opportunities/source-evidence-20260826.json",
+    "source_evidence_sha256": "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c026693258cd6c974bc8"
   },
   "identity": {
     "canonical_title": "THE THING WITHOUT A NAME",
@@ -242,7 +242,7 @@
       "status": "verified",
       "evidence": {
         "path": "scripts/check-danse.py",
-        "sha256": "f2559c74cd8571ef0ece1dc2db5b5d137144dad5ec4d081c0f6c9e34ee5366d6",
+        "sha256": "f0a541770ebd2e50ce98125538dbdce0e60912eebe8bdf26ce8799df302f3ad9",
         "summary": "Executable invariant source bound by digest; the release receipt must record its passing run."
       }
     },
@@ -259,13 +259,13 @@
     },
     {
       "id": "opportunity-freeze",
-      "text": "Release opportunity facts are frozen at successor snapshot omega-20260901 rather than fetched or rewritten during a build; the August 29 and August 26 snapshots remain preserved as historical evidence.",
+      "text": "Release opportunity facts are frozen at successor snapshot omega-20260829 rather than fetched or rewritten during a build; the August 26 snapshots remain preserved as historical evidence.",
       "publish": true,
       "status": "verified",
       "evidence": {
-        "path": "opportunities/omega-20260901.json",
-        "sha256": "4e003cf1e05d400d06da9a852bcb130a1faf6d138622c026c4298835afbfdfb3",
-        "summary": "Immutable issue #22 successor binding the elapsed ScreenDance no-go and newly published WaveMaker 2027 timeline; its predecessors are retained unchanged."
+        "path": "opportunities/omega-20260829.json",
+        "sha256": "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294",
+        "summary": "Immutable successor snapshot binding the corrected operational ScreenDance register; its predecessors are retained unchanged."
       }
     },
     {
