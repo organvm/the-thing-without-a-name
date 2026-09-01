@@ -1889,6 +1889,55 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('#danse-dock[hidden],#surface-tray[hidden],#hud[hidden],#hud-toggle[hidden] { display:none; }', self.styles)
         self.assertIn("min-width: 48px; min-height: 48px", self.html)
 
+    def test_first_visit_and_renderer_fallback_offer_human_entry_points(self) -> None:
+        for element_id in (
+            "experience-intro",
+            "intro-dismiss",
+            "intro-river",
+            "intro-project",
+            "fallback-project",
+            "fallback-controls",
+            "fallback-retry",
+        ):
+            self.assertIn(element_id, self.markup.by_id)
+        fallback_images = [
+            attrs
+            for tag, attrs in self.markup.tags
+            if tag == "img" and attrs.get("src") == "./corpus/plates/screen/IMG_1926.webp"
+        ]
+        self.assertEqual(len(fallback_images), 1)
+        self.assertIn("hand-cut 2017 Danse Macabre composite", fallback_images[0]["alt"])
+        self.assertIn('document.body.dataset.renderer = "unavailable";', self.script)
+        self.assertIn('dock.dataset.mode = "fallback";', self.script)
+        self.assertIn('el("fallback-retry").addEventListener("click", () => location.reload())', self.script)
+        self.assertIn("One dancer session, opened into a photographic room that never repeats.", self.html)
+        self.assertIn('property="og:image" content="https://danse.pages.dev/corpus/plates/screen/IMG_1926.webp"', self.html)
+        self.assertIn('name="twitter:card" content="summary_large_image"', self.html)
+
+    def test_progressive_controls_disclose_state_and_have_explicit_close_paths(self) -> None:
+        expandable = {
+            attrs["data-category"]: attrs
+            for tag, attrs in self.markup.tags
+            if tag == "button" and attrs.get("data-category") in {"river", "score", "presence", "map"}
+        }
+        self.assertTrue(all(attrs["aria-expanded"] == "false" for attrs in expandable.values()))
+        self.assertEqual(expandable["map"]["aria-haspopup"], "dialog")
+        tray_closes = [attrs for tag, attrs in self.markup.tags if tag == "button" and "data-tray-close" in attrs]
+        self.assertEqual(len(tray_closes), 3)
+        self.assertIn('button.hasAttribute("aria-controls")', (ROOT / "interface/render.js").read_text(encoding="utf-8"))
+        self.assertIn('tray.querySelectorAll("[data-tray-close]")', self.script)
+        self.assertIn("Settings &amp; accessibility", self.html)
+
+    def test_project_keeps_current_truth_and_return_action_in_the_sticky_header(self) -> None:
+        self.assertIn("project-pulse", self.html)
+        self.assertIn("Live artwork</span><strong>Available now", self.html)
+        self.assertIn("Finite film</span><strong>In progress", self.html)
+        self.assertIn('id="map-close" aria-label="Close project information and return to artwork"', self.html)
+        self.assertIn('aria-current="location"', self.html)
+        self.assertIn(".project-nav-links", self.styles)
+        self.assertIn("overflow-x:auto", self.styles)
+        self.assertIn(".project-section:focus { outline:2px solid", self.styles)
+
     def test_keyboard_buttons_and_browser_probe_share_named_actions(self) -> None:
         self.assertIn("function setHudVisible(visible)", self.script)
         self.assertIn('hud.setAttribute("aria-hidden", String(!visible))', self.script)

@@ -7,6 +7,7 @@ export function renderControlSurface(root, state) {
     if (!button) continue;
     const selected = state.surface === `tray:${category}` || state.surface.startsWith(`sheet:${category}`) || state.surface === "map" && category === "map";
     button.setAttribute("aria-pressed", String(selected));
+    if (button.hasAttribute("aria-controls")) button.setAttribute("aria-expanded", String(selected));
     button.classList.toggle("is-selected", selected);
   }
   root.dataset.surface = state.surface;
@@ -17,8 +18,8 @@ export function renderControlSurface(root, state) {
   if (hold) {
     const held = state.playback !== "running";
     hold.setAttribute("aria-pressed", String(held));
-    hold.textContent = held ? "Resume" : "Hold";
-    hold.setAttribute("aria-label", state.playback === "held-reduced" ? "Resume motion despite reduced-motion preference" : held ? "Resume motion" : "Hold motion");
+    hold.textContent = held ? "Resume" : "Pause";
+    hold.setAttribute("aria-label", state.playback === "held-reduced" ? "Resume motion despite reduced-motion preference" : held ? "Resume motion" : "Pause motion");
   }
   const score = doc.getElementById("program-score");
   const free = doc.getElementById("program-free");
