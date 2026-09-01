@@ -717,6 +717,29 @@ class ProductionManifestTest(unittest.TestCase):
 
 
 class DeterminismAndCompletedPhaseTest(unittest.TestCase):
+    def test_source_snapshot_does_not_require_progressive_schema_for_pending_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = fixture_root(Path(temporary))
+            manifest = read_manifest(root)
+            progressive_gate = next(
+                gate
+                for gate in manifest["gates"]
+                if gate["id"] == "progressive-controls-replay"
+            )
+            self.assertEqual(progressive_gate["state"], "pending")
+            self.assertIsNone(progressive_gate["evidence"])
+            (root / CONTRACT.PROGRESSIVE_CONTROLS_SCHEMA_PATH).unlink()
+            commit = initialize_git_fixture(root)
+
+            validated = BUILD.validate_source_commit_release(
+                root,
+                commit,
+                manifest,
+                "draft",
+            )
+
+            self.assertEqual(validated, manifest)
+
     def test_source_snapshot_uses_original_checkout_for_progressive_git_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = fixture_root(Path(temporary))

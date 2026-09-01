@@ -16,7 +16,7 @@ import unittest
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -1987,9 +1987,9 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;', helper)
 
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
-        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        handler = self.script.split('addEventListener("hashchange", async (event) => {', 1)[1].split("/** Wind this river", 1)[0]
         self.assertIn("previousRiver = null;", handler)
-        self.assertIn("previousRiverWasRemembered = false;", handler)
+        self.assertIn("previousRememberedRiver = null;", handler)
         self.assertIn('el("river-undo").disabled = true;', handler)
 
     def test_river_actions_expire_pending_hash_navigation(self) -> None:
@@ -1997,6 +1997,432 @@ class InterfaceContractTest(unittest.TestCase):
         undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("navigationGeneration += 1;", new_river)
         self.assertLess(undo_river.index("if (!previousRiver) return null;"), undo_river.index("navigationGeneration += 1;"))
+
+    def test_shifted_river_undo_restores_its_pre_mint_address(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        hash_navigation = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        self.assertIn("let previousRiverUrl = null;", self.script)
+        self.assertIn("const projectFragment = Boolean(projectSectionFor(location.hash));", new_river)
+        self.assertIn("const freshRememberedRiver = currentRememberedRiver", new_river)
+        self.assertIn('Arrival.rememberedRiverForUndo(currentRememberedRiver, "", recalled)', new_river)
+        self.assertIn("const carriedProjectUrl = projectReturnRiverUrl", new_river)
+        self.assertIn("previousRiverUrl = projectFragment && carriedProjectUrl && freshRememberedRiver", new_river)
+        self.assertIn(": riverHref(river, { mode: program ? null : \"free\" });", new_river)
+        self.assertIn(
+            "const restoredUrl = withCurrentQuery(previousRiverUrl ?? riverHref(river));",
+            undo_river,
+        )
+        self.assertIn("Arrival.withMode(restoredUrl, program ? null : \"free\")", undo_river)
+        self.assertIn("previousRiverUrl = null;", undo_river)
+        self.assertIn("previousRiverUrl = null;", hash_navigation)
+        self.assertIn("previousRememberedRiver = freshRememberedRiver;", new_river)
+        self.assertIn("currentRememberedRiver = river;", new_river)
+        self.assertIn("currentRememberedRiver = previousRememberedRiver;", undo_river)
+        project_navigation = hash_navigation.split("const generation =", 1)[0]
+        self.assertNotIn("currentRememberedRiver =", project_navigation)
+        self.assertIn("currentRememberedRiver = Arrival.rememberedRiverForUndo", hash_navigation)
+
+    def test_legacy_project_fragments_open_the_moved_live_section(self) -> None:
+        redirect = (ROOT / "404.html").read_text(encoding="utf-8")
+        state = (ROOT / "interface/state.js").read_text(encoding="utf-8")
+        self.assertIn(r"/^\/(?:[A-Za-z0-9._~-]+\/)?project(?:\/index\.html)?\/?$/", redirect)
+        self.assertIn("${location.search}${location.hash}", redirect)
+        self.assertIn('evidence: "project-evidence"', state)
+        self.assertIn('"ballet-score": "project-film"', state)
+        self.assertIn("projectSectionFor", self.script)
+        helper = self.script.split(
+            "async function openProjectSection(section = projectSectionFor(location.hash)) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("await openMap(", helper)
+        self.assertIn('target?.scrollIntoView({ block: "start" })', helper)
+        self.assertIn("target?.focus({ preventScroll: true })", helper)
+        self.assertIn("void openProjectSection();", self.script)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
+    def test_legacy_project_redirect_executes_only_for_anchored_optional_prefixes(self) -> None:
+        markup = (ROOT / "404.html").read_text(encoding="utf-8")
+        script = markup.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        def redirect(pathname: str, search: str = "?view=legacy", fragment: str = "#evidence") -> str | None:
+            probe = f"""
+const result = {{ value: null }};
+globalThis.location = {{
+  pathname: {json.dumps(pathname)},
+  search: {json.dumps(search)},
+  hash: {json.dumps(fragment)},
+  replace: (value) => {{ result.value = value; }},
+}};
+{script}
+console.log(JSON.stringify(result.value));
+"""
+            completed = subprocess.run(
+                ["node", "--input-type=module", "--eval", probe],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return json.loads(completed.stdout)
+
+        destination = "https://danse.pages.dev/?view=legacy#evidence"
+        for path in (
+            "/project",
+            "/project/",
+            "/project/index.html",
+            "/the-thing-without-a-name/project",
+            "/the-thing-without-a-name/project/",
+            "/the-thing-without-a-name/project/index.html",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(redirect(path), destination)
+        for path in (
+            "/projectile",
+            "/project/extra",
+            "/prefix/nested/project/",
+            "//project/",
+            "/the-thing-without-a-name/projectile",
+            "/the-thing-without-a-name/project/index.htm",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(redirect(path))
+
+    def test_legacy_project_fragment_survives_the_river_url_updater(self) -> None:
+        updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
+        guard = "if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;"
+        self.assertIn(guard, updater)
+        self.assertLess(updater.index(guard), updater.index("commitRiverUrl"))
+
+    def test_closing_project_immediately_restores_a_mode_complete_river_url(self) -> None:
+        close = self.script.split("function closeVisualSurfaces() {", 1)[1].split("\n}", 1)[0]
+        capture = (
+            "const closedProjectFragment = projectMap.open "
+            "&& Boolean(projectSectionFor(location.hash));"
+        )
+        canonical = (
+            'commitRiverUrl(Arrival.withMode(currentRiverUrl, '
+            'program ? null : "free"));'
+        )
+        self.assertIn(capture, close)
+        self.assertIn("if (closedProjectFragment) {", close)
+        self.assertIn(canonical, close)
+        self.assertIn("projectReturnRiverUrl = null;", close)
+        self.assertLess(close.index(capture), close.index("projectMap.close()"))
+        self.assertLess(close.index("projectMap.close()"), close.index(canonical))
+        self.assertLess(close.index(canonical), close.index("projectReturnRiverUrl = null;"))
+
+        persist = self.script.split("function persistProgramMode() {", 1)[1].split("\n}", 1)[0]
+        set_program = self.script.split("async function setProgram(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'Arrival.withMode(riverControlUrl(), program ? null : "free")',
+            persist,
+        )
+        self.assertIn("{ keepProjectOpen: true }", persist)
+        free = set_program.split('if (value === "free") {', 1)[1].split("}", 1)[0]
+        score = set_program.split("const loaded =", 1)[1]
+        self.assertLess(free.index("program = null;"), free.index("persistProgramMode();"))
+        self.assertLess(free.index("persistProgramMode();"), free.index("return true;"))
+        self.assertLess(score.index("program = loaded;"), score.index("persistProgramMode();"))
+        self.assertLess(score.index("persistProgramMode();"), score.index("return true;"))
+
+    def test_new_river_replaces_a_legacy_project_fragment_immediately(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        capture = "const projectFragment = Boolean(projectSectionFor(location.hash));"
+        replacement = (
+            'commitRiverUrl(riverHref(river, '
+            '{ mode: program ? null : "free" }));'
+        )
+        self.assertIn(capture, new_river)
+        self.assertIn(replacement, new_river)
+        self.assertLess(new_river.index(capture), new_river.index("Arrival.mint()"))
+        self.assertLess(new_river.index("Arrival.mint()"), new_river.index(replacement))
+
+    def test_project_back_forward_unmasks_river_and_urls_are_immediate(self) -> None:
+        hash_navigation = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        close = "if (projectMap.open) controlBus?.actions.close();"
+        self.assertIn(close, hash_navigation)
+        self.assertLess(hash_navigation.index(close), hash_navigation.index("Arrival.arrive(fragment)"))
+        canonical = 'commitRiverUrl(riverHref(river, { mode: program ? null : "free" }));'
+        self.assertIn(canonical, new_river)
+        self.assertLess(new_river.index("Arrival.mint()"), new_river.index(canonical))
+        self.assertIn("commitRiverUrl(", undo_river)
+        self.assertIn(
+            "const restoredUrl = withCurrentQuery(previousRiverUrl ?? riverHref(river));",
+            undo_river,
+        )
+        self.assertIn("projectSectionFor(new URL(restoredUrl).hash)", undo_river)
+        self.assertIn("Arrival.withMode(restoredUrl, program ? null : \"free\")", undo_river)
+
+    def test_project_navigation_preserves_self_contained_rivers_and_defers_impurity(self) -> None:
+        handler = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("let projectReturnRiverUrl = projectSectionAtArrival ? currentRiverUrl : null;", self.script)
+        self.assertIn("const oldFragment = new URL(event.oldURL).hash;", handler)
+        self.assertIn("let currentRiverUrl = initialCommittedUrl.href;", self.script)
+        self.assertIn("if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = currentRiverUrl;", handler)
+        self.assertNotIn("projectReturnRiverUrl = event.oldURL", handler)
+        self.assertIn("Arrival.hasSelfContainedRiver(new URL(carriedProjectUrl).hash)", new_river)
+        self.assertIn("projectFragment && carriedProjectUrl", new_river)
+        self.assertIn(": riverHref(river, { mode: program ? null : \"free\" });", new_river)
+        self.assertIn("const fragment = location.hash;", handler)
+        self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
+        self.assertLess(handler.index("if (generation !== navigationGeneration) return;"), handler.index("Arrival.arrive(fragment)"))
+        self.assertLess(handler.index("Arrival.arrive(fragment)"), handler.index("river = nextRiver;"))
+        self.assertLess(handler.index("river = nextRiver;"), handler.index("const committedNavigationUrl = new URL(currentRiverUrl);"))
+        self.assertIn("committedNavigationUrl.hash = fragment;", handler)
+        self.assertLess(
+            handler.index("committedNavigationUrl.hash = fragment;"),
+            handler.index("commitRiverUrl(Arrival.withMode(committedNavigationUrl"),
+        )
+
+    def test_pending_navigation_combines_its_target_with_the_latest_control_query(self) -> None:
+        handler = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
+        self.assertLess(
+            handler.index("await Program.load()"),
+            handler.index("const committedNavigationUrl = new URL(currentRiverUrl);"),
+        )
+        self.assertIn("committedNavigationUrl.hash = fragment;", handler)
+        self.assertIn(
+            'Arrival.withMode(committedNavigationUrl, program ? null : "free")',
+            handler,
+        )
+        self.assertNotIn("currentRiverUrl = location.href", handler)
+
+    def test_query_only_controls_refresh_the_committed_river_url(self) -> None:
+        conductor = self.script.split("function persistConductor() {", 1)[1].split("\n}", 1)[0]
+        cutout = self.script.split("function toggleCutout() {", 1)[1].split("\n}", 1)[0]
+        for helper in (conductor, cutout):
+            self.assertIn("const url = riverControlUrl();", helper)
+            self.assertIn("commitRiverUrl(url, { keepProjectOpen: true });", helper)
+
+    def test_all_address_writes_update_the_committed_river_url_atomically(self) -> None:
+        helper = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
+        self.assertIn("currentRiverUrl = String(url);", helper)
+        self.assertIn('history.replaceState(null, "", currentRiverUrl);', helper)
+        self.assertLess(
+            helper.index("currentRiverUrl = String(url);"),
+            helper.index('history.replaceState(null, "", currentRiverUrl);'),
+        )
+        self.assertEqual(helper.count("history.replaceState("), 2)
+        before, after = self.script.split("function commitRiverUrl(url", 1)
+        after = after.split("\n}", 1)[1]
+        self.assertNotIn("history.replaceState(", before + after)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
+    def test_synthesized_river_urls_preserve_the_complete_query_identity(self) -> None:
+        source = (ROOT / "arrival.js").as_uri()
+        probe = f"""
+globalThis.location = {{
+  href: "https://danse.pages.dev/?score=music%2Fscore.json&choreography=render%2Fchoreography.json&cutout=1&conductor=compound&meter=6%2F8&bpm=132#evidence",
+}};
+const {{ href }} = await import({json.dumps(source)});
+console.log(href({{ seed: 42, epoch: 1000, stream: 7 }}, {{ mode: "free" }}));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "--eval", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        url = urlsplit(completed.stdout.strip())
+        query = parse_qs(url.query)
+        self.assertEqual(
+            query,
+            {
+                "score": ["music/score.json"],
+                "choreography": ["render/choreography.json"],
+                "cutout": ["1"],
+                "conductor": ["compound"],
+                "meter": ["6/8"],
+                "bpm": ["132"],
+            },
+        )
+        self.assertEqual(url.fragment, "s=42&e=1000&u=7&p=free")
+
+        updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("riverHref(river", updater)
+        self.assertIn("riverHref(river", new_river)
+        self.assertIn("riverHref(river", undo_river)
+
+    def test_project_local_controls_preserve_river_identity_and_all_query_state(self) -> None:
+        commit = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
+        source = self.script.split("function riverControlUrl() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("keepProjectOpen && projectSectionFor(location.hash)", commit)
+        self.assertIn("currentRiverUrl = durableCurrentRiverUrl();", commit)
+        self.assertIn("projectReturnRiverUrl = currentRiverUrl;", commit)
+        self.assertIn("visibleProjectUrl.search = new URL(currentRiverUrl).search;", commit)
+        self.assertIn("history.state && typeof history.state === \"object\"", commit)
+        self.assertIn("history.replaceState({ ...state, danseRiverUrl: currentRiverUrl }", commit)
+        self.assertIn("return new URL(currentRiverUrl);", source)
+
+    def test_project_state_canonicalizes_every_non_self_contained_river(self) -> None:
+        durable = self.script.split("function durableCurrentRiverUrl() {", 1)[1].split("\n}", 1)[0]
+        commit = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
+        self.assertIn("Arrival.hasSelfContainedRiver(candidate.hash)", durable)
+        self.assertIn(
+            'return riverHref(river, { mode: program ? null : "free" });',
+            durable,
+        )
+        self.assertNotIn("Arrival.recall", durable)
+        self.assertNotIn("currentRememberedRiver", durable)
+        self.assertLess(
+            commit.index("currentRiverUrl = durableCurrentRiverUrl();"),
+            commit.index("danseRiverUrl: currentRiverUrl"),
+        )
+        startup = self.script.split('hudToggle.removeAttribute("aria-hidden");', 1)[1].split(
+            "void openProjectSection();", 1
+        )[0]
+        self.assertIn("if (projectSectionAtArrival)", startup)
+        self.assertIn(
+            "commitRiverUrl(currentRiverUrl, { keepProjectOpen: true });",
+            startup,
+        )
+
+    def test_new_during_pending_navigation_never_promotes_the_uncommitted_target(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        shifted_branch = new_river.split(": shifted &&", 1)[1].split(
+            ": riverHref(river", 1
+        )[0]
+        self.assertIn("Arrival.hasCitedSeed(new URL(currentRiverUrl).hash)", shifted_branch)
+        self.assertIn("? currentRiverUrl", shifted_branch)
+        self.assertNotIn("location.href", shifted_branch)
+        self.assertNotIn("location.hash", shifted_branch)
+
+    def test_project_reload_restores_the_committed_river_and_mode(self) -> None:
+        arrival = self.script.split("const projectSectionAtArrival", 1)[1].split("const canvas", 1)[0]
+        self.assertIn("state.danseRiverUrl", arrival)
+        self.assertIn("candidate.username || candidate.password", arrival)
+        self.assertIn("candidate.search !== visible.search", arrival)
+        self.assertIn("candidate.origin !== visible.origin", arrival)
+        self.assertIn("candidate.pathname !== visible.pathname", arrival)
+        self.assertIn("projectSectionFor(candidate.hash)", arrival)
+        self.assertIn("Arrival.hasSelfContainedRiver(candidate.hash)", arrival)
+        self.assertIn('for (const key of ["s", "e", "t", "u"])', arrival)
+        self.assertIn('raw.trim() === "" || !Number.isFinite(Number(raw))', arrival)
+        self.assertIn('values.has("t") && citedTime < 0', arrival)
+        self.assertNotIn("&& Arrival.recall()", arrival)
+        self.assertIn("const initialRiverFragment = projectRiverFragment ?? location.hash;", arrival)
+        self.assertIn("let river = Arrival.arrive(initialRiverFragment);", arrival)
+        self.assertIn('Arrival.modeOf(initialRiverFragment) === "free"', arrival)
+        self.assertIn("const initialCommittedUrl = new URL(projectRiverUrl ?? location.href);", arrival)
+        self.assertIn("initialCommittedUrl.hash = projectRiverFragment", arrival)
+        self.assertIn("initialRiverFragment,", self.script.split("let currentRememberedRiver", 1)[1])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
+    def test_project_reload_state_rejects_foreign_and_malformed_rivers(self) -> None:
+        body = self.script.split("function projectRiverUrlAtArrival() {", 1)[1].split("\n}", 1)[0]
+        probe = f"""
+const projectSectionAtArrival = true;
+globalThis.location = {{ href: "https://danse.pages.dev/watch?cutout=1#evidence" }};
+globalThis.history = {{ state: null }};
+let remembered = true;
+const projectSectionFor = (fragment) => fragment === "#evidence" ? "project-evidence" : null;
+const Arrival = {{
+  hasCitedSeed(fragment) {{
+    const value = new URLSearchParams(fragment.replace(/^#/, "")).get("s");
+    return value !== null && Number.isFinite(Number(value));
+  }},
+  hasSelfContainedRiver(fragment) {{
+    const query = new URLSearchParams(fragment.replace(/^#/, ""));
+    if (!this.hasCitedSeed(fragment)) return false;
+    return ["e", "t"].some((key) => {{
+      const value = query.get(key);
+      return value !== null && Number.isFinite(Number(value));
+    }});
+  }},
+  recall() {{ return remembered ? {{ seed: 1, epoch: 2 }} : null; }},
+}};
+function projectRiverUrlAtArrival() {{{body}\n}}
+const cases = [];
+const run = (value, keep = true) => {{
+  remembered = keep;
+  history.state = {{ danseRiverUrl: value }};
+  return projectRiverUrlAtArrival();
+}};
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&u=7&p=free"));
+cases.push(run("https://evil.example/watch#s=42&e=1000"));
+cases.push(run("https://danse.pages.dev/other#s=42&e=1000"));
+cases.push(run("https://danse.pages.dev/watch#evidence"));
+cases.push(run("not a url"));
+cases.push(run("https://user:secret@danse.pages.dev/watch?cutout=1#s=42&e=1000"));
+cases.push(run("https://danse.pages.dev/watch?cutout=0#s=42&e=1000"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#t=30", true));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#t=30", false));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=-1"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=not-a-time"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=not-a-seed&t=30"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=&e=1000"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=+++"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&u=+++"));
+console.log(JSON.stringify(cases));
+"""
+        completed = subprocess.run(
+            ["node", "--input-type=module", "--eval", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        values = json.loads(completed.stdout)
+        self.assertEqual(
+            values,
+            [
+                "https://danse.pages.dev/watch?cutout=1#s=42&e=1000&u=7&p=free",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+        )
+
+    def test_undo_overlays_latest_controls_onto_the_restored_river_identity(self) -> None:
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        query = self.script.split("function withCurrentQuery(url) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            "const restoredUrl = withCurrentQuery(previousRiverUrl ?? riverHref(river));",
+            undo_river,
+        )
+        self.assertIn("destination.search = new URL(currentRiverUrl).search;", query)
+        self.assertLess(
+            undo_river.index("const restoredUrl = withCurrentQuery"),
+            undo_river.index("Arrival.withMode(restoredUrl"),
+        )
+
+    def test_undo_never_installs_a_closed_project_fragment(self) -> None:
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        project_branch = undo_river.split(
+            "projectSectionFor(new URL(restoredUrl).hash)", 1
+        )[1].split(": Arrival.withMode", 1)[0]
+        self.assertIn(
+            'riverHref(river, { mode: program ? null : "free" })',
+            project_branch,
+        )
+        self.assertNotIn("? restoredUrl", undo_river)
+        self.assertIn("commitRiverUrl(", undo_river)
 
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
@@ -2006,13 +2432,13 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
         self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
-        self.assertIn("previousRiverWasRemembered = !river.shifted && Boolean(remembered)", self.script)
-        self.assertIn("if (previousRiverWasRemembered) Arrival.remember(river)", self.script)
+        self.assertIn("let currentRememberedRiver = Arrival.rememberedRiverForUndo", self.script)
+        self.assertIn("if (previousRememberedRiver) Arrival.remember(previousRememberedRiver)", self.script)
         self.assertIn("const programIntent = ++programGeneration", self.script)
         self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
         self.assertIn("if (generation !== programGeneration) return false", self.script)
         self.assertIn('value: program ? "score-led" : "free"', self.script)
-        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        handler = self.script.split('addEventListener("hashchange", async (event) => {', 1)[1].split("/** Wind this river", 1)[0]
         self.assertIn("if (programIntent === programGeneration) {", handler)
         self.assertLess(
             handler.index("if (programIntent === programGeneration) {", handler.index("river = nextRiver;")),
@@ -2041,7 +2467,7 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("const sharedRiver = river;", share)
         self.assertIn("if (river !== sharedRiver) return false;", share)
         self.assertIn("sharePresentationState(controlBus.getState())", share)
-        self.assertIn("sharePresentationUrl(Arrival.href(sharedRiver), presentation)", share)
+        self.assertIn("sharePresentationUrl(riverHref(sharedRiver), presentation)", share)
         self.assertNotIn("location.href", share)
 
     def test_slow_replay_receipt_cannot_replace_a_later_presence_choice(self) -> None:
