@@ -58,6 +58,27 @@ def resolve_executable(path: Path, label: str) -> Path:
     return resolved
 
 
+def require_safe_output(path: Path) -> Path:
+    """Require in-repository output to live under a Git-ignored path."""
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(ROOT.resolve())
+    except ValueError:
+        return resolved
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", relative.as_posix().rstrip("/") + "/"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ignored.returncode == 0:
+        return resolved
+    if ignored.returncode == 1:
+        raise ValueError("portable audio --out inside the repository must be Git-ignored")
+    raise ValueError("cannot verify portable audio output ignore status")
+
+
 def repository_head() -> str:
     """Bind the portable wrapper and its contracts to one exact source tree."""
     head = subprocess.run(
@@ -275,6 +296,7 @@ def main() -> int:
             raise ValueError("fluidsynth and ffmpeg are required")
         args.fluidsynth = resolve_executable(args.fluidsynth, "FluidSynth")
         args.ffmpeg = resolve_executable(args.ffmpeg, "ffmpeg")
+        args.out = require_safe_output(args.out)
 
         score = document(score_path, "danse.music.score.v1")
         adaptation = document(adaptation_path, "danse.music.adaptation.v1")
