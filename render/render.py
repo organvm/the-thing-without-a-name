@@ -52,6 +52,7 @@ from browser import (  # noqa: E402
     CANONICAL_RENDER_CONTEXT,
     EMERGENCY_SOFTWARE_CAPTURE_CONTEXT,
     browser,
+    renderer_matches_context,
     serve,
 )
 from choreography import validate as validate_choreography  # noqa: E402
@@ -400,9 +401,8 @@ def segment_identity(args, segment: int, frames: int) -> dict:
             "seconds": timing_score["duration_seconds"],
         }
     render_context = browser_render_context(args)
+    payload["inputs"]["browser_render_context"] = render_context
     if render_context != CANONICAL_RENDER_CONTEXT:
-        # A deadline SwiftShader segment must never satisfy canonical --resume.
-        payload["inputs"]["browser_render_context"] = render_context
         payload["inputs"].update(emergency_source_identity(args) or {})
     return payload
 
@@ -411,8 +411,13 @@ def output_stem(args) -> Path:
     """Keep canonical A/B producers disjoint without renaming legacy delivery output."""
     stem_seed = args.seed if args.seed is not None else "default"
     stream_suffix = f"-stream-{args.stream}" if args.stream else ""
+    renderer_suffix = (
+        "-emergency-swiftshader"
+        if browser_render_context(args) == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT
+        else ""
+    )
     control_suffix = "-control" if timing_score_identity(args) else ""
-    return args.out / f"{args.window}-{stem_seed}{stream_suffix}{control_suffix}"
+    return args.out / f"{args.window}-{stem_seed}{stream_suffix}{renderer_suffix}{control_suffix}"
 
 
 def segment_receipt_path(dest: Path) -> Path:
@@ -550,9 +555,10 @@ def write_segment_receipt(
             }
         except KeyError as exc:
             raise SystemExit(f"renderer capture result is incomplete: {exc.args[0]}") from exc
+        render_context = payload["inputs"]["browser_render_context"]
         if (
             not isinstance(capture_receipt["renderer"], str)
-            or not capture_receipt["renderer"]
+            or not renderer_matches_context(capture_receipt["renderer"], render_context)
             or not isinstance(capture_receipt["raw_rgba_sha256"], str)
             or len(capture_receipt["raw_rgba_sha256"]) != 64
             or any(character not in "0123456789abcdef" for character in capture_receipt["raw_rgba_sha256"])
@@ -884,10 +890,11 @@ def complete(dest: Path, want: int, expected: dict) -> bool:
     if receipt.get("file_sha256") != file_sha256(dest):
         return False
     capture = receipt.get("capture")
-    if capture is not None and (
+    render_context = expected["inputs"].get("browser_render_context")
+    if (
         not isinstance(capture, dict)
         or not isinstance(capture.get("renderer"), str)
-        or not capture.get("renderer")
+        or not renderer_matches_context(capture.get("renderer", ""), render_context)
         or not isinstance(capture.get("raw_rgba_sha256"), str)
         or len(capture["raw_rgba_sha256"]) != 64
         or any(character not in "0123456789abcdef" for character in capture["raw_rgba_sha256"])
@@ -953,13 +960,18 @@ def concat_receipt_path(dest: Path) -> Path:
 
 
 def concat_identity(args, parts: list[Path]) -> dict:
-    return {
+    render_context = browser_render_context(args)
+    payload = {
         "schema": "danse.render.concat.v1",
         "codec": args.codec,
+        "browser_render_context": render_context,
         "segments": [
             {"name": part.name, "receipt_sha256": file_sha256(segment_receipt_path(part))} for part in parts
         ],
     }
+    if render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
+        payload["emergency_source_identity"] = emergency_source_identity(args)
+    return payload
 
 
 def planned_frame_count(parts: list[Path]) -> int:
