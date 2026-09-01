@@ -1,7 +1,37 @@
 import { CATEGORIES } from "./state.js";
 
+const PUBLIC_CREDIT =
+  "Performance and primary choreography — Madison Garber. " +
+  "Concept, direction, additional choreography, photography, editing, sound, software, archive, and production — Anthony J. Padavano. " +
+  "Music — Léo Delibes; source arrangements — Paul De Bra (CC BY 4.0).";
+
+function insertCreditAfter(doc, anchorId, creditId) {
+  if (
+    typeof doc?.getElementById !== "function" ||
+    typeof doc?.createElement !== "function" ||
+    doc.getElementById(creditId)
+  ) return;
+  const anchor = doc.getElementById(anchorId);
+  if (!anchor) return;
+  const credit = doc.createElement("p");
+  credit.id = creditId;
+  credit.className = "project-credit";
+  credit.textContent = PUBLIC_CREDIT;
+  if (typeof anchor.insertAdjacentElement === "function") {
+    anchor.insertAdjacentElement("afterend", credit);
+  } else if (anchor.parentNode && typeof anchor.parentNode.insertBefore === "function") {
+    anchor.parentNode.insertBefore(credit, anchor.nextSibling ?? null);
+  }
+}
+
+function renderPublicCredits(doc) {
+  insertCreditAfter(doc, "intro-behavior", "intro-project-credit");
+  insertCreditAfter(doc, "project-map-status", "project-map-credit");
+}
+
 export function renderControlSurface(root, state) {
   const doc = root.ownerDocument ?? document;
+  renderPublicCredits(doc);
   for (const category of CATEGORIES) {
     const button = root.querySelector(`[data-category="${category}"]`);
     if (!button) continue;
@@ -48,6 +78,7 @@ export function renderProjectMap(list, status, map) {
   if (!map || map.schema !== "danse.map.v1" || !Array.isArray(map.nodes)) throw new TypeError("invalid danse.map.v1 record");
   list.replaceChildren();
   const doc = list.ownerDocument ?? document;
+  renderPublicCredits(doc);
   for (const node of map.nodes) {
     const item = doc.createElement("li");
     const available = node.status === "admitted" && typeof node.href === "string";
