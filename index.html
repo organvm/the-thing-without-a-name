@@ -362,13 +362,12 @@ function projectRiverUrlAtArrival() {
   if (candidate.username || candidate.password || candidate.search !== visible.search) return null;
   if (candidate.origin !== visible.origin || candidate.pathname !== visible.pathname) return null;
   if (!candidate.hash || projectSectionFor(candidate.hash)) return null;
-  if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
   const values = new URLSearchParams(candidate.hash.slice(1));
   const citedTime = Number(values.get("t"));
+  if (values.has("t") && (!Number.isFinite(citedTime) || citedTime < 0)) return null;
+  if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
   return values.has("t")
-    && Number.isFinite(citedTime)
-    && citedTime >= 0
-    && !Arrival.hasCitedSeed(candidate.hash)
+    && !values.has("s")
     && Arrival.recall()
     ? candidate.href
     : null;
@@ -442,7 +441,7 @@ function durableCurrentRiverUrl() {
     values.has("t")
     && Number.isFinite(citedTime)
     && citedTime >= 0
-    && !Arrival.hasCitedSeed(candidate.hash)
+    && !values.has("s")
     && durableRememberedRiver
   ) return candidate.href;
   return riverHref(river, { mode: program ? null : "free" });

@@ -2364,6 +2364,9 @@ cases.push(run("https://user:secret@danse.pages.dev/watch?cutout=1#s=42&e=1000")
 cases.push(run("https://danse.pages.dev/watch?cutout=0#s=42&e=1000"));
 cases.push(run("https://danse.pages.dev/watch?cutout=1#t=30", true));
 cases.push(run("https://danse.pages.dev/watch?cutout=1#t=30", false));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=-1"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=not-a-time"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=not-a-seed&t=30"));
 console.log(JSON.stringify(cases));
 """
         completed = subprocess.run(
@@ -2385,6 +2388,9 @@ console.log(JSON.stringify(cases));
                 None,
                 None,
                 "https://danse.pages.dev/watch?cutout=1#t=30",
+                None,
+                None,
+                None,
                 None,
             ],
         )
