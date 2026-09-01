@@ -22,14 +22,25 @@ async function test(name, run) {
 }
 
 await test("legacy Project fragments resolve narrowly and fail closed", () => {
-  assert.equal(projectSectionFor("#evidence"), "project-evidence");
+  const published = new Map([
+    ["content", "project-artwork"],
+    ["artwork", "project-artwork"],
+    ["film", "project-film"],
+    ["ballet-score", "project-film"],
+    ["status", "project-status"],
+    ["readings", "project-readings"],
+    ["cubism", "project-readings"],
+    ["glitch", "project-readings"],
+    ["evidence", "project-evidence"],
+    ["access", "project-artwork"],
+    ["resources", "project-evidence"],
+    ["installation-contract", "project-evidence"],
+  ]);
+  for (const [fragment, section] of published) {
+    assert.equal(projectSectionFor(`#${fragment}`), section, fragment);
+  }
   assert.equal(projectSectionFor("#content"), "project-artwork");
   assert.equal(projectSectionFor("#%65VIDENCE"), "project-evidence");
-  assert.equal(projectSectionFor("#ballet-score"), "project-film");
-  assert.equal(projectSectionFor("#cubism"), "project-readings");
-  assert.equal(projectSectionFor("#access"), "project-artwork");
-  assert.equal(projectSectionFor("#resources"), "project-evidence");
-  assert.equal(projectSectionFor("#installation-contract"), "project-evidence");
   assert.equal(projectSectionFor("#%52ESOURCES"), "project-evidence");
   for (const fragment of [
     "",

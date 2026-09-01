@@ -498,7 +498,7 @@ ARRIVAL = APP / "arrival.js"
 # and can be held to the same standard as the engine.
 ARRIVAL_PROBE = """
 import { readFileSync } from "node:fs";
-import { arrive, href, mint, modeOf, now, platform, recall, remember, rememberedRiverForUndo, riverOf, streamOf } from "%(arrival)s";
+import { arrive, hasCitedSeed, hasSelfContainedRiver, href, mint, modeOf, now, platform, recall, remember, rememberedRiverForUndo, riverOf, streamOf, withMode } from "%(arrival)s";
 import { passageAt } from "%(program)s";
 import { state } from "%(clock)s";
 
@@ -549,6 +549,93 @@ const tOnlyUndoDurable =
   rememberedRiverForUndo(tOnly, "#s=1&t=30", backing) === null &&
   rememberedRiverForUndo(tOnly, "#s=not-a-seed&t=30", backing) === backing &&
   rememberedRiverForUndo({...tOnly, seed: tOnly.seed + 1}, "#t=30", backing) === null;
+
+const rememberedMatrix = [
+  ["bare/recalled", backing, "", backing, backing],
+  ["s-only/recalled", backing, "#s=270544960", backing, backing],
+  ["wrong epoch", {...backing, epoch: backing.epoch + 1}, "", backing, null],
+  ["t-only", tOnly, "#t=30", backing, backing],
+  ["cited s+t", tOnly, "#s=270544960&t=30", backing, null],
+  ["malformed s+t", tOnly, "#s=not-a-seed&t=30", backing, backing],
+  ["Project without carried provenance", tOnly, "#evidence", backing, null],
+  ["foreign river", {...tOnly, stream: tOnly.stream + 1}, "#t=30", backing, null],
+  ["no remembered river", tOnly, "#t=30", null, null],
+];
+const rememberedMatrixPasses = rememberedMatrix.every(
+  ([, candidate, fragment, storedRiver, expected]) =>
+    rememberedRiverForUndo(candidate, fragment, storedRiver) === expected,
+);
+
+// A Project-only hash navigation keeps the already-proven backing in UI state.
+// After New/Undo restores that stored value, reloading the Project fragment must
+// still open the pre-mint river rather than the minted replacement.
+const backingAcrossProject = rememberedRiverForUndo(tOnly, "#t=30", backing);
+NEXT = 0xaabbccdd;
+mint();
+if (backingAcrossProject) remember(backingAcrossProject);
+const projectReload = arrive("#evidence");
+const projectUndoDurable =
+  backingAcrossProject === backing &&
+  projectReload.seed === backing.seed &&
+  projectReload.stream === backing.stream &&
+  projectReload.epoch === backing.epoch &&
+  !projectReload.shifted;
+
+// A cited/shared river is self-contained even after a Project-only fragment
+// temporarily hides its hash. Preserve that old cited URL for Undo/reload.
+const foreignFragment = "#s=324508639&t=30&u=610839776";
+const foreign = arrive(foreignFragment);
+NEXT = 0x13579bdf;
+mint();
+const foreignReload = arrive(foreignFragment);
+const foreignProjectDurable =
+  hasCitedSeed(foreignFragment) &&
+  hasSelfContainedRiver(foreignFragment) &&
+  hasSelfContainedRiver("#s=42&e=1780000000000") &&
+  !hasSelfContainedRiver("#s=42") &&
+  !hasSelfContainedRiver("#s=42&e=not-an-epoch") &&
+  !hasCitedSeed("#s=not-a-seed&t=30") &&
+  !hasCitedSeed("#evidence") &&
+  foreignReload.seed === foreign.seed &&
+  foreignReload.stream === foreign.stream &&
+  Math.abs(now(foreignReload) - 30) < 1e-9;
+
+// An s-only URL names a seed but not a stable epoch. Once Project navigation
+// hides it, Undo must synthesize an s+e URL from the live river rather than
+// reusing the incomplete old fragment.
+const sOnly = arrive("#s=42");
+const sOnlyExplicit = href(sOnly);
+NEXT = 0x2468ace0;
+mint();
+const sOnlyReload = arrive(sOnlyExplicit.split("#")[1]);
+const sOnlyProjectDurable =
+  !hasSelfContainedRiver("#s=42") &&
+  sOnlyReload.seed === sOnly.seed &&
+  sOnlyReload.stream === sOnly.stream &&
+  sOnlyReload.epoch === sOnly.epoch;
+
+const restoredScoreUrl = withMode(
+  "https://danse.pages.dev/#s=42&t=30&u=7&p=free",
+  "program",
+);
+const restoredFreeUrl = withMode(restoredScoreUrl, "free");
+const undoModeDurable =
+  modeOf(restoredScoreUrl.split("#")[1]) === "program" &&
+  modeOf(restoredFreeUrl.split("#")[1]) === "free" &&
+  new URLSearchParams(restoredFreeUrl.split("#")[1]).get("t") === "30";
+
+// A carried backing is a claim about current local storage, not a lease. If
+// another tab changes storage, reject the stale carry and use an explicit href.
+remember(backing);
+const carriedBeforeStorageChange = rememberedRiverForUndo(tOnly, "#t=30", recall());
+remember({seed: 9, stream: 10, epoch: 11});
+const staleCarry = rememberedRiverForUndo(carriedBeforeStorageChange, "", recall());
+const explicitReload = arrive(href(tOnly).split("#")[1]);
+const staleBackingRejected =
+  staleCarry === null &&
+  explicitReload.seed === tOnly.seed &&
+  explicitReload.stream === tOnly.stream &&
+  explicitReload.epoch === tOnly.epoch;
 
 // ── a named river ─────────────────────────────────────────────────────────────
 // `#name=` is the cheap slice of "put yourself into it": the seed comes from
@@ -640,7 +727,9 @@ const aged = passageAt(program, decade.seed, now(decade));
 const agedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
 console.log(JSON.stringify({
-  links, tOnlyUndoDurable, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
+  links, tOnlyUndoDurable, rememberedMatrixPasses, projectUndoDurable, foreignProjectDurable,
+  sOnlyProjectDurable, undoModeDurable,
+  staleBackingRejected, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
   visitors: V, distinct, disambiguated, backwards, rewound, synced, agedMs,
   agedPassage: aged.index, samples: 2001,
 }));
@@ -683,6 +772,36 @@ def check_arrival() -> None:
         "a t-only undo restores its recalled backing river",
         r["tOnlyUndoDurable"],
         "undo/reload preserves seed, stream, and the 30-second shifted position",
+    )
+    check(
+        "remembered-river provenance covers every fragment class",
+        r["rememberedMatrixPasses"],
+        "bare, s-only, t-only, cited, malformed, Project-only, foreign, and absent storage",
+    )
+    check(
+        "Project navigation retains a t-only river's proven backing",
+        r["projectUndoDurable"],
+        "Project enter → New → Undo → reload returns to the pre-mint backing river",
+    )
+    check(
+        "Project navigation retains a foreign cited river's explicit address",
+        r["foreignProjectDurable"],
+        "cited s+t+u survives Project enter → New → Undo → reload without local storage",
+    )
+    check(
+        "Project navigation canonicalizes an s-only river",
+        r["sOnlyProjectDurable"],
+        "s-only enter → Project → New → Undo → reload preserves the synthesized epoch",
+    )
+    check(
+        "Undo reconciles a shifted River URL with the current program mode",
+        r["undoModeDurable"],
+        "t-only/free → New → score-led → Undo removes stale p=free without changing t",
+    )
+    check(
+        "a cross-tab storage change invalidates carried backing",
+        r["staleBackingRejected"],
+        "stale carry is rejected and an explicit synthesized href remains reloadable",
     )
     check("arrival is deterministic in its inputs", r["deterministic"], "same draw and epoch, same river")
     check(

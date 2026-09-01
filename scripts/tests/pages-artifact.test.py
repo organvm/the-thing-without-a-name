@@ -1987,7 +1987,7 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;', helper)
 
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
-        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        handler = self.script.split('addEventListener("hashchange", async (event) => {', 1)[1].split("/** Wind this river", 1)[0]
         self.assertIn("previousRiver = null;", handler)
         self.assertIn("previousRememberedRiver = null;", handler)
         self.assertIn('el("river-undo").disabled = true;', handler)
@@ -2002,16 +2002,28 @@ class InterfaceContractTest(unittest.TestCase):
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
         undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
         hash_navigation = self.script.split(
-            'addEventListener("hashchange", async () => {', 1
+            'addEventListener("hashchange", async (event) => {', 1
         )[1].split("/** Wind this river", 1)[0]
         self.assertIn("let previousRiverUrl = null;", self.script)
-        self.assertIn("previousRiverUrl = shifted ? location.href : null;", new_river)
+        self.assertIn("const projectFragment = Boolean(projectSectionFor(location.hash));", new_river)
+        self.assertIn("const freshRememberedRiver = currentRememberedRiver", new_river)
+        self.assertIn('Arrival.rememberedRiverForUndo(currentRememberedRiver, "", recalled)', new_river)
+        self.assertIn("const carriedCitedUrl = projectReturnRiverUrl", new_river)
+        self.assertIn("previousRiverUrl = projectFragment && freshRememberedRiver", new_river)
+        self.assertIn(": Arrival.href(river, { mode: program ? null : \"free\" });", new_river)
         self.assertIn(
-            'if (shifted && previousRiverUrl) history.replaceState(null, "", previousRiverUrl);',
+            "const restoredUrl = previousRiverUrl ?? Arrival.href(river);",
             undo_river,
         )
+        self.assertIn("Arrival.withMode(restoredUrl, program ? null : \"free\")", undo_river)
         self.assertIn("previousRiverUrl = null;", undo_river)
         self.assertIn("previousRiverUrl = null;", hash_navigation)
+        self.assertIn("previousRememberedRiver = freshRememberedRiver;", new_river)
+        self.assertIn("currentRememberedRiver = river;", new_river)
+        self.assertIn("currentRememberedRiver = previousRememberedRiver;", undo_river)
+        project_navigation = hash_navigation.split("const generation =", 1)[0]
+        self.assertNotIn("currentRememberedRiver =", project_navigation)
+        self.assertIn("currentRememberedRiver = Arrival.rememberedRiverForUndo", hash_navigation)
 
     def test_legacy_project_fragments_open_the_moved_live_section(self) -> None:
         redirect = (ROOT / "404.html").read_text(encoding="utf-8")
@@ -2083,7 +2095,7 @@ console.log(JSON.stringify(result.value));
 
     def test_new_river_replaces_a_legacy_project_fragment_immediately(self) -> None:
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
-        capture = "const replacesProjectFragment = Boolean(projectSectionFor(location.hash));"
+        capture = "const projectFragment = Boolean(projectSectionFor(location.hash));"
         replacement = (
             'history.replaceState(null, "", Arrival.href(river, '
             '{ mode: program ? null : "free" }));'
@@ -2093,6 +2105,42 @@ console.log(JSON.stringify(result.value));
         self.assertLess(new_river.index(capture), new_river.index("Arrival.mint()"))
         self.assertLess(new_river.index("Arrival.mint()"), new_river.index(replacement))
 
+    def test_project_back_forward_unmasks_river_and_urls_are_immediate(self) -> None:
+        hash_navigation = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        close = "if (projectMap.open) controlBus?.actions.close();"
+        self.assertIn(close, hash_navigation)
+        self.assertLess(hash_navigation.index(close), hash_navigation.index("Arrival.arrive(fragment)"))
+        canonical = 'history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));'
+        self.assertIn(canonical, new_river)
+        self.assertLess(new_river.index("Arrival.mint()"), new_river.index(canonical))
+        self.assertIn("history.replaceState(", undo_river)
+        self.assertIn(
+            "const restoredUrl = previousRiverUrl ?? Arrival.href(river);",
+            undo_river,
+        )
+        self.assertIn("projectSectionFor(new URL(restoredUrl).hash)", undo_river)
+        self.assertIn("Arrival.withMode(restoredUrl, program ? null : \"free\")", undo_river)
+
+    def test_project_navigation_preserves_self_contained_rivers_and_defers_impurity(self) -> None:
+        handler = self.script.split(
+            'addEventListener("hashchange", async (event) => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("let projectReturnRiverUrl = null;", self.script)
+        self.assertIn("const oldFragment = new URL(event.oldURL).hash;", handler)
+        self.assertIn("if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = event.oldURL;", handler)
+        self.assertIn("Arrival.hasSelfContainedRiver(new URL(projectReturnRiverUrl).hash)", new_river)
+        self.assertIn("projectFragment && carriedCitedUrl", new_river)
+        self.assertIn(": Arrival.href(river, { mode: program ? null : \"free\" });", new_river)
+        self.assertIn("const fragment = location.hash;", handler)
+        self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
+        self.assertLess(handler.index("if (generation !== navigationGeneration) return;"), handler.index("Arrival.arrive(fragment)"))
+        self.assertLess(handler.index("Arrival.arrive(fragment)"), handler.index("river = nextRiver;"))
+
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
         self.assertIn('playback === "running"', handler)
@@ -2101,13 +2149,13 @@ console.log(JSON.stringify(result.value));
 
     def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
         self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
-        self.assertIn("previousRememberedRiver = Arrival.rememberedRiverForUndo", self.script)
+        self.assertIn("let currentRememberedRiver = Arrival.rememberedRiverForUndo", self.script)
         self.assertIn("if (previousRememberedRiver) Arrival.remember(previousRememberedRiver)", self.script)
         self.assertIn("const programIntent = ++programGeneration", self.script)
         self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
         self.assertIn("if (generation !== programGeneration) return false", self.script)
         self.assertIn('value: program ? "score-led" : "free"', self.script)
-        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        handler = self.script.split('addEventListener("hashchange", async (event) => {', 1)[1].split("/** Wind this river", 1)[0]
         self.assertIn("if (programIntent === programGeneration) {", handler)
         self.assertLess(
             handler.index("if (programIntent === programGeneration) {", handler.index("river = nextRiver;")),

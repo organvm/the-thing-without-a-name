@@ -362,6 +362,7 @@ const musicalScore = scoreUrl
 let navigationGeneration = 0;
 let programGeneration = 0;
 let previousRiverUrl = null;
+let projectReturnRiverUrl = null;
 
 const canvas = document.getElementById("stage");
 const el = (id) => document.getElementById(id);
@@ -373,6 +374,11 @@ const tray = document.getElementById("surface-tray");
 const projectMap = document.getElementById("project-map");
 let previousRiver = null;
 let previousRememberedRiver = null;
+let currentRememberedRiver = Arrival.rememberedRiverForUndo(
+  river,
+  location.hash,
+  Arrival.recall(),
+);
 let controlBus = null;
 let presenceOperationGeneration = 0;
 
@@ -552,9 +558,11 @@ setInterval(() => {
 // so without this the link would silently do nothing, which is the one way a
 // shared river can fail while looking like it worked. `replaceState` above does
 // not fire this event, so the page cannot chase its own tail.
-addEventListener("hashchange", async () => {
+addEventListener("hashchange", async (event) => {
   const projectSection = projectSectionFor(location.hash);
   if (projectSection) {
+    const oldFragment = new URL(event.oldURL).hash;
+    if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = event.oldURL;
     navigationGeneration += 1;
     programGeneration += 1;
     previousRiver = null;
@@ -564,10 +572,11 @@ addEventListener("hashchange", async () => {
     await openProjectSection(projectSection);
     return;
   }
+  if (projectMap.open) controlBus?.actions.close();
   const generation = ++navigationGeneration;
   const programIntent = ++programGeneration;
-  const nextRiver = Arrival.arrive(location.hash);
-  const mode = Arrival.modeOf(location.hash);
+  const fragment = location.hash;
+  const mode = Arrival.modeOf(fragment);
   if (mode === "free") program = null;
   else if (!program) {
     const loaded = await Program.load();
@@ -575,7 +584,14 @@ addEventListener("hashchange", async () => {
     if (programIntent === programGeneration) program = loaded;
   }
   if (generation !== navigationGeneration) return;
+  const nextRiver = Arrival.arrive(fragment);
   river = nextRiver;
+  currentRememberedRiver = Arrival.rememberedRiverForUndo(
+    nextRiver,
+    fragment,
+    Arrival.recall(),
+  );
+  projectReturnRiverUrl = null;
   previousRiver = null;
   previousRiverUrl = null;
   previousRememberedRiver = null;
@@ -801,16 +817,29 @@ function toggleHold() {
 
 function newRiver() {
   navigationGeneration += 1;
-  const replacesProjectFragment = Boolean(projectSectionFor(location.hash));
+  const projectFragment = Boolean(projectSectionFor(location.hash));
+  const recalled = Arrival.recall();
+  const freshRememberedRiver = currentRememberedRiver
+    ? Arrival.rememberedRiverForUndo(currentRememberedRiver, "", recalled)
+    : null;
+  const carriedCitedUrl = projectReturnRiverUrl
+    && Arrival.hasSelfContainedRiver(new URL(projectReturnRiverUrl).hash)
+    ? projectReturnRiverUrl
+    : null;
   previousRiver = river;
-  previousRiverUrl = shifted ? location.href : null;
-  const remembered = Arrival.recall();
-  previousRememberedRiver = Arrival.rememberedRiverForUndo(river, location.hash, remembered);
+  previousRiverUrl = projectFragment && freshRememberedRiver
+    ? location.href
+    : projectFragment && carriedCitedUrl
+      ? carriedCitedUrl
+      : shifted && (freshRememberedRiver || Arrival.hasCitedSeed(location.hash))
+        ? location.href
+        : Arrival.href(river, { mode: program ? null : "free" });
+  previousRememberedRiver = freshRememberedRiver;
   river = { ...Arrival.mint(), minted: true, shifted: false };
+  currentRememberedRiver = river;
+  projectReturnRiverUrl = null;
   shifted = false;
-  if (replacesProjectFragment) {
-    history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
-  }
+  history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;
@@ -825,9 +854,17 @@ function undoRiver() {
   river = previousRiver;
   previousRiver = null;
   if (previousRememberedRiver) Arrival.remember(previousRememberedRiver);
+  currentRememberedRiver = previousRememberedRiver;
   previousRememberedRiver = null;
   shifted = Boolean(river.shifted);
-  if (shifted && previousRiverUrl) history.replaceState(null, "", previousRiverUrl);
+  const restoredUrl = previousRiverUrl ?? Arrival.href(river);
+  history.replaceState(
+    null,
+    "",
+    projectSectionFor(new URL(restoredUrl).hash)
+      ? restoredUrl
+      : Arrival.withMode(restoredUrl, program ? null : "free"),
+  );
   previousRiverUrl = null;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;

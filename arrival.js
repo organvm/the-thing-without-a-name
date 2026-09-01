@@ -128,6 +128,23 @@ export function remember(river) {
   }
 }
 
+/** Whether a fragment carries its own finite river seed. */
+export function hasCitedSeed(fragment = "") {
+  const query = new URLSearchParams(String(fragment ?? "").replace(/^#/, ""));
+  const rawSeed = query.get("s");
+  return rawSeed !== null && Number.isFinite(Number(rawSeed));
+}
+
+/** Whether a fragment can reconstruct both river identity and time origin. */
+export function hasSelfContainedRiver(fragment = "") {
+  const query = new URLSearchParams(String(fragment ?? "").replace(/^#/, ""));
+  if (!hasCitedSeed(fragment)) return false;
+  return ["e", "t"].some((key) => {
+    const value = query.get(key);
+    return value !== null && Number.isFinite(Number(value));
+  });
+}
+
 /** Identify the durable local-storage river that Undo must restore.
  *
  * A `#t=`-only arrival shifts the recalled river's epoch, so object equality is
@@ -141,9 +158,7 @@ export function rememberedRiverForUndo(river, fragment, remembered) {
   }
   if (!river.shifted) return river.epoch === remembered.epoch ? remembered : null;
   const query = new URLSearchParams(String(fragment ?? "").replace(/^#/, ""));
-  const rawSeed = query.get("s");
-  const hasCitedSeed = rawSeed !== null && Number.isFinite(Number(rawSeed));
-  return query.has("t") && !hasCitedSeed ? remembered : null;
+  return query.has("t") && !hasCitedSeed(fragment) ? remembered : null;
 }
 
 /** How far into a river we are, right now. */
@@ -217,6 +232,15 @@ export function href(river, { at = null, mode = null } = {}) {
     ? `${base}#s=${river.seed}&e=${river.epoch}&u=${river.stream ?? 0}`
     : `${base}#s=${river.seed}&t=${String(at)}&u=${river.stream ?? 0}`;
   return mode === "free" ? `${link}&p=free` : link;
+}
+
+/** Rewrite only the program mode carried by a self-contained River URL. */
+export function withMode(url, mode = null) {
+  const [base, fragment = ""] = String(url).split("#", 2);
+  const query = new URLSearchParams(fragment);
+  if (mode === "free") query.set("p", "free");
+  else query.delete("p");
+  return `${base}#${query.toString()}`;
 }
 
 export function modeOf(fragment = globalThis.location?.hash ?? "") {

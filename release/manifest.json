@@ -242,7 +242,7 @@
       "status": "verified",
       "evidence": {
         "path": "scripts/check-danse.py",
-        "sha256": "fe7365f5826dc5ae559cf0845236f7d45c9e919400ae8089776f611278e25545",
+        "sha256": "28ab662049d9ce9dc9afdf3b7df0bbd717fa445b484f8f80b42546e003ba8c5f",
         "summary": "Executable invariant source bound by digest; the release receipt must record its passing run."
       }
     },
