@@ -643,6 +643,7 @@ def _parent_descriptor_under(
     relative: str,
     *,
     create_parents: bool,
+    durable_parents: bool = False,
 ) -> tuple[int, str] | None:
     """Open the target parent one component at a time without following links."""
 
@@ -659,19 +660,20 @@ def _parent_descriptor_under(
         raise AssetError("asset root cannot be opened safely") from exc
     try:
         for part in parts[:-1]:
+            created = False
             try:
                 child = os.open(part, directory_flags, dir_fd=current)
             except FileNotFoundError:
                 if not create_parents:
                     os.close(current)
                     return None
-                created = False
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=current)
                     created = True
                 except FileExistsError:
                     pass
                 child = os.open(part, directory_flags, dir_fd=current)
+            if create_parents or durable_parents:
                 try:
                     _fsync_asset_directory(current, "asset ancestor parent")
                     linked = os.stat(part, dir_fd=current, follow_symlinks=False)
@@ -1180,7 +1182,12 @@ def _remove_published_link(descriptor: int, name: str) -> None:
 
 
 def _fsync_verified_under(root: Path, relative: str, asset: Asset, label: str) -> None:
-    parent = _parent_descriptor_under(root, relative, create_parents=False)
+    parent = _parent_descriptor_under(
+        root,
+        relative,
+        create_parents=False,
+        durable_parents=True,
+    )
     if parent is None:
         raise AssetError(f"{label} disappeared before durable synchronization")
     descriptor, name = parent
@@ -1431,6 +1438,8 @@ def inspect(command: str, lock: Lock, root: Path) -> dict:
     final_targets = [
         _identity_proof_under(root, asset.target, asset) for asset in lock.assets
     ]
+    _assert_repository_binding(root, lock)
+    _assert_locked_tree(root, lock)
     if final_targets != first_targets:
         raise AssetError("asset target tree changed during completed verification")
     rows = [

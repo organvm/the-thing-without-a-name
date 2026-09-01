@@ -850,6 +850,39 @@ class AssetParityTest(unittest.TestCase):
             ASSETS.inspect("verify", lock, self.fixture.root)
         self.assertTrue(mutated)
 
+    def test_final_target_scan_rechecks_clean_checkout_binding(self) -> None:
+        lock = ASSETS.load_lock(self.fixture.lock)
+        asset = lock.assets[0]
+        target = self.fixture.root / asset.target
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.payload)
+        target.chmod(0o444)
+        real_identity = ASSETS._identity_proof_under
+        target_scans = 0
+
+        def dirty_checkout_after_final_target(root, relative, checked_asset):
+            nonlocal target_scans
+            proof = real_identity(root, relative, checked_asset)
+            if relative == asset.target:
+                target_scans += 1
+                if target_scans == 2:
+                    (self.fixture.root / "README.md").write_text(
+                        "concurrent tracked mutation\n",
+                        encoding="utf-8",
+                    )
+            return proof
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_identity_proof_under",
+                side_effect=dirty_checkout_after_final_target,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "tracked or staged changes"),
+        ):
+            ASSETS.inspect("verify", lock, self.fixture.root)
+        self.assertEqual(target_scans, 2)
+
     def test_receipts_are_immutable(self) -> None:
         self.assertEqual(
             ASSETS.main(
