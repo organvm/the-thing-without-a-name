@@ -2041,6 +2041,7 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("target?.focus({ preventScroll: true })", helper)
         self.assertIn("void openProjectSection();", self.script)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
     def test_legacy_project_redirect_executes_only_for_anchored_optional_prefixes(self) -> None:
         markup = (ROOT / "404.html").read_text(encoding="utf-8")
         script = markup.split("<script>", 1)[1].split("</script>", 1)[0]
@@ -2062,6 +2063,7 @@ console.log(JSON.stringify(result.value));
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=120,
             )
             return json.loads(completed.stdout)
 
@@ -2089,9 +2091,27 @@ console.log(JSON.stringify(result.value));
 
     def test_legacy_project_fragment_survives_the_river_url_updater(self) -> None:
         updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
-        guard = "if (shifted || projectSectionFor(location.hash)) return;"
+        guard = "if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;"
         self.assertIn(guard, updater)
         self.assertLess(updater.index(guard), updater.index("history.replaceState"))
+
+    def test_closing_project_immediately_restores_a_mode_complete_river_url(self) -> None:
+        close = self.script.split("function closeVisualSurfaces() {", 1)[1].split("\n}", 1)[0]
+        capture = (
+            "const closedProjectFragment = projectMap.open "
+            "&& Boolean(projectSectionFor(location.hash));"
+        )
+        canonical = (
+            'history.replaceState(null, "", Arrival.href(river, '
+            '{ mode: program ? null : "free" }));'
+        )
+        self.assertIn(capture, close)
+        self.assertIn("if (closedProjectFragment) {", close)
+        self.assertIn(canonical, close)
+        self.assertIn("projectReturnRiverUrl = null;", close)
+        self.assertLess(close.index(capture), close.index("projectMap.close()"))
+        self.assertLess(close.index("projectMap.close()"), close.index(canonical))
+        self.assertLess(close.index(canonical), close.index("projectReturnRiverUrl = null;"))
 
     def test_new_river_replaces_a_legacy_project_fragment_immediately(self) -> None:
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]

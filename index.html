@@ -549,7 +549,7 @@ requestAnimationFrame(frame);
 // lets the clock say where in it you are. While `shifted`, nothing is written at
 // all: a position reached for debugging must not overwrite the river you keep.
 setInterval(() => {
-  if (shifted || projectSectionFor(location.hash)) return;
+  if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;
   history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
 }, 1000);
 
@@ -970,8 +970,13 @@ async function setPresence(value) {
 }
 
 function closeVisualSurfaces() {
+  const closedProjectFragment = projectMap.open && Boolean(projectSectionFor(location.hash));
   if (projectMap.open) {
     projectMap.close();
+  }
+  if (closedProjectFragment) {
+    history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
+    projectReturnRiverUrl = null;
   }
   if (!hud.hidden) setHudVisible(false);
   const trigger = surfaceTrigger;
