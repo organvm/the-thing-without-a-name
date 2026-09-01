@@ -13,6 +13,7 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "interaction-test.html"
       - "index.html"
       - "verify.html"
       - "probe.html"
@@ -32,6 +33,7 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "interaction-test.html"
       - "index.html"
       - "verify.html"
       - "probe.html"
@@ -63,10 +65,12 @@ jobs:
           cache: pip
       - name: Install runtime
         run: python -m pip install '.[media]'
+      - name: Verify portable asset durability
+        run: python scripts/tests/assets.test.py
       - name: Require system Chrome and Apple Metal
         run: |
           test -d '/Applications/Google Chrome.app'
-          args=(--check --verify --arrival --probe)
+          args=(--check --verify --arrival --probe --interaction)
           if python render/browser.py --help | grep -q -- '--controls'; then
             args+=(--controls)
           fi
