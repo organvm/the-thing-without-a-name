@@ -70,7 +70,7 @@ can remember, repeat, and reveal.
   calibration, recovery, and restore gates are blocked.
 - Madison Garber is credited as performer and primary choreographer; Anthony J.
   Padavano is credited for concept, direction, additional choreography,
-  image-making, editing, sound, software, archive, and production. Performer
+  photography, editing, sound, software, archive, and production. Performer
   release, pictured-object review, music clearance, selected press stills, and
   several publication approvals remain governed by the draft rights and release
   records.
