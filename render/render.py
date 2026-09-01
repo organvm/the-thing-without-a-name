@@ -293,6 +293,80 @@ def browser_render_context(args) -> str:
     return CANONICAL_RENDER_CONTEXT
 
 
+def emergency_source_identity(args) -> dict[str, object] | None:
+    """Bind emergency receipts to clean Git sources and exact Chromium bytes."""
+    if browser_render_context(args) == CANONICAL_RENDER_CONTEXT:
+        return None
+    cached = getattr(args, "_emergency_source_identity", None)
+    if cached:
+        return cached
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode or status.stdout.strip():
+        raise SystemExit("emergency capture requires a clean tracked Git worktree")
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{tree}"],
+        cwd=APP,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if (
+        len(head) not in {40, 64}
+        or len(tree) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in head + tree)
+    ):
+        raise SystemExit("cannot bind emergency capture to an exact Git commit and tree")
+    executable_value = os.environ.get("DANSE_CHROME_EXECUTABLE")
+    if not executable_value:
+        raise SystemExit("emergency capture requires DANSE_CHROME_EXECUTABLE")
+    executable = Path(executable_value)
+    if executable.is_symlink():
+        raise SystemExit("emergency Chromium executable must not be a symlink")
+    try:
+        executable = executable.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit("emergency Chromium executable is missing") from exc
+    if not executable.is_file():
+        raise SystemExit("emergency Chromium executable is not a regular file")
+    version = subprocess.run(
+        [str(executable), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    version_line = (version.stdout or version.stderr).strip().splitlines()
+    if version.returncode or not version_line:
+        raise SystemExit("cannot identify emergency Chromium executable")
+    program = json.loads((APP / "render/program.json").read_text())
+    effective_seed = args.seed if args.seed is not None else program.get("seed")
+    identity: dict[str, object] = {
+        "repository_head": head,
+        "repository_tree": tree,
+        "effective_seed": effective_seed,
+        "browser_toolchain": {
+            "executable": str(executable),
+            "executable_sha256": file_sha256(executable),
+            "version": version_line[0],
+        },
+    }
+    args._emergency_source_identity = identity
+    return identity
+
+
 def segment_identity(args, segment: int, frames: int) -> dict:
     payload = {
         "schema": "danse.render.segment.v1",
@@ -329,6 +403,7 @@ def segment_identity(args, segment: int, frames: int) -> dict:
     if render_context != CANONICAL_RENDER_CONTEXT:
         # A deadline SwiftShader segment must never satisfy canonical --resume.
         payload["inputs"]["browser_render_context"] = render_context
+        payload["inputs"].update(emergency_source_identity(args) or {})
     return payload
 
 
