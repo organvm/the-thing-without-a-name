@@ -372,7 +372,7 @@ const dock = document.getElementById("danse-dock");
 const tray = document.getElementById("surface-tray");
 const projectMap = document.getElementById("project-map");
 let previousRiver = null;
-let previousRiverWasRemembered = false;
+let previousRememberedRiver = null;
 let controlBus = null;
 let presenceOperationGeneration = 0;
 
@@ -559,7 +559,7 @@ addEventListener("hashchange", async () => {
     programGeneration += 1;
     previousRiver = null;
     previousRiverUrl = null;
-    previousRiverWasRemembered = false;
+    previousRememberedRiver = null;
     el("river-undo").disabled = true;
     await openProjectSection(projectSection);
     return;
@@ -578,7 +578,7 @@ addEventListener("hashchange", async () => {
   river = nextRiver;
   previousRiver = null;
   previousRiverUrl = null;
-  previousRiverWasRemembered = false;
+  previousRememberedRiver = null;
   el("river-undo").disabled = true;
   el("river-receipt").textContent = `River ${hex(river.seed)} arrived from this link. Undo is unavailable.`;
   shifted = nextRiver.shifted;
@@ -804,10 +804,7 @@ function newRiver() {
   previousRiver = river;
   previousRiverUrl = shifted ? location.href : null;
   const remembered = Arrival.recall();
-  previousRiverWasRemembered = !river.shifted && Boolean(remembered)
-    && remembered.seed === river.seed
-    && remembered.stream === river.stream
-    && remembered.epoch === river.epoch;
+  previousRememberedRiver = Arrival.rememberedRiverForUndo(river, location.hash, remembered);
   river = { ...Arrival.mint(), minted: true, shifted: false };
   shifted = false;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
@@ -823,8 +820,8 @@ function undoRiver() {
   navigationGeneration += 1;
   river = previousRiver;
   previousRiver = null;
-  if (previousRiverWasRemembered) Arrival.remember(river);
-  previousRiverWasRemembered = false;
+  if (previousRememberedRiver) Arrival.remember(previousRememberedRiver);
+  previousRememberedRiver = null;
   shifted = Boolean(river.shifted);
   if (shifted && previousRiverUrl) history.replaceState(null, "", previousRiverUrl);
   previousRiverUrl = null;

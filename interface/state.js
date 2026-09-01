@@ -17,6 +17,9 @@ const PROJECT_FRAGMENT_SECTIONS = Object.freeze({
   cubism: "project-readings",
   glitch: "project-readings",
   evidence: "project-evidence",
+  access: "project-artwork",
+  resources: "project-evidence",
+  "installation-contract": "project-evidence",
 });
 
 /** Resolve only declared legacy Project fragments into the live dialog. */

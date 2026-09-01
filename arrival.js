@@ -128,6 +128,24 @@ export function remember(river) {
   }
 }
 
+/** Identify the durable local-storage river that Undo must restore.
+ *
+ * A `#t=`-only arrival shifts the recalled river's epoch, so object equality is
+ * intentionally insufficient: its seed and stream still identify the backing
+ * river that the fragment will shift again after reload. A cited `#s&t` river
+ * belongs to its sender and must never overwrite the visitor's stored river.
+ */
+export function rememberedRiverForUndo(river, fragment, remembered) {
+  if (!remembered || river.seed !== remembered.seed || river.stream !== remembered.stream) {
+    return null;
+  }
+  if (!river.shifted) return river.epoch === remembered.epoch ? remembered : null;
+  const query = new URLSearchParams(String(fragment ?? "").replace(/^#/, ""));
+  const rawSeed = query.get("s");
+  const hasCitedSeed = rawSeed !== null && Number.isFinite(Number(rawSeed));
+  return query.has("t") && !hasCitedSeed ? remembered : null;
+}
+
 /** How far into a river we are, right now. */
 export function now(river) {
   return (platform.now() - river.epoch) / 1000;

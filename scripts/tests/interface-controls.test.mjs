@@ -26,6 +26,10 @@ await test("legacy Project fragments resolve narrowly and fail closed", () => {
   assert.equal(projectSectionFor("#%65VIDENCE"), "project-evidence");
   assert.equal(projectSectionFor("#ballet-score"), "project-film");
   assert.equal(projectSectionFor("#cubism"), "project-readings");
+  assert.equal(projectSectionFor("#access"), "project-artwork");
+  assert.equal(projectSectionFor("#resources"), "project-evidence");
+  assert.equal(projectSectionFor("#installation-contract"), "project-evidence");
+  assert.equal(projectSectionFor("#%52ESOURCES"), "project-evidence");
   for (const fragment of [
     "",
     "#s=20170620&e=0",

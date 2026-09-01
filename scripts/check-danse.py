@@ -498,7 +498,7 @@ ARRIVAL = APP / "arrival.js"
 # and can be held to the same standard as the engine.
 ARRIVAL_PROBE = """
 import { readFileSync } from "node:fs";
-import { arrive, href, mint, modeOf, now, platform, riverOf, streamOf } from "%(arrival)s";
+import { arrive, href, mint, modeOf, now, platform, recall, remember, rememberedRiverForUndo, riverOf, streamOf } from "%(arrival)s";
 import { passageAt } from "%(program)s";
 import { state } from "%(clock)s";
 
@@ -508,6 +508,11 @@ let CLOCK = 1780000000000;
 let NEXT = 0;
 platform.now = () => CLOCK;
 platform.draw = () => NEXT;
+const stored = new Map();
+globalThis.localStorage = {
+  getItem: (key) => stored.get(key) ?? null,
+  setItem: (key, value) => stored.set(key, value),
+};
 
 // ── the precedence table, exactly as arrival.js documents it ──────────────────
 NEXT = 0xabcdef01;
@@ -526,6 +531,24 @@ const links =
   fresh.minted && fresh.seed === riverOf(0xabcdef01, CLOCK) &&
   citedFresh.stream === fresh.stream && citedSerialized === citedAt && Math.abs(now(citedFresh) - citedAt) < 1e-6 &&
   modeOf(href(fresh, {mode: "free"})) === "free";
+
+// ── a t-only undo restores the backing river, not just the visible URL ────────
+const backing = { seed: 0x10203040, stream: 0x50607080, epoch: CLOCK - 90000 };
+remember(backing);
+const tOnly = arrive("#t=30");
+const undoBacking = rememberedRiverForUndo(tOnly, "#t=30", recall());
+NEXT = 0x99887766;
+mint();
+if (undoBacking) remember(undoBacking);
+const tOnlyReloaded = arrive("#t=30");
+const tOnlyUndoDurable =
+  undoBacking?.epoch === backing.epoch &&
+  tOnlyReloaded.seed === tOnly.seed &&
+  tOnlyReloaded.stream === tOnly.stream &&
+  Math.abs(now(tOnlyReloaded) - 30) < 1e-9 &&
+  rememberedRiverForUndo(tOnly, "#s=1&t=30", backing) === null &&
+  rememberedRiverForUndo(tOnly, "#s=not-a-seed&t=30", backing) === backing &&
+  rememberedRiverForUndo({...tOnly, seed: tOnly.seed + 1}, "#t=30", backing) === null;
 
 // ── a named river ─────────────────────────────────────────────────────────────
 // `#name=` is the cheap slice of "put yourself into it": the seed comes from
@@ -617,7 +640,7 @@ const aged = passageAt(program, decade.seed, now(decade));
 const agedMs = Number(process.hrtime.bigint() - started) / 1e6;
 
 console.log(JSON.stringify({
-  links, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
+  links, tOnlyUndoDurable, named, deterministic, byDraw: byDraw.size, byEpoch: byEpoch.size, N,
   visitors: V, distinct, disambiguated, backwards, rewound, synced, agedMs,
   agedPassage: aged.index, samples: 2001,
 }));
@@ -656,6 +679,11 @@ def check_arrival() -> None:
         probe.unlink(missing_ok=True)
 
     check("a link resolves to the river it names", r["links"], "#s&e joins · #s&t cites · #s starts · bare mints")
+    check(
+        "a t-only undo restores its recalled backing river",
+        r["tOnlyUndoDurable"],
+        "undo/reload preserves seed, stream, and the 30-second shifted position",
+    )
     check("arrival is deterministic in its inputs", r["deterministic"], "same draw and epoch, same river")
     check(
         "a named river is yours, not the name's",

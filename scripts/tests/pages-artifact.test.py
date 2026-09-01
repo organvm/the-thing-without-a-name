@@ -1989,7 +1989,7 @@ class InterfaceContractTest(unittest.TestCase):
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
         handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
         self.assertIn("previousRiver = null;", handler)
-        self.assertIn("previousRiverWasRemembered = false;", handler)
+        self.assertIn("previousRememberedRiver = null;", handler)
         self.assertIn('el("river-undo").disabled = true;', handler)
 
     def test_river_actions_expire_pending_hash_navigation(self) -> None:
@@ -2016,7 +2016,7 @@ class InterfaceContractTest(unittest.TestCase):
     def test_legacy_project_fragments_open_the_moved_live_section(self) -> None:
         redirect = (ROOT / "404.html").read_text(encoding="utf-8")
         state = (ROOT / "interface/state.js").read_text(encoding="utf-8")
-        self.assertIn(r"/^\/project(?:\/index\.html)?\/?$/", redirect)
+        self.assertIn(r"/^\/(?:[A-Za-z0-9._~-]+\/)?project(?:\/index\.html)?\/?$/", redirect)
         self.assertIn("${location.search}${location.hash}", redirect)
         self.assertIn('evidence: "project-evidence"', state)
         self.assertIn('"ballet-score": "project-film"', state)
@@ -2028,6 +2028,52 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('target?.scrollIntoView({ block: "start" })', helper)
         self.assertIn("target?.focus({ preventScroll: true })", helper)
         self.assertIn("void openProjectSection();", self.script)
+
+    def test_legacy_project_redirect_executes_only_for_anchored_optional_prefixes(self) -> None:
+        markup = (ROOT / "404.html").read_text(encoding="utf-8")
+        script = markup.split("<script>", 1)[1].split("</script>", 1)[0]
+
+        def redirect(pathname: str, search: str = "?view=legacy", fragment: str = "#evidence") -> str | None:
+            probe = f"""
+const result = {{ value: null }};
+globalThis.location = {{
+  pathname: {json.dumps(pathname)},
+  search: {json.dumps(search)},
+  hash: {json.dumps(fragment)},
+  replace: (value) => {{ result.value = value; }},
+}};
+{script}
+console.log(JSON.stringify(result.value));
+"""
+            completed = subprocess.run(
+                ["node", "--input-type=module", "--eval", probe],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return json.loads(completed.stdout)
+
+        destination = "https://danse.pages.dev/?view=legacy#evidence"
+        for path in (
+            "/project",
+            "/project/",
+            "/project/index.html",
+            "/the-thing-without-a-name/project",
+            "/the-thing-without-a-name/project/",
+            "/the-thing-without-a-name/project/index.html",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(redirect(path), destination)
+        for path in (
+            "/projectile",
+            "/project/extra",
+            "/prefix/nested/project/",
+            "//project/",
+            "/the-thing-without-a-name/projectile",
+            "/the-thing-without-a-name/project/index.htm",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(redirect(path))
 
     def test_legacy_project_fragment_survives_the_river_url_updater(self) -> None:
         updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
@@ -2043,8 +2089,8 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
         self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
-        self.assertIn("previousRiverWasRemembered = !river.shifted && Boolean(remembered)", self.script)
-        self.assertIn("if (previousRiverWasRemembered) Arrival.remember(river)", self.script)
+        self.assertIn("previousRememberedRiver = Arrival.rememberedRiverForUndo", self.script)
+        self.assertIn("if (previousRememberedRiver) Arrival.remember(previousRememberedRiver)", self.script)
         self.assertIn("const programIntent = ++programGeneration", self.script)
         self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
         self.assertIn("if (generation !== programGeneration) return false", self.script)
