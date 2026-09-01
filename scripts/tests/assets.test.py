@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import http.client
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -300,6 +302,71 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual((held_parent / "IMG_1570.JPG").read_bytes(), self.fixture.payload)
 
+    def test_cache_parent_swap_cannot_redirect_hydration(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        relative = ASSETS._cache_relative(asset)
+        cache_parent = (self.fixture.root / relative).parent
+        held_parent = cache_parent.with_name(f"{cache_parent.name}-held")
+        outside = self.fixture.base / "outside-cache-race"
+        outside.mkdir()
+        real_temporary = ASSETS._temporary_file_at
+        swapped = False
+
+        def swap_parent_then_create(parent):
+            nonlocal swapped
+            cache_parent.rename(held_parent)
+            cache_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+            return real_temporary(parent)
+
+        with mock.patch.object(
+            ASSETS,
+            "_temporary_file_at",
+            side_effect=swap_parent_then_create,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+            ASSETS._cache_from_sources(
+                self.fixture.root,
+                asset,
+                allow_file=True,
+                source_root=self.fixture.source,
+                timeout=1.0,
+            )
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_midstream_http_failure_uses_fallback_and_writes_receipt(self) -> None:
+        sources = [
+            {"kind": "https", "url": "https://example.com/first"},
+            {"kind": "https", "url": "https://example.com/fallback"},
+        ]
+        self.fixture.write_lock(asset={"sources": sources})
+        expected = len(self.fixture.payload)
+
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                raise http.client.IncompleteRead(b"partial", expected)
+
+        with mock.patch.object(
+            ASSETS,
+            "_source_stream",
+            side_effect=[Interrupted(), io.BytesIO(self.fixture.payload)],
+        ) as source_stream:
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(source_stream.call_count, 2)
+        self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
     def test_repository_commit_is_exact(self) -> None:
         self.fixture.write_lock(repository_commit="a" * 40)
         self.assertEqual(
@@ -380,6 +447,67 @@ class AssetParityTest(unittest.TestCase):
                 rights_class="private",
             )
 
+    def test_inventory_rejects_content_mutation_before_publication(self) -> None:
+        output = self.fixture.base / "mutable-lock.json"
+        source = self.fixture.source / "pipeline/raw/IMG_1570.JPG"
+        real_snapshot = ASSETS._inventory_snapshot
+        calls = 0
+
+        def mutate_after_first_snapshot(root):
+            nonlocal calls
+            proof = real_snapshot(root)
+            calls += 1
+            if calls == 1:
+                source.write_bytes(b"x" * len(self.fixture.payload))
+            return proof
+
+        with mock.patch.object(
+            ASSETS,
+            "_inventory_snapshot",
+            side_effect=mutate_after_first_snapshot,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "completed scan"):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="mutable-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse(output.exists())
+
+    def test_inventory_rejects_late_file_before_publication(self) -> None:
+        output = self.fixture.base / "late-lock.json"
+        real_snapshot = ASSETS._inventory_snapshot
+        calls = 0
+
+        def add_file_after_first_snapshot(root):
+            nonlocal calls
+            proof = real_snapshot(root)
+            calls += 1
+            if calls == 1:
+                late = self.fixture.source / "late/private.bin"
+                late.parent.mkdir()
+                late.write_bytes(b"late")
+            return proof
+
+        with mock.patch.object(
+            ASSETS,
+            "_inventory_snapshot",
+            side_effect=add_file_after_first_snapshot,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "completed scan"):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="late-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse(output.exists())
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixtures require POSIX")
     def test_inventory_rejects_special_files(self) -> None:
         os.mkfifo(self.fixture.source / "named-pipe")
@@ -441,6 +569,25 @@ class AssetParityTest(unittest.TestCase):
         self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
         lock = ASSETS.load_lock(self.fixture.lock)
         self.assertEqual(len(lock.assets), 487)
+        bound_root = self.fixture.base / "bound-checkout"
+        for relative in (
+            "corpus/manifest.json",
+            "music/audio-toolchain.json",
+            "submission/screendance-2027.yaml",
+        ):
+            destination = bound_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((ROOT / relative).read_bytes())
+        bound_manifest = json.loads(
+            (bound_root / "corpus/manifest.json").read_text(encoding="utf-8")
+        )
+        bound_manifest["frames"][0]["source"] = "BOUND_ONLY.JPG"
+        (bound_root / "corpus/manifest.json").write_text(
+            json.dumps(bound_manifest),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ASSETS.AssetError, "487-object"):
+            ASSETS.load_lock(self.fixture.lock, repository_root=bound_root)
         extra = self.fixture.root / "pipeline/.work/raw/EXTRA.JPG"
         extra.parent.mkdir(parents=True)
         extra.write_bytes(b"stale ignored input")

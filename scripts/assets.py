@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import stat
 import subprocess
@@ -74,6 +75,15 @@ class Lock:
     repository_commit: str
     assets: tuple[Asset, ...]
     sha256: str
+
+
+@dataclass(frozen=True)
+class InventoryEntry:
+    relative: str
+    kind: str
+    identity: tuple[int, int, int, int, int, int]
+    size: int | None = None
+    sha256: str | None = None
 
 
 def _opaque_asset_id(digest: str, target: str) -> str:
@@ -221,7 +231,7 @@ def _validate_source(source: object) -> dict:
     return dict(source)
 
 
-def load_lock(path: Path) -> Lock:
+def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -299,7 +309,7 @@ def load_lock(path: Path) -> Lock:
             )
         )
     if value["profile"] == "screendance-production":
-        _validate_production_assets(assets)
+        _validate_production_assets(assets, repository_root=repository_root)
     return Lock(
         value["lock_id"],
         value["profile"],
@@ -309,8 +319,13 @@ def load_lock(path: Path) -> Lock:
     )
 
 
-def _production_targets() -> set[str]:
-    manifest = _json_loads((ROOT / "corpus/manifest.json").read_bytes(), "corpus manifest")
+def _production_targets(repository_root: Path | None = None) -> set[str]:
+    root = ROOT if repository_root is None else repository_root
+    try:
+        raw = (root / "corpus/manifest.json").read_bytes()
+    except OSError as exc:
+        raise AssetError("tracked corpus manifest is missing or unreadable") from exc
+    manifest = _json_loads(raw, "corpus manifest")
     frames = manifest.get("frames")
     if not isinstance(frames, list) or len(frames) != 162:
         raise AssetError("tracked corpus manifest does not declare the 162-frame production set")
@@ -330,14 +345,17 @@ def _production_targets() -> set[str]:
     return targets
 
 
-def _canonical_production_pins() -> tuple[str, str, str]:
-    toolchain = _json_loads(
-        (ROOT / "music/audio-toolchain.json").read_bytes(),
-        "audio toolchain",
-    )
+def _canonical_production_pins(
+    repository_root: Path | None = None,
+) -> tuple[str, str, str]:
+    root = ROOT if repository_root is None else repository_root
     try:
+        toolchain = _json_loads(
+            (root / "music/audio-toolchain.json").read_bytes(),
+            "audio toolchain",
+        )
         register = yaml.safe_load(
-            (ROOT / "submission/screendance-2027.yaml").read_text(encoding="utf-8")
+            (root / "submission/screendance-2027.yaml").read_text(encoding="utf-8")
         )
         origin_sha256 = register["package"]["origin_still"]["source_sha256"]
         soundfont = toolchain["soundfont"]
@@ -357,13 +375,17 @@ def _canonical_production_pins() -> tuple[str, str, str]:
     return origin_sha256, soundfont_sha256, soundfont_url
 
 
-def _validate_production_assets(assets: list[Asset]) -> None:
-    expected = _production_targets()
+def _validate_production_assets(
+    assets: list[Asset],
+    *,
+    repository_root: Path | None = None,
+) -> None:
+    expected = _production_targets(repository_root)
     actual = {asset.target for asset in assets}
     if actual != expected or len(assets) != len(expected):
         raise AssetError("production lock does not contain the exact 487-object target census")
     by_target = {asset.target: asset for asset in assets}
-    origin_sha256, soundfont_sha256, soundfont_url = _canonical_production_pins()
+    origin_sha256, soundfont_sha256, soundfont_url = _canonical_production_pins(repository_root)
     if by_target["pipeline/.work/raw/IMG_1594.JPG"].sha256 != origin_sha256:
         raise AssetError("production lock origin still disagrees with the canonical digest")
     if by_target[".work/music/MuseScore_General.sf3"].sha256 != soundfont_sha256:
@@ -404,16 +426,6 @@ def _validate_production_assets(assets: list[Asset]) -> None:
             raise AssetError("production input ids must use the deterministic opaque form")
 
 
-def _sha256(path: Path) -> tuple[int, str]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(CHUNK), b""):
-            size += len(block)
-            digest.update(block)
-    return size, digest.hexdigest()
-
-
 def _sha256_stream(handle: BinaryIO) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
@@ -421,6 +433,67 @@ def _sha256_stream(handle: BinaryIO) -> tuple[int, str]:
         size += len(block)
         digest.update(block)
     return size, digest.hexdigest()
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _inventory_snapshot(root: Path) -> tuple[InventoryEntry, ...]:
+    try:
+        entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    except OSError as exc:
+        raise AssetError("inventory source census could not be read") from exc
+    snapshot: list[InventoryEntry] = []
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    for path in entries:
+        relative = path.relative_to(root).as_posix()
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            raise AssetError("inventory source changed during its census") from exc
+        if stat.S_ISLNK(before.st_mode):
+            raise AssetError("inventory source contains a symlink")
+        if stat.S_ISDIR(before.st_mode):
+            try:
+                after = path.lstat()
+            except OSError as exc:
+                raise AssetError("inventory source changed during its census") from exc
+            if _stat_identity(before) != _stat_identity(after):
+                raise AssetError("inventory source changed during its census")
+            snapshot.append(InventoryEntry(relative, "directory", _stat_identity(after)))
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            raise AssetError("inventory source contains a non-regular filesystem entry")
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise AssetError("inventory source file could not be opened safely") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _stat_identity(before) != _stat_identity(opened):
+                raise AssetError("inventory source changed before it could be hashed")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                size, digest = _sha256_stream(handle)
+            hashed = os.fstat(descriptor)
+            try:
+                final = path.lstat()
+            except OSError as exc:
+                raise AssetError("inventory source changed while it was being hashed") from exc
+            identity = _stat_identity(hashed)
+            if identity != _stat_identity(opened) or identity != _stat_identity(final):
+                raise AssetError("inventory source changed while it was being hashed")
+            snapshot.append(InventoryEntry(relative, "file", identity, size, digest))
+        finally:
+            os.close(descriptor)
+    return tuple(snapshot)
 
 
 def _root(path: Path, *, create: bool) -> Path:
@@ -495,6 +568,44 @@ def _parent_descriptor_under(
     except OSError as exc:
         os.close(current)
         raise AssetError("asset target traverses a symlink or non-directory") from exc
+
+
+def _temporary_file_at(parent: int) -> tuple[int, str]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _ in range(128):
+        name = f".asset-{secrets.token_hex(16)}"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=parent), name
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise AssetError("temporary cache object could not be created safely") from exc
+    raise AssetError("temporary cache object name space is exhausted")
+
+
+def _parent_descriptor_matches(root: Path, relative: str, expected: int) -> bool:
+    try:
+        current = _parent_descriptor_under(root, relative, create_parents=False)
+    except AssetError:
+        return False
+    if current is None:
+        return False
+    descriptor, _ = current
+    try:
+        expected_stat = os.fstat(expected)
+        current_stat = os.fstat(descriptor)
+        return (expected_stat.st_dev, expected_stat.st_ino) == (
+            current_stat.st_dev,
+            current_stat.st_ino,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _repository_head(root: Path, lock: Lock) -> str:
@@ -822,44 +933,79 @@ def _cache_from_sources(
     source_root: Path | None,
     timeout: float,
 ) -> Path:
-    cache = _cache_path(root, asset, create=True)
-    state = _identity(cache, asset)
-    if state == "verified":
-        return cache
-    if state != "missing":
-        raise AssetError("content-addressed cache contains a corrupt object")
-    errors: list[str] = []
-    for index, source in enumerate(asset.sources, start=1):
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".asset-", dir=cache.parent)
-        temporary = Path(temporary_name)
-        try:
+    relative = _cache_relative(asset)
+    parent = _parent_descriptor_under(root, relative, create_parents=True)
+    if parent is None:
+        raise AssetError("content-addressed cache parent is missing")
+    cache_descriptor, cache_name = parent
+    try:
+        state = _identity_at(cache_descriptor, cache_name, asset)
+        if state == "verified":
+            return root / relative
+        if state != "missing":
+            raise AssetError("content-addressed cache contains a corrupt object")
+        errors: list[str] = []
+        for index, source in enumerate(asset.sources, start=1):
+            temporary_descriptor = -1
+            temporary_name: str | None = None
+            published = False
             try:
-                with os.fdopen(descriptor, "wb") as output, _source_stream(
-                    source,
-                    allow_file=allow_file,
-                    source_root=source_root,
-                    timeout=timeout,
-                ) as stream:
-                    _write_stream_verified(stream, output, asset)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temporary, 0o444)
                 try:
-                    os.link(temporary, cache)
-                except FileExistsError:
-                    pass
-                if _identity(cache, asset) != "verified":
-                    raise AssetError("cache publication did not preserve asset identity")
-                return cache
-            except (AssetError, OSError, urllib.error.URLError) as exc:
-                errors.append(f"source {index} ({source['kind']}): {exc}")
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-    detail = "; ".join(errors) if errors else "no sources declared"
-    raise AssetError(f"no source satisfied asset {asset.asset_id}: {detail}")
+                    temporary_descriptor, temporary_name = _temporary_file_at(cache_descriptor)
+                    output = os.fdopen(temporary_descriptor, "wb")
+                    temporary_descriptor = -1
+                    with output, _source_stream(
+                        source,
+                        allow_file=allow_file,
+                        source_root=source_root,
+                        timeout=timeout,
+                    ) as stream:
+                        _write_stream_verified(stream, output, asset)
+                        output.flush()
+                        os.fsync(output.fileno())
+                        os.fchmod(output.fileno(), 0o444)
+                    try:
+                        os.link(
+                            temporary_name,
+                            cache_name,
+                            src_dir_fd=cache_descriptor,
+                            dst_dir_fd=cache_descriptor,
+                            follow_symlinks=False,
+                        )
+                        published = True
+                    except FileExistsError:
+                        pass
+                except (
+                    AssetError,
+                    OSError,
+                    urllib.error.URLError,
+                    http.client.HTTPException,
+                ) as exc:
+                    errors.append(f"source {index} ({source['kind']}): {exc}")
+                    continue
+                if _identity_at(cache_descriptor, cache_name, asset) != "verified":
+                    errors.append(
+                        f"source {index} ({source['kind']}): "
+                        "cache publication did not preserve asset identity"
+                    )
+                    continue
+                if not _parent_descriptor_matches(root, relative, cache_descriptor):
+                    if published:
+                        os.unlink(cache_name, dir_fd=cache_descriptor)
+                    raise AssetError("content-addressed cache parent changed during hydration")
+                return root / relative
+            finally:
+                if temporary_descriptor >= 0:
+                    os.close(temporary_descriptor)
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=cache_descriptor)
+                    except FileNotFoundError:
+                        pass
+        detail = "; ".join(errors) if errors else "no sources declared"
+        raise AssetError(f"no source satisfied asset {asset.asset_id}: {detail}")
+    finally:
+        os.close(cache_descriptor)
 
 
 def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> None:
@@ -1041,27 +1187,19 @@ def inventory(
         raise AssetError("inventory rights class is invalid")
     rows = []
     expected = _production_targets() if profile == "screendance-production" else None
-    entries = sorted(root.rglob("*"))
-    for path in entries:
-        mode = path.lstat().st_mode
-        if stat.S_ISLNK(mode):
-            raise AssetError("inventory source contains a symlink")
-        if not stat.S_ISDIR(mode) and not stat.S_ISREG(mode):
-            raise AssetError("inventory source contains a non-regular filesystem entry")
-    actual = {
-        path.relative_to(root).as_posix()
-        for path in entries
-        if stat.S_ISREG(path.lstat().st_mode)
-    }
+    snapshot = _inventory_snapshot(root)
+    actual = {entry.relative for entry in snapshot if entry.kind == "file"}
     if expected is not None and actual != expected:
         raise AssetError("production inventory source does not contain the exact 487-object target census")
-    for path in entries:
-        if not stat.S_ISREG(path.lstat().st_mode):
+    for entry in snapshot:
+        if entry.kind != "file":
             continue
-        relative = path.relative_to(root).as_posix()
-        size, digest = _sha256(path)
+        relative = entry.relative
+        if entry.size is None or entry.sha256 is None:
+            raise AssetError("inventory source proof is incomplete")
+        size, digest = entry.size, entry.sha256
         media_type = "application/octet-stream"
-        suffix = path.suffix.lower()
+        suffix = Path(relative).suffix.lower()
         media_type = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -1119,6 +1257,8 @@ def inventory(
                 for row in rows
             ]
         )
+    if _inventory_snapshot(root) != snapshot:
+        raise AssetError("inventory source changed during its completed scan")
     _atomic_json(output, value, no_overwrite=True)
     return value
 
@@ -1163,8 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"assets: inventoried {len(value['assets'])} assets", flush=True)
             return 0
-        lock = load_lock(args.lock)
         root = _root(args.root, create=args.command == "pull")
+        lock = load_lock(args.lock, repository_root=root)
         if args.command == "pull":
             if args.timeout <= 0:
                 raise AssetError("timeout must be positive")
