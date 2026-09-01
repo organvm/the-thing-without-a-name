@@ -1451,7 +1451,9 @@ def _git_reference_lock_path(root: Path) -> Path:
     if symbolic.returncode == 0:
         if not reference.startswith("refs/") or ".." in PurePosixPath(reference).parts:
             raise AssetError("Git symbolic HEAD is invalid")
-        storage = ref_format.stdout.strip() if ref_format.returncode == 0 else "files"
+        storage = ref_format.stdout.strip()
+        if ref_format.returncode != 0 or storage == "--show-ref-format":
+            storage = "files"
         if storage == "reftable":
             ref_path = _git_absolute_path(root, "--git-path", "reftable/tables.list")
         elif storage in {"", "files"}:
@@ -1478,6 +1480,59 @@ def _assert_root_binding(root: Path, proof: tuple[int, int]) -> None:
     linked = top.stat()
     if (linked.st_dev, linked.st_ino) != proof:
         raise AssetError("Git checkout root changed during lease establishment")
+
+
+def _prepare_git_reference_parent(
+    root: Path,
+    git_directory: Path,
+    ref_lock_path: Path,
+) -> Path:
+    """Create and authenticate a missing loose-reference lock parent."""
+
+    try:
+        common_directory = _git_absolute_path(root, "--git-common-dir").resolve(strict=True)
+        anchors = sorted(
+            {git_directory, common_directory},
+            key=lambda candidate: len(candidate.parts),
+            reverse=True,
+        )
+        for anchor in anchors:
+            try:
+                relative = ref_lock_path.relative_to(anchor)
+            except ValueError:
+                continue
+            if (
+                not relative.parts
+                or any(part in {"", ".", ".."} for part in relative.parts)
+                or relative.name != ref_lock_path.name
+            ):
+                continue
+            opened = _parent_descriptor_under(
+                anchor,
+                relative.as_posix(),
+                create_parents=True,
+                durable_parents=True,
+            )
+            if opened is None:
+                raise AssetError("Git reference lease parent could not be prepared")
+            descriptor, name = opened
+            try:
+                parent = ref_lock_path.parent.resolve(strict=True)
+                if (
+                    name != ref_lock_path.name
+                    or not _directory_descriptor_matches(parent, descriptor)
+                ):
+                    raise AssetError(
+                        "Git reference lease parent changed during preparation"
+                    )
+                return parent
+            finally:
+                os.close(descriptor)
+    except AssetError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AssetError("Git reference lease parent could not be prepared safely") from exc
+    raise AssetError("Git reference lease path escapes the Git administrative directory")
 
 
 def _create_operation_lease(root: Path) -> OperationLease:
@@ -1507,7 +1562,7 @@ def _create_operation_lease(root: Path) -> OperationLease:
         index_parent = index_path.parent.resolve(strict=True)
         _assert_root_binding(root, root_proof)
         ref_lock_path = _git_reference_lock_path(root)
-        ref_parent = ref_lock_path.parent.resolve(strict=True)
+        ref_parent = _prepare_git_reference_parent(root, git_directory, ref_lock_path)
         _assert_root_binding(root, root_proof)
         git_directory_proof = _stat_identity(git_directory.stat())
         index_parent_proof = _stat_identity(index_parent.stat())

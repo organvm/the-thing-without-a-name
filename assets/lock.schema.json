@@ -52,8 +52,8 @@
       "properties": {
         "kind": {"const": "github-release"},
         "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
-        "tag": {"type": "string", "pattern": "^(?!.*[\\uD800-\\uDFFF])[^\\r\\n\\u0000]+$"},
-        "asset": {"type": "string", "pattern": "^(?!.*[\\uD800-\\uDFFF])[^/\\\\\\r\\n\\u0000]+$"},
+        "tag": {"type": "string", "pattern": "^(?![\\s\\S]*[\\uD800-\\uDFFF])[^\\r\\n\\u0000]+$"},
+        "asset": {"type": "string", "pattern": "^(?![\\s\\S]*[\\uD800-\\uDFFF])[^/\\\\\\r\\n\\u0000]+$"},
         "token_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}
       }
     },

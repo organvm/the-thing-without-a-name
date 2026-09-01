@@ -1229,6 +1229,81 @@ class AssetParityTest(unittest.TestCase):
             self.assertNotIn("GIT_REPLACE_REF_BASE", environment)
             self.assertNotIn("GIT_OBJECT_DIRECTORY", environment)
 
+    def test_git_reference_format_probe_falls_back_when_option_is_echoed(self) -> None:
+        root = self.fixture.root.resolve()
+        real_run = subprocess.run
+        reference = real_run(
+            ["git", "-C", str(root), "symbolic-ref", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        expected = Path(
+            f"{ASSETS._git_absolute_path(root, '--git-path', reference)}.lock"
+        )
+
+        def emulate_git_243(command, *args, **kwargs):
+            if command[-1] == "--show-ref-format":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="--show-ref-format\n",
+                    stderr="",
+                )
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(
+            ASSETS.subprocess,
+            "run",
+            side_effect=emulate_git_243,
+        ):
+            self.assertEqual(ASSETS._git_reference_lock_path(root), expected)
+
+    def test_operation_lease_prepares_packed_nested_branch_parent(self) -> None:
+        root = self.fixture.root.resolve()
+        reference = "refs/heads/feature/packed"
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--quiet", "-b", "feature/packed"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "pack-refs", "--all", "--prune"],
+            check=True,
+        )
+        git_directory = ASSETS._git_absolute_path(root, "--absolute-git-dir").resolve()
+        ref_lock_path = Path(
+            f"{ASSETS._git_absolute_path(root, '--git-path', reference)}.lock"
+        )
+        try:
+            ref_lock_path.parent.rmdir()
+        except FileNotFoundError:
+            pass
+        self.assertFalse(ref_lock_path.parent.exists())
+
+        with (
+            mock.patch.object(
+                ASSETS.os,
+                "mkdir",
+                side_effect=PermissionError("injected reference-parent denial"),
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "ancestor|parent|traverses"),
+        ):
+            ASSETS._create_operation_lease(root)
+        self.assertFalse((git_directory / "danse-assets-operation.lock").exists())
+
+        lease = ASSETS._create_operation_lease(root)
+        try:
+            self.assertEqual(lease.ref_lock_path, ref_lock_path)
+            self.assertTrue(ref_lock_path.parent.is_dir())
+            self.assertTrue(
+                descriptor_matches_path(
+                    lease.ref_parent_descriptor,
+                    ref_lock_path.parent,
+                )
+            )
+        finally:
+            lease.close()
+
     def test_operation_lease_resolves_linked_worktree_gitdir_and_index(self) -> None:
         worktree = self.fixture.base / "linked-worktree"
         subprocess.run(
@@ -2580,7 +2655,7 @@ class AssetParityTest(unittest.TestCase):
                 repository_commit=self.fixture.head,
                 rights_class="private",
             )
-        self.assertEqual(calls, 1)
+        self.assertEqual(calls, 2)
         self.assertFalse(output.exists())
 
     def test_inventory_rejects_source_root_replacement_after_completed_scan(self) -> None:
@@ -3543,6 +3618,28 @@ class AssetParityTest(unittest.TestCase):
                     }
                 ]
             with self.subTest(schema_surrogate_field=field), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe)
+        github_fields = lock_schema["$defs"]["githubReleaseSource"]["properties"]
+        for field in ("tag", "asset"):
+            self.assertIn(r"[\s\S]*", github_fields[field]["pattern"])
+        for field, value in (
+            ("tag", "bad-\u2028\ud800"),
+            ("tag", "bad-\u2029\udfff"),
+            ("asset", "bad-\u2028\ud800.bin"),
+            ("asset", "bad-\u2029\udfff.bin"),
+        ):
+            unsafe = copy.deepcopy(lock_value)
+            unsafe["assets"][0]["sources"] = [
+                {
+                    "kind": "github-release",
+                    "repository": "organvm/example",
+                    "tag": value if field == "tag" else "v1",
+                    "asset": value if field == "asset" else "asset.bin",
+                }
+            ]
+            with self.subTest(ecmascript_surrogate_field=field, value=value), self.assertRaises(
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe)
