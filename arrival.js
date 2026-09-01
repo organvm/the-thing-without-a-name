@@ -132,7 +132,7 @@ export function remember(river) {
 export function hasCitedSeed(fragment = "") {
   const query = new URLSearchParams(String(fragment ?? "").replace(/^#/, ""));
   const rawSeed = query.get("s");
-  return rawSeed !== null && Number.isFinite(Number(rawSeed));
+  return rawSeed !== null && rawSeed.trim() !== "" && Number.isFinite(Number(rawSeed));
 }
 
 /** Whether a fragment can reconstruct both river identity and time origin. */
@@ -141,7 +141,7 @@ export function hasSelfContainedRiver(fragment = "") {
   if (!hasCitedSeed(fragment)) return false;
   return ["e", "t"].some((key) => {
     const value = query.get(key);
-    return value !== null && Number.isFinite(Number(value));
+    return value !== null && value.trim() !== "" && Number.isFinite(Number(value));
   });
 }
 
@@ -192,7 +192,7 @@ export function arrive(fragment = globalThis.location?.hash ?? "") {
   const q = new URLSearchParams(fragment.replace(/^#/, ""));
   const num = (k) => {
     const raw = q.get(k);
-    if (raw === null) return null;
+    if (raw === null || raw.trim() === "") return null;
     const v = Number(raw);
     return Number.isFinite(v) ? v : null;
   };

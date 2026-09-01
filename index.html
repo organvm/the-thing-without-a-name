@@ -363,8 +363,12 @@ function projectRiverUrlAtArrival() {
   if (candidate.origin !== visible.origin || candidate.pathname !== visible.pathname) return null;
   if (!candidate.hash || projectSectionFor(candidate.hash)) return null;
   const values = new URLSearchParams(candidate.hash.slice(1));
+  for (const key of ["s", "e", "t", "u"]) {
+    const raw = values.get(key);
+    if (raw !== null && (raw.trim() === "" || !Number.isFinite(Number(raw)))) return null;
+  }
   const citedTime = Number(values.get("t"));
-  if (values.has("t") && (!Number.isFinite(citedTime) || citedTime < 0)) return null;
+  if (values.has("t") && citedTime < 0) return null;
   if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
   return null;
 }

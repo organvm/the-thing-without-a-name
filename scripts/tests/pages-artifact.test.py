@@ -2311,7 +2311,9 @@ console.log(href({{ seed: 42, epoch: 1000, stream: 7 }}, {{ mode: "free" }}));
         self.assertIn("candidate.pathname !== visible.pathname", arrival)
         self.assertIn("projectSectionFor(candidate.hash)", arrival)
         self.assertIn("Arrival.hasSelfContainedRiver(candidate.hash)", arrival)
-        self.assertIn("Number.isFinite(citedTime)", arrival)
+        self.assertIn('for (const key of ["s", "e", "t", "u"])', arrival)
+        self.assertIn('raw.trim() === "" || !Number.isFinite(Number(raw))', arrival)
+        self.assertIn('values.has("t") && citedTime < 0', arrival)
         self.assertNotIn("&& Arrival.recall()", arrival)
         self.assertIn("const initialRiverFragment = projectRiverFragment ?? location.hash;", arrival)
         self.assertIn("let river = Arrival.arrive(initialRiverFragment);", arrival)
@@ -2363,6 +2365,9 @@ cases.push(run("https://danse.pages.dev/watch?cutout=1#t=30", false));
 cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=-1"));
 cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&t=not-a-time"));
 cases.push(run("https://danse.pages.dev/watch?cutout=1#s=not-a-seed&t=30"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=&e=1000"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=+++"));
+cases.push(run("https://danse.pages.dev/watch?cutout=1#s=42&e=1000&u=+++"));
 console.log(JSON.stringify(cases));
 """
         completed = subprocess.run(
@@ -2377,6 +2382,9 @@ console.log(JSON.stringify(cases));
             values,
             [
                 "https://danse.pages.dev/watch?cutout=1#s=42&e=1000&u=7&p=free",
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,

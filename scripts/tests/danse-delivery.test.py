@@ -1060,6 +1060,7 @@ class DeliveryContractTest(unittest.TestCase):
           import { requireTier } from './engine/tier.js';
           import { fromData } from './engine/corpus.js';
           const zero = numericParam(new URLSearchParams('s=0'), 's', 99, {integer:true,min:0});
+          const whitespace = numericParam(new URLSearchParams('s=+++'), 's', 99, {integer:true,min:0});
           let invalid = false;
           try { numericParam(new URLSearchParams('s=nope'), 's', 99, {integer:true,min:0}); } catch { invalid = true; }
           const corpus = {
@@ -1079,7 +1080,7 @@ class DeliveryContractTest(unittest.TestCase):
           const got = progressive.get(null, 'plates', 'IMG_1570', 'screen');
           progressive.get(null, 'plates', 'IMG_1570', 'screen');
           console.log(JSON.stringify({
-            zero, invalid, missingMatte,
+            zero, whitespace, invalid, missingMatte,
             progressiveFallback: got === fallback,
             progressiveRequests: requested,
           }));
@@ -1096,6 +1097,7 @@ class DeliveryContractTest(unittest.TestCase):
             json.loads(done.stdout),
             {
                 "zero": 0,
+                "whitespace": 99,
                 "invalid": True,
                 "missingMatte": True,
                 "progressiveFallback": True,

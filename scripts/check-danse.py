@@ -594,6 +594,12 @@ const foreignProjectDurable =
   hasSelfContainedRiver("#s=42&e=1780000000000") &&
   !hasSelfContainedRiver("#s=42") &&
   !hasSelfContainedRiver("#s=42&e=not-an-epoch") &&
+  !hasSelfContainedRiver("#s=42&e=") &&
+  !hasSelfContainedRiver("#s=42&e=+++") &&
+  !hasSelfContainedRiver("#s=42&t=") &&
+  !hasSelfContainedRiver("#s=42&t=+++") &&
+  !hasCitedSeed("#s=&e=1780000000000") &&
+  !hasCitedSeed("#s=+++&e=1780000000000") &&
   !hasCitedSeed("#s=not-a-seed&t=30") &&
   !hasCitedSeed("#evidence") &&
   foreignReload.seed === foreign.seed &&
