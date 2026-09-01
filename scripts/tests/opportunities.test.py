@@ -33,10 +33,10 @@ class RegistryFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "repo"
-        self.snapshot = self.root / "opportunities/omega-20260829.json"
+        self.snapshot = self.root / "opportunities/omega-20260901.json"
         self.schema = self.root / "opportunities/opportunity.schema.json"
-        self.receipt = self.root / "opportunities/omega-20260829.receipt.json"
-        self.evidence = self.root / "opportunities/source-evidence-20260826.json"
+        self.receipt = self.root / "opportunities/omega-20260901.receipt.json"
+        self.evidence = self.root / "opportunities/source-evidence-20260901.json"
         self.consumer = self.root / "submission/screendance-2027.yaml"
         for source, target in (
             (CHECK.SNAPSHOT, self.snapshot),
@@ -59,6 +59,26 @@ class RegistryFixture:
 
 
 class ProductionRegistryTest(unittest.TestCase):
+    def test_issue_22_successor_is_current_without_rewriting_its_predecessors(self) -> None:
+        successor = CHECK.validate_registry(
+            ROOT / "opportunities/omega-20260901.json",
+            CHECK.SCHEMA,
+            root=ROOT,
+            evidence_path=ROOT / "opportunities/source-evidence-20260901.json",
+        )
+        by_id = {entry["id"]: entry for entry in successor["opportunities"]}
+        self.assertEqual(successor["owner_issue"], 22)
+        self.assertEqual(len(successor["ranked_actions"]), 5)
+        self.assertEqual(by_id["screendance-miami-2027"]["disposition"], "closed")
+        self.assertEqual(
+            by_id["wavemaker-grants-2027-watch"]["deadline_at"],
+            "2027-04-01T00:00:00-04:00",
+        )
+        CHECK.validate_operational(
+            successor,
+            datetime.fromisoformat("2026-09-01T02:40:40+00:00"),
+        )
+
     def test_original_august_4_freeze_remains_byte_for_byte_historical_evidence(self) -> None:
         self.assertEqual(
             CHECK.digest(ROOT / "opportunities/omega-20260804.json"),
@@ -93,10 +113,24 @@ class ProductionRegistryTest(unittest.TestCase):
             "0f55ba2784bbe28659107d0e473d68f35bcd1f57ffa0bd7f547fdb5e55b9dfbe",
         )
 
+    def test_august_29_predecessor_remains_byte_for_byte_historical_evidence(self) -> None:
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260829.json"),
+            "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294",
+        )
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/omega-20260829.receipt.json"),
+            "d53752f1a9232a5af06637b54cb110d8460780dbc8c81910a14bb11d31e8eeae",
+        )
+        self.assertEqual(
+            CHECK.digest(ROOT / "opportunities/source-evidence-20260826.json"),
+            "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c026693258cd6c974bc8",
+        )
+
     def test_exact_production_snapshot_and_consumers_validate(self) -> None:
         snapshot, receipt = CHECK.validate_all()
         self.assertEqual(len(snapshot["opportunities"]), 17)
-        self.assertEqual(len(snapshot["ranked_actions"]), 6)
+        self.assertEqual(len(snapshot["ranked_actions"]), 5)
         self.assertEqual(receipt["snapshot"]["sha256"], CHECK.digest(CHECK.SNAPSHOT))
 
     def test_every_plan_target_has_one_explicit_disposition(self) -> None:
@@ -107,6 +141,7 @@ class ProductionRegistryTest(unittest.TestCase):
         self.assertEqual(by_id["locust-projects-main-gallery"]["disposition"], "watch")
         self.assertEqual(by_id["mignolo-screendance-2026"]["disposition"], "conflicted")
         self.assertEqual(by_id["miami-dade-tdc-2026-q2"]["disposition"], "blocked")
+        self.assertEqual(by_id["screendance-miami-2027"]["disposition"], "closed")
 
     def test_elapsed_oolite_extension_is_preserved_without_a_live_queue_claim(self) -> None:
         snapshot = CHECK.validate_registry()
@@ -241,7 +276,7 @@ class RegistryFailureTest(unittest.TestCase):
         text = self.fixture.consumer.read_text(encoding="utf-8")
         text = text.replace(
             "checked: 2026-08-26\n    check: manual\n\n  - id: festival-scheduling-discretion",
-            "checked: 2026-08-27\n    check: manual\n\n  - id: festival-scheduling-discretion",
+            "checked: 2026-09-02\n    check: manual\n\n  - id: festival-scheduling-discretion",
         )
         self.fixture.consumer.write_text(text, encoding="utf-8")
         with self.assertRaisesRegex(CHECK.RegistryError, "postdates its frozen source check"):
@@ -288,9 +323,9 @@ class RegistryFailureTest(unittest.TestCase):
 
     def test_live_queue_expires_without_mutating_frozen_snapshot(self) -> None:
         snapshot = self.validate_registry()
-        CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-01T01:58:00+00:00"))
+        CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-14T21:59:00+00:00"))
         with self.assertRaisesRegex(CHECK.RegistryError, "issue #22 must publish a successor"):
-            CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-01T02:00:00+00:00"))
+            CHECK.validate_operational(snapshot, datetime.fromisoformat("2026-09-14T22:00:00+00:00"))
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_receipt_path_cannot_follow_a_symlink(self) -> None:
@@ -301,7 +336,7 @@ class RegistryFailureTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECK.RegistryError, "traverses a symlink"):
             CHECK.safe_file(
                 self.fixture.root,
-                "opportunities/omega-20260829.json",
+                "opportunities/omega-20260901.json",
                 "receipt snapshot path",
             )
 

@@ -32,9 +32,9 @@ FIXTURE_FILES = (
     "release/manifest.schema.json",
     "release/evidence/live-interaction-replay-20260804.json",
     "release/progressive-controls-replay.schema.json",
-    "opportunities/omega-20260829.json",
-    "opportunities/omega-20260829.receipt.json",
-    "opportunities/source-evidence-20260826.json",
+    "opportunities/omega-20260901.json",
+    "opportunities/omega-20260901.receipt.json",
+    "opportunities/source-evidence-20260901.json",
     "opportunities/opportunity.schema.json",
     "scripts/check-opportunities.py",
     "submission/screendance-2027.yaml",
@@ -459,7 +459,7 @@ class ProductionManifestTest(unittest.TestCase):
     def test_snapshot_binding_uses_final_merged_freeze_and_source_evidence(self) -> None:
         binding = self.manifest["opportunity_snapshot"]
         self.assertEqual(binding["sha256"], CONTRACT.EXPECTED_OPPORTUNITY_SHA256)
-        self.assertEqual(binding["snapshot_id"], "omega-20260829")
+        self.assertEqual(binding["snapshot_id"], "omega-20260901")
         self.assertEqual(binding["frozen_at"], CONTRACT.EXPECTED_OPPORTUNITY_FROZEN_AT)
         self.assertEqual(
             binding["source_evidence_sha256"],
@@ -582,7 +582,7 @@ class ProductionManifestTest(unittest.TestCase):
         self.assertEqual(self.receipt["release"]["manifest"]["path"], "release/manifest.json")
         self.assertEqual(
             self.receipt["release"]["opportunity_snapshot"]["path"],
-            "opportunities/omega-20260829.json",
+            "opportunities/omega-20260901.json",
         )
         self.assertEqual(
             self.receipt["release"]["source_evidence"]["sha256"],

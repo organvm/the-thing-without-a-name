@@ -1955,11 +1955,11 @@ def verify_artifact(
         raise ReleaseError(
             "release artifact installation binding drifted from its source manifest"
         )
-    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260829.json":
+    if release["opportunity_snapshot"]["path"] != "opportunities/omega-20260901.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity snapshot")
-    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260829.receipt.json":
+    if release["opportunity_receipt"]["path"] != "opportunities/omega-20260901.receipt.json":
         raise ReleaseError("release artifact points at a non-canonical opportunity receipt")
-    if release["source_evidence"]["path"] != "opportunities/source-evidence-20260826.json":
+    if release["source_evidence"]["path"] != "opportunities/source-evidence-20260901.json":
         raise ReleaseError("release artifact points at a non-canonical source-evidence manifest")
     if (
         release["opportunity_snapshot"]["sha256"] != EXPECTED_OPPORTUNITY_SHA256

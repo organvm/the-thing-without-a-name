@@ -21,7 +21,7 @@
     "schema": { "const": "danse.opportunities.v1" },
     "snapshot_id": { "type": "string", "pattern": "^omega-[0-9]{8}(?:-[1-9][0-9]*)?$" },
     "frozen_at": { "type": "string", "format": "date-time" },
-    "owner_issue": { "const": 15 },
+    "owner_issue": { "enum": [15, 22] },
     "successor_issue": { "const": 22 },
     "policy": {
       "type": "object",

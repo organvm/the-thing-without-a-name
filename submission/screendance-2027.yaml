@@ -19,11 +19,11 @@
 
 schema: danse.submission.v2
 opportunity_snapshot:
-  snapshot_id: omega-20260829
-  path: opportunities/omega-20260829.json
-  sha256: "c9941a027bd91236f6e48157f332d6ca11f08d9946af2bfc7f029e44bbc67294"
-  receipt: opportunities/omega-20260829.receipt.json
-  frozen_at: "2026-08-29T22:12:19Z"
+  snapshot_id: omega-20260901
+  path: opportunities/omega-20260901.json
+  sha256: "4e003cf1e05d400d06da9a852bcb130a1faf6d138622c026c4298835afbfdfb3"
+  receipt: opportunities/omega-20260901.receipt.json
+  frozen_at: "2026-09-01T02:40:40Z"
   opportunity_id: screendance-miami-2027
   timezone: America/New_York
 call: ScreenDance Miami Festival 2027

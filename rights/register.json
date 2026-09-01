@@ -47,7 +47,7 @@
     "submission": {
       "source": {
         "path": "submission/screendance-2027.yaml",
-        "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0",
+        "sha256": "42ae09b75e39fa522c4dfc18989b7cf6f951300cf40b16b97b4c939f8dd63448",
         "summary": "Frozen ScreenDance package requirements, approvals, and published legal terms."
       },
       "schema": "danse.submission.v2",
@@ -424,7 +424,7 @@
       "public_credit": {"state": "not-required", "label": null, "note": "This row records a use choice rather than a contributor credit."},
       "private_evidence": {"state": "not-required", "custodian": null, "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Published archive-library opt-in or opt-out choice."}
+        {"path": "submission/screendance-2027.yaml", "sha256": "42ae09b75e39fa522c4dfc18989b7cf6f951300cf40b16b97b4c939f8dd63448", "summary": "Published archive-library opt-in or opt-out choice."}
       ],
       "uses": [
         {"id": "festival-archive", "medium": "festival-archive", "required_for": ["submitted"], "territory": "pending", "term": "pending", "expires": null, "promotion": "not-applicable", "archive": "pending", "status": "blocked", "evidence": null, "conditional_exclusion": {"gate": "archive-library-choice", "value": "opt-out"}, "note": "Include requires cleared archive scope; the registered opt-out decision excludes this use."}
@@ -475,7 +475,7 @@
       "public_credit": {"state": "pending", "label": "Optional apartment source recordings — Anthony J. Padavano", "note": "This hybrid-only source credit and ownership claim remain unapproved."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Hybrid-only private source names and byte digests, explicitly package-ineligible and without private locations."},
+        {"path": "submission/screendance-2027.yaml", "sha256": "42ae09b75e39fa522c4dfc18989b7cf6f951300cf40b16b97b4c939f8dd63448", "summary": "Hybrid-only private source names and byte digests, explicitly package-ineligible and without private locations."},
         {"path": "submission/text/rights_declaration.txt", "sha256": "86532bceb79f745cf24e1f579c0dd00108afb39e86696208668f9b62ab0801a5", "summary": "Unapproved tracked ownership claim; not completion evidence."},
         {"path": "sound/audio-uses.json", "sha256": "d312487481ca456c4f26357b18fef7f0f58b5d8ae4a3dc5e687895d9c98f53e4", "summary": "Usage manifest confines the private grain bank to the package-ineligible hybrid-apartment profile."}
       ],
@@ -494,7 +494,7 @@
       "public_credit": {"state": "pending", "label": null, "note": "No still selection or final caption and credit package exists."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "submission/screendance-2027.yaml", "sha256": "82e0631422458f453b73b0333abe9734af8ecb9b1786b9bfbac315c81408a0b0", "summary": "Still dimensions and unlimited official-selection promotional term."}
+        {"path": "submission/screendance-2027.yaml", "sha256": "42ae09b75e39fa522c4dfc18989b7cf6f951300cf40b16b97b4c939f8dd63448", "summary": "Still dimensions and unlimited official-selection promotional term."}
       ],
       "uses": [
         {"id": "press", "medium": "press", "required_for": ["public", "release"], "territory": "pending", "term": "pending", "expires": null, "promotion": "pending", "archive": "pending", "status": "blocked", "evidence": null, "note": "No selected source digest or clearance receipt."},
