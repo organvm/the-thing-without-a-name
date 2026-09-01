@@ -44,6 +44,10 @@ CHECK = load("danse_submission_check_test", ROOT / "submission/check.py")
 RIGHTS = load("danse_rights_contract_delivery_test", ROOT / "scripts/rights_contract.py")
 BROWSER = load("danse_browser_test", ROOT / "render/browser.py")
 OFFLINE = load("danse_offline_test", ROOT / "render/render.py")
+PORTABLE_AUDIO = load(
+    "danse_portable_audio_test",
+    ROOT / "submission/render_portable_audio.py",
+)
 BANK_CONTRACT = sys.modules["bank_contract"]
 CORPUS_CONTRACT = load("danse_corpus_contract_test", ROOT / "pipeline/corpus_contract.py")
 _prior_corpus_contract = sys.modules.get("corpus_contract")
@@ -67,6 +71,15 @@ SPAN = {
 }
 SUBMISSION_AUDIO_RENDER_RECEIPT = b'{"schema":"danse.audio.render.v1","fixture":true}\n'
 SUBMISSION_REPOSITORY_HEAD = "a" * 40
+SCREENDANCE_FINISHER = ROOT / "submission/finish-screendance-linux.sh"
+
+
+def finisher_python(function_name: str) -> str:
+    source = SCREENDANCE_FINISHER.read_text()
+    function_start = source.index(f"{function_name}() {{")
+    body_start = source.index("<<'PY'\n", function_start) + len("<<'PY'\n")
+    body_end = source.index("\nPY\n}", body_start)
+    return source[body_start:body_end]
 
 
 def submission_sound_identity(master_sha256: str) -> dict:
@@ -7213,6 +7226,312 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertIn("machine evidence", report.rows[0][1])
         self.assertIn("human review not attested", report.rows[0][3])
         self.assertNotIn("accepted", report.rows[0][3])
+
+    def test_portable_audio_output_boundary_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "portable-audio"
+            self.assertEqual(PORTABLE_AUDIO.require_safe_output(outside), outside.resolve())
+
+        ignored = ROOT / ".work" / "portable-audio-output-test"
+        self.assertEqual(PORTABLE_AUDIO.require_safe_output(ignored), ignored.resolve())
+        self.assertEqual(
+            PORTABLE_AUDIO.require_safe_output(ROOT / ".work"),
+            (ROOT / ".work").resolve(),
+        )
+
+        unignored = ROOT / "portable-audio-output-test"
+        with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
+            PORTABLE_AUDIO.require_safe_output(unignored)
+        with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
+            PORTABLE_AUDIO.require_safe_output(ROOT)
+        with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
+            PORTABLE_AUDIO.require_safe_output(ROOT / ".work" / ".." / unignored.name)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            alias = Path(temporary) / "repository-alias"
+            alias.symlink_to(ROOT, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
+                PORTABLE_AUDIO.require_safe_output(alias / unignored.name)
+
+        with (
+            mock.patch.object(
+                PORTABLE_AUDIO.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=128),
+            ),
+            self.assertRaisesRegex(ValueError, "cannot verify"),
+        ):
+            PORTABLE_AUDIO.require_safe_output(ROOT / ".work" / "unverifiable")
+
+    def test_finisher_rejects_unsafe_credit_font_paths_before_encode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            commands = root / "commands"
+            commands.mkdir()
+            for command in (
+                "awk",
+                "basename",
+                "cp",
+                "dirname",
+                "ffmpeg",
+                "ffprobe",
+                "find",
+                "git",
+                "mkdir",
+                "mktemp",
+                "python3",
+                "rm",
+                "sha256sum",
+                "sort",
+                "stat",
+            ):
+                executable = commands / command
+                executable.write_text("#!/bin/sh\nexit 97\n")
+                executable.chmod(0o755)
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
+            picture = root / "picture.mp4"
+            audio = root / "audio.wav"
+            picture.write_bytes(b"picture")
+            audio.write_bytes(b"audio")
+            for name in ('double"quote.ttf', "open[bracket.ttf", "close]bracket.ttf"):
+                with self.subTest(name=name):
+                    font = root / name
+                    font.write_bytes(b"font")
+                    environment = os.environ.copy()
+                    environment["DANSE_CREDIT_FONT"] = str(font)
+                    environment["PATH"] = str(commands)
+                    result = subprocess.run(
+                        [
+                            str(bash),
+                            str(SCREENDANCE_FINISHER),
+                            str(root / "output"),
+                            str(picture),
+                            str(audio),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "credit-card font path contains characters unsafe for the ffmpeg filter",
+                        result.stderr,
+                    )
+
+    def test_finisher_requires_real_sha256_cross_bindings(self) -> None:
+        duration = 350.896343125
+        sample_rate = 48000
+        frames = round(duration * sample_rate)
+        score_digest = "1" * 64
+        choreography_digest = "2" * 64
+        audio_digest = "3" * 64
+        repository_head = "4" * 40
+        required_gates = {
+            "duration_matches_score": True,
+            "non_silent": True,
+            "stems_non_silent": True,
+            "polyphonic": True,
+            "loudness_in_target": True,
+            "true_peak_in_target": True,
+        }
+        audio_receipt = {
+            "schema": "danse.submission.portable-audio.v1",
+            "profile": "competition-classical",
+            "repository_head": repository_head,
+            "inputs": {
+                "score": {"sha256": score_digest},
+                "choreography": {"sha256": choreography_digest},
+            },
+            "outputs": {
+                "master": {
+                    "sha256": audio_digest,
+                    "sample_rate": sample_rate,
+                    "channels": 2,
+                    "frames": frames,
+                    "duration_seconds": frames / sample_rate,
+                }
+            },
+            "verification": required_gates,
+        }
+        picture_graph = {
+            "segments": [
+                {
+                    "inputs": {
+                        "music_score": {"file_sha256": score_digest},
+                        "choreography": {"file_sha256": choreography_digest},
+                    }
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio_path = root / "audio.json"
+            picture_path = root / "picture-graph.json"
+
+            def validate(
+                audio_document: dict,
+                picture_document: dict,
+            ) -> subprocess.CompletedProcess:
+                audio_path.write_text(json.dumps(audio_document))
+                picture_path.write_text(json.dumps(picture_document))
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-",
+                        str(audio_path),
+                        audio_digest,
+                        "1",
+                        str(duration),
+                        str(picture_path),
+                        repository_head,
+                    ],
+                    input=finisher_python("validate_audio_receipt"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            accepted = validate(audio_receipt, picture_graph)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            missing_audio = copy.deepcopy(audio_receipt)
+            missing_picture = copy.deepcopy(picture_graph)
+            missing_audio["inputs"]["score"] = {}
+            missing_picture["segments"][0]["inputs"]["music_score"] = {}
+            missing = validate(missing_audio, missing_picture)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("score/choreography differs", missing.stderr)
+
+            for label, malformed in (
+                ("null", None),
+                ("empty", ""),
+                ("short", "a" * 63),
+                ("uppercase", "A" * 64),
+                ("non-string", 7),
+            ):
+                for binding in ("score", "choreography"):
+                    with self.subTest(label=label, binding=binding):
+                        audio_copy = copy.deepcopy(audio_receipt)
+                        picture_copy = copy.deepcopy(picture_graph)
+                        audio_copy["inputs"][binding]["sha256"] = malformed
+                        picture_key = "music_score" if binding == "score" else "choreography"
+                        picture_copy["segments"][0]["inputs"][picture_key][
+                            "file_sha256"
+                        ] = malformed
+                        rejected = validate(audio_copy, picture_copy)
+                        self.assertNotEqual(rejected.returncode, 0)
+                        self.assertIn("score/choreography differs", rejected.stderr)
+
+    def test_finisher_accepts_sha1_repository_tree_identity(self) -> None:
+        repository_head = "4" * 40
+        repository_tree = "5" * 40
+        source_tree = "6" * 64
+        picture_digest = "7" * 64
+        decoded = {
+            "sha256": "8" * 64,
+            "frames": 10527,
+            "width": 1920,
+            "height": 1080,
+            "fps": 30.0,
+        }
+        name = "emergency-seg-000.mp4"
+        segment = {
+            "schema": "danse.render.segment.v1",
+            "segment": 0,
+            "frames": decoded["frames"],
+            "inputs": {
+                "window": "screener",
+                "start": 0,
+                "tier": "screen",
+                "stream": 0,
+                "codec": "h264",
+                "segment_frames": 600,
+                "browser_render_context": "emergency-software-capture",
+                "repository_head": repository_head,
+                "repository_tree": repository_tree,
+                "effective_seed": 20170620,
+                "source_tree_sha256": source_tree,
+                "music_score": {},
+                "choreography": {},
+                "browser_toolchain": {
+                    "executable": "/usr/bin/chromium",
+                    "executable_sha256": "9" * 64,
+                    "version": "Chromium test fixture",
+                },
+            },
+            "capture": {
+                "renderer": "Google SwiftShader",
+                "missing": 0,
+                "raw_rgba_sha256": "a" * 64,
+                "signature": "test capture",
+                "passage": {
+                    "index": 0,
+                    "seed": 2943173797,
+                    "t0": 0.0,
+                    "seconds": 350.896343125,
+                },
+            },
+            "file_sha256": "b" * 64,
+            "file_bytes": 1,
+            "decoded_video": {
+                "sha256": "c" * 64,
+                "frames": decoded["frames"],
+                "width": decoded["width"],
+                "height": decoded["height"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            segment_path = root / f"{name}.receipt.json"
+            segment_path.write_text(json.dumps(segment))
+            segment_digest = hashlib.sha256(segment_path.read_bytes()).hexdigest()
+            concat_path = root / "picture.mp4.receipt.json"
+            concat = {
+                "schema": "danse.render.concat.v1",
+                "codec": "h264",
+                "file_sha256": picture_digest,
+                "file_bytes": 1,
+                "decoded_video": decoded,
+                "segments": [{"name": name, "receipt_sha256": segment_digest}],
+            }
+            concat_path.write_text(json.dumps(concat))
+
+            def validate(destination: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-",
+                        "copy",
+                        str(concat_path),
+                        picture_digest,
+                        "1",
+                        str(root / destination),
+                        repository_head,
+                        repository_tree,
+                        source_tree,
+                    ],
+                    input=finisher_python("picture_receipt_graph"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            accepted = validate("copied")
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            segment["inputs"]["repository_tree"] = "d" * 40
+            segment_path.write_text(json.dumps(segment))
+            concat["segments"][0]["receipt_sha256"] = hashlib.sha256(
+                segment_path.read_bytes()
+            ).hexdigest()
+            concat_path.write_text(json.dumps(concat))
+            rejected = validate("copied-forged")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("fixed emergency screener rail", rejected.stderr)
 
 
 if __name__ == "__main__":

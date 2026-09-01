@@ -51,12 +51,12 @@ TARGET_LRA_LU="11.0"
   echo "refusing to overwrite output directory: $DEST" >&2
   exit 1
 }
-case "$FONT" in
-  *[":,;='\\"]*)
+for unsafe_font_character in ':' ',' ';' '=' "'" '\' '"' '[' ']'; do
+  if [[ "$FONT" == *"$unsafe_font_character"* ]]; then
     echo "credit-card font path contains characters unsafe for the ffmpeg filter: $FONT" >&2
     exit 1
-    ;;
-esac
+  fi
+done
 
 SCRIPT_PATH="$(cd "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")"
 ROOT="$(cd "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
@@ -439,6 +439,7 @@ validate_audio_receipt() {
     "$STAGE/$PICTURE_GRAPH_ARTIFACT" "$REPOSITORY_HEAD" <<'PY'
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -481,11 +482,22 @@ audio_score = audio_inputs.get("score") if isinstance(audio_inputs, dict) else N
 audio_choreography = audio_inputs.get("choreography") if isinstance(audio_inputs, dict) else None
 picture_score = picture_inputs.get("music_score") if isinstance(picture_inputs, dict) else None
 picture_choreography = picture_inputs.get("choreography") if isinstance(picture_inputs, dict) else None
+digest_pattern = re.compile(r"^[0-9a-f]{64}$")
+cross_bindings = (
+    audio_score.get("sha256") if isinstance(audio_score, dict) else None,
+    audio_choreography.get("sha256") if isinstance(audio_choreography, dict) else None,
+    picture_score.get("file_sha256") if isinstance(picture_score, dict) else None,
+    picture_choreography.get("file_sha256") if isinstance(picture_choreography, dict) else None,
+)
 if (
     not isinstance(audio_score, dict)
     or not isinstance(audio_choreography, dict)
     or not isinstance(picture_score, dict)
     or not isinstance(picture_choreography, dict)
+    or any(
+        not isinstance(value, str) or not digest_pattern.fullmatch(value)
+        for value in cross_bindings
+    )
     or audio_score.get("sha256") != picture_score.get("file_sha256")
     or audio_choreography.get("sha256") != picture_choreography.get("file_sha256")
 ):

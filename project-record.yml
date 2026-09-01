@@ -1,0 +1,188 @@
+contract_name: project-record.v1
+contract_version: 1
+project_id: danse
+name: Danse Macabre
+canonical_repository: organvm/the-thing-without-a-name
+former_repositories:
+  - organvm/limen
+repository_role: canonical
+documentation_class: A
+one_sentence: >-
+  Danse is a seeded, browser-based photographic artwork that turns one 2017
+  dancer session and a hand-cut composite into an unbounded, reproducible room
+  of moving image and sound.
+problem: >-
+  The project asks how a finite photographic record can become a time-based work
+  without losing the provenance, spatial continuity, and specific history of its
+  source images.
+intended_users:
+  - general viewers
+  - artists, curators, scholars, and educators
+  - engineers and media technologists
+  - presenters and production partners
+  - evaluators and collaborators
+implementation_status: ACTIVE
+deployment_status: public
+authorship:
+  owner: Anthony J. Padavano
+  role: artist named in the tracked project identity; implementation attribution remains evidence-bounded
+  contributions:
+    - artistic identity and direction recorded in release/manifest.json
+    - photographic source attribution recorded under pending human approval
+    - canonical repository custody and migration lineage
+  collaborators: []
+  generated: []
+  inherited:
+    - source lineage migrated from organvm/limen at apps/danse
+  external:
+    - unnamed performer; credit and release wording pending
+    - music composed by Leo Delibes
+    - source arrangements by Paul De Bra under CC BY 4.0
+    - vendored MediaPipe runtime and model under Apache-2.0
+claim_references:
+  - id: corpus-session
+    claim_posture: implemented
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-corpus-session
+    assertion_ref: docs/evidence/assertions/danse-corpus-session.json
+    scope: provenance
+    placements: [readme, general, technical, humanities, evaluator, evidence]
+  - id: pure-engine-contract
+    claim_posture: implemented
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-pure-engine-contract
+    assertion_ref: docs/evidence/assertions/danse-pure-engine-contract.json
+    scope: capability
+    placements: [readme, general, technical, humanities, evaluator, evidence]
+  - id: public-artwork-deployment
+    claim_posture: implemented
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-public-artwork-deployment
+    assertion_ref: docs/evidence/assertions/danse-public-artwork-deployment.json
+    scope: deployment
+    placements: [readme, general, technical, business, evaluator, evidence]
+  - id: release-is-draft
+    claim_posture: partial
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-release-is-draft
+    assertion_ref: docs/evidence/assertions/danse-release-is-draft.json
+    scope: status
+    placements: [readme, general, technical, humanities, business, evaluator, evidence]
+  - id: installation-reference-only
+    claim_posture: proposed
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-installation-reference-only
+    assertion_ref: docs/evidence/assertions/danse-installation-reference-only.json
+    scope: limitation
+    placements: [readme, general, technical, humanities, business, evaluator, evidence]
+  - id: attribution-boundaries
+    claim_posture: partial
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-attribution-boundaries
+    assertion_ref: docs/evidence/assertions/danse-attribution-boundaries.json
+    scope: authorship
+    placements: [readme, general, humanities, business, evaluator, evidence]
+  - id: canonical-lineage
+    claim_posture: implemented
+    assertion_contract: assertion-evidence.v1
+    assertion_id: danse-canonical-lineage
+    assertion_ref: docs/evidence/assertions/danse-canonical-lineage.json
+    scope: identity
+    placements: [evaluator, evidence]
+limitations:
+  - id: release-draft
+    statement: >-
+      The public project package and finite screendance package remain draft;
+      deployment of the immersive root artwork is not final release approval.
+    assertion_ref: docs/evidence/assertions/danse-release-is-draft.json
+    assertion_id: danse-release-is-draft
+  - id: installation-unproven
+    statement: >-
+      The installation is a reference design and simulator with blocked physical
+      venue, hardware, calibration, recovery, and restore predicates.
+    assertion_ref: docs/evidence/assertions/danse-installation-reference-only.json
+    assertion_id: danse-installation-reference-only
+  - id: rights-pending
+    statement: >-
+      Performer, pictured-object, music, press-still, identity, and publication
+      approvals remain pending in the draft rights and release records.
+    assertion_ref: docs/evidence/assertions/danse-attribution-boundaries.json
+    assertion_id: danse-attribution-boundaries
+  - id: deployment-receipt-precedes-head
+    statement: >-
+      The recorded public artwork replay is bound to source commit f19244a, which
+      precedes the current canonical branch.
+    assertion_ref: docs/evidence/assertions/danse-public-artwork-deployment.json
+    assertion_id: danse-public-artwork-deployment
+  - id: no-outcome-metrics
+    statement: >-
+      The repository records no audience, adoption, revenue, client, conversion,
+      festival-selection, or long-term venue outcomes.
+  - id: contribution-ledger-gap
+    statement: >-
+      No ratified granular ledger distinguishes every human, tool-assisted,
+      generated, inherited, and collaborative implementation contribution.
+audience_routes:
+  - mode: general
+    path: docs/audiences/general.md
+    primary_question: What is this work and what happens when I enter it?
+    surface: public
+    search_intents: [informational]
+  - mode: technical
+    path: docs/audiences/technical.md
+    primary_question: How does the deterministic artwork and production system work?
+    surface: public
+    search_intents: [technical, implementation]
+  - mode: humanities
+    path: docs/audiences/humanities.md
+    primary_question: What does the work argue about time, photography, history, and simultaneity?
+    surface: public
+    search_intents: [research, informational]
+  - mode: business
+    path: docs/audiences/business.md
+    primary_question: What can a curator or presenter responsibly produce from the current system?
+    surface: public
+    search_intents: [problem, implementation]
+  - mode: evaluator
+    path: docs/audiences/evaluator.md
+    primary_question: What work is inspectable, who is attributed, and where are the boundaries?
+    surface: public
+    search_intents: [hiring, research]
+industries: []
+concepts:
+  - computational-photography
+  - deterministic-rendering
+  - generative-art
+  - media-archaeology
+  - photographic-provenance
+  - projective-texturing
+  - screendance
+search_intents:
+  - intent: informational
+    terms:
+      - generative photographic artwork
+      - browser-based screendance
+  - intent: technical
+    terms:
+      - deterministic generative art engine
+      - projective texturing photographic installation
+  - intent: research
+    terms:
+      - photography simultaneity computational art
+      - provenance in generative art
+  - intent: implementation
+    terms:
+      - deterministic screendance production pipeline
+      - interactive media installation evidence gates
+  - intent: hiring
+    terms:
+      - creative technologist generative art portfolio
+links:
+  repository: https://github.com/organvm/the-thing-without-a-name
+  documentation: docs/audiences/general.md
+  project_page: https://danse.pages.dev/
+  demo: https://danse.pages.dev/
+  deployment: https://danse.pages.dev/
+  evidence: docs/evidence/README.md
+generated_at: "2026-08-31T22:44:39Z"
+verified_at: "2026-08-31T22:44:39Z"

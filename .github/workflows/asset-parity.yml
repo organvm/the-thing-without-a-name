@@ -1,0 +1,50 @@
+name: Asset parity contract
+
+on:
+  pull_request:
+    paths:
+      - "assets/**"
+      - "scripts/assets.py"
+      - "scripts/tests/assets.test.py"
+      - "corpus/manifest.json"
+      - "music/audio-toolchain.json"
+      - "submission/screendance-2027.yaml"
+      - ".github/workflows/asset-parity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "assets/**"
+      - "scripts/assets.py"
+      - "scripts/tests/assets.test.py"
+      - "corpus/manifest.json"
+      - "music/audio-toolchain.json"
+      - "submission/screendance-2027.yaml"
+      - ".github/workflows/asset-parity.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: assets-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install contract dependencies
+        run: python -m pip install .
+      - name: Compile asset tooling
+        run: python -m py_compile scripts/assets.py scripts/tests/assets.test.py
+      - name: Exercise adversarial asset contract
+        run: python scripts/tests/assets.test.py

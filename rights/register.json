@@ -66,7 +66,7 @@
       "id": "synopsis-short-text",
       "source": {
         "path": "submission/text/synopsis_short.txt",
-        "sha256": "f90c7d47959f2d99892c67f202024cdecc8f934468bd1fb696090dbfa5496a30",
+        "sha256": "34a7db79d301c492a30cc7ec9dd4220b729b042735cf7e99f56867ca9dc69f67",
         "summary": "Tracked short synopsis copied byte-for-byte into a staged package."
       },
       "destination": "text/synopsis_short.txt",
@@ -76,7 +76,7 @@
       "id": "synopsis-long-text",
       "source": {
         "path": "submission/text/synopsis_long.txt",
-        "sha256": "900591f164306fae6d2534c2bd08f8e3050f1e6b86b37be3f9cb1da28993e393",
+        "sha256": "453b8efc60dfe11a52d4938b2846a30070f8f932cce66ea38e198e7a05972487",
         "summary": "Tracked long synopsis copied byte-for-byte into a staged package."
       },
       "destination": "text/synopsis_long.txt",
@@ -86,7 +86,7 @@
       "id": "artist-statement-text",
       "source": {
         "path": "submission/text/artist_statement.txt",
-        "sha256": "6a89bcdba7e75a2ec4f4af0c03c8e57569e98393ea2c9f1396cab9fa13c16b53",
+        "sha256": "27063af3330ab7ed21db607f0faee6a49be7e3dfc335b017fe8d39ce86795068",
         "summary": "Tracked artist statement copied byte-for-byte into a staged package."
       },
       "destination": "text/artist_statement.txt",
@@ -403,7 +403,7 @@
       "public_credit": {"state": "pending", "label": null, "note": "No object-by-object credit or legal disposition is approved."},
       "private_evidence": {"state": "not-recorded", "custodian": "Anthony J. Padavano", "receipt": null},
       "provenance": [
-        {"path": "README.md", "sha256": "dde16daa3a8370930f247ce369d118e5c5f064ff58141bfc583a136e47609a25", "summary": "Public project description records the framed poster wall."},
+        {"path": "README.md", "sha256": "4282a8a51bb2c889f13f01a3a6589c6f95abc931c0041c321e2a3c671e4612f6", "summary": "Public project description records the framed poster wall."},
         {"path": "corpus/manifest.json", "sha256": "970b0aa062a0d8a4d96f64688034ccd745b1dde5cfdaf4002de173509accb371", "summary": "Exact visual source inventory to be reviewed."}
       ],
       "uses": [
@@ -441,7 +441,7 @@
       "public_credit": {"state": "not-required", "label": null, "note": "No font bytes are distributed."},
       "private_evidence": {"state": "not-required", "custodian": null, "receipt": null},
       "provenance": [
-        {"path": "index.html", "sha256": "fc1f7d85fd7920e307805944b4c2703c0c7d329fd8057972f78bc69668abd6fb", "summary": "System-only CSS font stack in the live artwork."}
+        {"path": "index.html", "sha256": "24e54cc948c9f1d951e3f8a8540b66f47a207500b5a2ea4fb7e159561c9e95b1", "summary": "System-only CSS font stack in the live artwork."}
       ],
       "uses": [
         {"id": "no-font-binary", "medium": "software-distribution", "required_for": [], "territory": "not-applicable", "term": "not-applicable", "expires": null, "promotion": "not-applicable", "archive": "not-applicable", "status": "excluded", "evidence": null, "note": "The exclusion is enforced by artifact inventory tests."}

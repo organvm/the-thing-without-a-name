@@ -35,6 +35,19 @@ PAGES = load_pages_builder()
 TEST_COMMIT = "a" * 40
 
 
+def load_browser_runner():
+    spec = importlib.util.spec_from_file_location(
+        "danse_browser_runner_test", ROOT / "render/browser.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+BROWSER = load_browser_runner()
+
+
 def load_release_support():
     spec = importlib.util.spec_from_file_location(
         "danse_pages_release_test_support",
@@ -102,6 +115,7 @@ def write(path: Path, data: bytes = b"fixture\n") -> None:
 def public_fixture(root: Path) -> None:
     for relative in PAGES.RUNTIME_FILES:
         write(root / relative)
+    write(root / PAGES.PROJECT_MAP, (ROOT / PAGES.PROJECT_MAP).read_bytes())
     vendor_leaf = "vision_bundle.mjs"
     vendor_data = b"export const localFixture = true;\n"
     write(root / PAGES.VENDOR_BASE / vendor_leaf, vendor_data)
@@ -183,6 +197,7 @@ def release_artifact_fixture(base: Path, phase: str) -> tuple[Path, Path]:
         manifest = RELEASE_SUPPORT.complete_manifest(source)
         manifest["status"] = "public-approved"
         RELEASE_SUPPORT.write_manifest(source, manifest)
+        RELEASE_SUPPORT.rebind_progressive_receipt(source, manifest)
     output = base / f"{phase}-release-artifact"
     RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
     return output, source
@@ -200,6 +215,7 @@ def authenticated_public_pages_fixture(base: Path) -> tuple[Path, Path, str]:
     for relative in contract_bound_runtime:
         shutil.copyfile(ROOT / relative, root / relative)
     RELEASE_SUPPORT.write_manifest(root, manifest)
+    RELEASE_SUPPORT.rebind_progressive_receipt(root, manifest)
     commit = RELEASE_SUPPORT.initialize_git_fixture(root)
     release_artifact = base / "public-release"
     RELEASE_BUILD.build(
@@ -405,6 +421,97 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("installation/") for path in inventory))
         self.assertFalse(any(path.startswith("rights/") for path in inventory))
         self.assertFalse(any(path.startswith("corpus/tier-receipts/") for path in inventory))
+        project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
+        self.assertEqual(project_map["schema"], "danse.map.v1")
+        self.assertTrue(all(node["href"] is None for node in project_map["nodes"] if node["product_id"]))
+
+    def test_live_project_map_node_is_exactly_the_local_artwork_route(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        mutations = (
+            {"route": "javascript:alert(1)", "href": "javascript:alert(1)"},
+            {"route": "https://example.invalid/", "href": "https://example.invalid/"},
+            {"route": "../private/", "href": "../private/"},
+            {"route": "//example.invalid/live", "href": "//example.invalid/live"},
+            {"product_id": "project-page-copy"},
+            {"fragment": "live"},
+            {"availability": "unavailable"},
+            {"route": 1, "href": 1},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][0].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "canonical local artwork route|malformed node field",
+                ):
+                    PAGES.project_map(self.root)
+
+    def test_project_map_metadata_and_source_node_identities_are_canonical(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+
+        def swap_fragments(project_map: dict) -> None:
+            project_map["nodes"][2]["fragment"], project_map["nodes"][3]["fragment"] = (
+                project_map["nodes"][3]["fragment"],
+                project_map["nodes"][2]["fragment"],
+            )
+
+        mutations = (
+            ("title", lambda project_map: project_map.update(title="Rights cleared")),
+            ("version", lambda project_map: project_map.update(version=999)),
+            (
+                "study label",
+                lambda project_map: project_map["nodes"][1].update(label="Rights cleared"),
+            ),
+            ("fragment swap", swap_fragments),
+            (
+                "evidence label",
+                lambda project_map: project_map["nodes"][5].update(label="Publication evidence"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                project_map = copy.deepcopy(original)
+                mutate(project_map)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError,
+                    "metadata or schema is not canonical|source-node identity drifted",
+                ):
+                    PAGES.project_map(self.root)
+
+    def test_project_map_accepts_only_the_declared_admission_projection(self) -> None:
+        map_path = self.root / PAGES.PROJECT_MAP
+        original = json.loads(map_path.read_text(encoding="utf-8"))
+        source = original["nodes"][1]
+        canonical_href = source["route"]
+        mutations = (
+            {"status": "admitted", "availability": "available", "href": None},
+            {"status": "admitted", "availability": "available", "href": "javascript:alert(1)"},
+            {"status": "admitted", "availability": "available now", "href": canonical_href},
+            {"status": "gated", "availability": "available", "href": canonical_href},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                project_map = copy.deepcopy(original)
+                project_map["nodes"][1].update(mutation)
+                map_path.write_text(
+                    json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    PAGES.ArtifactError, "node resolution is not canonical"
+                ):
+                    PAGES.project_map(self.root, allow_resolved=True)
 
     def test_cli_accepts_only_the_clean_exact_git_checkout(self) -> None:
         add_release_validation_fixture(self.root)
@@ -467,6 +574,7 @@ class ArtifactBoundaryTest(unittest.TestCase):
         for relative in contract_bound_runtime:
             shutil.copyfile(ROOT / relative, source / relative)
         RELEASE_SUPPORT.write_manifest(source, manifest)
+        RELEASE_SUPPORT.rebind_progressive_receipt(source, manifest)
         commit = RELEASE_SUPPORT.initialize_git_fixture(source)
         root = self.base / "transform-checkout"
         subprocess.run(
@@ -976,8 +1084,15 @@ class ArtifactBoundaryTest(unittest.TestCase):
             (self.output / "project/index.html").read_bytes(),
             root_index,
         )
+        project_map = json.loads((self.output / PAGES.PROJECT_MAP).read_text(encoding="utf-8"))
+        self.assertTrue(all(node["status"] == "admitted" for node in project_map["nodes"]))
+        self.assertEqual(
+            {node["href"] for node in project_map["nodes"] if node["product_id"]},
+            {"./project/", "./project/#cubism", "./project/#glitch", "./project/#ballet-score", "./project/#evidence"},
+        )
         markup = Markup()
         markup.feed((self.output / "project/index.html").read_text(encoding="utf-8"))
+        self.assertTrue({"cubism", "glitch", "ballet-score", "evidence"} <= set(markup.by_id))
         hrefs = {
             attrs["href"]
             for tag, attrs in markup.tags
@@ -1013,6 +1128,34 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.assertFalse(any(path.startswith("release/") for path in paths))
         self.assertFalse(any(path.startswith("installation/") for path in paths))
         self.assertFalse(any(path.startswith("submission/") for path in paths))
+
+    def test_partially_admitted_study_map_fails_closed(self) -> None:
+        PAGES.build(self.root, self.output, TEST_COMMIT)
+        map_path = self.output / PAGES.PROJECT_MAP
+        project_map = json.loads(map_path.read_text(encoding="utf-8"))
+        node = next(node for node in project_map["nodes"] if node["product_id"])
+        node["status"] = "admitted"
+        node["availability"] = "available"
+        node["href"] = node["route"] + (
+            f"#{node['fragment']}" if node["fragment"] else ""
+        )
+        map_path.write_text(
+            json.dumps(project_map, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        manifest_path = self.output / PAGES.ARTIFACT_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record = next(
+            record for record in manifest["files"] if record["path"] == PAGES.PROJECT_MAP
+        )
+        record["bytes"] = map_path.stat().st_size
+        record["sha256"] = PAGES.sha256(map_path)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(PAGES.ArtifactError, "admits study routes partially"):
+            PAGES.verify_artifact(self.output, TEST_COMMIT)
 
     def test_receipted_project_link_outside_pages_boundary_fails(self) -> None:
         release, release_source = release_artifact_fixture(self.base, "public")
@@ -1678,8 +1821,49 @@ class InterfaceContractTest(unittest.TestCase):
         cls.markup = Markup()
         cls.markup.feed(cls.html)
         cls.script = "\n".join(cls.markup.scripts)
+        cls.styles = (ROOT / "interface/styles.css").read_text(encoding="utf-8")
 
-    def test_hud_is_really_hidden_and_disclosed_by_an_accessible_touch_target(self) -> None:
+    def test_browser_launcher_requires_the_canonical_apple_metal_identity(self) -> None:
+        runner = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        self.assertIn("if not renderer_matches_context(name, render_context):", runner)
+        self.assertTrue(
+            BROWSER.renderer_matches_context(
+                "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+                BROWSER.CANONICAL_RENDER_CONTEXT,
+            )
+        )
+        self.assertFalse(
+            BROWSER.renderer_matches_context(
+                "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device), SwiftShader driver)",
+                BROWSER.CANONICAL_RENDER_CONTEXT,
+            )
+        )
+        self.assertNotIn("any(w in name.lower() for w in WANTED)", runner)
+        self.assertEqual(
+            BROWSER.APPLE_ANGLE_METAL_RENDERER.pattern,
+            RELEASE_SUPPORT.CONTRACT.APPLE_ANGLE_METAL_RENDERER.pattern,
+        )
+        accepted = (
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)",
+        )
+        rejected = (
+            "Apple Metal Renderer",
+            "ANGLE (Apple, OpenGL Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Google, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, SwiftShader software rasterizer)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version) trailing",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)\n",
+            "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device), SwiftShader driver)",
+        )
+        for renderer in accepted:
+            with self.subTest(renderer=renderer):
+                self.assertIsNotNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
+        for renderer in rejected:
+            with self.subTest(renderer=renderer):
+                self.assertIsNone(BROWSER.APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer))
+
+    def test_five_category_surface_and_advanced_sheet_are_accessible(self) -> None:
         tag, hud = self.markup.by_id["hud"]
         self.assertEqual(tag, "section")
         self.assertIn("hidden", hud)
@@ -1687,22 +1871,239 @@ class InterfaceContractTest(unittest.TestCase):
         tag, toggle = self.markup.by_id["hud-toggle"]
         self.assertEqual(tag, "button")
         self.assertEqual(toggle["type"], "button")
+        self.assertIn("hidden", toggle)
+        self.assertEqual(toggle["aria-hidden"], "true")
         self.assertEqual(toggle["aria-controls"], "hud")
         self.assertEqual(toggle["aria-expanded"], "false")
         self.assertEqual(toggle["aria-label"], "Show Danse controls")
-        self.assertIn("#hud[hidden] { display: none; }", self.html)
+        tag, dock = self.markup.by_id["danse-dock"]
+        self.assertEqual((tag, dock["aria-label"]), ("nav", "Danse control categories"))
+        self.assertIn("hidden", dock)
+        self.assertEqual(dock["aria-hidden"], "true")
+        categories = [
+            attrs["data-category"]
+            for tag, attrs in self.markup.tags
+            if tag == "button" and attrs.get("data-category")
+        ]
+        self.assertEqual(categories, ["hold", "river", "score", "presence", "map"])
+        self.assertIn('#danse-dock[hidden],#surface-tray[hidden],#hud[hidden],#hud-toggle[hidden] { display:none; }', self.styles)
         self.assertIn("min-width: 48px; min-height: 48px", self.html)
 
-    def test_keyboard_and_touch_controls_keep_aria_state_in_sync(self) -> None:
+    def test_keyboard_buttons_and_browser_probe_share_named_actions(self) -> None:
         self.assertIn("function setHudVisible(visible)", self.script)
         self.assertIn('hud.setAttribute("aria-hidden", String(!visible))', self.script)
         self.assertIn('hudToggle.setAttribute("aria-expanded", String(visible))', self.script)
-        self.assertIn('hudToggle.addEventListener("click"', self.script)
-        self.assertIn('const key = e.key.toLowerCase()', self.script)
-        self.assertIn('if (key === "h")', self.script)
-        self.assertIn('if (e.key === "Escape")', self.script)
+        self.assertIn('hudToggle.addEventListener("click", toggleControls)', self.script)
+        self.assertIn("const command = shortcutAction(event)", self.script)
+        self.assertIn("createControlActions({", self.script)
+        self.assertIn("actions: controlBus.actions", self.script)
         self.assertIn("keyboard-instructions", self.markup.by_id)
         self.assertIn("touch-instructions", self.markup.by_id)
+
+    def test_controls_initialize_before_listening_and_open_the_project_atomically(self) -> None:
+        bus = self.script.index("controlBus = createControlActions({")
+        listener = self.script.index('hudToggle.addEventListener("click", toggleControls)')
+        reveal = self.script.index("dock.hidden = false;")
+        self.assertLess(bus, listener)
+        self.assertLess(listener, reveal)
+        self.assertLess(self.script.index("projectMap.addEventListener(\"cancel\""), reveal)
+        self.assertLess(self.script.index('addEventListener("keydown"'), reveal)
+        self.assertIn('dock.removeAttribute("aria-hidden")', self.script[reveal:])
+        self.assertIn("hudToggle.hidden = false;", self.script[reveal:])
+        self.assertIn('hudToggle.removeAttribute("aria-hidden")', self.script[reveal:])
+        toggle = self.script.split("function toggleControls() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if (!controlBus) return;", toggle)
+        self.assertIn("if (projectMap.open) controlBus.actions.close();", toggle)
+
+    def test_renderer_failure_keeps_the_controls_and_keyboard_fail_readable(self) -> None:
+        self.assertIn("renderer-fallback", self.markup.by_id)
+        initialization = self.script.split("let baseRenderer = null;", 1)[1].split("// Non-null", 1)[0]
+        self.assertIn("try {", initialization)
+        self.assertIn("let candidateRenderer = null;", initialization)
+        self.assertIn("candidateRenderer = new Renderer(canvas, corpus);", initialization)
+        self.assertIn("await corpus.prime(candidateRenderer.gl", initialization)
+        self.assertLess(
+            initialization.index("await corpus.prime(candidateRenderer.gl"),
+            initialization.index("baseRenderer = candidateRenderer;"),
+        )
+        self.assertIn("baseRenderer = null;", initialization.split("catch (error)", 1)[1])
+        self.assertIn('el("renderer-fallback").hidden = false;', initialization)
+        self.assertIn("renderer-fallback-reason", self.markup.by_id)
+        self.assertIn(
+            'el("renderer-fallback-reason").textContent = rendererFallbackMessage;',
+            initialization,
+        )
+        self.assertIn(
+            'el("stage-description").textContent = rendererFallbackMessage;',
+            initialization,
+        )
+        self.assertIn("const rendererUnavailableReason = candidateRenderer", initialization)
+        self.assertIn('"a required corpus image or texture could not be prepared"', initialization)
+        self.assertIn('"WebGL2 could not initialize"', initialization)
+        self.assertIn("Danse visual renderer unavailable: ${rendererUnavailableReason}", initialization)
+        frame = self.script.split("function frame() {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(frame.index("interaction.tick("), frame.index("if (!renderer)"))
+        self.assertIn("const fallback = step(corpus, river.seed, t, program", frame)
+        self.assertIn("renderDetails(t, fallback.state);", frame)
+        self.assertIn("requestAnimationFrame(frame);", frame.split("if (!renderer)", 1)[1])
+        details = self.script.split("function renderDetails(t, state, rendered = null) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('el("river").textContent = hex(river.seed);', details)
+        self.assertIn(': "unavailable";', details)
+        self.assertIn('el("interaction-summary").textContent = `${interaction.mode}${embodied}`;', details)
+        self.assertIn("requestAnimationFrame(frame);", self.script)
+        self.assertIn("get rendererAvailable() { return rendererFailure === null; }", self.script)
+
+    def test_live_frame_synchronizes_the_pressed_score_movement(self) -> None:
+        details = self.script.split(
+            "function renderDetails(t, state, rendered = null) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("movement.id === state.movement", details)
+        self.assertIn("controlBus.getState().movement !== liveMovement", details)
+        self.assertIn("type: ACTIONS.SET_MOVEMENT, value: liveMovement", details)
+
+    def test_project_atomically_replaces_the_visual_details_sheet(self) -> None:
+        helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openMap()"))
+
+    def test_project_record_is_local_fail_readable_and_not_fetch_gated(self) -> None:
+        helper = self.script.split("async function openMap(trigger) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("projectMap.showModal()", helper)
+        self.assertNotIn("fetch(", helper)
+        self.assertNotIn("loadProjectMap", self.script)
+        for section in ("project-artwork", "project-film", "project-status", "project-readings", "project-evidence"):
+            self.assertIn(section, self.markup.by_id)
+        self.assertIn("161 registered raw photographs + 1 archival composite", self.html)
+        self.assertIn("05:50.896", self.html)
+        self.assertIn("not yet encoded or rendered", self.html)
+
+    def test_transient_feedback_stays_above_every_progressive_surface(self) -> None:
+        self.assertIn("#toast {\n    position: fixed; z-index: 8;", self.html)
+        self.assertIn("#danse-dock {\n  position:fixed; z-index:6;", self.styles)
+        self.assertIn("#hud {\n  position:fixed; z-index:7;", self.styles)
+
+    def test_opening_a_tray_closes_the_visual_details_sheet_first(self) -> None:
+        helper = self.script.split("function openTray(category, trigger) {", 1)[1].split("\n}", 1)[0]
+        self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openTray(category)"))
+        self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;', helper)
+
+    def test_hash_navigation_expires_pending_river_undo(self) -> None:
+        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        self.assertIn("previousRiver = null;", handler)
+        self.assertIn("previousRiverWasRemembered = false;", handler)
+        self.assertIn('el("river-undo").disabled = true;', handler)
+
+    def test_river_actions_expire_pending_hash_navigation(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("navigationGeneration += 1;", new_river)
+        self.assertLess(undo_river.index("if (!previousRiver) return null;"), undo_river.index("navigationGeneration += 1;"))
+
+    def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
+        handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('playback === "running"', handler)
+        self.assertIn('playback === "held-reduced"', handler)
+        self.assertNotIn('playback === "held-user"', handler.split("flash", 1)[0])
+
+    def test_primary_receipts_and_async_navigation_stay_synchronized(self) -> None:
+        self.assertIn('el("river-seed").textContent = `Current river: ${hex(river.seed)}`', self.script)
+        self.assertIn("previousRiverWasRemembered = !river.shifted && Boolean(remembered)", self.script)
+        self.assertIn("if (previousRiverWasRemembered) Arrival.remember(river)", self.script)
+        self.assertIn("const programIntent = ++programGeneration", self.script)
+        self.assertIn("if (programIntent === programGeneration) program = loaded", self.script)
+        self.assertIn("if (generation !== programGeneration) return false", self.script)
+        self.assertIn('value: program ? "score-led" : "free"', self.script)
+        handler = self.script.split('addEventListener("hashchange", async () => {', 1)[1].split("/** Wind this river", 1)[0]
+        self.assertIn("if (programIntent === programGeneration) {", handler)
+        self.assertLess(
+            handler.index("if (programIntent === programGeneration) {", handler.index("river = nextRiver;")),
+            handler.index('controlBus?.actions.sync({ type: ACTIONS.SET_PROGRAM'),
+        )
+        self.assertIn("describeProgram();", self.script)
+
+    def test_music_toggle_and_advanced_receipt_follow_authoritative_state(self) -> None:
+        music = self.script.split("async function toggleMusic(intent) {", 1)[1].split("\n}", 1)[0]
+        hold = self.script.split("function toggleHold() {", 1)[1].split("\n}", 1)[0]
+        subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
+        self.assertIn('if (intent === "stopped")', music)
+        self.assertIn("await scoreAudio.start(scoreSecondAt(at()))", music)
+        self.assertIn("if (heldAt !== null)", music)
+        held = music.split("if (heldAt !== null)", 1)[1]
+        self.assertIn("scoreAudio.sync(scoreSecondAt(at()), true);", held)
+        self.assertNotIn("scoreAudio.stop();", held.split("return", 1)[0])
+        self.assertIn("scoreAudio.stop();", music.split("catch (error)", 1)[1])
+        self.assertIn("const previousHeldAt = heldAt;", hold)
+        self.assertIn("heldAt = previousHeldAt;", hold.split("catch (error)", 1)[1])
+        self.assertIn("throw error;", hold.split("catch (error)", 1)[1])
+        self.assertIn("renderMusicReceipt(state);", subscription)
+
+    def test_shared_river_uses_only_allowlisted_presentation_state(self) -> None:
+        share = self.script.split("async function shareRiver() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const sharedRiver = river;", share)
+        self.assertIn("if (river !== sharedRiver) return false;", share)
+        self.assertIn("sharePresentationState(controlBus.getState())", share)
+        self.assertIn("sharePresentationUrl(Arrival.href(sharedRiver), presentation)", share)
+        self.assertNotIn("location.href", share)
+
+    def test_slow_replay_receipt_cannot_replace_a_later_presence_choice(self) -> None:
+        receipt = self.script.split('el("receipt-load").addEventListener("change", async (event) => {', 1)[1].split("\n});", 1)[0]
+        presence = self.script.split("async function setPresence(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const generation = ++presenceOperationGeneration;", receipt)
+        self.assertIn('controlBus?.actions.status("presence", "Loading replay receipt…")', receipt)
+        self.assertGreaterEqual(receipt.count("generation !== presenceOperationGeneration"), 2)
+        self.assertIn("const generation = ++presenceOperationGeneration;", presence)
+        self.assertIn("if (generation !== presenceOperationGeneration) return controlBus.getState().presence;", presence)
+
+    def test_presence_status_clear_renders_the_authoritative_interaction_message(self) -> None:
+        interaction = self.script.split("function renderInteraction(snapshot) {", 1)[1].split("\n}", 1)[0]
+        subscription = self.script.split("controlBus.subscribe((state) => {", 1)[1].split("\n});", 1)[0]
+        self.assertIn('controlBus?.getState().status.presence || message', interaction)
+        self.assertIn('el("presence-receipt").textContent = state.status.presence || presenceMessage();', subscription)
+
+    def test_pre_activation_fallback_values_are_applied_when_presence_starts(self) -> None:
+        fallback = self.script.split("function fallbackValues() {", 1)[1].split("\n}", 1)[0]
+        presence = self.script.split("async function setPresence(value) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('value("fallback-x")', fallback)
+        self.assertIn('value("fallback-y")', fallback)
+        self.assertIn('value("fallback-open")', fallback)
+        self.assertIn('value("fallback-reach")', fallback)
+        self.assertIn('interaction.setFallback(fallbackValues(), at())', presence)
+
+    def test_map_and_browser_checks_preserve_visible_and_timing_gates(self) -> None:
+        self.assertIn('#project-map [aria-disabled="true"]', self.styles)
+        self.assertIn(
+            '#project-map a:not([aria-disabled="true"]) { display:inline-flex;',
+            self.styles,
+        )
+        self.assertIn(".fallback-grid input, .fallback-grid select", self.html)
+        self.assertIn("#hud summary { box-sizing: border-box; min-height: 44px", self.html)
+        browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        self.assertIn("presence-receipt')?.textContent", browser)
+        self.assertIn("document.getElementById('veil').hidden", browser)
+        self.assertIn("def touch_targets(scope: str, label: str)", browser)
+        self.assertIn('touch_targets("#project-map", "Project")', browser)
+        self.assertIn('touch_targets("#hud", "no-WebGL Details")', browser)
+        fallback = browser.split("fallback_movement_variants =", 1)[1].split(
+            'page.click("#fallback-start")', 1
+        )[0]
+        self.assertIn("danse.program.movements.findIndex", fallback)
+        self.assertIn("movement[\"control\"] == movement[\"expected\"]", fallback)
+        self.assertIn("movement[\"selected\"] == [movement[\"expected\"]]", fallback)
+        self.assertGreaterEqual(fallback.count("0x12345678"), 2)
+        self.assertGreaterEqual(fallback.count("0x87654321"), 2)
+        self.assertNotIn("danse.controlState.movement === 2", fallback)
+        self.assertNotIn("danse.controlState.movement === 3", fallback)
+
+    def test_controls_replay_exercises_the_shipped_score_audio_lifecycle(self) -> None:
+        browser = (ROOT / "render/browser.py").read_text(encoding="utf-8")
+        shipped = browser.split(
+            "# The unavailable-score visit above proves fail-readable controls.", 1
+        )[1].split("page.add_init_script", 1)[0]
+        self.assertIn('page.goto(f"{base}/index.html", wait_until="load")', shipped)
+        self.assertIn("danse.controlState.music === 'playing'", shipped)
+        self.assertIn("danse.controlState.music === 'suspended-by-hold'", shipped)
+        self.assertIn("danse.controlState.music === 'stopped'", shipped)
+        self.assertGreaterEqual(shipped.count("#music-tray"), 3)
+        self.assertEqual(shipped.count("[data-category=\"hold\"]"), 2)
 
     def test_share_feedback_has_its_own_polite_live_region(self) -> None:
         tag, toast = self.markup.by_id["toast"]
@@ -1739,7 +2140,7 @@ class InterfaceContractTest(unittest.TestCase):
             if tag == "link" and attrs.get("rel") == "canonical"
         ]
         self.assertEqual(
-            canonical[0]["href"], "https://organvm.github.io/the-thing-without-a-name/"
+            canonical[0]["href"], "https://danse.pages.dev/"
         )
         descriptions = [
             attrs
@@ -1747,13 +2148,15 @@ class InterfaceContractTest(unittest.TestCase):
             if tag == "meta" and attrs.get("name") == "description"
         ]
         self.assertIn("Anthony J. Padavano", descriptions[0]["content"])
-        self.assertIn("<title>Danse — a room that never repeats</title>", self.html)
+        self.assertIn("<title>Danse Macabre — a room that never repeats</title>", self.html)
 
     def test_layout_uses_mobile_safe_areas_and_reduced_motion_holds_a_frame(self) -> None:
         self.assertIn("viewport-fit=cover", self.html)
-        self.assertIn("env(safe-area-inset-bottom)", self.html)
+        self.assertIn("env(safe-area-inset-bottom)", self.styles)
         self.assertIn("@media (max-width: 640px)", self.html)
-        self.assertIn("@media (prefers-reduced-motion: reduce)", self.html)
+        self.assertIn("@media (prefers-reduced-motion:reduce)", self.styles)
+        self.assertIn("min-height:calc(64px + env(safe-area-inset-bottom))", self.styles)
+        self.assertIn("min-width:44px; min-height:44px", self.styles)
         self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', self.script)
         self.assertIn(
             "let heldAt = reducedMotion.matches ? Arrival.now(river) : null", self.script
