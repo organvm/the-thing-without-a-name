@@ -26,11 +26,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import hashlib
 import http.server
 import json
 import os
+import re
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -38,10 +41,13 @@ from pathlib import Path
 
 APP = Path(__file__).resolve().parent.parent
 
-# ANGLE on macOS reports e.g. "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, …)".
-# SwiftShader reports "SwiftShader" and llvmpipe reports "llvmpipe" — either means
-# the frame is being drawn on the CPU.
-WANTED = ("metal", "apple")
+# The machine-bound receipt contract accepts only system Chrome's structured
+# ANGLE identity.  An Apple OpenGL label or non-Apple Metal renderer must never
+# satisfy the canonical production gate.
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
 
 CANONICAL_RENDER_CONTEXT = "canonical"
 EMERGENCY_SOFTWARE_CAPTURE_CONTEXT = "emergency-software-capture"
@@ -79,7 +85,7 @@ GPU_ARGS = [
 # project Mac is unavailable.  This is deliberately opt-in: production and
 # exhibition captures still require the measured Metal path above.  Chromium's
 # supported SwiftShader WebGL backend keeps the render deterministic and lets a
-# portal-valid 720p screener be recovered entirely from committed source.
+# portal-valid 1080p screener be recovered entirely from committed source.
 SOFTWARE_GPU_ARGS = [
     "--use-gl=angle",
     "--use-angle=swiftshader",
@@ -147,6 +153,44 @@ def reachable(url: str, timeout: float = 0.4) -> bool:
     return False
 
 
+def renderer_matches_context(name: str, render_context: str) -> bool:
+    """Classify one measured renderer under the exact requested contract."""
+    if render_context == CANONICAL_RENDER_CONTEXT:
+        return APPLE_ANGLE_METAL_RENDERER.fullmatch(name) is not None
+    if render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
+        return "swiftshader" in name.lower()
+    return False
+
+
+def emergency_executable_identity(raw: str | None) -> dict[str, str]:
+    """Resolve and bind the exact Chromium binary used for emergency pixels."""
+    if not raw:
+        raise SystemExit("emergency software capture requires DANSE_CHROME_EXECUTABLE")
+    selected = Path(raw)
+    if not selected.is_absolute():
+        raise SystemExit("DANSE_CHROME_EXECUTABLE must be an absolute path")
+    try:
+        resolved = selected.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"cannot resolve DANSE_CHROME_EXECUTABLE: {exc}") from exc
+    if not resolved.is_file():
+        raise SystemExit(f"DANSE_CHROME_EXECUTABLE is not a regular file: {resolved}")
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    version = subprocess.run(
+        [str(resolved), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    line = (version.stdout + version.stderr).strip().splitlines()
+    if version.returncode != 0 or not line:
+        raise SystemExit(f"cannot identify DANSE_CHROME_EXECUTABLE: {resolved}")
+    return {"path": str(resolved), "sha256": digest.hexdigest(), "version": line[0]}
+
+
 @contextlib.contextmanager
 def browser(
     headless: bool = True,
@@ -165,14 +209,13 @@ def browser(
     from playwright.sync_api import sync_playwright
 
     if render_context == CANONICAL_RENDER_CONTEXT:
-        allow_software = False
         gpu_args = GPU_ARGS
         launch_target = {"channel": "chrome"}
+        executable_identity = None
     elif render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
-        allow_software = True
         gpu_args = SOFTWARE_GPU_ARGS
-        executable = os.environ.get("DANSE_CHROME_EXECUTABLE")
-        launch_target = {"executable_path": executable} if executable else {"channel": "chrome"}
+        executable_identity = emergency_executable_identity(os.environ.get("DANSE_CHROME_EXECUTABLE"))
+        launch_target = {"executable_path": executable_identity["path"]}
     else:
         raise ValueError(f"unknown browser render context: {render_context!r}")
     with sync_playwright() as p:
@@ -183,18 +226,20 @@ def browser(
             if not gpu["ok"]:
                 raise SystemExit(f"no WebGL2: {gpu['renderer']}")
             name = str(gpu["renderer"])
-            if allow_software and "swiftshader" not in name.lower():
-                raise SystemExit(
-                    f"refusing deadline software render on {name!r}; "
-                    "the portable path requires Chromium SwiftShader"
-                )
-            if not allow_software and not any(w in name.lower() for w in WANTED):
+            if not renderer_matches_context(name, render_context):
+                if render_context == EMERGENCY_SOFTWARE_CAPTURE_CONTEXT:
+                    raise SystemExit(
+                        f"refusing deadline software render on {name!r}; "
+                        "the portable path requires Chromium SwiftShader"
+                    )
                 raise SystemExit(
                     f"refusing to render on {name!r}.\n"
-                    "This is a software rasteriser. The film would take a day and come out wrong.\n"
-                    "Check that Google Chrome is installed and that channel='chrome' resolved to it."
+                    "The renderer is not the canonical system-Chrome ANGLE Apple-Metal backend.\n"
+                    "Check that Google Chrome is installed, channel='chrome' resolves to it, "
+                    "and ANGLE reports the Apple Metal device identity."
                 )
             page.gl_renderer = name
+            page.browser_executable_identity = executable_identity
             yield page
         finally:
             launched.close()
