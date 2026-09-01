@@ -72,6 +72,32 @@ REPOSITORY_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   echo "cannot bind finishing run to an exact repository HEAD" >&2
   exit 1
 }
+[[ -z "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=no)" ]] || {
+  echo "finishing requires a clean tracked Git worktree" >&2
+  exit 1
+}
+EXPECTED_PICTURE_SOURCE_TREE="$(python3 - "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "render"))
+import render
+
+args = SimpleNamespace(
+    tier="screen",
+    score="music/score.json",
+    timing_score=None,
+    choreography="render/choreography.json",
+)
+print(render.source_tree_sha256(args))
+PY
+)"
+[[ "$EXPECTED_PICTURE_SOURCE_TREE" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "cannot derive the current screener source-tree identity" >&2
+  exit 1
+}
 
 PARENT="$(dirname -- "$DEST")"
 BASE="$(basename -- "$DEST")"
@@ -159,7 +185,7 @@ AUDIO_RECEIPT_ARTIFACT="source-receipts/audio.json"
 picture_receipt_graph() {
   local mode="$1"
   python3 - "$mode" "$PICTURE_RECEIPT" "$PICTURE_SHA256" "$PICTURE_BYTES" \
-    "$STAGE/source-receipts/picture" <<'PY'
+    "$STAGE/source-receipts/picture" "$REPOSITORY_HEAD" "$EXPECTED_PICTURE_SOURCE_TREE" <<'PY'
 import hashlib
 import json
 import os
@@ -168,7 +194,15 @@ import shutil
 import sys
 from pathlib import Path
 
-mode, receipt_value, picture_sha256, picture_bytes_value, destination_value = sys.argv[1:]
+(
+    mode,
+    receipt_value,
+    picture_sha256,
+    picture_bytes_value,
+    destination_value,
+    repository_head,
+    expected_source_tree,
+) = sys.argv[1:]
 receipt_path = Path(receipt_value)
 destination = Path(destination_value)
 picture_bytes = int(picture_bytes_value)
@@ -264,11 +298,24 @@ for index, row in enumerate(segments):
         or inputs.get("codec") != "h264"
         or inputs.get("segment_frames") != 600
         or inputs.get("browser_render_context") != "emergency-software-capture"
-        or not digest_pattern.fullmatch(str(inputs.get("source_tree_sha256", "")))
+        or inputs.get("repository_head") != repository_head
+        or not digest_pattern.fullmatch(str(inputs.get("repository_tree", "")))
+        or inputs.get("effective_seed") != 20170620
+        or inputs.get("source_tree_sha256") != expected_source_tree
         or not isinstance(inputs.get("music_score"), dict)
         or not isinstance(inputs.get("choreography"), dict)
     ):
         raise SystemExit(f"segment receipt is not from the fixed emergency screener rail: {name}")
+    browser_toolchain = inputs.get("browser_toolchain")
+    if (
+        not isinstance(browser_toolchain, dict)
+        or not isinstance(browser_toolchain.get("executable"), str)
+        or not browser_toolchain["executable"]
+        or not digest_pattern.fullmatch(str(browser_toolchain.get("executable_sha256", "")))
+        or not isinstance(browser_toolchain.get("version"), str)
+        or not browser_toolchain["version"]
+    ):
+        raise SystemExit(f"segment receipt has no exact Chromium toolchain: {name}")
     capture = segment.get("capture")
     if (
         not isinstance(capture, dict)
@@ -283,6 +330,14 @@ for index, row in enumerate(segments):
     capture_identity = {
         key: capture[key] for key in ("renderer", "signature", "passage")
     }
+    passage = capture["passage"]
+    if (
+        passage.get("index") != 0
+        or passage.get("seed") != 2943173797
+        or float(passage.get("t0", -1)) != 0.0
+        or abs(float(passage.get("seconds", 0)) - 350.896343125) > 1e-9
+    ):
+        raise SystemExit(f"segment receipt is not river seed 20170620 passage 0: {name}")
     if shared_capture is None:
         shared_capture = capture_identity
     elif capture_identity != shared_capture:
