@@ -2269,20 +2269,16 @@ console.log(href({{ seed: 42, epoch: 1000, stream: 7 }}, {{ mode: "free" }}));
         self.assertIn("history.replaceState({ ...state, danseRiverUrl: currentRiverUrl }", commit)
         self.assertIn("return new URL(currentRiverUrl);", source)
 
-    def test_project_state_canonicalizes_bare_and_seed_only_rivers(self) -> None:
+    def test_project_state_canonicalizes_every_non_self_contained_river(self) -> None:
         durable = self.script.split("function durableCurrentRiverUrl() {", 1)[1].split("\n}", 1)[0]
         commit = self.script.split("function commitRiverUrl(url", 1)[1].split("\n}", 1)[0]
         self.assertIn("Arrival.hasSelfContainedRiver(candidate.hash)", durable)
-        self.assertIn("values.has(\"t\")", durable)
-        self.assertIn(
-            'Arrival.rememberedRiverForUndo(currentRememberedRiver, "", Arrival.recall())',
-            durable,
-        )
-        self.assertIn("&& durableRememberedRiver", durable)
         self.assertIn(
             'return riverHref(river, { mode: program ? null : "free" });',
             durable,
         )
+        self.assertNotIn("Arrival.recall", durable)
+        self.assertNotIn("currentRememberedRiver", durable)
         self.assertLess(
             commit.index("currentRiverUrl = durableCurrentRiverUrl();"),
             commit.index("danseRiverUrl: currentRiverUrl"),
@@ -2316,7 +2312,7 @@ console.log(href({{ seed: 42, epoch: 1000, stream: 7 }}, {{ mode: "free" }}));
         self.assertIn("projectSectionFor(candidate.hash)", arrival)
         self.assertIn("Arrival.hasSelfContainedRiver(candidate.hash)", arrival)
         self.assertIn("Number.isFinite(citedTime)", arrival)
-        self.assertIn("Arrival.recall()", arrival)
+        self.assertNotIn("&& Arrival.recall()", arrival)
         self.assertIn("const initialRiverFragment = projectRiverFragment ?? location.hash;", arrival)
         self.assertIn("let river = Arrival.arrive(initialRiverFragment);", arrival)
         self.assertIn('Arrival.modeOf(initialRiverFragment) === "free"', arrival)
@@ -2387,7 +2383,7 @@ console.log(JSON.stringify(cases));
                 None,
                 None,
                 None,
-                "https://danse.pages.dev/watch?cutout=1#t=30",
+                None,
                 None,
                 None,
                 None,

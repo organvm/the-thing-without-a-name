@@ -366,11 +366,7 @@ function projectRiverUrlAtArrival() {
   const citedTime = Number(values.get("t"));
   if (values.has("t") && (!Number.isFinite(citedTime) || citedTime < 0)) return null;
   if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
-  return values.has("t")
-    && !values.has("s")
-    && Arrival.recall()
-    ? candidate.href
-    : null;
+  return null;
 }
 const projectRiverUrl = projectRiverUrlAtArrival();
 const projectRiverFragment = projectRiverUrl ? new URL(projectRiverUrl).hash : null;
@@ -432,18 +428,6 @@ function riverHref(value, options = {}) {
 function durableCurrentRiverUrl() {
   const candidate = new URL(currentRiverUrl);
   if (Arrival.hasSelfContainedRiver(candidate.hash)) return candidate.href;
-  const values = new URLSearchParams(candidate.hash.slice(1));
-  const citedTime = Number(values.get("t"));
-  const durableRememberedRiver = currentRememberedRiver
-    ? Arrival.rememberedRiverForUndo(currentRememberedRiver, "", Arrival.recall())
-    : null;
-  if (
-    values.has("t")
-    && Number.isFinite(citedTime)
-    && citedTime >= 0
-    && !values.has("s")
-    && durableRememberedRiver
-  ) return candidate.href;
   return riverHref(river, { mode: program ? null : "free" });
 }
 
