@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import http.client
 import importlib.util
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -204,16 +207,39 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com/a#x",
             "https://example.com:444/a",
             "https://example.com./a",
+            "https://-bad.example/a",
+            "https://example..com/a",
             "https://localhost/a",
+            "https://LOCALHOST/a",
             "https://127.0.0.1/a",
+            "https://999.999/a",
             "https://host.local/a",
             "https://[::1]/a",
         ):
             with self.subTest(url=url), self.assertRaises(ASSETS.AssetError):
                 ASSETS._validate_source({"kind": "https", "url": url})
-        for path in (".", "./", "../outside", "/absolute", ".git/refs/heads/main", r"windows\outside"):
+        for path in (
+            ".",
+            "./",
+            "../outside",
+            "/absolute",
+            ".git/refs/heads/main",
+            ".GIT/refs/heads/main",
+            ".Asset-Cache/sha256/object",
+            r"windows\outside",
+        ):
             with self.subTest(path=path), self.assertRaises(ASSETS.AssetError):
                 ASSETS._safe_relative(path, "test path")
+
+    def test_lock_rejects_case_colliding_targets(self) -> None:
+        value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+        duplicate = copy.deepcopy(value["assets"][0])
+        duplicate["id"] = "origin-img-1570-case-collision"
+        duplicate["target"] = "Pipeline/.work/raw/IMG_1570.JPG"
+        value["assets"].append(duplicate)
+        self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
+            ASSETS.load_lock(self.fixture.lock)
 
     def test_missing_parent_path_preserves_every_component(self) -> None:
         target = ASSETS._path_under(
@@ -295,10 +321,132 @@ class AssetParityTest(unittest.TestCase):
             target_parent.symlink_to(outside, target_is_directory=True)
             return real_link(source, target, **kwargs)
 
-        with mock.patch.object(ASSETS.os, "link", side_effect=swap_parent_then_link):
+        with mock.patch.object(
+            ASSETS.os,
+            "link",
+            side_effect=swap_parent_then_link,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertEqual((held_parent / "IMG_1570.JPG").read_bytes(), self.fixture.payload)
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_target_parent_swap_after_final_identity_removes_publication(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        target_parent = self.fixture.root / "pipeline/.work/raw"
+        target_parent.mkdir(parents=True)
+        held_parent = self.fixture.root / "pipeline/.work/raw-held"
+        outside = self.fixture.base / "outside-target-final"
+        outside.mkdir()
+        real_identity_at = ASSETS._identity_at
+        swapped = False
+
+        def swap_parent_after_final_identity(parent_descriptor, name, expected):
+            nonlocal swapped
+            state = real_identity_at(parent_descriptor, name, expected)
+            if not swapped and name == Path(asset.target).name and state == "verified":
+                target_parent.rename(held_parent)
+                target_parent.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return state
+
+        with mock.patch.object(
+            ASSETS,
+            "_identity_at",
+            side_effect=swap_parent_after_final_identity,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_writable_preverified_target_is_rejected(self) -> None:
+        target = self.fixture.root / "pipeline/.work/raw/IMG_1570.JPG"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.payload)
+        target.chmod(0o644)
+        code = ASSETS.main(
+            [
+                "pull",
+                "--lock",
+                str(self.fixture.lock),
+                "--root",
+                str(self.fixture.root),
+                "--allow-file",
+                "--file-source-root",
+                str(self.fixture.source),
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(target.read_bytes(), self.fixture.payload)
+        self.assertEqual(stat_mode(target), 0o644)
+
+    def test_cache_parent_swap_cannot_redirect_hydration(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        relative = ASSETS._cache_relative(asset)
+        cache_parent = (self.fixture.root / relative).parent
+        held_parent = cache_parent.with_name(f"{cache_parent.name}-held")
+        outside = self.fixture.base / "outside-cache-race"
+        outside.mkdir()
+        real_temporary = ASSETS._temporary_file_at
+        swapped = False
+
+        def swap_parent_then_create(parent):
+            nonlocal swapped
+            cache_parent.rename(held_parent)
+            cache_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+            return real_temporary(parent)
+
+        with mock.patch.object(
+            ASSETS,
+            "_temporary_file_at",
+            side_effect=swap_parent_then_create,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
+            ASSETS._cache_from_sources(
+                self.fixture.root,
+                asset,
+                allow_file=True,
+                source_root=self.fixture.source,
+                timeout=1.0,
+            )
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_midstream_http_failure_uses_fallback_and_writes_receipt(self) -> None:
+        sources = [
+            {"kind": "https", "url": "https://example.com/first"},
+            {"kind": "https", "url": "https://example.com/fallback"},
+        ]
+        self.fixture.write_lock(asset={"sources": sources})
+        expected = len(self.fixture.payload)
+
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                raise http.client.IncompleteRead(b"partial", expected)
+
+        with mock.patch.object(
+            ASSETS,
+            "_source_stream",
+            side_effect=[Interrupted(), io.BytesIO(self.fixture.payload)],
+        ) as source_stream:
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(source_stream.call_count, 2)
+        self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
 
     def test_repository_commit_is_exact(self) -> None:
         self.fixture.write_lock(repository_commit="a" * 40)
@@ -319,6 +467,103 @@ class AssetParityTest(unittest.TestCase):
             ASSETS.main(["audit", "--lock", str(self.fixture.lock), "--root", str(self.fixture.root)]),
             1,
         )
+
+    def test_production_metadata_is_revalidated_after_checkout_verification(self) -> None:
+        generic = ASSETS.load_lock(self.fixture.lock)
+        production = ASSETS.Lock(
+            generic.lock_id,
+            "screendance-production",
+            generic.repository_commit,
+            generic.assets,
+            generic.sha256,
+        )
+        events = []
+
+        def verified_head(root, lock):
+            events.append("head")
+            return production.repository_commit
+
+        def validate(assets, *, repository_root=None, repository_commit=None):
+            events.append("production-metadata")
+            self.assertEqual(repository_commit, production.repository_commit)
+
+        with (
+            mock.patch.object(ASSETS, "_repository_head", side_effect=verified_head),
+            mock.patch.object(ASSETS, "_validate_production_assets", side_effect=validate),
+        ):
+            ASSETS._assert_repository_binding(self.fixture.root, production)
+        self.assertEqual(events, ["head", "production-metadata", "head"])
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_repository_head",
+                return_value=production.repository_commit,
+            ),
+            mock.patch.object(
+                ASSETS,
+                "_validate_production_assets",
+                side_effect=ASSETS.AssetError("authority metadata changed"),
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "authority metadata changed"),
+        ):
+            ASSETS._assert_repository_binding(self.fixture.root, production)
+
+    def test_hidden_git_index_flags_are_rejected(self) -> None:
+        lock = ASSETS.load_lock(self.fixture.lock)
+        for enable, disable in (
+            ("--assume-unchanged", "--no-assume-unchanged"),
+            ("--skip-worktree", "--no-skip-worktree"),
+        ):
+            with self.subTest(flag=enable):
+                subprocess.run(
+                    ["git", "-C", str(self.fixture.root), "update-index", enable, "README.md"],
+                    check=True,
+                )
+                try:
+                    with self.assertRaisesRegex(ASSETS.AssetError, "index|skip-worktree"):
+                        ASSETS._repository_head(self.fixture.root, lock)
+                finally:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(self.fixture.root),
+                            "update-index",
+                            disable,
+                            "README.md",
+                        ],
+                        check=True,
+                    )
+
+    def test_complete_target_set_is_stable_before_report_construction(self) -> None:
+        lock = ASSETS.load_lock(self.fixture.lock)
+        asset = lock.assets[0]
+        target = self.fixture.root / asset.target
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.payload)
+        target.chmod(0o444)
+        real_identity = ASSETS._identity_proof_under
+        mutated = False
+
+        def remove_earlier_target_while_cache_is_checked(root, relative, checked_asset):
+            nonlocal mutated
+            proof = real_identity(root, relative, checked_asset)
+            if relative == ASSETS._cache_relative(asset) and not mutated:
+                target.unlink()
+                mutated = True
+            return proof
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_identity_proof_under",
+                side_effect=remove_earlier_target_while_cache_is_checked,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "target tree changed"),
+        ):
+            ASSETS.inspect("verify", lock, self.fixture.root)
+        self.assertTrue(mutated)
 
     def test_receipts_are_immutable(self) -> None:
         self.assertEqual(
@@ -352,6 +597,117 @@ class AssetParityTest(unittest.TestCase):
         )
         self.assertEqual(self.fixture.receipt.read_bytes(), before)
 
+    def test_receipt_output_cannot_enter_verified_checkout(self) -> None:
+        direct = self.fixture.root / "pipeline/.work/verification.json"
+        alias = self.fixture.base / "checkout-alias"
+        alias.symlink_to(self.fixture.root, target_is_directory=True)
+        for receipt in (direct, alias / ".asset-cache/receipt.json"):
+            with self.subTest(receipt=receipt):
+                self.assertEqual(
+                    ASSETS.main(
+                        [
+                            "audit",
+                            "--lock",
+                            str(self.fixture.lock),
+                            "--root",
+                            str(self.fixture.root),
+                            "--receipt",
+                            str(receipt),
+                        ]
+                    ),
+                    1,
+                )
+                self.assertFalse(receipt.exists())
+
+    def test_receipt_parent_swap_cannot_redirect_descriptor_publication(self) -> None:
+        receipt_parent = self.fixture.base / "external-receipts"
+        receipt_parent.mkdir()
+        receipt = receipt_parent / "proof.json"
+        held_parent = self.fixture.base / "external-receipts-held"
+        checkout_destination = self.fixture.root / ".asset-cache/redirected-receipts"
+        checkout_destination.mkdir(parents=True)
+        real_link = os.link
+
+        def publish_then_swap(source, destination, **kwargs):
+            result = real_link(source, destination, **kwargs)
+            receipt_parent.rename(held_parent)
+            receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+            return result
+
+        with (
+            mock.patch.object(ASSETS.os, "link", side_effect=publish_then_swap),
+            self.assertRaisesRegex(ASSETS.AssetError, "parent changed during publication"),
+        ):
+            ASSETS._atomic_json(
+                receipt,
+                {"ok": True},
+                no_overwrite=True,
+                forbidden_root=self.fixture.root,
+            )
+        self.assertFalse((checkout_destination / receipt.name).exists())
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_atomic_json_fsyncs_parent_after_temporary_cleanup(self) -> None:
+        output = self.fixture.base / "durable-output.json"
+        real_fsync = os.fsync
+        synced_directories = []
+
+        def record_sync(descriptor):
+            synced_directories.append(stat_mode_descriptor(descriptor))
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync):
+            ASSETS._atomic_json(output, {"durable": True}, no_overwrite=True)
+        self.assertEqual(synced_directories, ["file", "directory"])
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"durable": True})
+
+        blocked = self.fixture.base / "unsynced-output.json"
+
+        def reject_directory_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("injected directory fsync failure")
+            return real_fsync(descriptor)
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=reject_directory_sync),
+            self.assertRaisesRegex(ASSETS.AssetError, "durably synchronized"),
+        ):
+            ASSETS._atomic_json(blocked, {"durable": False}, no_overwrite=True)
+        self.assertFalse(blocked.exists())
+
+    def test_receipt_parent_swap_during_directory_sync_removes_published_link(self) -> None:
+        receipt_parent = self.fixture.base / "late-swap-receipts"
+        receipt_parent.mkdir()
+        receipt = receipt_parent / "proof.json"
+        held_parent = self.fixture.base / "late-swap-receipts-held"
+        checkout_destination = self.fixture.root / ".asset-cache/late-redirect"
+        checkout_destination.mkdir(parents=True)
+        real_fsync = os.fsync
+        swapped = False
+
+        def sync_then_swap(descriptor):
+            nonlocal swapped
+            result = real_fsync(descriptor)
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not swapped:
+                receipt_parent.rename(held_parent)
+                receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+                swapped = True
+            return result
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=sync_then_swap),
+            self.assertRaisesRegex(ASSETS.AssetError, "durable publication"),
+        ):
+            ASSETS._atomic_json(
+                receipt,
+                {"ok": True},
+                no_overwrite=True,
+                forbidden_root=self.fixture.root,
+            )
+        self.assertTrue(swapped)
+        self.assertFalse((checkout_destination / receipt.name).exists())
+        self.assertEqual(list(held_parent.iterdir()), [])
+
     def test_inventory_is_deterministic_closed_and_no_overwrite(self) -> None:
         duplicate = self.fixture.source / "other/duplicate.JPG"
         duplicate.parent.mkdir()
@@ -379,6 +735,171 @@ class AssetParityTest(unittest.TestCase):
                 repository_commit=self.fixture.head,
                 rights_class="private",
             )
+
+    def test_inventory_rejects_content_mutation_before_publication(self) -> None:
+        output = self.fixture.base / "mutable-lock.json"
+        source = self.fixture.source / "pipeline/raw/IMG_1570.JPG"
+        real_snapshot = ASSETS._inventory_snapshot
+        calls = 0
+
+        def mutate_after_first_snapshot(root):
+            nonlocal calls
+            proof = real_snapshot(root)
+            calls += 1
+            if calls == 1:
+                source.write_bytes(b"x" * len(self.fixture.payload))
+            return proof
+
+        with mock.patch.object(
+            ASSETS,
+            "_inventory_snapshot",
+            side_effect=mutate_after_first_snapshot,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "completed scan"):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="mutable-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse(output.exists())
+
+    def test_inventory_rejects_late_file_before_publication(self) -> None:
+        output = self.fixture.base / "late-lock.json"
+        real_snapshot = ASSETS._inventory_snapshot
+        calls = 0
+
+        def add_file_after_first_snapshot(root):
+            nonlocal calls
+            proof = real_snapshot(root)
+            calls += 1
+            if calls == 1:
+                late = self.fixture.source / "late/private.bin"
+                late.parent.mkdir()
+                late.write_bytes(b"late")
+            return proof
+
+        with mock.patch.object(
+            ASSETS,
+            "_inventory_snapshot",
+            side_effect=add_file_after_first_snapshot,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "completed scan"):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="late-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse(output.exists())
+
+    def test_inventory_opens_files_relative_to_held_parent_descriptors(self) -> None:
+        output = self.fixture.base / "descriptor-lock.json"
+        real_open = ASSETS.os.open
+        observed_parent_descriptors = []
+
+        def record_file_open(path, flags, *args, dir_fd=None, **kwargs):
+            if path == "IMG_1570.JPG":
+                observed_parent_descriptors.append(dir_fd)
+            return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+        with mock.patch.object(ASSETS.os, "open", side_effect=record_file_open):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="descriptor-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertGreaterEqual(len(observed_parent_descriptors), 2)
+        self.assertTrue(all(value is not None for value in observed_parent_descriptors))
+
+    def test_empty_generic_inventory_is_rejected_before_write(self) -> None:
+        empty = self.fixture.base / "empty-source"
+        empty.mkdir()
+        output = self.fixture.base / "empty-lock.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "at least one"):
+            ASSETS.inventory(
+                empty,
+                output,
+                lock_id="empty-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+    def test_generic_inventory_rejects_unsafe_targets_before_write(self) -> None:
+        for index, relative in enumerate((r"bad\name.bin", ".GIT/config")):
+            with self.subTest(relative=relative):
+                source = self.fixture.base / f"unsafe-source-{index}"
+                target = source / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(b"unsafe")
+                output = self.fixture.base / f"unsafe-lock-{index}.json"
+                with self.assertRaises(ASSETS.AssetError):
+                    ASSETS.inventory(
+                        source,
+                        output,
+                        lock_id="unsafe-assets",
+                        profile="generic",
+                        repository_commit=self.fixture.head,
+                        rights_class="private",
+                    )
+                self.assertFalse(output.exists())
+
+    def test_generic_inventory_rejects_case_colliding_targets_before_write(self) -> None:
+        source = self.fixture.base / "case-colliding-source"
+        source.mkdir()
+        (source / "Asset.bin").write_bytes(b"first")
+        (source / "asset.bin").write_bytes(b"second")
+        output = self.fixture.base / "case-colliding-lock.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="case-colliding-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+    def test_production_inventory_requires_exact_clean_script_checkout(self) -> None:
+        output = self.fixture.base / "production-lock.json"
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            self.assertRaisesRegex(ASSETS.AssetError, "exact clean script checkout"),
+        ):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit="a" * 40,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+        (self.fixture.root / "README.md").write_text("dirty authority\n", encoding="utf-8")
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            self.assertRaisesRegex(ASSETS.AssetError, "tracked or staged"),
+        ):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixtures require POSIX")
     def test_inventory_rejects_special_files(self) -> None:
@@ -441,6 +962,25 @@ class AssetParityTest(unittest.TestCase):
         self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
         lock = ASSETS.load_lock(self.fixture.lock)
         self.assertEqual(len(lock.assets), 487)
+        bound_root = self.fixture.base / "bound-checkout"
+        for relative in (
+            "corpus/manifest.json",
+            "music/audio-toolchain.json",
+            "submission/screendance-2027.yaml",
+        ):
+            destination = bound_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((ROOT / relative).read_bytes())
+        bound_manifest = json.loads(
+            (bound_root / "corpus/manifest.json").read_text(encoding="utf-8")
+        )
+        bound_manifest["frames"][0]["source"] = "BOUND_ONLY.JPG"
+        (bound_root / "corpus/manifest.json").write_text(
+            json.dumps(bound_manifest),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ASSETS.AssetError, "487-object"):
+            ASSETS.load_lock(self.fixture.lock, repository_root=bound_root)
         extra = self.fixture.root / "pipeline/.work/raw/EXTRA.JPG"
         extra.parent.mkdir(parents=True)
         extra.write_bytes(b"stale ignored input")
@@ -453,6 +993,9 @@ class AssetParityTest(unittest.TestCase):
             "rights": lambda row: row.update(rights_class="public"),
             "media": lambda row: row.update(media_type="application/octet-stream"),
             "source": lambda row: row.update(sources=[{"kind": "https", "url": "https://example.com/raw"}]),
+            "personal file source": lambda row: row.update(
+                sources=[{"kind": "file", "path": "Users/alice/archive/IMG_1594.JPG"}]
+            ),
             "unauthenticated release": lambda row: row.update(
                 sources=[
                     {
@@ -547,7 +1090,38 @@ class AssetParityTest(unittest.TestCase):
             ) as open_url,
             self.assertRaisesRegex(ASSETS.AssetError, "private GitHub repository"),
         ):
-            ASSETS._github_release_asset(source, 1.0)
+            ASSETS._github_release_asset(
+                source,
+                1.0,
+                require_private_repository=True,
+            )
+        open_url.assert_called_once()
+
+    def test_authenticated_public_release_does_not_claim_private_custody(self) -> None:
+        source = {
+            "kind": "github-release",
+            "repository": "organvm/public-assets",
+            "tag": "v1",
+            "asset": "payload.bin",
+            "token_env": "DANSE_PUBLIC_TOKEN",
+        }
+        metadata = json.dumps(
+            {"assets": [{"name": "payload.bin", "url": "https://api.github.com/assets/1"}]}
+        ).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = [metadata, b""]
+        response.__exit__.return_value = False
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DANSE_PUBLIC_TOKEN": "printable-token"},
+                clear=True,
+            ),
+            mock.patch.object(ASSETS, "_open_url", return_value=response) as open_url,
+        ):
+            url, headers = ASSETS._github_release_asset(source, 1.0)
+        self.assertEqual(url, "https://api.github.com/assets/1")
+        self.assertEqual(headers["Authorization"], "Bearer printable-token")
         open_url.assert_called_once()
 
     def test_header_construction_errors_are_redacted_asset_errors(self) -> None:
@@ -600,6 +1174,7 @@ class AssetParityTest(unittest.TestCase):
         for path in (
             "corpus/**",
             "music/**",
+            "interaction-test.html",
             "index.html",
             "verify.html",
             "probe.html",
@@ -608,6 +1183,10 @@ class AssetParityTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertEqual(workflow.count(f'      - "{path}"'), 2)
+        self.assertIn("args=(--check --verify --arrival --probe --interaction)", workflow)
+        self.assertIn("grep -q -- '--controls'", workflow)
+        self.assertIn("args+=(--controls)", workflow)
+        self.assertIn('python render/browser.py "${args[@]}"', workflow)
 
     @unittest.skipIf(jsonschema is None, "jsonschema is not installed")
     def test_lock_and_redacted_receipt_match_tracked_schemas(self) -> None:
@@ -619,8 +1198,12 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com/private?signature=secret",
             "https://example.com/private#fragment",
             "https://example.com:444/private",
+            "https://-bad.example/private",
+            "https://example..com/private",
             "https://localhost/private",
+            "https://LOCALHOST/private",
             "https://127.0.0.1/private",
+            "https://999.999/private",
             "https://host.local/private",
             "https://[::1]/private",
         ):
@@ -632,6 +1215,25 @@ class AssetParityTest(unittest.TestCase):
         unsafe_path["assets"][0]["target"] = ".git/refs/heads/main"
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for target in (".GIT/refs/heads/main", ".Asset-Cache/sha256/object"):
+            unsafe_path = copy.deepcopy(lock_value)
+            unsafe_path["assets"][0]["target"] = target
+            with self.subTest(schema_target=target), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for field in ("target", "file source"):
+            unsafe_path = copy.deepcopy(lock_value)
+            if field == "target":
+                unsafe_path["assets"][0]["target"] = "foo\x00bar"
+            else:
+                unsafe_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "foo\x00bar"}
+                ]
+            with self.subTest(schema_path_field=field), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
         self.assertEqual(
             ASSETS.main(
                 [
@@ -661,6 +1263,10 @@ class AssetParityTest(unittest.TestCase):
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def stat_mode_descriptor(descriptor: int) -> str:
+    return "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
 
 
 if __name__ == "__main__":
