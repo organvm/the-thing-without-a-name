@@ -10,6 +10,7 @@ are then published to their target with an atomic, no-overwrite hard link.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -115,7 +116,8 @@ def _safe_relative(value: object, label: str) -> str:
         or not value
         or "\\" in value
         or "\x00" in value
-        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        or unicodedata.normalize("NFC", value) != value
     ):
         raise AssetError(f"{label} must be a safe POSIX-relative path")
     pure = PurePosixPath(value)
@@ -765,11 +767,20 @@ def _repository_head(root: Path, lock: Lock | None = None) -> str:
             check=False,
             env=environment,
         )
+        final_identity = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
     except OSError as exc:
         raise AssetError("git is required to verify the repository commit") from exc
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2 or not GIT_SHA.fullmatch(lines[1]):
         raise AssetError("asset root is not a readable Git checkout")
+    if final_identity.returncode != 0 or final_identity.stdout != identity.stdout:
+        raise AssetError("Git checkout identity changed during verification")
     try:
         top = Path(lines[0]).resolve(strict=True)
     except OSError as exc:
@@ -937,10 +948,7 @@ def _fsync_verified_asset_at(parent: int, name: str, asset: Asset) -> None:
         opened = _stat_identity(os.fstat(descriptor))
         if opened != proof:
             raise AssetError("asset changed before durable synchronization")
-        try:
-            os.fsync(descriptor)
-        except OSError as exc:
-            raise AssetError("asset file could not be durably synchronized") from exc
+        _fsync_asset_file(descriptor, "asset file")
         synchronized = _stat_identity(os.fstat(descriptor))
         try:
             linked = _stat_identity(os.stat(name, dir_fd=parent, follow_symlinks=False))
@@ -1163,10 +1171,28 @@ def _write_stream_verified(stream, output: BinaryIO, asset: Asset) -> None:
 
 
 def _fsync_asset_directory(descriptor: int, label: str) -> None:
+    # Darwin's F_FULLFSYNC applies to regular files. Directory entry ordering
+    # uses the directory descriptor's fsync barrier after each metadata change.
     try:
         os.fsync(descriptor)
     except OSError as exc:
         raise AssetError(f"{label} could not be durably synchronized") from exc
+
+
+def _fsync_asset_file(descriptor: int, label: str) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise AssetError(f"{label} could not be durably synchronized") from exc
+    if sys.platform != "darwin":
+        return
+    full_fsync = getattr(fcntl, "F_FULLFSYNC", None)
+    if full_fsync is None:
+        raise AssetError(f"{label} cannot prove durable storage on Darwin")
+    try:
+        fcntl.fcntl(descriptor, full_fsync)
+    except OSError as exc:
+        raise AssetError(f"{label} could not be fully synchronized on Darwin") from exc
 
 
 def _remove_published_link(descriptor: int, name: str) -> None:
@@ -1243,9 +1269,9 @@ def _cache_from_sources(
                     ) as stream:
                         _write_stream_verified(stream, output, asset)
                         output.flush()
-                        os.fsync(output.fileno())
+                        _fsync_asset_file(output.fileno(), "temporary asset file")
                         os.fchmod(output.fileno(), 0o444)
-                        os.fsync(output.fileno())
+                        _fsync_asset_file(output.fileno(), "temporary asset file")
                     try:
                         os.link(
                             temporary_name,
@@ -1257,6 +1283,15 @@ def _cache_from_sources(
                         published = True
                     except FileExistsError:
                         pass
+                    try:
+                        os.unlink(temporary_name, dir_fd=cache_descriptor)
+                    except OSError as exc:
+                        if published:
+                            _remove_published_link(cache_descriptor, cache_name)
+                        raise AssetError(
+                            "temporary cache object could not be removed before publication"
+                        ) from exc
+                    temporary_name = None
                 except (
                     AssetError,
                     OSError,
@@ -1298,6 +1333,11 @@ def _cache_from_sources(
                         os.unlink(temporary_name, dir_fd=cache_descriptor)
                     except FileNotFoundError:
                         pass
+                    else:
+                        try:
+                            os.fsync(cache_descriptor)
+                        except OSError:
+                            pass
         detail = "; ".join(errors) if errors else "no sources declared"
         raise AssetError(f"no source satisfied asset {asset.asset_id}: {detail}")
     finally:
@@ -1520,6 +1560,63 @@ def _fsync_output_parent(descriptor: int) -> None:
         raise AssetError("output parent could not be durably synchronized") from exc
 
 
+def _open_durable_output_directory(path: Path) -> int:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    absolute = path.resolve(strict=False)
+    anchor = Path(absolute.anchor)
+    try:
+        current = os.open(anchor, directory_flags)
+    except OSError as exc:
+        raise AssetError("output parent anchor could not be opened safely") from exc
+    try:
+        for part in absolute.relative_to(anchor).parts:
+            created = False
+            try:
+                child = os.open(part, directory_flags, dir_fd=current)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current)
+                    created = True
+                except FileExistsError:
+                    pass
+                child = os.open(part, directory_flags, dir_fd=current)
+            try:
+                if created:
+                    _fsync_output_parent(current)
+                linked = os.stat(part, dir_fd=current, follow_symlinks=False)
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(linked.st_mode)
+                    or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+                ):
+                    raise AssetError("output parent changed during durable creation")
+            except (AssetError, OSError) as exc:
+                os.close(child)
+                if created:
+                    try:
+                        os.rmdir(part, dir_fd=current)
+                        os.fsync(current)
+                    except OSError:
+                        pass
+                if isinstance(exc, AssetError):
+                    raise
+                raise AssetError("output parent changed during durable creation") from exc
+            os.close(current)
+            current = child
+        return current
+    except AssetError:
+        os.close(current)
+        raise
+    except OSError as exc:
+        os.close(current)
+        raise AssetError("output parent traverses a symlink or non-directory") from exc
+
+
 def _atomic_json(
     path: Path,
     value: dict,
@@ -1529,22 +1626,12 @@ def _atomic_json(
 ) -> None:
     try:
         parent_path = path.parent.resolve(strict=False)
-        parent_path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise AssetError("output parent could not be prepared safely") from exc
     path = parent_path / path.name
     if forbidden_root is not None:
         _receipt_outside_checkout(path, forbidden_root)
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        parent_descriptor = os.open(parent_path, directory_flags)
-    except OSError as exc:
-        raise AssetError("output parent could not be opened safely") from exc
+    parent_descriptor = _open_durable_output_directory(parent_path)
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
     temporary_descriptor = -1
     temporary_name: str | None = None
@@ -1574,7 +1661,7 @@ def _atomic_json(
             temporary_descriptor = -1
             handle.write(payload)
             handle.flush()
-            os.fsync(handle.fileno())
+            _fsync_asset_file(handle.fileno(), "receipt file")
         if not parent_is_valid():
             raise AssetError("output parent changed before publication")
         if no_overwrite:

@@ -162,6 +162,10 @@ class AssetParityTest(unittest.TestCase):
             else:
                 for label, path in durable_directories.items():
                     if descriptor_matches_path(descriptor, path):
+                        if label == "cache-bucket":
+                            self.assertFalse(
+                                any(name.startswith(".asset-") for name in os.listdir(descriptor))
+                            )
                         events.append(label)
                         break
             return real_fsync(descriptor)
@@ -198,6 +202,80 @@ class AssetParityTest(unittest.TestCase):
                 self.assertLess(events.index(label), receipt_index)
         self.assertLess(events.index("cache-bucket"), events.index("target-parent"))
         self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_darwin_file_sync_orders_fsync_before_fullfsync(self) -> None:
+        path = self.fixture.base / "darwin-durable.bin"
+        path.write_bytes(b"durable")
+        descriptor = os.open(path, os.O_RDONLY)
+        events = []
+        try:
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(ASSETS.fcntl, "F_FULLFSYNC", 51, create=True),
+                mock.patch.object(ASSETS.os, "fsync", side_effect=lambda _fd: events.append("fsync")),
+                mock.patch.object(
+                    ASSETS.fcntl,
+                    "fcntl",
+                    side_effect=lambda _fd, command: events.append(("fullfsync", command)),
+                ),
+            ):
+                ASSETS._fsync_asset_file(descriptor, "test asset")
+        finally:
+            os.close(descriptor)
+        self.assertEqual(events, ["fsync", ("fullfsync", 51)])
+
+    def test_darwin_file_sync_fails_closed_without_fullfsync(self) -> None:
+        path = self.fixture.base / "darwin-blocked.bin"
+        path.write_bytes(b"blocked")
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(ASSETS.fcntl, "F_FULLFSYNC", None, create=True),
+                mock.patch.object(ASSETS.os, "fsync"),
+                self.assertRaisesRegex(ASSETS.AssetError, "cannot prove durable storage"),
+            ):
+                ASSETS._fsync_asset_file(descriptor, "test asset")
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(ASSETS.fcntl, "F_FULLFSYNC", 51, create=True),
+                mock.patch.object(ASSETS.os, "fsync"),
+                mock.patch.object(ASSETS.fcntl, "fcntl", side_effect=OSError("blocked")),
+                self.assertRaisesRegex(ASSETS.AssetError, "fully synchronized"),
+            ):
+                ASSETS._fsync_asset_file(descriptor, "test asset")
+        finally:
+            os.close(descriptor)
+
+    def test_non_darwin_file_sync_never_calls_fullfsync(self) -> None:
+        path = self.fixture.base / "portable-durable.bin"
+        path.write_bytes(b"portable")
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "linux"),
+                mock.patch.object(ASSETS.os, "fsync") as portable_sync,
+                mock.patch.object(ASSETS.fcntl, "fcntl") as full_sync,
+            ):
+                ASSETS._fsync_asset_file(descriptor, "test asset")
+            portable_sync.assert_called_once_with(descriptor)
+            full_sync.assert_not_called()
+        finally:
+            os.close(descriptor)
+
+    def test_darwin_directory_sync_uses_directory_fsync_contract(self) -> None:
+        descriptor = os.open(self.fixture.base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(ASSETS.os, "fsync") as directory_sync,
+                mock.patch.object(ASSETS.fcntl, "fcntl") as full_sync,
+            ):
+                ASSETS._fsync_asset_directory(descriptor, "test directory")
+            directory_sync.assert_called_once_with(descriptor)
+            full_sync.assert_not_called()
+        finally:
+            os.close(descriptor)
 
     def test_verified_fast_path_syncs_inode_and_directories_before_receipt(self) -> None:
         self.assertEqual(
@@ -509,22 +587,25 @@ class AssetParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
             ASSETS.load_lock(self.fixture.lock)
 
-    def test_paths_reject_nfc_and_nfd_unicode_aliases(self) -> None:
+    def test_paths_allow_nfc_and_reject_nfd_unicode_aliases(self) -> None:
         aliases = ("caf\u00e9/asset.bin", "cafe\u0301/asset.bin")
         self.assertEqual(
             ASSETS._portable_path_key(aliases[0]),
             ASSETS._portable_path_key(aliases[1]),
         )
-        for target in aliases:
-            with self.subTest(target=target):
-                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
-                    ASSETS._safe_relative(target, "test path")
-                value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
-                value["assets"][0]["target"] = target
-                self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
-                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
-                    ASSETS.load_lock(self.fixture.lock)
-                self.fixture.write_lock()
+        self.assertEqual(ASSETS._safe_relative(aliases[0], "test path"), aliases[0])
+        self.assertEqual(ASSETS._safe_relative("日本/素材.bin", "test path"), "日本/素材.bin")
+        value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+        value["assets"][0]["target"] = aliases[0]
+        self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+        self.assertEqual(ASSETS.load_lock(self.fixture.lock).assets[0].target, aliases[0])
+        with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+            ASSETS._safe_relative(aliases[1], "test path")
+        value["assets"][0]["target"] = aliases[1]
+        self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+            ASSETS.load_lock(self.fixture.lock)
+        self.fixture.write_lock()
 
     def test_missing_parent_path_preserves_every_component(self) -> None:
         target = ASSETS._path_under(
@@ -821,6 +902,52 @@ class AssetParityTest(unittest.TestCase):
                         check=True,
                     )
 
+    def test_repository_head_rejects_real_midscan_checkout_switch(self) -> None:
+        original = subprocess.run(
+            ["git", "-C", str(self.fixture.root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        (self.fixture.root / "README.md").write_text("second commit\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.fixture.root), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.fixture.root), "commit", "--quiet", "-m", "second"],
+            check=True,
+        )
+        second = subprocess.run(
+            ["git", "-C", str(self.fixture.root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        real_run = subprocess.run
+        switched = False
+
+        def switch_after_status(command, *args, **kwargs):
+            nonlocal switched
+            result = real_run(command, *args, **kwargs)
+            if not switched and "status" in command:
+                real_run(
+                    ["git", "-C", str(self.fixture.root), "checkout", "--quiet", original],
+                    check=True,
+                )
+                switched = True
+            return result
+
+        try:
+            with (
+                mock.patch.object(ASSETS.subprocess, "run", side_effect=switch_after_status),
+                self.assertRaisesRegex(ASSETS.AssetError, "identity changed"),
+            ):
+                ASSETS._repository_head(self.fixture.root)
+            self.assertTrue(switched)
+        finally:
+            real_run(
+                ["git", "-C", str(self.fixture.root), "checkout", "--quiet", second],
+                check=True,
+            )
+
     def test_complete_target_set_is_stable_before_report_construction(self) -> None:
         lock = ASSETS.load_lock(self.fixture.lock)
         asset = lock.assets[0]
@@ -992,6 +1119,57 @@ class AssetParityTest(unittest.TestCase):
         ):
             ASSETS._atomic_json(blocked, {"durable": False}, no_overwrite=True)
         self.assertFalse(blocked.exists())
+
+    def test_atomic_json_persists_every_new_output_ancestor(self) -> None:
+        output = self.fixture.base / "external/a/b/proof.json"
+        directories = {
+            "base": self.fixture.base,
+            "external": self.fixture.base / "external",
+            "a": self.fixture.base / "external/a",
+            "b": self.fixture.base / "external/a/b",
+        }
+        events = []
+        real_fsync = os.fsync
+
+        def record_sync(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                events.append("file")
+            else:
+                for label, path in directories.items():
+                    if descriptor_matches_path(descriptor, path):
+                        events.append(label)
+                        break
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync):
+            ASSETS._atomic_json(output, {"durable": True}, no_overwrite=True)
+        file_index = events.index("file")
+        for label in ("base", "external", "a"):
+            with self.subTest(directory=label):
+                self.assertLess(events.index(label), file_index)
+        self.assertGreater(events.index("b"), file_index)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"durable": True})
+
+    def test_output_ancestor_sync_failure_cleans_directory_and_blocks_output(self) -> None:
+        output = self.fixture.base / "blocked-parent/a/proof.json"
+        real_fsync = os.fsync
+        rejected = False
+
+        def reject_base_once(descriptor):
+            nonlocal rejected
+            if not rejected and descriptor_matches_path(descriptor, self.fixture.base):
+                rejected = True
+                raise OSError("injected output ancestor sync failure")
+            return real_fsync(descriptor)
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=reject_base_once),
+            self.assertRaisesRegex(ASSETS.AssetError, "durably synchronized"),
+        ):
+            ASSETS._atomic_json(output, {"durable": False}, no_overwrite=True)
+        self.assertTrue(rejected)
+        self.assertFalse((self.fixture.base / "blocked-parent").exists())
+        self.assertFalse(output.exists())
 
     def test_receipt_parent_swap_during_directory_sync_removes_published_link(self) -> None:
         receipt_parent = self.fixture.base / "late-swap-receipts"
@@ -1190,23 +1368,42 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertFalse(output.exists())
 
-    def test_generic_inventory_rejects_nfc_and_nfd_targets_before_write(self) -> None:
-        for index, name in enumerate(("caf\u00e9.bin", "cafe\u0301.bin")):
-            with self.subTest(name=name):
-                source = self.fixture.base / f"unicode-source-{index}"
-                source.mkdir()
-                (source / name).write_bytes(b"nonportable")
-                output = self.fixture.base / f"unicode-lock-{index}.json"
-                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
-                    ASSETS.inventory(
-                        source,
-                        output,
-                        lock_id="unicode-assets",
-                        profile="generic",
-                        repository_commit=self.fixture.head,
-                        rights_class="private",
-                    )
-                self.assertFalse(output.exists())
+    def test_generic_inventory_allows_nfc_and_rejects_nfd_targets(self) -> None:
+        source = self.fixture.base / "unicode-source"
+        source.mkdir()
+        payload = b"portable-unicode"
+        digest = hashlib.sha256(payload).hexdigest()
+        nfc = "caf\u00e9.bin"
+        nfd = "cafe\u0301.bin"
+        nfc_entry = ASSETS.InventoryEntry(nfc, "file", (1, 2, 0, len(payload), 3, 4), len(payload), digest)
+        nfd_entry = ASSETS.InventoryEntry(nfd, "file", (1, 2, 0, len(payload), 3, 4), len(payload), digest)
+
+        nfc_output = self.fixture.base / "unicode-nfc-lock.json"
+        with mock.patch.object(ASSETS, "_inventory_snapshot", return_value=(nfc_entry,)):
+            value = ASSETS.inventory(
+                source,
+                nfc_output,
+                lock_id="unicode-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertEqual(value["assets"][0]["target"], nfc)
+
+        nfd_output = self.fixture.base / "unicode-nfd-lock.json"
+        with (
+            mock.patch.object(ASSETS, "_inventory_snapshot", return_value=(nfd_entry,)),
+            self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"),
+        ):
+            ASSETS.inventory(
+                source,
+                nfd_output,
+                lock_id="unicode-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(nfd_output.exists())
 
     def test_production_inventory_requires_exact_clean_script_checkout(self) -> None:
         output = self.fixture.base / "production-lock.json"
@@ -1525,6 +1722,7 @@ class AssetParityTest(unittest.TestCase):
         self.assertIn("grep -q -- '--controls'", workflow)
         self.assertIn("args+=(--controls)", workflow)
         self.assertIn('python render/browser.py "${args[@]}"', workflow)
+        self.assertIn("run: python scripts/tests/assets.test.py", workflow)
 
     @unittest.skipIf(jsonschema is None, "jsonschema is not installed")
     def test_lock_and_redacted_receipt_match_tracked_schemas(self) -> None:
@@ -1560,19 +1758,34 @@ class AssetParityTest(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
-        for alias in ("caf\u00e9/asset.bin", "cafe\u0301/asset.bin"):
-            for field in ("target", "file source"):
-                unsafe_path = copy.deepcopy(lock_value)
-                if field == "target":
-                    unsafe_path["assets"][0]["target"] = alias
-                else:
-                    unsafe_path["assets"][0]["sources"] = [
-                        {"kind": "file", "path": alias}
-                    ]
-                with self.subTest(schema_unicode=alias, field=field), self.assertRaises(
-                    jsonschema.ValidationError
-                ):
-                    jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for field in ("target", "file source"):
+            nfc_path = copy.deepcopy(lock_value)
+            if field == "target":
+                nfc_path["assets"][0]["target"] = "caf\u00e9/asset.bin"
+            else:
+                nfc_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "caf\u00e9/asset.bin"}
+                ]
+            jsonschema.Draft202012Validator(lock_schema).validate(nfc_path)
+
+            japanese_path = copy.deepcopy(lock_value)
+            if field == "target":
+                japanese_path["assets"][0]["target"] = "日本/素材.bin"
+            else:
+                japanese_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "日本/素材.bin"}
+                ]
+            jsonschema.Draft202012Validator(lock_schema).validate(japanese_path)
+
+            nfd_path = copy.deepcopy(lock_value)
+            if field == "target":
+                nfd_path["assets"][0]["target"] = "cafe\u0301/asset.bin"
+            else:
+                nfd_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "cafe\u0301/asset.bin"}
+                ]
+            with self.subTest(field=field), self.assertRaises(jsonschema.ValidationError):
+                jsonschema.Draft202012Validator(lock_schema).validate(nfd_path)
         for field in ("target", "file source"):
             unsafe_path = copy.deepcopy(lock_value)
             if field == "target":
