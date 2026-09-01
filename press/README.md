@@ -6,7 +6,8 @@ This directory contains the current public-facing publication materials for **Da
 
 - [`social_media_package.md`](social_media_package.md) — preferred LinkedIn post, two alternatives, follow-up comments, tagging rules, and claim audit.
 - [`linkedin_networking_plan.md`](linkedin_networking_plan.md) — verified ScreenDance Miami relationship map and individualized connection notes.
-- [`linkedin_visual_brief.md`](linkedin_visual_brief.md) — production-only 1200 × 627 visual direction and alt text.
+- [`linkedin_visual_scoremap.svg`](linkedin_visual_scoremap.svg) — ready 1200 × 627 white-background publication visual built from the repository’s actual provenance map.
+- [`linkedin_visual_brief.md`](linkedin_visual_brief.md) — score-map alt text plus production-only frame-sequence and single-frame specifications.
 - [`public_credits.md`](public_credits.md) — controlling current public credit block.
 
 ## Governing status
