@@ -861,7 +861,7 @@ class DeliveryContractTest(unittest.TestCase):
                 "missing": 0,
                 "sha256": "a" * 64,
                 "signature": "renderer-signature",
-                "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5)",
+                "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version)",
                 "width": 3840,
                 "height": 2160,
                 "fps": 30,
@@ -947,6 +947,32 @@ class DeliveryContractTest(unittest.TestCase):
                 args.start = 0.0
                 dest.write_bytes(b"different segment")
                 self.assertFalse(OFFLINE.complete(dest, 30, expected))
+
+    def test_emergency_source_identity_revalidates_cached_inputs(self) -> None:
+        args = SimpleNamespace(emergency_software_render=True, seed=0)
+
+        def source_probe(command, **_kwargs):
+            if command[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if command[:3] == ["git", "rev-parse", "--verify"]:
+                identity = "a" * 40 if command[-1] == "HEAD^{commit}" else "b" * 40
+                return subprocess.CompletedProcess(command, 0, stdout=identity + "\n", stderr="")
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(command, 0, stdout="Chromium fixture\n", stderr="")
+            raise AssertionError(f"unexpected source probe: {command}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "chromium"
+            executable.write_bytes(b"first Chromium bytes")
+            with (
+                mock.patch.dict(os.environ, {"DANSE_CHROME_EXECUTABLE": str(executable)}),
+                mock.patch.object(OFFLINE.subprocess, "run", side_effect=source_probe),
+            ):
+                identity = OFFLINE.emergency_source_identity(args)
+                self.assertEqual(identity["browser_toolchain"]["executable_sha256"], OFFLINE.file_sha256(executable))
+                executable.write_bytes(b"changed Chromium bytes")
+                with self.assertRaisesRegex(SystemExit, "identity changed during capture"):
+                    OFFLINE.emergency_source_identity(args)
 
     def test_film_rejects_legacy_duration_and_uses_exact_passage_span_selection(self) -> None:
         film = (ROOT / "film.html").read_text(encoding="utf-8")

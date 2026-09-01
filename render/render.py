@@ -299,8 +299,6 @@ def emergency_source_identity(args) -> dict[str, object] | None:
     if browser_render_context(args) == CANONICAL_RENDER_CONTEXT:
         return None
     cached = getattr(args, "_emergency_source_identity", None)
-    if cached:
-        return cached
 
     status = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=no"],
@@ -364,6 +362,8 @@ def emergency_source_identity(args) -> dict[str, object] | None:
             "version": version_line[0],
         },
     }
+    if cached is not None and identity != cached:
+        raise SystemExit("emergency source identity changed during capture")
     args._emergency_source_identity = identity
     return identity
 
@@ -754,6 +754,7 @@ class _Slot:
 
 def render_segment(args, segment: int, dest: Path) -> dict:
     """One segment, start to finish, in its own browser process."""
+    emergency_source_identity(args)
     slot = _Slot()
     with serve(sink=slot) as base:
         # The window's format unless overridden; the page is asked for exactly
@@ -838,6 +839,7 @@ def render_segment(args, segment: int, dest: Path) -> dict:
             if written[0] != count:
                 raise SystemExit(f"segment {segment}: sank {written[0]} frames, rendered {count}")
 
+            emergency_source_identity(args)
             return {
                 "frames": count,
                 "missing": missing,
