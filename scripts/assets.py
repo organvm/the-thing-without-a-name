@@ -132,6 +132,22 @@ def _portable_path_key(value: str) -> str:
     return unicodedata.normalize("NFC", value).casefold()
 
 
+def _register_portable_target(
+    known: set[tuple[str, ...]],
+    value: str,
+    label: str,
+) -> None:
+    key = tuple(_portable_path_key(part) for part in PurePosixPath(value).parts)
+    for existing in known:
+        shared = min(len(existing), len(key))
+        if existing[:shared] != key[:shared]:
+            continue
+        if len(existing) == len(key):
+            raise AssetError(f"{label} contains case-colliding asset targets")
+        raise AssetError(f"{label} contains file-and-ancestor-colliding asset targets")
+    known.add(key)
+
+
 def _https_url(value: object, *, allow_query: bool = False) -> str:
     if not isinstance(value, str):
         raise AssetError("HTTPS source URL must be a string")
@@ -270,7 +286,7 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
     assets: list[Asset] = []
     ids: set[str] = set()
     targets: set[str] = set()
-    casefolded_targets: set[str] = set()
+    portable_targets: set[tuple[str, ...]] = set()
     for row in value["assets"]:
         required_keys = {
             "id",
@@ -294,10 +310,7 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
         if target in targets:
             raise AssetError("asset lock repeats an asset target")
         targets.add(target)
-        casefolded_target = _portable_path_key(target)
-        if casefolded_target in casefolded_targets:
-            raise AssetError("asset lock contains case-colliding asset targets")
-        casefolded_targets.add(casefolded_target)
+        _register_portable_target(portable_targets, target, "asset lock")
         digest = row["sha256"]
         if not isinstance(digest, str) or not HEX64.fullmatch(digest):
             raise AssetError("asset SHA-256 is invalid")
@@ -1394,15 +1407,12 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target could not be published atomically") from exc
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    os.unlink(target_name, dir_fd=target_descriptor)
+                    _remove_published_link(target_descriptor, target_name)
                 raise AssetError("asset target parent changed during publication")
             final_state = _identity_at(target_descriptor, target_name, asset)
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    try:
-                        os.unlink(target_name, dir_fd=target_descriptor)
-                    except FileNotFoundError:
-                        pass
+                    _remove_published_link(target_descriptor, target_name)
                 raise AssetError("asset target parent changed during final verification")
             if final_state != "verified":
                 if published:
@@ -1780,16 +1790,13 @@ def inventory(
     snapshot = _inventory_snapshot(root)
     files = [entry for entry in snapshot if entry.kind == "file"]
     targets: set[str] = set()
-    casefolded_targets: set[str] = set()
+    portable_targets: set[tuple[str, ...]] = set()
     for entry in files:
         target = _safe_relative(entry.relative, "inventory target")
         if target in targets:
             raise AssetError("inventory repeats an asset target")
         targets.add(target)
-        casefolded_target = _portable_path_key(target)
-        if casefolded_target in casefolded_targets:
-            raise AssetError("inventory contains case-colliding asset targets")
-        casefolded_targets.add(casefolded_target)
+        _register_portable_target(portable_targets, target, "inventory")
     actual = targets
     if not actual:
         raise AssetError("inventory source must contain at least one regular file")

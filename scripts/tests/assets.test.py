@@ -587,6 +587,23 @@ class AssetParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
             ASSETS.load_lock(self.fixture.lock)
 
+    def test_lock_rejects_file_and_ancestor_target_collisions_portably(self) -> None:
+        for ancestor, descendant in (
+            ("pipeline/output", "pipeline/output/asset.bin"),
+            ("Pipeline/Output", "pipeline/output/asset.bin"),
+        ):
+            with self.subTest(ancestor=ancestor):
+                value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+                value["assets"][0]["target"] = ancestor
+                descendant_row = copy.deepcopy(value["assets"][0])
+                descendant_row["id"] = "origin-img-1570-descendant"
+                descendant_row["target"] = descendant
+                value["assets"].append(descendant_row)
+                self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(ASSETS.AssetError, "ancestor-colliding"):
+                    ASSETS.load_lock(self.fixture.lock)
+                self.fixture.write_lock()
+
     def test_paths_allow_nfc_and_reject_nfd_unicode_aliases(self) -> None:
         aliases = ("caf\u00e9/asset.bin", "cafe\u0301/asset.bin")
         self.assertEqual(
@@ -695,6 +712,35 @@ class AssetParityTest(unittest.TestCase):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_vanished_publication_during_parent_swap_is_controlled_blocked(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        target = self.fixture.root / asset.target
+        target.parent.mkdir(parents=True)
+        real_matches = ASSETS._parent_descriptor_matches
+        checks = 0
+
+        def remove_after_publication(root, relative, descriptor):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                target.unlink()
+                return False
+            return real_matches(root, relative, descriptor)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_parent_descriptor_matches",
+                side_effect=remove_after_publication,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "parent changed during publication"),
+        ):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertFalse(target.exists())
 
     def test_target_parent_swap_after_final_identity_removes_publication(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -1362,6 +1408,36 @@ class AssetParityTest(unittest.TestCase):
                 source,
                 output,
                 lock_id="case-colliding-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+    def test_generic_inventory_rejects_portable_ancestor_collisions_before_write(self) -> None:
+        source = self.fixture.base / "ancestor-colliding-source"
+        source.mkdir()
+        payload = b"portable-ancestor"
+        digest = hashlib.sha256(payload).hexdigest()
+        entries = (
+            ASSETS.InventoryEntry("Foo", "file", (1, 2, 0, len(payload), 3, 4), len(payload), digest),
+            ASSETS.InventoryEntry(
+                "foo/asset.bin",
+                "file",
+                (1, 3, 0, len(payload), 3, 4),
+                len(payload),
+                digest,
+            ),
+        )
+        output = self.fixture.base / "ancestor-colliding-lock.json"
+        with (
+            mock.patch.object(ASSETS, "_inventory_snapshot", return_value=entries),
+            self.assertRaisesRegex(ASSETS.AssetError, "ancestor-colliding"),
+        ):
+            ASSETS.inventory(
+                source,
+                output,
+                lock_id="ancestor-colliding-assets",
                 profile="generic",
                 repository_commit=self.fixture.head,
                 rights_class="private",
