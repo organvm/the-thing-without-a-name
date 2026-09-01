@@ -2008,8 +2008,8 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("const projectFragment = Boolean(projectSectionFor(location.hash));", new_river)
         self.assertIn("const freshRememberedRiver = currentRememberedRiver", new_river)
         self.assertIn('Arrival.rememberedRiverForUndo(currentRememberedRiver, "", recalled)', new_river)
-        self.assertIn("const carriedCitedUrl = projectReturnRiverUrl", new_river)
-        self.assertIn("previousRiverUrl = projectFragment && freshRememberedRiver", new_river)
+        self.assertIn("const carriedProjectUrl = projectReturnRiverUrl", new_river)
+        self.assertIn("previousRiverUrl = projectFragment && carriedProjectUrl && freshRememberedRiver", new_river)
         self.assertIn(": Arrival.href(river, { mode: program ? null : \"free\" });", new_river)
         self.assertIn(
             "const restoredUrl = previousRiverUrl ?? Arrival.href(river);",
@@ -2102,12 +2102,13 @@ console.log(JSON.stringify(result.value));
             "&& Boolean(projectSectionFor(location.hash));"
         )
         canonical = (
-            'history.replaceState(null, "", Arrival.href(river, '
-            '{ mode: program ? null : "free" }));'
+            'currentRiverUrl = Arrival.href(river, '
+            '{ mode: program ? null : "free" });'
         )
         self.assertIn(capture, close)
         self.assertIn("if (closedProjectFragment) {", close)
         self.assertIn(canonical, close)
+        self.assertIn('history.replaceState(null, "", currentRiverUrl);', close)
         self.assertIn("projectReturnRiverUrl = null;", close)
         self.assertLess(close.index(capture), close.index("projectMap.close()"))
         self.assertLess(close.index("projectMap.close()"), close.index(canonical))
@@ -2134,11 +2135,12 @@ console.log(JSON.stringify(result.value));
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
         capture = "const projectFragment = Boolean(projectSectionFor(location.hash));"
         replacement = (
-            'history.replaceState(null, "", Arrival.href(river, '
-            '{ mode: program ? null : "free" }));'
+            'currentRiverUrl = Arrival.href(river, '
+            '{ mode: program ? null : "free" });'
         )
         self.assertIn(capture, new_river)
         self.assertIn(replacement, new_river)
+        self.assertIn('history.replaceState(null, "", currentRiverUrl);', new_river)
         self.assertLess(new_river.index(capture), new_river.index("Arrival.mint()"))
         self.assertLess(new_river.index("Arrival.mint()"), new_river.index(replacement))
 
@@ -2151,7 +2153,7 @@ console.log(JSON.stringify(result.value));
         close = "if (projectMap.open) controlBus?.actions.close();"
         self.assertIn(close, hash_navigation)
         self.assertLess(hash_navigation.index(close), hash_navigation.index("Arrival.arrive(fragment)"))
-        canonical = 'history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));'
+        canonical = 'currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });'
         self.assertIn(canonical, new_river)
         self.assertLess(new_river.index("Arrival.mint()"), new_river.index(canonical))
         self.assertIn("history.replaceState(", undo_river)
@@ -2169,14 +2171,32 @@ console.log(JSON.stringify(result.value));
         new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("let projectReturnRiverUrl = null;", self.script)
         self.assertIn("const oldFragment = new URL(event.oldURL).hash;", handler)
-        self.assertIn("if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = event.oldURL;", handler)
-        self.assertIn("Arrival.hasSelfContainedRiver(new URL(projectReturnRiverUrl).hash)", new_river)
-        self.assertIn("projectFragment && carriedCitedUrl", new_river)
+        self.assertIn("let currentRiverUrl = projectSectionFor(location.hash)", self.script)
+        self.assertIn("if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = currentRiverUrl;", handler)
+        self.assertNotIn("projectReturnRiverUrl = event.oldURL", handler)
+        self.assertIn("Arrival.hasSelfContainedRiver(new URL(carriedProjectUrl).hash)", new_river)
+        self.assertIn("projectFragment && carriedProjectUrl", new_river)
         self.assertIn(": Arrival.href(river, { mode: program ? null : \"free\" });", new_river)
         self.assertIn("const fragment = location.hash;", handler)
         self.assertLess(handler.index("const fragment = location.hash;"), handler.index("await Program.load()"))
         self.assertLess(handler.index("if (generation !== navigationGeneration) return;"), handler.index("Arrival.arrive(fragment)"))
         self.assertLess(handler.index("Arrival.arrive(fragment)"), handler.index("river = nextRiver;"))
+        self.assertLess(handler.index("river = nextRiver;"), handler.index("currentRiverUrl = location.href;"))
+
+    def test_undo_never_installs_a_closed_project_fragment(self) -> None:
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        project_branch = undo_river.split(
+            "projectSectionFor(new URL(restoredUrl).hash)", 1
+        )[1].split(": Arrival.withMode", 1)[0]
+        self.assertIn(
+            'Arrival.href(river, { mode: program ? null : "free" })',
+            project_branch,
+        )
+        self.assertNotIn("? restoredUrl", undo_river)
+        self.assertLess(
+            undo_river.index("history.replaceState("),
+            undo_river.index("currentRiverUrl = location.href;"),
+        )
 
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]

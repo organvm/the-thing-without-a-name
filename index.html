@@ -363,6 +363,9 @@ let navigationGeneration = 0;
 let programGeneration = 0;
 let previousRiverUrl = null;
 let projectReturnRiverUrl = null;
+let currentRiverUrl = projectSectionFor(location.hash)
+  ? Arrival.href(river, { mode: program ? null : "free" })
+  : location.href;
 
 const canvas = document.getElementById("stage");
 const el = (id) => document.getElementById(id);
@@ -550,7 +553,8 @@ requestAnimationFrame(frame);
 // all: a position reached for debugging must not overwrite the river you keep.
 setInterval(() => {
   if (shifted || (projectMap.open && projectSectionFor(location.hash))) return;
-  history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
+  currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
+  history.replaceState(null, "", currentRiverUrl);
 }, 1000);
 
 // Someone pasted a river into the address bar of a page that is already open.
@@ -562,7 +566,7 @@ addEventListener("hashchange", async (event) => {
   const projectSection = projectSectionFor(location.hash);
   if (projectSection) {
     const oldFragment = new URL(event.oldURL).hash;
-    if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = event.oldURL;
+    if (!projectSectionFor(oldFragment)) projectReturnRiverUrl = currentRiverUrl;
     navigationGeneration += 1;
     programGeneration += 1;
     previousRiver = null;
@@ -586,6 +590,7 @@ addEventListener("hashchange", async (event) => {
   if (generation !== navigationGeneration) return;
   const nextRiver = Arrival.arrive(fragment);
   river = nextRiver;
+  currentRiverUrl = location.href;
   currentRememberedRiver = Arrival.rememberedRiverForUndo(
     nextRiver,
     fragment,
@@ -822,15 +827,16 @@ function newRiver() {
   const freshRememberedRiver = currentRememberedRiver
     ? Arrival.rememberedRiverForUndo(currentRememberedRiver, "", recalled)
     : null;
-  const carriedCitedUrl = projectReturnRiverUrl
-    && Arrival.hasSelfContainedRiver(new URL(projectReturnRiverUrl).hash)
+  const carriedProjectUrl = projectReturnRiverUrl
+    && !projectSectionFor(new URL(projectReturnRiverUrl).hash)
     ? projectReturnRiverUrl
     : null;
   previousRiver = river;
-  previousRiverUrl = projectFragment && freshRememberedRiver
-    ? location.href
-    : projectFragment && carriedCitedUrl
-      ? carriedCitedUrl
+  previousRiverUrl = projectFragment && carriedProjectUrl && freshRememberedRiver
+    ? carriedProjectUrl
+    : projectFragment && carriedProjectUrl
+      && Arrival.hasSelfContainedRiver(new URL(carriedProjectUrl).hash)
+      ? carriedProjectUrl
       : shifted && (freshRememberedRiver || Arrival.hasCitedSeed(location.hash))
         ? location.href
         : Arrival.href(river, { mode: program ? null : "free" });
@@ -839,7 +845,8 @@ function newRiver() {
   currentRememberedRiver = river;
   projectReturnRiverUrl = null;
   shifted = false;
-  history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
+  currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
+  history.replaceState(null, "", currentRiverUrl);
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = false;
@@ -862,9 +869,10 @@ function undoRiver() {
     null,
     "",
     projectSectionFor(new URL(restoredUrl).hash)
-      ? restoredUrl
+      ? Arrival.href(river, { mode: program ? null : "free" })
       : Arrival.withMode(restoredUrl, program ? null : "free"),
   );
+  currentRiverUrl = location.href;
   previousRiverUrl = null;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
@@ -928,7 +936,8 @@ function jumpMovement(number) {
 
 function persistProgramMode() {
   const currentUrl = projectSectionFor(location.hash) ? Arrival.href(river) : location.href;
-  history.replaceState(null, "", Arrival.withMode(currentUrl, program ? null : "free"));
+  currentRiverUrl = Arrival.withMode(currentUrl, program ? null : "free");
+  history.replaceState(null, "", currentRiverUrl);
 }
 
 async function setProgram(value) {
@@ -982,7 +991,8 @@ function closeVisualSurfaces() {
     projectMap.close();
   }
   if (closedProjectFragment) {
-    history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
+    currentRiverUrl = Arrival.href(river, { mode: program ? null : "free" });
+    history.replaceState(null, "", currentRiverUrl);
     projectReturnRiverUrl = null;
   }
   if (!hud.hidden) setHudVisible(false);
