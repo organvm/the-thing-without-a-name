@@ -1900,19 +1900,19 @@ class InterfaceContractTest(unittest.TestCase):
             "fallback-retry",
         ):
             self.assertIn(element_id, self.markup.by_id)
-        fallback_images = [
-            attrs
-            for tag, attrs in self.markup.tags
-            if tag == "img" and attrs.get("src") == "./corpus/plates/screen/IMG_1926.webp"
-        ]
-        self.assertEqual(len(fallback_images), 1)
-        self.assertIn("hand-cut 2017 Danse Macabre composite", fallback_images[0]["alt"])
+        fallback_markup = self.html.split('id="renderer-fallback"', 1)[1].split("</section>", 1)[0]
+        self.assertNotIn("<img", fallback_markup)
+        self.assertIn("161 registered photographs<br>1 archival composite", fallback_markup)
         self.assertIn('document.body.dataset.renderer = "unavailable";', self.script)
         self.assertIn('dock.dataset.mode = "fallback";', self.script)
         self.assertIn('el("fallback-retry").addEventListener("click", () => location.reload())', self.script)
         self.assertIn("One dancer session, opened into a photographic room that never repeats.", self.html)
-        self.assertIn('property="og:image" content="https://danse.pages.dev/corpus/plates/screen/IMG_1926.webp"', self.html)
-        self.assertIn('name="twitter:card" content="summary_large_image"', self.html)
+        self.assertNotIn('property="og:image"', self.html)
+        self.assertIn('name="twitter:card" content="summary"', self.html)
+        self.assertIn('for (const category of ["hold", "score", "presence"])', self.script)
+        self.assertIn('el("interaction-controls").hidden = true;', self.script)
+        self.assertIn('["hold", "movement", "toggleProgram", "toggleCutout"].includes(command.name)', self.script)
+        self.assertIn("hudToggle.hidden = !experienceIntro.hidden;", self.script)
 
     def test_progressive_controls_disclose_state_and_have_explicit_close_paths(self) -> None:
         expandable = {
@@ -1921,10 +1921,14 @@ class InterfaceContractTest(unittest.TestCase):
             if tag == "button" and attrs.get("data-category") in {"river", "score", "presence", "map"}
         }
         self.assertTrue(all(attrs["aria-expanded"] == "false" for attrs in expandable.values()))
+        self.assertTrue(all("aria-pressed" not in attrs for attrs in expandable.values()))
         self.assertEqual(expandable["map"]["aria-haspopup"], "dialog")
         tray_closes = [attrs for tag, attrs in self.markup.tags if tag == "button" and "data-tray-close" in attrs]
         self.assertEqual(len(tray_closes), 3)
-        self.assertIn('button.hasAttribute("aria-controls")', (ROOT / "interface/render.js").read_text(encoding="utf-8"))
+        renderer = (ROOT / "interface/render.js").read_text(encoding="utf-8")
+        self.assertIn('const expanded = state.surface === `tray:${category}`', renderer)
+        self.assertIn('button.setAttribute("aria-expanded", String(expanded))', renderer)
+        self.assertIn('button.hasAttribute("aria-pressed")', renderer)
         self.assertIn('tray.querySelectorAll("[data-tray-close]")', self.script)
         self.assertIn("Settings &amp; accessibility", self.html)
 
@@ -1936,7 +1940,8 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn('aria-current="location"', self.html)
         self.assertIn(".project-nav-links", self.styles)
         self.assertIn("overflow-x:auto", self.styles)
-        self.assertIn(".project-section:focus { outline:2px solid", self.styles)
+        self.assertIn(".project-section h3:focus { outline:2px solid", self.styles)
+        self.assertIn('target?.querySelector("h3")?.focus', self.script)
 
     def test_keyboard_buttons_and_browser_probe_share_named_actions(self) -> None:
         self.assertIn("function setHudVisible(visible)", self.script)
@@ -1958,7 +1963,7 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertLess(self.script.index("projectMap.addEventListener(\"cancel\""), reveal)
         self.assertLess(self.script.index('addEventListener("keydown"'), reveal)
         self.assertIn('dock.removeAttribute("aria-hidden")', self.script[reveal:])
-        self.assertIn("hudToggle.hidden = false;", self.script[reveal:])
+        self.assertIn("hudToggle.hidden = !experienceIntro.hidden;", self.script[reveal:])
         self.assertIn('hudToggle.removeAttribute("aria-hidden")', self.script[reveal:])
         toggle = self.script.split("function toggleControls() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("if (!controlBus) return;", toggle)
@@ -2033,7 +2038,7 @@ class InterfaceContractTest(unittest.TestCase):
     def test_opening_a_tray_closes_the_visual_details_sheet_first(self) -> None:
         helper = self.script.split("function openTray(category, trigger) {", 1)[1].split("\n}", 1)[0]
         self.assertLess(helper.index("setHudVisible(false)"), helper.index("controlBus.actions.openTray(category)"))
-        self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : trigger;', helper)
+        self.assertIn('surfaceTrigger = controlBus.getState().surface === `tray:${category}` ? null : returnTrigger;', helper)
 
     def test_hash_navigation_expires_pending_river_undo(self) -> None:
         handler = self.script.split('addEventListener("hashchange", async (event) => {', 1)[1].split("/** Wind this river", 1)[0]
@@ -2087,7 +2092,7 @@ class InterfaceContractTest(unittest.TestCase):
         )[1].split("\n}", 1)[0]
         self.assertIn("await openMap(", helper)
         self.assertIn('target?.scrollIntoView({ block: "start" })', helper)
-        self.assertIn("target?.focus({ preventScroll: true })", helper)
+        self.assertIn('target?.querySelector("h3")?.focus({ preventScroll: true })', helper)
         self.assertIn("void openProjectSection();", self.script)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable")
@@ -2634,7 +2639,7 @@ console.log(JSON.stringify(cases));
         self.assertIn("min-width:44px; min-height:44px", self.styles)
         self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', self.script)
         self.assertIn(
-            "let heldAt = reducedMotion.matches ? Arrival.now(river) : null", self.script
+            "let heldAt = baseRenderer && reducedMotion.matches ? Arrival.now(river) : null", self.script
         )
         self.assertIn('reducedMotion.addEventListener("change"', self.script)
 

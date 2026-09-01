@@ -6,8 +6,9 @@ export function renderControlSurface(root, state) {
     const button = root.querySelector(`[data-category="${category}"]`);
     if (!button) continue;
     const selected = state.surface === `tray:${category}` || state.surface.startsWith(`sheet:${category}`) || state.surface === "map" && category === "map";
-    button.setAttribute("aria-pressed", String(selected));
-    if (button.hasAttribute("aria-controls")) button.setAttribute("aria-expanded", String(selected));
+    const expanded = state.surface === `tray:${category}` || state.surface === "map" && category === "map";
+    if (button.hasAttribute("aria-pressed")) button.setAttribute("aria-pressed", String(selected));
+    if (button.hasAttribute("aria-controls")) button.setAttribute("aria-expanded", String(expanded));
     button.classList.toggle("is-selected", selected);
   }
   root.dataset.surface = state.surface;
