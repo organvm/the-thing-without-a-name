@@ -14,7 +14,7 @@ This file is the controlling credit block for public posts, press materials, cap
 **Performance and primary choreography**  
 Madison Garber
 
-**Concept, direction, additional choreography, image-making, editing, sound, software, archive, and production**  
+**Concept, direction, additional choreography, photography, editing, sound, software, archive, and production**  
 Anthony J. Padavano
 
 **Music and arrangement attribution**  
@@ -23,11 +23,11 @@ Use the exact music attribution recorded in the release manifest and rights regi
 ## Compact credit block
 
 **Performance & primary choreography — Madison Garber**  
-**Direction, concept, additional choreography, image, editing, sound, software, archive & production — Anthony J. Padavano**
+**Direction, concept, additional choreography, photography, editing, sound, software, archive & production — Anthony J. Padavano**
 
 ## One-line credit block
 
-Performance and primary choreography by Madison Garber; directed, assembled, edited, sonified, engineered, archived, and produced by Anthony J. Padavano.
+Performance and primary choreography by Madison Garber; concept, direction, additional choreography, photography, editing, sound, software, archive, and production by Anthony J. Padavano.
 
 ## Historical-record boundary
 
