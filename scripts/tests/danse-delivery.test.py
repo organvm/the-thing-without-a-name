@@ -7425,6 +7425,14 @@ class DeliveryContractTest(unittest.TestCase):
                         self.assertNotEqual(rejected.returncode, 0)
                         self.assertIn("score/choreography differs", rejected.stderr)
 
+    def test_finisher_resolves_tree_from_captured_repository_head(self) -> None:
+        source = SCREENDANCE_FINISHER.read_text()
+        self.assertIn(
+            'rev-parse "${REPOSITORY_HEAD}^{tree}"',
+            source,
+        )
+        self.assertNotIn("rev-parse 'HEAD^{tree}'", source)
+
     def test_finisher_accepts_sha1_repository_tree_identity(self) -> None:
         repository_head = "4" * 40
         repository_tree = "5" * 40

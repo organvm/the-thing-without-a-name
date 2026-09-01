@@ -72,7 +72,7 @@ REPOSITORY_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   echo "cannot bind finishing run to an exact repository HEAD" >&2
   exit 1
 }
-REPOSITORY_TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+REPOSITORY_TREE="$(git -C "$ROOT" rev-parse "${REPOSITORY_HEAD}^{tree}" 2>/dev/null || true)"
 [[ "$REPOSITORY_TREE" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || {
   echo "cannot bind finishing run to the exact repository tree" >&2
   exit 1
