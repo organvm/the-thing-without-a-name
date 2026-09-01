@@ -43,7 +43,7 @@ installation.
 | **What a visitor receives** | A locally stored river identity and an evolving view whose exact moments can be cited by seed and time. |
 | **Implementation state** | Active source and test system; public Pages artwork evidenced at an earlier source commit. |
 | **Release state** | Draft. The public project package, festival package, and physical installation remain gated. |
-| **Tracked project identity** | Anthony J. Padavano is named as the artist. Performer credit and several authorship/rights approvals remain pending. |
+| **Tracked project identity** | Anthony J. Padavano is the project artist; Madison Garber is credited as performer and primary choreographer. Publication and rights approvals remain governed separately by the release and rights records. |
 | **Evidence** | [Claim ledger](docs/evidence/README.md), source, tests, manifests, release gates, rights register, and lineage record. |
 | **Machine-readable facts** | [`project-record.yml`](project-record.yml) |
 
