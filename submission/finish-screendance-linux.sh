@@ -72,6 +72,11 @@ REPOSITORY_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   echo "cannot bind finishing run to an exact repository HEAD" >&2
   exit 1
 }
+REPOSITORY_TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+[[ "$REPOSITORY_TREE" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || {
+  echo "cannot bind finishing run to the exact repository tree" >&2
+  exit 1
+}
 [[ -z "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=no)" ]] || {
   echo "finishing requires a clean tracked Git worktree" >&2
   exit 1
@@ -185,7 +190,8 @@ AUDIO_RECEIPT_ARTIFACT="source-receipts/audio.json"
 picture_receipt_graph() {
   local mode="$1"
   python3 - "$mode" "$PICTURE_RECEIPT" "$PICTURE_SHA256" "$PICTURE_BYTES" \
-    "$STAGE/source-receipts/picture" "$REPOSITORY_HEAD" "$EXPECTED_PICTURE_SOURCE_TREE" <<'PY'
+    "$STAGE/source-receipts/picture" "$REPOSITORY_HEAD" "$REPOSITORY_TREE" \
+    "$EXPECTED_PICTURE_SOURCE_TREE" <<'PY'
 import hashlib
 import json
 import os
@@ -201,13 +207,13 @@ from pathlib import Path
     picture_bytes_value,
     destination_value,
     repository_head,
+    repository_tree,
     expected_source_tree,
 ) = sys.argv[1:]
 receipt_path = Path(receipt_value)
 destination = Path(destination_value)
 picture_bytes = int(picture_bytes_value)
 digest_pattern = re.compile(r"^[0-9a-f]{64}$")
-git_object_pattern = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 name_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 if receipt_path.is_symlink() or not receipt_path.is_file():
     raise SystemExit(f"picture concat receipt is missing or unsafe: {receipt_path}")
@@ -300,7 +306,7 @@ for index, row in enumerate(segments):
         or inputs.get("segment_frames") != 600
         or inputs.get("browser_render_context") != "emergency-software-capture"
         or inputs.get("repository_head") != repository_head
-        or not git_object_pattern.fullmatch(str(inputs.get("repository_tree", "")))
+        or inputs.get("repository_tree") != repository_tree
         or inputs.get("effective_seed") != 20170620
         or inputs.get("source_tree_sha256") != expected_source_tree
         or not isinstance(inputs.get("music_score"), dict)
