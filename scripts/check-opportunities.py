@@ -28,6 +28,19 @@ SCHEMA = ROOT / "opportunities" / "opportunity.schema.json"
 RECEIPT = ROOT / "opportunities" / "omega-20260829.receipt.json"
 EVIDENCE = ROOT / "opportunities" / "source-evidence-20260826.json"
 CONSUMER = ROOT / "submission" / "screendance-2027.yaml"
+MAINTENANCE_SNAPSHOT = ROOT / "opportunities" / "omega-20260901.json"
+MAINTENANCE_RECEIPT = ROOT / "opportunities" / "omega-20260901.receipt.json"
+MAINTENANCE_EVIDENCE = ROOT / "opportunities" / "source-evidence-20260901.json"
+EXPECTED_MAINTENANCE_SNAPSHOT_SHA256 = (
+    "74cdb8da3b574f0e19655c00c44278a5318c514dc4dcacfbb0438ef08ee27777"
+)
+EXPECTED_MAINTENANCE_RECEIPT_SHA256 = (
+    "5077740c61681091591d247fe7e4757ab105c90bc8f005fdcb4a3f3e2b917195"
+)
+EXPECTED_MAINTENANCE_EVIDENCE_SHA256 = (
+    "220e184ddc36a4bc2c95744be06cacc7abe4919cff0fd18fbc4db15f55804150"
+)
+MAINTENANCE_RECEIPT_NOT_BEFORE = "2026-09-01T04:15:22Z"
 
 FACT_STATUSES = ("verified", "unstated", "not-applicable", "conflicted")
 DISPOSITIONS = ("active", "closed", "watch", "conflicted", "blocked", "historical")
@@ -410,8 +423,27 @@ def validate_registry(
         raise RegistryError("operational queue expiry must bind the earliest ranked deadline")
 
     consumers = {row["issue"]: row for row in snapshot["release_consumers"]}
-    if set(consumers) != {2, 12} or consumers[2]["status"] != "bound" or consumers[12]["status"] != "pending":
-        raise RegistryError("snapshot must bind issue #2 and reserve the identical digest for pending issue #12")
+    if snapshot["owner_issue"] == 15:
+        if (
+            set(consumers) != {2, 12}
+            or consumers[2]["status"] != "bound"
+            or consumers[12]["status"] != "pending"
+        ):
+            raise RegistryError(
+                "release snapshot must bind issue #2 and reserve the identical digest "
+                "for pending issue #12"
+            )
+    elif consumers != {
+        22: {
+            "issue": 22,
+            "role": "post-release opportunity maintenance",
+            "status": "maintenance",
+        }
+    }:
+        raise RegistryError(
+            "maintenance snapshot must remain owned by issue #22 and unbound from "
+            "the frozen release consumers"
+        )
 
     corrections = {
         "bakehouse-studio-residency-2026": ("closed", "2026-05-01"),
@@ -427,6 +459,18 @@ def validate_registry(
             raise RegistryError(f"{entry_id}: source correction regressed")
     if by_id["cinedans-fest-2027-installation"]["disposition"] != "active":
         raise RegistryError("Cinedans FEST '27 installation route must remain an active current target")
+    if snapshot["owner_issue"] == 22:
+        stale_owners = sorted(
+            entry["id"]
+            for entry in opportunities
+            if entry["disposition"] in ACTIVE_DISPOSITIONS
+            and entry["owner_issue"] == 15
+        )
+        if stale_owners:
+            raise RegistryError(
+                "maintenance current work still points at closed predecessor issue #15: "
+                + ", ".join(stale_owners)
+            )
     if by_id["screendance-miami-2027"]["owner_issue"] != 2:
         raise RegistryError("ScreenDance filing must remain owned by issue #2")
 
@@ -455,14 +499,15 @@ def validate_operational(snapshot: dict[str, Any], as_of: datetime) -> None:
         )
 
 
-def validate_binding(
+def validate_receipt(
     snapshot: dict[str, Any],
     *,
     root: Path = ROOT,
     snapshot_path: Path = SNAPSHOT,
     receipt_path: Path = RECEIPT,
-    consumer_path: Path = CONSUMER,
-) -> dict[str, Any]:
+    expected_consumers: dict[int, dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """Authenticate one immutable snapshot receipt without inferring a consumer."""
     receipt = load_json(receipt_path, "opportunity receipt")
     if set(receipt) != {
         "schema",
@@ -501,19 +546,49 @@ def validate_binding(
         raise RegistryError("receipt ranked-action count is stale")
 
     consumer_rows = {row.get("issue"): row for row in receipt["consumers"] if isinstance(row, dict)}
-    if consumer_rows != {
-        2: {
-            "issue": 2,
-            "binding": "submission/screendance-2027.yaml",
-            "status": "verified",
-        },
-        12: {
-            "issue": 12,
-            "binding": "release/manifest.json",
-            "status": "pending",
-        },
-    }:
+    if len(consumer_rows) != len(receipt["consumers"]) or consumer_rows != expected_consumers:
         raise RegistryError("receipt consumer contract drifted")
+    return receipt, actual
+
+
+def validate_maintenance_receipt_provenance(receipt: dict[str, Any]) -> None:
+    """Reject a successor receipt timestamp that predates its corrected bytes."""
+    if parse_time(receipt["issued_at"], "maintenance receipt issued_at") < parse_time(
+        MAINTENANCE_RECEIPT_NOT_BEFORE,
+        "maintenance receipt correction boundary",
+    ):
+        raise RegistryError("maintenance receipt predates its corrected snapshot binding")
+
+
+def validate_binding(
+    snapshot: dict[str, Any],
+    *,
+    root: Path = ROOT,
+    snapshot_path: Path = SNAPSHOT,
+    receipt_path: Path = RECEIPT,
+    consumer_path: Path = CONSUMER,
+) -> dict[str, Any]:
+    if snapshot.get("owner_issue") != 15:
+        raise RegistryError("maintenance snapshot cannot replace a frozen release consumer")
+    receipt, actual = validate_receipt(
+        snapshot,
+        root=root,
+        snapshot_path=snapshot_path,
+        receipt_path=receipt_path,
+        expected_consumers={
+            2: {
+                "issue": 2,
+                "binding": "submission/screendance-2027.yaml",
+                "status": "verified",
+            },
+            12: {
+                "issue": 12,
+                "binding": "release/manifest.json",
+                "status": "pending",
+            },
+        },
+    )
+    record = receipt["snapshot"]
 
     try:
         register = yaml.safe_load(consumer_path.read_text(encoding="utf-8")) or {}
@@ -622,14 +697,75 @@ def validate_all(
     return snapshot, receipt
 
 
+def validate_maintenance(
+    snapshot_path: Path = MAINTENANCE_SNAPSHOT,
+    schema_path: Path = SCHEMA,
+    receipt_path: Path = MAINTENANCE_RECEIPT,
+    evidence_path: Path = MAINTENANCE_EVIDENCE,
+    root: Path = ROOT,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the issue-22 successor without rebinding frozen release state."""
+    for label, path, expected in (
+        (
+            "maintenance snapshot",
+            snapshot_path,
+            EXPECTED_MAINTENANCE_SNAPSHOT_SHA256,
+        ),
+        (
+            "maintenance receipt",
+            receipt_path,
+            EXPECTED_MAINTENANCE_RECEIPT_SHA256,
+        ),
+        (
+            "maintenance source evidence",
+            evidence_path,
+            EXPECTED_MAINTENANCE_EVIDENCE_SHA256,
+        ),
+    ):
+        try:
+            actual = digest(path)
+        except OSError as exc:
+            raise RegistryError(f"cannot read pinned {label}: {exc}") from exc
+        if actual != expected:
+            raise RegistryError(f"{label} does not match its pinned current digest")
+    snapshot = validate_registry(
+        snapshot_path,
+        schema_path,
+        root=root,
+        evidence_path=evidence_path,
+    )
+    if snapshot.get("owner_issue") != 22:
+        raise RegistryError("maintenance snapshot is not owned by issue #22")
+    receipt, _actual = validate_receipt(
+        snapshot,
+        root=root,
+        snapshot_path=snapshot_path,
+        receipt_path=receipt_path,
+        expected_consumers={
+            22: {
+                "issue": 22,
+                "binding": "https://github.com/organvm/the-thing-without-a-name/issues/22",
+                "status": "maintenance",
+            }
+        },
+    )
+    validate_maintenance_receipt_provenance(receipt)
+    return snapshot, receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--snapshot", type=Path, default=SNAPSHOT)
-    parser.add_argument("--schema", type=Path, default=SCHEMA)
-    parser.add_argument("--receipt", type=Path, default=RECEIPT)
-    parser.add_argument("--evidence", type=Path, default=EVIDENCE)
-    parser.add_argument("--consumer", type=Path, default=CONSUMER)
+    parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--schema", type=Path)
+    parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--consumer", type=Path)
+    parser.add_argument(
+        "--maintenance-current",
+        action="store_true",
+        help="validate the current issue-22 successor without rebinding release consumers",
+    )
     parser.add_argument("--registry-only", action="store_true")
     parser.add_argument(
         "--operational-as-of",
@@ -638,13 +774,42 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
+    args.schema = args.schema or args.root / "opportunities/opportunity.schema.json"
+    args.consumer = args.consumer or args.root / "submission/screendance-2027.yaml"
+    if args.maintenance_current:
+        args.snapshot = args.snapshot or args.root / "opportunities/omega-20260901.json"
+        args.receipt = args.receipt or args.root / "opportunities/omega-20260901.receipt.json"
+        args.evidence = args.evidence or args.root / "opportunities/source-evidence-20260901.json"
+    else:
+        args.snapshot = args.snapshot or args.root / "opportunities/omega-20260829.json"
+        args.receipt = args.receipt or args.root / "opportunities/omega-20260829.receipt.json"
+        args.evidence = args.evidence or args.root / "opportunities/source-evidence-20260826.json"
+
     try:
-        snapshot = validate_registry(
-            args.snapshot,
-            args.schema,
-            root=args.root,
-            evidence_path=args.evidence,
-        )
+        if args.maintenance_current and not args.registry_only:
+            snapshot, receipt = validate_maintenance(
+                snapshot_path=args.snapshot,
+                schema_path=args.schema,
+                receipt_path=args.receipt,
+                evidence_path=args.evidence,
+                root=args.root,
+            )
+        else:
+            snapshot = validate_registry(
+                args.snapshot,
+                args.schema,
+                root=args.root,
+                evidence_path=args.evidence,
+            )
+            receipt = None
+            if not args.registry_only:
+                receipt = validate_binding(
+                    snapshot,
+                    root=args.root,
+                    snapshot_path=args.snapshot,
+                    receipt_path=args.receipt,
+                    consumer_path=args.consumer,
+                )
         if args.operational_as_of:
             as_of = (
                 datetime.now(timezone.utc)
@@ -652,15 +817,6 @@ def main() -> int:
                 else parse_time(args.operational_as_of, "operational as-of")
             )
             validate_operational(snapshot, as_of)
-        receipt = None
-        if not args.registry_only:
-            receipt = validate_binding(
-                snapshot,
-                root=args.root,
-                snapshot_path=args.snapshot,
-                receipt_path=args.receipt,
-                consumer_path=args.consumer,
-            )
     except RegistryError as exc:
         print(f"opportunity registry: FAIL — {exc}", file=sys.stderr)
         return 1
