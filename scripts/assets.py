@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -30,7 +31,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import yaml
 
@@ -575,15 +576,47 @@ def _https_url(value: object, *, allow_query: bool = False) -> str:
     return value
 
 
-def _assert_public_https_host(url: str, *, allow_query: bool = False) -> None:
+HTTPSAddress = tuple[int, int, int, Any]
+
+
+def _public_https_addresses(
+    url: str,
+    *,
+    allow_query: bool = False,
+) -> tuple[HTTPSAddress, ...]:
     host = urllib.parse.urlsplit(_https_url(url, allow_query=allow_query)).hostname
     assert host is not None
     try:
-        addresses = {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
-    except socket.gaierror as exc:
+        rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError as exc:
         raise AssetError("HTTPS source host cannot be resolved") from exc
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-        raise AssetError("HTTPS source URL cannot target a non-public address")
+    addresses: list[HTTPSAddress] = []
+    for family, socket_type, protocol, _canonical_name, sockaddr in rows:
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            continue
+        if socket_type not in {0, socket.SOCK_STREAM}:
+            continue
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise AssetError("HTTPS source host returned an invalid address") from exc
+        if not address.is_global:
+            raise AssetError("HTTPS source URL cannot target a non-public address")
+        candidate = (
+            family,
+            socket_type or socket.SOCK_STREAM,
+            protocol,
+            sockaddr,
+        )
+        if candidate not in addresses:
+            addresses.append(candidate)
+    if not addresses:
+        raise AssetError("HTTPS source host has no supported public address")
+    return tuple(addresses)
+
+
+def _assert_public_https_host(url: str, *, allow_query: bool = False) -> None:
+    _public_https_addresses(url, allow_query=allow_query)
 
 
 def _validate_http_headers(headers: dict[str, str]) -> None:
@@ -1536,18 +1569,23 @@ def _prepare_git_reference_parent(
 
 
 def _create_operation_lease(root: Path) -> OperationLease:
-    root = root.resolve(strict=True)
-    initial_root = root.stat()
-    if not stat.S_ISDIR(initial_root.st_mode):
-        raise AssetError("asset root is not a directory")
-    root_proof = (initial_root.st_dev, initial_root.st_ino)
-    root_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    root_descriptor = os.open(root, root_flags)
+    try:
+        root = root.resolve(strict=True)
+        initial_root = root.stat()
+        if not stat.S_ISDIR(initial_root.st_mode):
+            raise AssetError("asset root is not a directory")
+        root_proof = (initial_root.st_dev, initial_root.st_ino)
+        root_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_descriptor = os.open(root, root_flags)
+    except AssetError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise AssetError("asset root could not be opened safely") from exc
     try:
         try:
             fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2020,14 +2058,116 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
                 "release-assets.githubusercontent.com",
             }
         )
-        _assert_public_https_host(newurl, allow_query=allow_query)
+        newurl = _https_url(newurl, allow_query=allow_query)
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None:
             new_host = new.hostname
             if old_host != new_host:
                 redirected.remove_header("Authorization")
                 redirected.unredirected_hdrs.pop("Authorization", None)
+            setattr(redirected, "_danse_allow_query", allow_query)
         return redirected
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        address: HTTPSAddress,
+        *,
+        timeout: float,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        self._validated_address = address
+        if context is None:
+            context = ssl.create_default_context()
+        super().__init__(host, 443, timeout=timeout, context=context)
+
+    def connect(self) -> None:
+        family, socket_type, protocol, sockaddr = self._validated_address
+        raw_socket = None
+        try:
+            raw_socket = socket.socket(family, socket_type, protocol)
+            raw_socket.settimeout(self.timeout)
+            raw_socket.connect(sockaddr)
+            self.sock = raw_socket
+            if self._tunnel_host:
+                self._tunnel()
+            server_hostname = self._tunnel_host or self.host
+            self.sock = self._context.wrap_socket(
+                self.sock,
+                server_hostname=server_hostname,
+            )
+        except Exception:
+            if raw_socket is not None:
+                raw_socket.close()
+            self.sock = None
+            raise
+
+
+class _PinnedHTTPSResponse:
+    def __init__(
+        self,
+        response: http.client.HTTPResponse,
+        connection: _PinnedHTTPSConnection,
+    ) -> None:
+        self._response = response
+        self._connection = connection
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+    def __enter__(self) -> _PinnedHTTPSResponse:
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def _open_pinned_https_request(
+    request: urllib.request.Request,
+    timeout: float,
+    addresses: tuple[HTTPSAddress, ...],
+) -> _PinnedHTTPSResponse:
+    parsed = urllib.parse.urlsplit(request.full_url)
+    host = parsed.hostname
+    assert host is not None
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    context = ssl.create_default_context()
+    last_error: OSError | http.client.HTTPException | None = None
+    for address in addresses:
+        connection = _PinnedHTTPSConnection(
+            host,
+            address,
+            timeout=timeout,
+            context=context,
+        )
+        try:
+            connection.request(
+                request.get_method(),
+                target,
+                headers=dict(request.header_items()),
+            )
+            return _PinnedHTTPSResponse(connection.getresponse(), connection)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            connection.close()
+            raise AssetError("HTTPS request headers could not be constructed") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            connection.close()
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise AssetError("HTTPS source host has no usable public address")
 
 
 def _open_url(
@@ -2036,19 +2176,73 @@ def _open_url(
     timeout: float,
     *,
     allow_github_asset_redirect: bool = False,
-):
+) -> _PinnedHTTPSResponse:
     url = _https_url(url)
-    _assert_public_https_host(url)
     _validate_http_headers(headers)
     try:
         request = urllib.request.Request(url, headers=headers)
     except (TypeError, ValueError, UnicodeError) as exc:
         raise AssetError("HTTPS request headers could not be constructed") from exc
     handler = _SafeRedirect(allow_github_asset_redirect=allow_github_asset_redirect)
-    try:
-        return urllib.request.build_opener(handler).open(request, timeout=timeout)
-    except (TypeError, ValueError, UnicodeError, http.client.HTTPException) as exc:
-        raise AssetError("HTTPS request headers could not be constructed") from exc
+    allow_query = False
+    for redirect_count in range(handler.max_redirections + 1):
+        current_url = _https_url(request.full_url, allow_query=allow_query)
+        addresses = _public_https_addresses(current_url, allow_query=allow_query)
+        try:
+            response = _open_pinned_https_request(request, timeout, addresses)
+        except (TypeError, ValueError, UnicodeError, http.client.HTTPException) as exc:
+            raise AssetError("HTTPS request could not be completed safely") from exc
+        status = response.status
+        if 200 <= status < 300:
+            return response
+        response_headers = response.headers
+        reason = response.reason
+        if status in {301, 302, 303, 307, 308}:
+            location = response.getheader("Location")
+            if not location:
+                response.close()
+                raise urllib.error.HTTPError(
+                    current_url,
+                    status,
+                    reason,
+                    response_headers,
+                    None,
+                )
+            if redirect_count >= handler.max_redirections:
+                response.close()
+                raise AssetError("HTTPS source exceeded the redirect limit")
+            newurl = urllib.parse.urljoin(current_url, location)
+            try:
+                redirected = handler.redirect_request(
+                    request,
+                    response,
+                    status,
+                    reason,
+                    response_headers,
+                    newurl,
+                )
+            finally:
+                response.close()
+            if redirected is None:
+                raise urllib.error.HTTPError(
+                    current_url,
+                    status,
+                    reason,
+                    response_headers,
+                    None,
+                )
+            request = redirected
+            allow_query = bool(getattr(request, "_danse_allow_query", False))
+            continue
+        response.close()
+        raise urllib.error.HTTPError(
+            current_url,
+            status,
+            reason,
+            response_headers,
+            None,
+        )
+    raise AssetError("HTTPS source exceeded the redirect limit")
 
 
 def _github_release_asset(

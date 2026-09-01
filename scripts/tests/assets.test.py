@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -1228,6 +1229,22 @@ class AssetParityTest(unittest.TestCase):
             self.assertEqual(environment.get("GIT_NO_REPLACE_OBJECTS"), "1")
             self.assertNotIn("GIT_REPLACE_REF_BASE", environment)
             self.assertNotIn("GIT_OBJECT_DIRECTORY", environment)
+
+    def test_operation_lease_normalizes_initial_root_open_failures(self) -> None:
+        root = self.fixture.root.resolve()
+        for failure in (
+            PermissionError("injected root denial"),
+            FileNotFoundError("injected root disappearance"),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(ASSETS.os, "open", side_effect=failure),
+                self.assertRaisesRegex(
+                    ASSETS.AssetError,
+                    "asset root could not be opened safely",
+                ),
+            ):
+                ASSETS._create_operation_lease(root)
 
     def test_git_reference_format_probe_falls_back_when_option_is_echoed(self) -> None:
         root = self.fixture.root.resolve()
@@ -2655,7 +2672,9 @@ class AssetParityTest(unittest.TestCase):
                 repository_commit=self.fixture.head,
                 rights_class="private",
             )
-        self.assertEqual(calls, 2)
+        # Creating late/ changes the held root metadata, so the source guard
+        # rejects before a second census can begin.
+        self.assertEqual(calls, 1)
         self.assertFalse(output.exists())
 
     def test_inventory_rejects_source_root_replacement_after_completed_scan(self) -> None:
@@ -3413,6 +3432,165 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(url, "https://api.github.com/assets/1")
         self.assertEqual(headers["Authorization"], "Bearer printable-token")
         open_url.assert_called_once()
+
+    def test_pinned_https_connection_uses_validated_ipv4_ipv6_and_tls_hostname(
+        self,
+    ) -> None:
+        for family, sockaddr in (
+            (socket.AF_INET, ("93.184.216.34", 443)),
+            (socket.AF_INET6, ("2606:4700:4700::1111", 443, 0, 0)),
+        ):
+            with self.subTest(family=family):
+                raw_socket = mock.MagicMock()
+                tls_socket = mock.MagicMock()
+                context = mock.MagicMock()
+                context.wrap_socket.return_value = tls_socket
+                address = (
+                    family,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    sockaddr,
+                )
+                with (
+                    mock.patch.object(
+                        ASSETS.ssl,
+                        "create_default_context",
+                        return_value=context,
+                    ) as create_context,
+                    mock.patch.object(
+                        ASSETS.socket,
+                        "socket",
+                        return_value=raw_socket,
+                    ) as socket_constructor,
+                    mock.patch.object(
+                        ASSETS.socket,
+                        "getaddrinfo",
+                        side_effect=AssertionError("connection performed a second DNS lookup"),
+                    ),
+                ):
+                    connection = ASSETS._PinnedHTTPSConnection(
+                        "example.com",
+                        address,
+                        timeout=1.0,
+                    )
+                    connection.connect()
+                create_context.assert_called_once_with()
+                socket_constructor.assert_called_once_with(
+                    family,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                )
+                raw_socket.settimeout.assert_called_once_with(1.0)
+                raw_socket.connect.assert_called_once_with(sockaddr)
+                context.wrap_socket.assert_called_once_with(
+                    raw_socket,
+                    server_hostname="example.com",
+                )
+                self.assertIs(connection.sock, tls_socket)
+                connection.close()
+
+    def test_https_open_pins_each_redirect_without_dns_rebinding(self) -> None:
+        initial = "https://api.github.com/assets/1"
+        signed = "https://release-assets.githubusercontent.com/object?sig=temporary"
+        public_rows = {
+            "api.github.com": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("140.82.112.6", 443),
+                )
+            ],
+            "release-assets.githubusercontent.com": [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("2606:50c0:8000::154", 443, 0, 0),
+                )
+            ],
+        }
+        private_row = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 443),
+            )
+        ]
+        resolutions = {}
+
+        def rebinding_resolver(host, _port, **_kwargs):
+            resolutions[host] = resolutions.get(host, 0) + 1
+            if resolutions[host] > 1:
+                return private_row
+            return public_rows[host]
+
+        redirected = mock.MagicMock()
+        redirected.status = 302
+        redirected.reason = "Found"
+        redirected.headers = {"Location": signed}
+        redirected.getheader.return_value = signed
+        final = mock.MagicMock()
+        final.status = 200
+        final.reason = "OK"
+        final.headers = {}
+
+        with (
+            mock.patch.object(
+                ASSETS.socket,
+                "getaddrinfo",
+                side_effect=rebinding_resolver,
+            ),
+            mock.patch.object(
+                ASSETS,
+                "_open_pinned_https_request",
+                side_effect=(redirected, final),
+            ) as pinned,
+        ):
+            response = ASSETS._open_url(
+                initial,
+                {"Authorization": "Bearer secret"},
+                1.0,
+                allow_github_asset_redirect=True,
+            )
+        self.assertIs(response, final)
+        self.assertEqual(
+            resolutions,
+            {
+                "api.github.com": 1,
+                "release-assets.githubusercontent.com": 1,
+            },
+        )
+        first_request, _, first_addresses = pinned.call_args_list[0].args
+        second_request, _, second_addresses = pinned.call_args_list[1].args
+        self.assertEqual(first_request.full_url, initial)
+        self.assertEqual(first_addresses[0][3], ("140.82.112.6", 443))
+        self.assertEqual(second_request.full_url, signed)
+        self.assertEqual(second_addresses[0][3], ("2606:50c0:8000::154", 443, 0, 0))
+        self.assertIsNone(second_request.get_header("Authorization"))
+        redirected.close.assert_called_once_with()
+
+    def test_https_open_rejects_nonpublic_address_before_connect(self) -> None:
+        private = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 443),
+            )
+        ]
+        with (
+            mock.patch.object(ASSETS.socket, "getaddrinfo", return_value=private),
+            mock.patch.object(ASSETS, "_open_pinned_https_request") as pinned,
+            self.assertRaisesRegex(ASSETS.AssetError, "non-public address"),
+        ):
+            ASSETS._open_url("https://example.com/private", {}, 1.0)
+        pinned.assert_not_called()
 
     def test_header_construction_errors_are_redacted_asset_errors(self) -> None:
         leaked = "do-not-echo-this-header"
