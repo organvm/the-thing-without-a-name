@@ -217,9 +217,28 @@ class AssetParityTest(unittest.TestCase):
         ):
             with self.subTest(url=url), self.assertRaises(ASSETS.AssetError):
                 ASSETS._validate_source({"kind": "https", "url": url})
-        for path in (".", "./", "../outside", "/absolute", ".git/refs/heads/main", r"windows\outside"):
+        for path in (
+            ".",
+            "./",
+            "../outside",
+            "/absolute",
+            ".git/refs/heads/main",
+            ".GIT/refs/heads/main",
+            ".Asset-Cache/sha256/object",
+            r"windows\outside",
+        ):
             with self.subTest(path=path), self.assertRaises(ASSETS.AssetError):
                 ASSETS._safe_relative(path, "test path")
+
+    def test_lock_rejects_case_colliding_targets(self) -> None:
+        value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+        duplicate = copy.deepcopy(value["assets"][0])
+        duplicate["id"] = "origin-img-1570-case-collision"
+        duplicate["target"] = "Pipeline/.work/raw/IMG_1570.JPG"
+        value["assets"].append(duplicate)
+        self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
+            ASSETS.load_lock(self.fixture.lock)
 
     def test_missing_parent_path_preserves_every_component(self) -> None:
         target = ASSETS._path_under(
@@ -416,6 +435,47 @@ class AssetParityTest(unittest.TestCase):
             1,
         )
 
+    def test_production_metadata_is_revalidated_after_checkout_verification(self) -> None:
+        generic = ASSETS.load_lock(self.fixture.lock)
+        production = ASSETS.Lock(
+            generic.lock_id,
+            "screendance-production",
+            generic.repository_commit,
+            generic.assets,
+            generic.sha256,
+        )
+        events = []
+
+        def verified_head(root, lock):
+            events.append("head")
+            return production.repository_commit
+
+        def validate(assets, *, repository_root=None, repository_commit=None):
+            events.append("production-metadata")
+            self.assertEqual(repository_commit, production.repository_commit)
+
+        with (
+            mock.patch.object(ASSETS, "_repository_head", side_effect=verified_head),
+            mock.patch.object(ASSETS, "_validate_production_assets", side_effect=validate),
+        ):
+            ASSETS._assert_repository_binding(self.fixture.root, production)
+        self.assertEqual(events, ["head", "production-metadata", "head"])
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_repository_head",
+                return_value=production.repository_commit,
+            ),
+            mock.patch.object(
+                ASSETS,
+                "_validate_production_assets",
+                side_effect=ASSETS.AssetError("authority metadata changed"),
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "authority metadata changed"),
+        ):
+            ASSETS._assert_repository_binding(self.fixture.root, production)
+
     def test_hidden_git_index_flags_are_rejected(self) -> None:
         lock = ASSETS.load_lock(self.fixture.lock)
         for enable, disable in (
@@ -474,6 +534,28 @@ class AssetParityTest(unittest.TestCase):
             1,
         )
         self.assertEqual(self.fixture.receipt.read_bytes(), before)
+
+    def test_receipt_output_cannot_enter_verified_checkout(self) -> None:
+        direct = self.fixture.root / "pipeline/.work/verification.json"
+        alias = self.fixture.base / "checkout-alias"
+        alias.symlink_to(self.fixture.root, target_is_directory=True)
+        for receipt in (direct, alias / ".asset-cache/receipt.json"):
+            with self.subTest(receipt=receipt):
+                self.assertEqual(
+                    ASSETS.main(
+                        [
+                            "audit",
+                            "--lock",
+                            str(self.fixture.lock),
+                            "--root",
+                            str(self.fixture.root),
+                            "--receipt",
+                            str(receipt),
+                        ]
+                    ),
+                    1,
+                )
+                self.assertFalse(receipt.exists())
 
     def test_inventory_is_deterministic_closed_and_no_overwrite(self) -> None:
         duplicate = self.fixture.source / "other/duplicate.JPG"
@@ -596,6 +678,37 @@ class AssetParityTest(unittest.TestCase):
                 output,
                 lock_id="empty-assets",
                 profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+    def test_production_inventory_requires_exact_clean_script_checkout(self) -> None:
+        output = self.fixture.base / "production-lock.json"
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            self.assertRaisesRegex(ASSETS.AssetError, "exact clean script checkout"),
+        ):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
+                repository_commit="a" * 40,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
+        (self.fixture.root / "README.md").write_text("dirty authority\n", encoding="utf-8")
+        with (
+            mock.patch.object(ASSETS, "ROOT", self.fixture.root),
+            self.assertRaisesRegex(ASSETS.AssetError, "tracked or staged"),
+        ):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="production-assets",
+                profile="screendance-production",
                 repository_commit=self.fixture.head,
                 rights_class="private",
             )
@@ -910,6 +1023,13 @@ class AssetParityTest(unittest.TestCase):
         unsafe_path["assets"][0]["target"] = ".git/refs/heads/main"
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for target in (".GIT/refs/heads/main", ".Asset-Cache/sha256/object"):
+            unsafe_path = copy.deepcopy(lock_value)
+            unsafe_path["assets"][0]["target"] = target
+            with self.subTest(schema_target=target), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
         self.assertEqual(
             ASSETS.main(
                 [

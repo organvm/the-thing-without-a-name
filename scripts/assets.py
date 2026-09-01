@@ -115,7 +115,7 @@ def _safe_relative(value: object, label: str) -> str:
     pure = PurePosixPath(value)
     if not pure.parts or pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
         raise AssetError(f"{label} must be a safe POSIX-relative path")
-    if pure.parts[0] in {".asset-cache", ".git"}:
+    if pure.parts[0].casefold() in {".asset-cache", ".git"}:
         raise AssetError(f"{label} collides with repository control data")
     return pure.as_posix()
 
@@ -258,6 +258,7 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
     assets: list[Asset] = []
     ids: set[str] = set()
     targets: set[str] = set()
+    casefolded_targets: set[str] = set()
     for row in value["assets"]:
         required_keys = {
             "id",
@@ -281,6 +282,10 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
         if target in targets:
             raise AssetError("asset lock repeats an asset target")
         targets.add(target)
+        casefolded_target = target.casefold()
+        if casefolded_target in casefolded_targets:
+            raise AssetError("asset lock contains case-colliding asset targets")
+        casefolded_targets.add(casefolded_target)
         digest = row["sha256"]
         if not isinstance(digest, str) or not HEX64.fullmatch(digest):
             raise AssetError("asset SHA-256 is invalid")
@@ -321,10 +326,33 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
     )
 
 
-def _production_targets(repository_root: Path | None = None) -> set[str]:
+def _tracked_bytes(root: Path, commit: str, relative: str) -> bytes:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", f"{commit}:{relative}"],
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+    except OSError as exc:
+        raise AssetError("git is required to read committed production authority") from exc
+    if result.returncode != 0:
+        raise AssetError("committed production authority is missing or unreadable")
+    return result.stdout
+
+
+def _production_targets(
+    repository_root: Path | None = None,
+    repository_commit: str | None = None,
+) -> set[str]:
     root = ROOT if repository_root is None else repository_root
     try:
-        raw = (root / "corpus/manifest.json").read_bytes()
+        raw = (
+            _tracked_bytes(root, repository_commit, "corpus/manifest.json")
+            if repository_commit is not None
+            else (root / "corpus/manifest.json").read_bytes()
+        )
     except OSError as exc:
         raise AssetError("tracked corpus manifest is missing or unreadable") from exc
     manifest = _json_loads(raw, "corpus manifest")
@@ -349,21 +377,30 @@ def _production_targets(repository_root: Path | None = None) -> set[str]:
 
 def _canonical_production_pins(
     repository_root: Path | None = None,
+    repository_commit: str | None = None,
 ) -> tuple[str, str, str]:
     root = ROOT if repository_root is None else repository_root
     try:
+        toolchain_raw = (
+            _tracked_bytes(root, repository_commit, "music/audio-toolchain.json")
+            if repository_commit is not None
+            else (root / "music/audio-toolchain.json").read_bytes()
+        )
+        register_raw = (
+            _tracked_bytes(root, repository_commit, "submission/screendance-2027.yaml")
+            if repository_commit is not None
+            else (root / "submission/screendance-2027.yaml").read_bytes()
+        )
         toolchain = _json_loads(
-            (root / "music/audio-toolchain.json").read_bytes(),
+            toolchain_raw,
             "audio toolchain",
         )
-        register = yaml.safe_load(
-            (root / "submission/screendance-2027.yaml").read_text(encoding="utf-8")
-        )
+        register = yaml.safe_load(register_raw.decode("utf-8"))
         origin_sha256 = register["package"]["origin_still"]["source_sha256"]
         soundfont = toolchain["soundfont"]
         soundfont_sha256 = soundfont["sha256"]
         soundfont_url = soundfont["source_url"]
-    except (OSError, TypeError, KeyError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeError, TypeError, KeyError, yaml.YAMLError) as exc:
         raise AssetError("canonical production pin records are missing or malformed") from exc
     if (
         not isinstance(origin_sha256, str)
@@ -381,13 +418,17 @@ def _validate_production_assets(
     assets: list[Asset],
     *,
     repository_root: Path | None = None,
+    repository_commit: str | None = None,
 ) -> None:
-    expected = _production_targets(repository_root)
+    expected = _production_targets(repository_root, repository_commit)
     actual = {asset.target for asset in assets}
     if actual != expected or len(assets) != len(expected):
         raise AssetError("production lock does not contain the exact 487-object target census")
     by_target = {asset.target: asset for asset in assets}
-    origin_sha256, soundfont_sha256, soundfont_url = _canonical_production_pins(repository_root)
+    origin_sha256, soundfont_sha256, soundfont_url = _canonical_production_pins(
+        repository_root,
+        repository_commit,
+    )
     if by_target["pipeline/.work/raw/IMG_1594.JPG"].sha256 != origin_sha256:
         raise AssetError("production lock origin still disagrees with the canonical digest")
     if by_target[".work/music/MuseScore_General.sf3"].sha256 != soundfont_sha256:
@@ -665,7 +706,7 @@ def _parent_descriptor_matches(root: Path, relative: str, expected: int) -> bool
         os.close(descriptor)
 
 
-def _repository_head(root: Path, lock: Lock) -> str:
+def _repository_head(root: Path, lock: Lock | None = None) -> str:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         identity = subprocess.run(
@@ -708,7 +749,7 @@ def _repository_head(root: Path, lock: Lock) -> str:
         marker = record[:1]
         if marker == b"S" or b"a" <= marker <= b"z":
             raise AssetError("Git checkout uses skip-worktree or assume-unchanged flags")
-    allowed = {asset.target for asset in lock.assets}
+    allowed = set() if lock is None else {asset.target for asset in lock.assets}
     for record in status.stdout.split(b"\0"):
         if not record:
             continue
@@ -719,6 +760,20 @@ def _repository_head(root: Path, lock: Lock) -> str:
             continue
         raise AssetError("Git checkout has untracked files outside locked asset targets")
     return lines[1]
+
+
+def _assert_repository_binding(root: Path, lock: Lock) -> None:
+    if _repository_head(root, lock) != lock.repository_commit:
+        raise AssetError("asset lock does not bind the exact checked-out repository commit")
+    if lock.profile != "screendance-production":
+        return
+    _validate_production_assets(
+        list(lock.assets),
+        repository_root=root,
+        repository_commit=lock.repository_commit,
+    )
+    if _repository_head(root, lock) != lock.repository_commit:
+        raise AssetError("asset lock does not bind a stable exact checked-out repository commit")
 
 
 def _assert_locked_tree(root: Path, lock: Lock) -> None:
@@ -1199,8 +1254,7 @@ def _report(command: str, lock: Lock, rows: list[tuple[Asset, str, str]]) -> dic
 
 
 def inspect(command: str, lock: Lock, root: Path) -> dict:
-    if _repository_head(root, lock) != lock.repository_commit:
-        raise AssetError("asset lock does not bind the exact checked-out repository commit")
+    _assert_repository_binding(root, lock)
     _assert_locked_tree(root, lock)
     rows = []
     for asset in lock.assets:
@@ -1222,8 +1276,7 @@ def pull(
     source_root: Path | None,
     timeout: float,
 ) -> dict:
-    if _repository_head(root, lock) != lock.repository_commit:
-        raise AssetError("asset lock does not bind the exact checked-out repository commit")
+    _assert_repository_binding(root, lock)
     _assert_locked_tree(root, lock)
     failures: list[str] = []
     for asset in lock.assets:
@@ -1276,6 +1329,18 @@ def _atomic_json(path: Path, value: dict, *, no_overwrite: bool) -> None:
             pass
 
 
+def _receipt_outside_checkout(path: Path, root: Path) -> Path:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise AssetError("receipt path cannot be resolved safely") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return resolved
+    raise AssetError("receipt output must remain outside the verified checkout")
+
+
 def inventory(
     source_root: Path,
     output: Path,
@@ -1293,7 +1358,10 @@ def inventory(
     if rights_class not in RIGHTS_CLASSES:
         raise AssetError("inventory rights class is invalid")
     rows = []
-    expected = _production_targets() if profile == "screendance-production" else None
+    production = profile == "screendance-production"
+    if production and _repository_head(ROOT) != repository_commit:
+        raise AssetError("production inventory does not bind the exact clean script checkout")
+    expected = _production_targets(ROOT, repository_commit) if production else None
     snapshot = _inventory_snapshot(root)
     actual = {entry.relative for entry in snapshot if entry.kind == "file"}
     if not actual:
@@ -1323,7 +1391,7 @@ def inventory(
             ".sf3": "audio/x-soundfont",
         }.get(suffix, media_type)
         effective_rights = rights_class
-        if profile == "screendance-production":
+        if production:
             effective_rights = "restricted" if relative == ".work/music/MuseScore_General.sf3" else "private"
         if effective_rights in {"private", "restricted"}:
             asset_id = _opaque_asset_id(digest, relative)
@@ -1350,7 +1418,7 @@ def inventory(
         "repository_commit": repository_commit,
         "assets": rows,
     }
-    if profile == "screendance-production":
+    if production:
         _validate_production_assets(
             [
                 Asset(
@@ -1364,10 +1432,14 @@ def inventory(
                     tuple(row["sources"]),
                 )
                 for row in rows
-            ]
+            ],
+            repository_root=ROOT,
+            repository_commit=repository_commit,
         )
     if _inventory_snapshot(root) != snapshot:
         raise AssetError("inventory source changed during its completed scan")
+    if production and _repository_head(ROOT) != repository_commit:
+        raise AssetError("production inventory lost its exact clean script checkout binding")
     _atomic_json(output, value, no_overwrite=True)
     return value
 
@@ -1414,6 +1486,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         root = _root(args.root, create=args.command == "pull")
         lock = load_lock(args.lock, repository_root=root)
+        receipt = _receipt_outside_checkout(args.receipt, root) if args.receipt else None
         if args.command == "pull":
             if args.timeout <= 0:
                 raise AssetError("timeout must be positive")
@@ -1426,8 +1499,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             report = inspect(args.command, lock, root)
-        if args.receipt:
-            _atomic_json(args.receipt, report, no_overwrite=True)
+        if receipt:
+            _atomic_json(
+                _receipt_outside_checkout(receipt, root),
+                report,
+                no_overwrite=True,
+            )
         print(
             f"assets: {args.command} {'OK' if report['ok'] else 'BLOCKED'} "
             f"({report['counts']['verified']}/{report['counts']['declared']} verified)",

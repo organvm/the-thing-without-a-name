@@ -21,7 +21,7 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!\\.git(?:/|$))(?!\\.asset-cache(?:/|$))(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\).+$"
+      "pattern": "^(?!/)(?!\\.[Gg][Ii][Tt](?:/|$))(?!\\.[Aa][Ss][Ss][Ee][Tt]-[Cc][Aa][Cc][Hh][Ee](?:/|$))(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\).+$"
     },
     "httpsSource": {
       "type": "object",
