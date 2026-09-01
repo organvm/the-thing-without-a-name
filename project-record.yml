@@ -27,15 +27,15 @@ authorship:
   owner: Anthony J. Padavano
   role: artist named in the tracked project identity; implementation attribution remains evidence-bounded
   contributions:
-    - artistic identity and direction recorded in release/manifest.json
-    - photographic source attribution recorded under pending human approval
+    - artistic identity, concept, and direction recorded in release/manifest.json
+    - additional choreography, image-making, editing, sound, software, archive, and production
     - canonical repository custody and migration lineage
-  collaborators: []
+  collaborators:
+    - "Madison Garber — performer and primary choreographer"
   generated: []
   inherited:
     - source lineage migrated from organvm/limen at apps/danse
   external:
-    - unnamed performer; credit and release wording pending
     - music composed by Leo Delibes
     - source arrangements by Paul De Bra under CC BY 4.0
     - vendored MediaPipe runtime and model under Apache-2.0
@@ -104,8 +104,8 @@ limitations:
     assertion_id: danse-installation-reference-only
   - id: rights-pending
     statement: >-
-      Performer, pictured-object, music, press-still, identity, and publication
-      approvals remain pending in the draft rights and release records.
+      Performer-release, pictured-object, music, press-still, identity, and
+      publication approvals remain governed by the draft rights and release records.
     assertion_ref: docs/evidence/assertions/danse-attribution-boundaries.json
     assertion_id: danse-attribution-boundaries
   - id: deployment-receipt-precedes-head
@@ -185,4 +185,4 @@ links:
   deployment: https://danse.pages.dev/
   evidence: docs/evidence/README.md
 generated_at: "2026-08-31T22:44:39Z"
-verified_at: "2026-08-31T22:44:39Z"
+verified_at: "2026-09-01T13:19:41Z"
