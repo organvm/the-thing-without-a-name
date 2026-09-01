@@ -102,7 +102,7 @@ def _safe_relative(value: object, label: str) -> str:
     return pure.as_posix()
 
 
-def _https_url(value: object) -> str:
+def _https_url(value: object, *, allow_query: bool = False) -> str:
     if not isinstance(value, str):
         raise AssetError("HTTPS source URL must be a string")
     parsed = urllib.parse.urlsplit(value)
@@ -111,7 +111,7 @@ def _https_url(value: object) -> str:
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.query
+        or (parsed.query and not allow_query)
         or parsed.fragment
     ):
         raise AssetError("HTTPS source URL violates the source policy")
@@ -134,8 +134,8 @@ def _https_url(value: object) -> str:
     return value
 
 
-def _assert_public_https_host(url: str) -> None:
-    host = urllib.parse.urlsplit(_https_url(url)).hostname
+def _assert_public_https_host(url: str, *, allow_query: bool = False) -> None:
+    host = urllib.parse.urlsplit(_https_url(url, allow_query=allow_query)).hostname
     assert host is not None
     try:
         addresses = {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
@@ -208,6 +208,8 @@ def load_lock(path: Path) -> Lock:
         raise AssetError("asset lock repository commit is invalid")
     if not isinstance(value["assets"], list):
         raise AssetError("asset lock assets must be an array")
+    if not value["assets"]:
+        raise AssetError("asset lock must declare at least one asset")
     assets: list[Asset] = []
     ids: set[str] = set()
     targets: set[str] = set()
@@ -458,6 +460,32 @@ def _repository_head(root: Path, lock: Lock) -> str:
     return lines[1]
 
 
+def _assert_locked_tree(root: Path, lock: Lock) -> None:
+    if lock.profile != "screendance-production":
+        return
+    expected_files = {asset.target for asset in lock.assets}
+    expected_directories: set[str] = set()
+    for target in expected_files:
+        parts = PurePosixPath(target).parts
+        for length in range(1, len(parts)):
+            expected_directories.add(PurePosixPath(*parts[:length]).as_posix())
+    for relative_root in (".work", "pipeline/.work"):
+        scan_root = root / relative_root
+        if not os.path.lexists(scan_root):
+            continue
+        if scan_root.is_symlink() or not scan_root.is_dir():
+            raise AssetError("production input root is a symlink or non-directory")
+        for path in scan_root.rglob("*"):
+            relative = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise AssetError("production input tree contains an unsafe filesystem entry")
+            if stat.S_ISDIR(mode) and relative not in expected_directories:
+                raise AssetError("production input tree contains an undeclared directory")
+            if stat.S_ISREG(mode) and relative not in expected_files:
+                raise AssetError("production input tree contains an undeclared file")
+
+
 def _cache_path(root: Path, asset: Asset, *, create: bool) -> Path:
     relative = f".asset-cache/sha256/{asset.sha256[:2]}/{asset.sha256}"
     return _path_under(root, relative, create_parents=create)
@@ -492,23 +520,45 @@ def _identity(path: Path, asset: Asset) -> str:
 
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allow_github_asset_redirect: bool = False) -> None:
+        super().__init__()
+        self.allow_github_asset_redirect = allow_github_asset_redirect
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _assert_public_https_host(newurl)
+        old_host = urllib.parse.urlsplit(req.full_url).hostname
+        new = urllib.parse.urlsplit(newurl)
+        allow_query = bool(
+            self.allow_github_asset_redirect
+            and old_host == "api.github.com"
+            and new.hostname
+            in {
+                "github-releases.githubusercontent.com",
+                "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com",
+            }
+        )
+        _assert_public_https_host(newurl, allow_query=allow_query)
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None:
-            old_host = urllib.parse.urlsplit(req.full_url).hostname
-            new_host = urllib.parse.urlsplit(newurl).hostname
+            new_host = new.hostname
             if old_host != new_host:
                 redirected.remove_header("Authorization")
                 redirected.unredirected_hdrs.pop("Authorization", None)
         return redirected
 
 
-def _open_url(url: str, headers: dict[str, str], timeout: float):
+def _open_url(
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+    *,
+    allow_github_asset_redirect: bool = False,
+):
     url = _https_url(url)
     _assert_public_https_host(url)
     request = urllib.request.Request(url, headers=headers)
-    return urllib.request.build_opener(_SafeRedirect()).open(request, timeout=timeout)
+    handler = _SafeRedirect(allow_github_asset_redirect=allow_github_asset_redirect)
+    return urllib.request.build_opener(handler).open(request, timeout=timeout)
 
 
 def _github_release_asset(source: dict, timeout: float) -> tuple[str, dict[str, str]]:
@@ -592,7 +642,12 @@ def _source_stream(
     if source["kind"] == "github-release":
         url, headers = _github_release_asset(source, timeout)
     try:
-        return _open_url(url, headers, timeout)
+        return _open_url(
+            url,
+            headers,
+            timeout,
+            allow_github_asset_redirect=source["kind"] == "github-release",
+        )
     except (OSError, urllib.error.URLError) as exc:
         raise AssetError("HTTPS asset source could not be read") from exc
 
@@ -719,6 +774,7 @@ def _report(command: str, lock: Lock, rows: list[tuple[Asset, str, str]]) -> dic
 def inspect(command: str, lock: Lock, root: Path) -> dict:
     if _repository_head(root, lock) != lock.repository_commit:
         raise AssetError("asset lock does not bind the exact checked-out repository commit")
+    _assert_locked_tree(root, lock)
     rows = []
     for asset in lock.assets:
         target = _path_under(root, asset.target, create_parents=False)
@@ -737,6 +793,7 @@ def pull(
 ) -> dict:
     if _repository_head(root, lock) != lock.repository_commit:
         raise AssetError("asset lock does not bind the exact checked-out repository commit")
+    _assert_locked_tree(root, lock)
     failures: list[str] = []
     for asset in lock.assets:
         target = _path_under(root, asset.target, create_parents=True)

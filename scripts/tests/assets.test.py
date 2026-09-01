@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -139,6 +140,13 @@ class AssetParityTest(unittest.TestCase):
         self.assertFalse(receipt["ok"])
         self.assertEqual(receipt["unresolved"], ["origin-img-1570"])
 
+    def test_empty_lock_fails_at_runtime(self) -> None:
+        value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+        value["assets"] = []
+        self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+        with self.assertRaisesRegex(ASSETS.AssetError, "at least one"):
+            ASSETS.load_lock(self.fixture.lock)
+
     def test_wrong_source_digest_never_publishes_cache_or_target(self) -> None:
         self.fixture.write_lock(asset={"sha256": "0" * 64})
         code = ASSETS.main(
@@ -198,6 +206,8 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com./a",
             "https://localhost/a",
             "https://127.0.0.1/a",
+            "https://host.local/a",
+            "https://[::1]/a",
         ):
             with self.subTest(url=url), self.assertRaises(ASSETS.AssetError):
                 ASSETS._validate_source({"kind": "https", "url": url})
@@ -407,7 +417,13 @@ class AssetParityTest(unittest.TestCase):
             "assets": rows,
         }
         self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
-        self.assertEqual(len(ASSETS.load_lock(self.fixture.lock).assets), 487)
+        lock = ASSETS.load_lock(self.fixture.lock)
+        self.assertEqual(len(lock.assets), 487)
+        extra = self.fixture.root / "pipeline/.work/raw/EXTRA.JPG"
+        extra.parent.mkdir(parents=True)
+        extra.write_bytes(b"stale ignored input")
+        with self.assertRaisesRegex(ASSETS.AssetError, "undeclared file"):
+            ASSETS._assert_locked_tree(self.fixture.root, lock)
 
         cases = {
             "target": lambda row: row.update(target="pipeline/.work/raw/EXTRA.JPG"),
@@ -451,6 +467,45 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(url, "https://api.github.com/assets/1")
         self.assertEqual(headers["Accept"], "application/octet-stream")
 
+    def test_github_release_redirect_allows_only_signed_asset_hosts(self) -> None:
+        request = urllib.request.Request(
+            "https://api.github.com/repos/organvm/private/releases/assets/1",
+            headers={"Authorization": "Bearer secret"},
+        )
+        signed = "https://release-assets.githubusercontent.com/object?sig=temporary"
+        address = [(2, 1, 6, "", ("140.82.112.1", 443))]
+        with mock.patch.object(ASSETS.socket, "getaddrinfo", return_value=address):
+            redirected = ASSETS._SafeRedirect(
+                allow_github_asset_redirect=True
+            ).redirect_request(request, None, 302, "Found", {}, signed)
+            self.assertEqual(redirected.full_url, signed)
+            self.assertIsNone(redirected.get_header("Authorization"))
+            with self.assertRaises(ASSETS.AssetError):
+                ASSETS._SafeRedirect().redirect_request(
+                    request,
+                    None,
+                    302,
+                    "Found",
+                    {},
+                    signed,
+                )
+
+    def test_metal_workflow_tracks_every_browser_contract_input(self) -> None:
+        workflow = (ROOT / ".github/workflows/macos-metal-contract.yml").read_text(
+            encoding="utf-8"
+        )
+        for path in (
+            "corpus/**",
+            "music/**",
+            "index.html",
+            "verify.html",
+            "probe.html",
+            "arrival.js",
+            "styles.css",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(workflow.count(f'      - "{path}"'), 2)
+
     @unittest.skipIf(jsonschema is None, "jsonschema is not installed")
     def test_lock_and_redacted_receipt_match_tracked_schemas(self) -> None:
         lock_value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
@@ -462,6 +517,9 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com/private#fragment",
             "https://example.com:444/private",
             "https://localhost/private",
+            "https://127.0.0.1/private",
+            "https://host.local/private",
+            "https://[::1]/private",
         ):
             unsafe = copy.deepcopy(lock_value)
             unsafe["assets"][0]["sources"] = [{"kind": "https", "url": url}]

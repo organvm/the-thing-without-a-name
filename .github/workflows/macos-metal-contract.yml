@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "render/**"
+      - "corpus/**"
+      - "music/**"
       - "engine/**"
       - "interface/**"
       - "interaction/**"
@@ -11,11 +13,18 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "index.html"
+      - "verify.html"
+      - "probe.html"
+      - "arrival.js"
+      - "styles.css"
       - ".github/workflows/macos-metal-contract.yml"
   push:
     branches: [main]
     paths:
       - "render/**"
+      - "corpus/**"
+      - "music/**"
       - "engine/**"
       - "interface/**"
       - "interaction/**"
@@ -23,6 +32,11 @@ on:
       - "assets/**"
       - "scripts/assets.py"
       - "scripts/tests/assets.test.py"
+      - "index.html"
+      - "verify.html"
+      - "probe.html"
+      - "arrival.js"
+      - "styles.css"
       - ".github/workflows/macos-metal-contract.yml"
   workflow_dispatch:
 
