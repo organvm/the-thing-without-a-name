@@ -138,6 +138,15 @@ class AssetParityTest(unittest.TestCase):
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
         cache_parent = ASSETS._cache_path(self.fixture.root, asset, create=False).parent
         target_parent = (self.fixture.root / asset.target).parent
+        durable_directories = {
+            "root": self.fixture.root,
+            "cache-root": self.fixture.root / ".asset-cache",
+            "cache-algorithm": self.fixture.root / ".asset-cache/sha256",
+            "cache-bucket": cache_parent,
+            "pipeline": self.fixture.root / "pipeline",
+            "private-root": self.fixture.root / "pipeline/.work",
+            "target-parent": target_parent,
+        }
         events = []
         real_fchmod = os.fchmod
         real_fsync = os.fsync
@@ -150,10 +159,11 @@ class AssetParityTest(unittest.TestCase):
         def record_sync(descriptor):
             if stat.S_ISREG(os.fstat(descriptor).st_mode):
                 events.append("file")
-            elif descriptor_matches_path(descriptor, cache_parent):
-                events.append("cache-directory")
-            elif descriptor_matches_path(descriptor, target_parent):
-                events.append("target-directory")
+            else:
+                for label, path in durable_directories.items():
+                    if descriptor_matches_path(descriptor, path):
+                        events.append(label)
+                        break
             return real_fsync(descriptor)
 
         def record_receipt(*args, **kwargs):
@@ -182,9 +192,145 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(code, 0)
         mode_index = events.index("mode")
         self.assertEqual(events[mode_index - 1 : mode_index + 2], ["file", "mode", "file"])
-        self.assertLess(events.index("cache-directory"), events.index("target-directory"))
-        self.assertLess(events.index("target-directory"), events.index("receipt"))
+        receipt_index = events.index("receipt")
+        for label in durable_directories:
+            with self.subTest(directory=label):
+                self.assertLess(events.index(label), receipt_index)
+        self.assertLess(events.index("cache-bucket"), events.index("target-parent"))
         self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_verified_fast_path_syncs_inode_and_directories_before_receipt(self) -> None:
+        self.assertEqual(
+            ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                ]
+            ),
+            0,
+        )
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=False)
+        target = self.fixture.root / asset.target
+        events = []
+        real_fsync = os.fsync
+        real_atomic_json = ASSETS._atomic_json
+
+        def record_sync(descriptor):
+            if descriptor_matches_path(descriptor, cache):
+                events.append("asset-file")
+            elif descriptor_matches_path(descriptor, cache.parent):
+                events.append("cache-directory")
+            elif descriptor_matches_path(descriptor, target.parent):
+                events.append("target-directory")
+            return real_fsync(descriptor)
+
+        def record_receipt(*args, **kwargs):
+            events.append("receipt")
+            return real_atomic_json(*args, **kwargs)
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync),
+            mock.patch.object(ASSETS, "_atomic_json", side_effect=record_receipt),
+        ):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertEqual(code, 0)
+        receipt_index = events.index("receipt")
+        self.assertGreaterEqual(events[:receipt_index].count("asset-file"), 2)
+        for label in ("cache-directory", "target-directory"):
+            with self.subTest(barrier=label):
+                self.assertLess(events.index(label), receipt_index)
+        self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_verified_fast_path_sync_failure_cannot_publish_receipt(self) -> None:
+        self.assertEqual(
+            ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                ]
+            ),
+            0,
+        )
+        real_fsync = os.fsync
+        rejected = False
+
+        def reject_verified_file_once(descriptor):
+            nonlocal rejected
+            if not rejected and stat.S_ISREG(os.fstat(descriptor).st_mode):
+                rejected = True
+                raise OSError("injected verified file fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=reject_verified_file_once):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(rejected)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.fixture.receipt.exists())
+
+    def test_ancestor_directory_sync_failure_cleans_creation_and_blocks_pull(self) -> None:
+        real_fsync = os.fsync
+        rejected = False
+
+        def reject_root_directory_once(descriptor):
+            nonlocal rejected
+            if not rejected and descriptor_matches_path(descriptor, self.fixture.root):
+                rejected = True
+                raise OSError("injected ancestor directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=reject_root_directory_once):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                    "--receipt",
+                    str(self.fixture.receipt),
+                ]
+            )
+        self.assertTrue(rejected)
+        self.assertEqual(code, 1)
+        self.assertFalse((self.fixture.root / ".asset-cache").exists())
+        self.assertFalse((self.fixture.root / "pipeline").exists())
+        self.assertFalse(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
 
     def test_cache_directory_sync_failure_cleans_link_and_blocks_receipt(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -362,6 +508,23 @@ class AssetParityTest(unittest.TestCase):
         self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
         with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
             ASSETS.load_lock(self.fixture.lock)
+
+    def test_paths_reject_nfc_and_nfd_unicode_aliases(self) -> None:
+        aliases = ("caf\u00e9/asset.bin", "cafe\u0301/asset.bin")
+        self.assertEqual(
+            ASSETS._portable_path_key(aliases[0]),
+            ASSETS._portable_path_key(aliases[1]),
+        )
+        for target in aliases:
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+                    ASSETS._safe_relative(target, "test path")
+                value = json.loads(self.fixture.lock.read_text(encoding="utf-8"))
+                value["assets"][0]["target"] = target
+                self.fixture.lock.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+                    ASSETS.load_lock(self.fixture.lock)
+                self.fixture.write_lock()
 
     def test_missing_parent_path_preserves_every_component(self) -> None:
         target = ASSETS._path_under(
@@ -994,6 +1157,24 @@ class AssetParityTest(unittest.TestCase):
             )
         self.assertFalse(output.exists())
 
+    def test_generic_inventory_rejects_nfc_and_nfd_targets_before_write(self) -> None:
+        for index, name in enumerate(("caf\u00e9.bin", "cafe\u0301.bin")):
+            with self.subTest(name=name):
+                source = self.fixture.base / f"unicode-source-{index}"
+                source.mkdir()
+                (source / name).write_bytes(b"nonportable")
+                output = self.fixture.base / f"unicode-lock-{index}.json"
+                with self.assertRaisesRegex(ASSETS.AssetError, "safe POSIX-relative"):
+                    ASSETS.inventory(
+                        source,
+                        output,
+                        lock_id="unicode-assets",
+                        profile="generic",
+                        repository_commit=self.fixture.head,
+                        rights_class="private",
+                    )
+                self.assertFalse(output.exists())
+
     def test_production_inventory_requires_exact_clean_script_checkout(self) -> None:
         output = self.fixture.base / "production-lock.json"
         with (
@@ -1346,6 +1527,19 @@ class AssetParityTest(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for alias in ("caf\u00e9/asset.bin", "cafe\u0301/asset.bin"):
+            for field in ("target", "file source"):
+                unsafe_path = copy.deepcopy(lock_value)
+                if field == "target":
+                    unsafe_path["assets"][0]["target"] = alias
+                else:
+                    unsafe_path["assets"][0]["sources"] = [
+                        {"kind": "file", "path": alias}
+                    ]
+                with self.subTest(schema_unicode=alias, field=field), self.assertRaises(
+                    jsonschema.ValidationError
+                ):
+                    jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
         for field in ("target", "file source"):
             unsafe_path = copy.deepcopy(lock_value)
             if field == "target":

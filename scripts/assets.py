@@ -21,6 +21,7 @@ import socket
 import stat
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -109,7 +110,13 @@ def _json_loads(raw: bytes, label: str) -> dict:
 
 
 def _safe_relative(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or "\x00" in value
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+    ):
         raise AssetError(f"{label} must be a safe POSIX-relative path")
     pure = PurePosixPath(value)
     if not pure.parts or pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
@@ -117,6 +124,10 @@ def _safe_relative(value: object, label: str) -> str:
     if pure.parts[0].casefold() in {".asset-cache", ".git"}:
         raise AssetError(f"{label} collides with repository control data")
     return pure.as_posix()
+
+
+def _portable_path_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
 
 
 def _https_url(value: object, *, allow_query: bool = False) -> str:
@@ -281,7 +292,7 @@ def load_lock(path: Path, *, repository_root: Path | None = None) -> Lock:
         if target in targets:
             raise AssetError("asset lock repeats an asset target")
         targets.add(target)
-        casefolded_target = target.casefold()
+        casefolded_target = _portable_path_key(target)
         if casefolded_target in casefolded_targets:
             raise AssetError("asset lock contains case-colliding asset targets")
         casefolded_targets.add(casefolded_target)
@@ -654,14 +665,39 @@ def _parent_descriptor_under(
                 if not create_parents:
                     os.close(current)
                     return None
+                created = False
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=current)
+                    created = True
                 except FileExistsError:
                     pass
                 child = os.open(part, directory_flags, dir_fd=current)
+                try:
+                    _fsync_asset_directory(current, "asset ancestor parent")
+                    linked = os.stat(part, dir_fd=current, follow_symlinks=False)
+                    opened = os.fstat(child)
+                    if (
+                        not stat.S_ISDIR(linked.st_mode)
+                        or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+                    ):
+                        raise AssetError("asset ancestor changed during durable creation")
+                except (AssetError, OSError) as exc:
+                    os.close(child)
+                    if created:
+                        try:
+                            os.rmdir(part, dir_fd=current)
+                            os.fsync(current)
+                        except OSError:
+                            pass
+                    if isinstance(exc, AssetError):
+                        raise
+                    raise AssetError("asset ancestor could not be durably synchronized") from exc
             os.close(current)
             current = child
         return current, parts[-1]
+    except AssetError:
+        os.close(current)
+        raise
     except OSError as exc:
         os.close(current)
         raise AssetError("asset target traverses a symlink or non-directory") from exc
@@ -884,6 +920,34 @@ def _identity_proof_at(
 
 def _identity_at(parent: int, name: str, asset: Asset) -> str:
     return _identity_proof_at(parent, name, asset)[0]
+
+
+def _fsync_verified_asset_at(parent: int, name: str, asset: Asset) -> None:
+    state, proof = _identity_proof_at(parent, name, asset)
+    if state != "verified" or proof is None:
+        raise AssetError("asset changed before durable synchronization")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except OSError as exc:
+        raise AssetError("asset could not be opened for durable synchronization") from exc
+    try:
+        opened = _stat_identity(os.fstat(descriptor))
+        if opened != proof:
+            raise AssetError("asset changed before durable synchronization")
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise AssetError("asset file could not be durably synchronized") from exc
+        synchronized = _stat_identity(os.fstat(descriptor))
+        try:
+            linked = _stat_identity(os.stat(name, dir_fd=parent, follow_symlinks=False))
+        except OSError as exc:
+            raise AssetError("asset changed during durable synchronization") from exc
+        if synchronized != opened or linked != synchronized:
+            raise AssetError("asset changed during durable synchronization")
+    finally:
+        os.close(descriptor)
 
 
 def _identity_proof_under(
@@ -1115,6 +1179,20 @@ def _remove_published_link(descriptor: int, name: str) -> None:
         pass
 
 
+def _fsync_verified_under(root: Path, relative: str, asset: Asset, label: str) -> None:
+    parent = _parent_descriptor_under(root, relative, create_parents=False)
+    if parent is None:
+        raise AssetError(f"{label} disappeared before durable synchronization")
+    descriptor, name = parent
+    try:
+        _fsync_verified_asset_at(descriptor, name, asset)
+        _fsync_asset_directory(descriptor, f"{label} parent")
+        if not _parent_descriptor_matches(root, relative, descriptor):
+            raise AssetError(f"{label} parent changed during durable synchronization")
+    finally:
+        os.close(descriptor)
+
+
 def _cache_from_sources(
     root: Path,
     asset: Asset,
@@ -1132,6 +1210,7 @@ def _cache_from_sources(
     try:
         state = _identity_at(cache_descriptor, cache_name, asset)
         if state == "verified":
+            _fsync_verified_asset_at(cache_descriptor, cache_name, asset)
             _fsync_asset_directory(cache_descriptor, "content-addressed cache parent")
             if not _parent_descriptor_matches(root, relative, cache_descriptor):
                 raise AssetError("content-addressed cache parent changed during hydration")
@@ -1185,6 +1264,7 @@ def _cache_from_sources(
                         "cache publication did not preserve asset identity"
                     )
                     continue
+                _fsync_verified_asset_at(cache_descriptor, cache_name, asset)
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
                         _remove_published_link(cache_descriptor, cache_name)
@@ -1242,6 +1322,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target parent changed before publication")
             target_state = _identity_at(target_descriptor, target_name, asset)
             if target_state == "verified":
+                _fsync_verified_asset_at(target_descriptor, target_name, asset)
                 _fsync_asset_directory(target_descriptor, "asset target parent")
                 if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                     raise AssetError("asset target parent changed during verification")
@@ -1280,6 +1361,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 if published:
                     _remove_published_link(target_descriptor, target_name)
                 raise AssetError("published asset target disagrees with the lock")
+            _fsync_verified_asset_at(target_descriptor, target_name, asset)
             try:
                 _fsync_asset_directory(target_descriptor, "asset target parent")
             except AssetError:
@@ -1376,6 +1458,15 @@ def pull(
     failures: list[str] = []
     for asset in lock.assets:
         if _identity_under(root, asset.target, asset) == "verified":
+            cache_relative = _cache_relative(asset)
+            if _identity_under(root, cache_relative, asset) == "verified":
+                _fsync_verified_under(
+                    root,
+                    cache_relative,
+                    asset,
+                    "content-addressed cache",
+                )
+            _fsync_verified_under(root, asset.target, asset, "asset target")
             continue
         try:
             _cache_from_sources(
@@ -1599,7 +1690,7 @@ def inventory(
         if target in targets:
             raise AssetError("inventory repeats an asset target")
         targets.add(target)
-        casefolded_target = target.casefold()
+        casefolded_target = _portable_path_key(target)
         if casefolded_target in casefolded_targets:
             raise AssetError("inventory contains case-colliding asset targets")
         casefolded_targets.add(casefolded_target)
