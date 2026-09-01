@@ -1,0 +1,93 @@
+{
+  "$id": "https://organvm.github.io/the-thing-without-a-name/release/progressive-controls-replay.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "enum": [
+              "exact-head",
+              "desktop-layout",
+              "mobile-320-layout",
+              "mobile-390-layout",
+              "zoom-200-layout",
+              "touch-targets",
+              "keyboard-focus",
+              "reduced-motion",
+              "receipt-state",
+              "map-gating",
+              "console-clean",
+              "http-clean"
+            ]
+          },
+          "observation": {"minLength": 1, "pattern": "\\S", "type": "string"},
+          "result": {"const": "passed"}
+        },
+        "required": ["id", "result", "observation"],
+        "type": "object"
+      },
+      "maxItems": 12,
+      "minItems": 12,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "gate_id": {"const": "progressive-controls-replay"},
+    "non_actions": {
+      "const": [
+        "No deployment, upload, submission, or publication action was performed by this receipt.",
+        "No rights, biography, final-cut, or archive-participation claim was made.",
+        "This browser replay does not satisfy final-cut, rights, package, upload, or filing readiness."
+      ]
+    },
+    "observed_at": {"format": "date-time", "type": "string"},
+    "result": {"const": "satisfied"},
+    "runtime": {
+      "additionalProperties": false,
+      "properties": {
+        "browser": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {"const": "Google Chrome"},
+            "version": {"minLength": 1, "type": "string"}
+          },
+          "required": ["name", "version"],
+          "type": "object"
+        },
+        "graphics_renderer": {
+          "pattern": "^ANGLE \\(Apple, ANGLE Metal Renderer: Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\\)(?![\\s\\S])",
+          "type": "string"
+        },
+        "platform": {"const": "darwin"}
+      },
+      "required": ["platform", "browser", "graphics_renderer"],
+      "type": "object"
+    },
+    "schema": {"const": "danse.progressive-controls-replay.v1"},
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "exact_head": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
+        "pull_request": {"const": 43},
+        "repository": {"const": "organvm/the-thing-without-a-name"},
+        "tree": {"pattern": "^[0-9a-f]{40}$", "type": "string"}
+      },
+      "required": ["repository", "pull_request", "exact_head", "tree"],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "gate_id",
+    "result",
+    "observed_at",
+    "source",
+    "runtime",
+    "checks",
+    "non_actions"
+  ],
+  "title": "Danse progressive controls exact-head replay receipt",
+  "type": "object"
+}

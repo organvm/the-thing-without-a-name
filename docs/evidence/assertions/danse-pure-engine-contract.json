@@ -1,0 +1,18 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-pure-engine-contract",
+  "assertion_class": "historical_record",
+  "statement": "In the 2026-08-31 audited tree, the tracked portable checker enforced a pure seed/time engine and isolated clock and entropy access to arrival.js.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-portable-checker-source",
+      "independence_group": "danse-source-tree",
+      "evidence_type": "artifact",
+      "reference": "scripts/check-danse.py",
+      "body_hash": "sha256:810efbcc89b9daab64ef80f754cda03cb42cdc6763ba4fa9f8a7f098890ec8a2",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

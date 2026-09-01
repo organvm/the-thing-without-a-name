@@ -1,0 +1,18 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-corpus-session",
+  "assertion_class": "historical_record",
+  "statement": "The tracked publishable corpus contains 162 records: 161 registered photographs from the 20 June 2017 session and one unregistered archival composite.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-corpus-manifest",
+      "independence_group": "danse-corpus-record",
+      "evidence_type": "artifact",
+      "reference": "corpus/manifest.json",
+      "body_hash": "sha256:970b0aa062a0d8a4d96f64688034ccd745b1dde5cfdaf4002de173509accb371",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

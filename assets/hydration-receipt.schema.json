@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://organvm.github.io/the-thing-without-a-name/assets/hydration-receipt.schema.json",
+  "title": "Danse redacted asset operation receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "command", "lock_id", "profile", "lock_sha256", "repository_commit", "ok", "counts", "by_rights_class", "unresolved"],
+  "properties": {
+    "schema": {"const": "danse.assets.receipt.v1"},
+    "command": {"enum": ["audit", "pull", "verify"]},
+    "lock_id": {"type": "string", "minLength": 1},
+    "profile": {"enum": ["generic", "screendance-production"]},
+    "lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "repository_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "ok": {"type": "boolean"},
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared", "required", "verified", "cache_verified", "missing", "mismatch", "unsafe"],
+      "properties": {
+        "declared": {"type": "integer", "minimum": 0},
+        "required": {"type": "integer", "minimum": 0},
+        "verified": {"type": "integer", "minimum": 0},
+        "cache_verified": {"type": "integer", "minimum": 0},
+        "missing": {"type": "integer", "minimum": 0},
+        "mismatch": {"type": "integer", "minimum": 0},
+        "unsafe": {"type": "integer", "minimum": 0}
+      }
+    },
+    "by_rights_class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public", "restricted", "private"],
+      "properties": {
+        "public": {"$ref": "#/$defs/bucket"},
+        "restricted": {"$ref": "#/$defs/bucket"},
+        "private": {"$ref": "#/$defs/bucket"}
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"}
+    }
+  },
+  "$defs": {
+    "bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared", "required", "verified", "unresolved"],
+      "properties": {
+        "declared": {"type": "integer", "minimum": 0},
+        "required": {"type": "integer", "minimum": 0},
+        "verified": {"type": "integer", "minimum": 0},
+        "unresolved": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

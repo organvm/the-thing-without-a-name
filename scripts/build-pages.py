@@ -45,14 +45,92 @@ INTERACTION_MODULES = (
     "interaction/controller.js",
     "interaction/session.js",
 )
+INTERFACE_FILES = (
+    "interface/actions.js",
+    "interface/state.js",
+    "interface/render.js",
+    "interface/styles.css",
+    "interface/map.v1.json",
+)
+PROJECT_MAP = "interface/map.v1.json"
+PROJECT_MAP_IDENTITY = {
+    "schema": "danse.map.v1",
+    "title": "Danse project map",
+    "version": 1,
+}
+LIVE_PROJECT_NODE = {
+    "id": "live",
+    "label": "Live artwork",
+    "product_id": None,
+    "route": "./",
+    "fragment": None,
+    "href": "./",
+    "status": "admitted",
+    "availability": "available",
+}
+PROJECT_MAP_SOURCE_NODES = (
+    LIVE_PROJECT_NODE,
+    {
+        "id": "study",
+        "label": "Study",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": None,
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "cubism",
+        "label": "Cubism",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "cubism",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "glitch",
+        "label": "Glitch?",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "glitch",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "ballet-score",
+        "label": "Ballet / Score",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "ballet-score",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+    {
+        "id": "evidence",
+        "label": "Evidence",
+        "product_id": "project-page-copy",
+        "route": "./project/",
+        "fragment": "evidence",
+        "href": None,
+        "status": "gated",
+        "availability": "unavailable until public admission",
+    },
+)
 VENDOR_BASE = "interaction/vendor/mediapipe"
 VENDOR_MANIFEST = f"{VENDOR_BASE}/manifest.json"
 RUNTIME_FILES = (
     ".nojekyll",
+    "404.html",
     "index.html",
     "arrival.js",
     *ENGINE_MODULES,
     *INTERACTION_MODULES,
+    *INTERFACE_FILES,
     VENDOR_MANIFEST,
     "music/score.json",
     "render/program.json",
@@ -133,6 +211,63 @@ def safe_relative(value: object, label: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ArtifactError(f"{label} contains an unsafe path component: {value!r}")
     return PurePosixPath(*parts).as_posix()
+
+
+def project_map(
+    root: Path,
+    *,
+    admit_study: bool = False,
+    allow_resolved: bool = False,
+    commit: str | None = None,
+) -> dict:
+    try:
+        value = json.loads(
+            source_bytes(root, PROJECT_MAP, "project map", commit).decode("utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"cannot read project map: {exc}") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {*PROJECT_MAP_IDENTITY, "nodes"}
+        or any(value.get(key) != expected for key, expected in PROJECT_MAP_IDENTITY.items())
+    ):
+        raise ArtifactError("project map metadata or schema is not canonical")
+    nodes = value.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != len(PROJECT_MAP_SOURCE_NODES):
+        raise ArtifactError("project map source-node inventory drifted")
+    resolution_keys = {"status", "availability", "href"}
+    for node, expected in zip(nodes, PROJECT_MAP_SOURCE_NODES, strict=True):
+        if not isinstance(node, dict) or set(node) != set(expected):
+            raise ArtifactError("project map contains a malformed node")
+        if expected["id"] == "live":
+            if node != expected:
+                raise ArtifactError(
+                    "live project-map node must remain the canonical local artwork route"
+                )
+            continue
+        if any(node[key] != expected[key] for key in set(expected) - resolution_keys):
+            raise ArtifactError("project map source-node identity drifted")
+        source_resolution = {key: expected[key] for key in resolution_keys}
+        canonical_href = expected["route"] + (
+            f"#{expected['fragment']}" if expected["fragment"] else ""
+        )
+        admitted_resolution = {
+            "status": "admitted",
+            "availability": "available",
+            "href": canonical_href,
+        }
+        actual_resolution = {key: node[key] for key in resolution_keys}
+        if actual_resolution != source_resolution and not (
+            allow_resolved and actual_resolution == admitted_resolution
+        ):
+            raise ArtifactError("project map node resolution is not canonical")
+    if admit_study:
+        for node in nodes:
+            if node["product_id"] == "project-page-copy":
+                node["status"] = "admitted"
+                node["availability"] = "available"
+                node["href"] = node["route"] + (f"#{node['fragment']}" if node["fragment"] else "")
+    return value
 
 
 def source_file(root: Path, relative: str) -> Path:
@@ -529,6 +664,7 @@ def source_files(root: Path, commit: str | None = None) -> tuple[str, ...]:
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactError(f"source root is not a regular directory: {root}")
+    project_map(root, commit=commit)
     files = set(RUNTIME_FILES) | corpus_files(root, commit) | vendor_files(root, commit)
     if commit is None:
         for relative in files:
@@ -773,6 +909,23 @@ def verify_artifact(
             source["commit"],
             source_files(source_root, source["commit"]),
         )
+        expected_map = (
+            json.dumps(
+                project_map(
+                    source_root,
+                    admit_study=release is not None,
+                    commit=source["commit"],
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        expected_records[PROJECT_MAP] = {
+            "path": PROJECT_MAP,
+            "bytes": len(expected_map),
+            "sha256": hashlib.sha256(expected_map).hexdigest(),
+        }
         builder = _load_release_builder()
         try:
             source_manifest, manifest_sha256 = builder.source_release_manifest(
@@ -872,6 +1025,14 @@ def verify_artifact(
             )
         except Exception as exc:
             raise ArtifactError(f"artifact project links failed verification: {exc}") from exc
+    resolved_map = project_map(output, allow_resolved=True)
+    study = [node for node in resolved_map["nodes"] if node["product_id"]]
+    admitted = [node for node in study if node["status"] == "admitted"]
+    if admitted and len(admitted) != len(study):
+        raise ArtifactError("project map admits study routes partially")
+    if bool(admitted) != has_project:
+        raise ArtifactError("project map admission disagrees with the delivered project route")
+    if has_project:
         try:
             project = (output / "project/index.html").read_text(encoding="utf-8")
             builder.verify_project_security(
@@ -962,7 +1123,22 @@ def build(
     for relative in files:
         target = output / PurePosixPath(relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if committed_payloads is not None:
+        if relative == PROJECT_MAP:
+            target.write_bytes(
+                (
+                    json.dumps(
+                        project_map(
+                            root,
+                            admit_study="project/index.html" in release_files,
+                            commit=commit if require_git_source else None,
+                        ),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        elif committed_payloads is not None:
             target.write_bytes(committed_payloads[relative])
         else:
             source = source_file(root, relative)
@@ -971,7 +1147,7 @@ def build(
         os.utime(target, (0, 0), follow_symlinks=False)
         record = (
             dict(committed_records[relative])
-            if committed_records is not None
+            if committed_records is not None and relative != PROJECT_MAP
             else {
                 "path": relative,
                 "bytes": target.stat().st_size,

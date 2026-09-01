@@ -12,6 +12,12 @@ only hashed snapshot/medium identities, source and remote commits, aggregate
 counts and bytes, and artifact digests. Caller labels, snapshot names, branch
 names, filenames, and local paths are not serialized into that receipt.
 
+The private GitHub asset plane described in [`assets/README.md`](../assets/README.md)
+is an operational availability copy of the same byte identities. It lets a clean
+authorized runner hydrate production inputs, but it is not a second independent
+physical device and does not satisfy this custody contract's restore rehearsal or
+human-acceptance predicates.
+
 ## Snapshot and duplicate
 
 Fetch the relevant remote first, then use two existing directories on genuinely

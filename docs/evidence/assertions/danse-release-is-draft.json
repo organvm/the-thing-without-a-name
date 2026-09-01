@@ -1,0 +1,26 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-release-is-draft",
+  "assertion_class": "historical_record",
+  "statement": "In the 2026-08-31 audited tree, the tracked public/release package was draft and retained pending artistic, rights, accessibility, publication, custody, restore, and presentation gates.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-release-manifest",
+      "independence_group": "danse-release-record",
+      "evidence_type": "artifact",
+      "reference": "release/manifest.json",
+      "body_hash": "sha256:d5dc71e49d0d9923595c15f1526345d3016f82fb3f6ce06fe6b1f3fa376e9a05",
+      "observed_at": "2026-08-31T22:44:39Z"
+    },
+    {
+      "evidence_id": "danse-rights-register",
+      "independence_group": "danse-rights-record",
+      "evidence_type": "artifact",
+      "reference": "rights/register.json",
+      "body_hash": "sha256:d40daafc0de378f460d096c700f28451fc7367e695bc446e8e93285d8609ae68",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

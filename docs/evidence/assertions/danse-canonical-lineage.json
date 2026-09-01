@@ -1,0 +1,18 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-canonical-lineage",
+  "assertion_class": "historical_record",
+  "statement": "organvm/the-thing-without-a-name is the canonical Danse repository, migrated from organvm/limen at apps/danse with the imported commit lineage recorded in LINEAGE.json.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-lineage-record",
+      "independence_group": "danse-lineage",
+      "evidence_type": "immutable_source_event",
+      "reference": "LINEAGE.json",
+      "body_hash": "sha256:ff5651e732492f88d8b5788ab468ca77542d453bc8a044b3be382401c9c508ff",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

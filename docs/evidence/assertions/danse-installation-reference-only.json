@@ -1,0 +1,18 @@
+{
+  "contract_name": "assertion-evidence.v1",
+  "contract_version": 1,
+  "assertion_id": "danse-installation-reference-only",
+  "assertion_class": "historical_record",
+  "statement": "In the 2026-08-31 audited tree, the tracked installation was a reference design whose physical venue, hardware, calibration, recovery, and restore predicates remained blocked.",
+  "verification_state": "verified",
+  "evidence_references": [
+    {
+      "evidence_id": "danse-installation-gate-ledger",
+      "independence_group": "danse-installation-record",
+      "evidence_type": "artifact",
+      "reference": "installation/gates.json",
+      "body_hash": "sha256:abdb7e56f90ee98150604dc0732a36d9dafd6677966a5b89cc4622aa1072166e",
+      "observed_at": "2026-08-31T22:44:39Z"
+    }
+  ]
+}

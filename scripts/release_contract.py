@@ -27,6 +27,26 @@ EXPECTED_SOURCE_EVIDENCE_SHA256 = "7e9ba1c74f8ac78df116ada8c94d8af4e7d04813f2a3c
 LIVE_INTERACTION_EVIDENCE_PATH = "release/evidence/live-interaction-replay-20260804.json"
 LIVE_INTERACTION_COMMENT_BODY_SHA256 = "4cc41f9ed353c92c27b172907800b123c7b4e85ef4ba7165ed210133f40952bf"
 LIVE_INTERACTION_DEPLOYED_COMMIT = "f19244afbce94015e78b7f746b07d267ed9e67ae"
+PROGRESSIVE_CONTROLS_EVIDENCE_PATH = "release/evidence/progressive-controls-replay.json"
+PROGRESSIVE_CONTROLS_SCHEMA_PATH = "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY = (
+    "Exact-head progressive-controls replay only; does not establish final-cut, "
+    "rights, package, upload, or filing readiness."
+)
+PROGRESSIVE_CONTROLS_CHECKS = (
+    "exact-head",
+    "desktop-layout",
+    "mobile-320-layout",
+    "mobile-390-layout",
+    "zoom-200-layout",
+    "touch-targets",
+    "keyboard-focus",
+    "reduced-motion",
+    "receipt-state",
+    "map-gating",
+    "console-clean",
+    "http-clean",
+)
 PHASES = ("draft", "public", "release")
 GENERATED_PRODUCT_PATHS = {
     "project-page-copy": "project/index.html",
@@ -39,6 +59,10 @@ GENERATED_PRODUCT_PATHS = {
 }
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+APPLE_ANGLE_METAL_RENDERER = re.compile(
+    r"\AANGLE \(Apple, ANGLE Metal Renderer: "
+    r"Apple M[1-9][0-9]*(?: (?:Pro|Max|Ultra))?, Unspecified Version\)\Z"
+)
 PRIVATE_PREFIXES = (
     ".git/",
     ".work/",
@@ -61,6 +85,25 @@ PUBLIC_MARKERS = re.compile(
 
 class ReleaseError(ValueError):
     """The release manifest or artifact violates its declared contract."""
+
+
+def _git_environment() -> dict[str, str]:
+    """Run provenance Git without ambient repository/object/config redirects."""
+    environment = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "LC_ALL": "C",
+    }
+    # Git for Windows needs SYSTEMROOT; temporary-path variables are harmless
+    # process prerequisites. Deliberately do not inherit any other ambient key,
+    # especially GIT_DIR, GIT_WORK_TREE, index/object redirects, namespaces, or
+    # GIT_CONFIG_COUNT/KEY/VALUE injection.
+    for key in ("SYSTEMROOT", "TMPDIR", "TMP", "TEMP"):
+        if value := os.environ.get(key):
+            environment[key] = value
+    return environment
 
 
 def sha256(path: Path) -> str:
@@ -479,7 +522,240 @@ def validate_live_interaction_receipt(path: Path) -> None:
         raise ReleaseError(f"live interaction replay exposes a private/local path marker: {leaked}")
 
 
-def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
+def validate_progressive_controls_receipt(
+    root: Path,
+    path: Path,
+    *,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
+) -> None:
+    """Validate the distinct exact-head browser receipt for the progressive UI gate."""
+    git_root = (provenance_root or root).absolute().resolve()
+    receipt = load_json(path, "progressive controls replay receipt")
+    schema_path = source_file(
+        root,
+        PROGRESSIVE_CONTROLS_SCHEMA_PATH,
+        "progressive controls replay schema",
+    )
+    schema = load_json(schema_path, "progressive controls replay schema")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(
+            schema,
+            format_checker=jsonschema.FormatChecker(),
+        ).validate(receipt)
+    except jsonschema.SchemaError as exc:
+        raise ReleaseError(f"progressive controls replay schema is invalid: {exc.message}") from exc
+    except jsonschema.ValidationError as exc:
+        location = ".".join(str(item) for item in exc.absolute_path) or "root"
+        raise ReleaseError(
+            f"progressive controls replay receipt violates schema at {location}: {exc.message}"
+        ) from exc
+
+    check_ids = [check["id"] for check in receipt["checks"]]
+    if check_ids != list(PROGRESSIVE_CONTROLS_CHECKS):
+        raise ReleaseError("progressive controls replay check inventory drifted")
+
+    source = receipt["source"]
+    exact_head = source["exact_head"]
+    target_commit = provenance_commit or "HEAD"
+    if provenance_commit is not None:
+        target_commit = provenance_commit.lower()
+        if not HEX40.fullmatch(target_commit):
+            raise ReleaseError(
+                "progressive controls provenance target must be a full commit SHA"
+            )
+        resolved_target = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(git_root),
+                "rev-parse",
+                "--verify",
+                f"{target_commit}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_git_environment(),
+        )
+        if (
+            resolved_target.returncode != 0
+            or resolved_target.stdout.strip() != target_commit
+        ):
+            raise ReleaseError(
+                "progressive controls provenance target is not a repository commit"
+            )
+    resolved_head = subprocess.run(
+        ["git", "-C", str(git_root), "rev-parse", "--verify", f"{exact_head}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if resolved_head.returncode != 0 or resolved_head.stdout.strip() != exact_head:
+        raise ReleaseError("progressive controls replay exact head is not a repository commit")
+    resolved_tree = subprocess.run(
+        ["git", "-C", str(git_root), "rev-parse", "--verify", f"{exact_head}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if resolved_tree.returncode != 0 or resolved_tree.stdout.strip() != source["tree"]:
+        raise ReleaseError("progressive controls replay tree does not belong to its exact head")
+    is_ancestor = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(git_root),
+            "merge-base",
+            "--is-ancestor",
+            exact_head,
+            target_commit,
+        ],
+        capture_output=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if is_ancestor.returncode != 0:
+        raise ReleaseError("progressive controls replay exact head is not an ancestor of the checkout")
+    completion_paths = {MANIFEST.as_posix(), PROGRESSIVE_CONTROLS_EVIDENCE_PATH}
+
+    manifest = load_json(root / MANIFEST, "release manifest")
+    exact_manifest_result = subprocess.run(
+        ["git", "-C", str(git_root), "show", f"{exact_head}:{MANIFEST.as_posix()}"],
+        capture_output=True,
+        check=False,
+        env=_git_environment(),
+    )
+    if exact_manifest_result.returncode != 0:
+        raise ReleaseError("progressive controls exact head has no release manifest")
+    try:
+        exact_manifest = json.loads(exact_manifest_result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("progressive controls exact-head manifest is invalid JSON") from exc
+
+    def progressive_gate(value: object, label: str) -> tuple[int, dict[str, Any]]:
+        gates = value.get("gates") if isinstance(value, dict) else None
+        if not isinstance(gates, list):
+            raise ReleaseError(f"progressive controls {label} manifest has no gate inventory")
+        matches = [
+            (index, gate)
+            for index, gate in enumerate(gates)
+            if isinstance(gate, dict) and gate.get("id") == "progressive-controls-replay"
+        ]
+        if len(matches) != 1:
+            raise ReleaseError(
+                f"progressive controls {label} manifest must contain exactly one replay gate"
+            )
+        return matches[0]
+
+    exact_gate_index, exact_gate = progressive_gate(exact_manifest, "exact-head")
+    current_gate_index, current_gate = progressive_gate(manifest, "current")
+    if (
+        exact_gate_index != current_gate_index
+        or exact_gate.get("state") != "pending"
+        or exact_gate.get("evidence") is not None
+        or current_gate.get("state") != "satisfied"
+        or any(
+            current_gate.get(key) != exact_gate.get(key)
+            for key in set(current_gate) | set(exact_gate)
+            if key not in {"state", "evidence"}
+        )
+    ):
+        raise ReleaseError("progressive controls manifest gate transition is not canonical")
+    gate_evidence = current_gate.get("evidence")
+    expected_gate_evidence = {
+        "path": PROGRESSIVE_CONTROLS_EVIDENCE_PATH,
+        "sha256": sha256(path),
+        "summary": PROGRESSIVE_CONTROLS_EVIDENCE_SUMMARY,
+    }
+    if gate_evidence != expected_gate_evidence:
+        raise ReleaseError("progressive controls manifest gate evidence is not canonical")
+    projected_manifest = json.loads(canonical_json(manifest))
+    projected_manifest["gates"][current_gate_index] = exact_gate
+    if canonical_json(projected_manifest) != canonical_json(exact_manifest):
+        raise ReleaseError(
+            "progressive controls manifest changed outside the canonical replay gate transition"
+        )
+
+    def git_paths(arguments: list[str], label: str) -> set[str]:
+        result = subprocess.run(
+            ["git", "-C", str(git_root), *arguments],
+            capture_output=True,
+            check=False,
+            env=_git_environment(),
+        )
+        if result.returncode != 0:
+            raise ReleaseError(f"cannot inspect progressive controls {label}")
+        try:
+            return {item.decode("utf-8") for item in result.stdout.split(b"\0") if item}
+        except UnicodeDecodeError as exc:
+            raise ReleaseError(
+                f"progressive controls {label} contains a non-UTF-8 path"
+            ) from exc
+
+    # Disable rename detection so both the deleted reviewed source and the added
+    # destination enter the path set. Otherwise a rename into an allowlisted
+    # completion path can report only its destination and hide source removal.
+    diff_arguments = ["--name-only", "--no-renames", "--diff-filter=ACDMRTUXB", "-z"]
+    changed_paths = git_paths(
+        ["diff", *diff_arguments, exact_head, target_commit, "--"],
+        "reviewed source diff",
+    )
+    if provenance_commit is None:
+        changed_paths.update(
+            git_paths(
+                ["diff", "--cached", *diff_arguments, "HEAD", "--"],
+                "staged source diff",
+            )
+        )
+        changed_paths.update(
+            git_paths(
+                ["diff", *diff_arguments, "HEAD", "--"],
+                "unstaged source diff",
+            )
+        )
+        untracked_paths = git_paths(
+            ["ls-files", "--others", "--exclude-standard", "-z", "--"],
+            "untracked source inventory",
+        )
+    else:
+        untracked_paths = set()
+    # The only post-review paths are the manifest's canonical gate transition
+    # and its exact receipt. No directory or mutable manifest record can confer
+    # trust on an additional source, evidence, or media path.
+    changed_paths.update(untracked_paths - completion_paths)
+    unexpected_paths = sorted(changed_paths - completion_paths)
+    if unexpected_paths:
+        raise ReleaseError(
+            "progressive controls reviewed source includes non-receipt changes: "
+            + ", ".join(unexpected_paths)
+        )
+
+    renderer = receipt["runtime"]["graphics_renderer"]
+    if APPLE_ANGLE_METAL_RENDERER.fullmatch(renderer) is None:
+        raise ReleaseError("progressive controls replay is not authenticated as Apple Metal")
+    leaked = next(
+        (
+            marker.group(0).strip()
+            for value in strings(receipt)
+            if (marker := PRIVATE_PATH_MARKER.search(value))
+        ),
+        None,
+    )
+    if leaked:
+        raise ReleaseError(f"progressive controls replay exposes a private/local path marker: {leaked}")
+
+
+def _validate_evidence_states(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
+) -> None:
     for claim in manifest["claims"]:
         evidence = claim["evidence"]
         if claim["status"] == "verified":
@@ -541,6 +817,15 @@ def _validate_evidence_states(root: Path, manifest: dict[str, Any]) -> None:
                 if evidence["path"] != LIVE_INTERACTION_EVIDENCE_PATH:
                     raise ReleaseError("live interaction replay names the wrong evidence receipt")
                 validate_live_interaction_receipt(evidence_path)
+            elif gate["id"] == "progressive-controls-replay":
+                if evidence["path"] != PROGRESSIVE_CONTROLS_EVIDENCE_PATH:
+                    raise ReleaseError("progressive controls replay names the wrong evidence receipt")
+                validate_progressive_controls_receipt(
+                    root,
+                    evidence_path,
+                    provenance_root=provenance_root,
+                    provenance_commit=provenance_commit,
+                )
         elif evidence is not None:
             raise ReleaseError(f"pending gate {gate['id']} may not carry completion evidence")
 
@@ -645,6 +930,8 @@ def validate_release(
     manifest_path: Path | str = MANIFEST,
     phase: str = "draft",
     checker_root: Path | None = None,
+    provenance_root: Path | None = None,
+    provenance_commit: str | None = None,
 ) -> dict[str, Any]:
     root = root.absolute()
     manifest_file = source_file(root, str(manifest_path), "release manifest")
@@ -681,7 +968,12 @@ def validate_release(
         raise ReleaseError("accessibility review names an unknown gate")
 
     _validate_graph(manifest, gate_ids)
-    _validate_evidence_states(root, manifest)
+    _validate_evidence_states(
+        root,
+        manifest,
+        provenance_root=provenance_root,
+        provenance_commit=provenance_commit,
+    )
     validate_installation_binding(root, manifest, checker_root=checker_root)
     validate_opportunity_binding(root, manifest, checker_root=checker_root)
     blockers = phase_blockers(manifest, phase)
