@@ -206,8 +206,12 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com/a#x",
             "https://example.com:444/a",
             "https://example.com./a",
+            "https://-bad.example/a",
+            "https://example..com/a",
             "https://localhost/a",
+            "https://LOCALHOST/a",
             "https://127.0.0.1/a",
+            "https://999.999/a",
             "https://host.local/a",
             "https://[::1]/a",
         ):
@@ -297,10 +301,35 @@ class AssetParityTest(unittest.TestCase):
             target_parent.symlink_to(outside, target_is_directory=True)
             return real_link(source, target, **kwargs)
 
-        with mock.patch.object(ASSETS.os, "link", side_effect=swap_parent_then_link):
+        with mock.patch.object(
+            ASSETS.os,
+            "link",
+            side_effect=swap_parent_then_link,
+        ), self.assertRaisesRegex(ASSETS.AssetError, "parent changed"):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertEqual((held_parent / "IMG_1570.JPG").read_bytes(), self.fixture.payload)
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_writable_preverified_target_is_rejected(self) -> None:
+        target = self.fixture.root / "pipeline/.work/raw/IMG_1570.JPG"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.payload)
+        target.chmod(0o644)
+        code = ASSETS.main(
+            [
+                "pull",
+                "--lock",
+                str(self.fixture.lock),
+                "--root",
+                str(self.fixture.root),
+                "--allow-file",
+                "--file-source-root",
+                str(self.fixture.source),
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(target.read_bytes(), self.fixture.payload)
+        self.assertEqual(stat_mode(target), 0o644)
 
     def test_cache_parent_swap_cannot_redirect_hydration(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
@@ -386,6 +415,33 @@ class AssetParityTest(unittest.TestCase):
             ASSETS.main(["audit", "--lock", str(self.fixture.lock), "--root", str(self.fixture.root)]),
             1,
         )
+
+    def test_hidden_git_index_flags_are_rejected(self) -> None:
+        lock = ASSETS.load_lock(self.fixture.lock)
+        for enable, disable in (
+            ("--assume-unchanged", "--no-assume-unchanged"),
+            ("--skip-worktree", "--no-skip-worktree"),
+        ):
+            with self.subTest(flag=enable):
+                subprocess.run(
+                    ["git", "-C", str(self.fixture.root), "update-index", enable, "README.md"],
+                    check=True,
+                )
+                try:
+                    with self.assertRaisesRegex(ASSETS.AssetError, "index|skip-worktree"):
+                        ASSETS._repository_head(self.fixture.root, lock)
+                finally:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(self.fixture.root),
+                            "update-index",
+                            disable,
+                            "README.md",
+                        ],
+                        check=True,
+                    )
 
     def test_receipts_are_immutable(self) -> None:
         self.assertEqual(
@@ -508,6 +564,43 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(calls, 2)
         self.assertFalse(output.exists())
 
+    def test_inventory_opens_files_relative_to_held_parent_descriptors(self) -> None:
+        output = self.fixture.base / "descriptor-lock.json"
+        real_open = ASSETS.os.open
+        observed_parent_descriptors = []
+
+        def record_file_open(path, flags, *args, dir_fd=None, **kwargs):
+            if path == "IMG_1570.JPG":
+                observed_parent_descriptors.append(dir_fd)
+            return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+        with mock.patch.object(ASSETS.os, "open", side_effect=record_file_open):
+            ASSETS.inventory(
+                self.fixture.source,
+                output,
+                lock_id="descriptor-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertGreaterEqual(len(observed_parent_descriptors), 2)
+        self.assertTrue(all(value is not None for value in observed_parent_descriptors))
+
+    def test_empty_generic_inventory_is_rejected_before_write(self) -> None:
+        empty = self.fixture.base / "empty-source"
+        empty.mkdir()
+        output = self.fixture.base / "empty-lock.json"
+        with self.assertRaisesRegex(ASSETS.AssetError, "at least one"):
+            ASSETS.inventory(
+                empty,
+                output,
+                lock_id="empty-assets",
+                profile="generic",
+                repository_commit=self.fixture.head,
+                rights_class="private",
+            )
+        self.assertFalse(output.exists())
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixtures require POSIX")
     def test_inventory_rejects_special_files(self) -> None:
         os.mkfifo(self.fixture.source / "named-pipe")
@@ -600,6 +693,9 @@ class AssetParityTest(unittest.TestCase):
             "rights": lambda row: row.update(rights_class="public"),
             "media": lambda row: row.update(media_type="application/octet-stream"),
             "source": lambda row: row.update(sources=[{"kind": "https", "url": "https://example.com/raw"}]),
+            "personal file source": lambda row: row.update(
+                sources=[{"kind": "file", "path": "Users/alice/archive/IMG_1594.JPG"}]
+            ),
             "unauthenticated release": lambda row: row.update(
                 sources=[
                     {
@@ -694,7 +790,38 @@ class AssetParityTest(unittest.TestCase):
             ) as open_url,
             self.assertRaisesRegex(ASSETS.AssetError, "private GitHub repository"),
         ):
-            ASSETS._github_release_asset(source, 1.0)
+            ASSETS._github_release_asset(
+                source,
+                1.0,
+                require_private_repository=True,
+            )
+        open_url.assert_called_once()
+
+    def test_authenticated_public_release_does_not_claim_private_custody(self) -> None:
+        source = {
+            "kind": "github-release",
+            "repository": "organvm/public-assets",
+            "tag": "v1",
+            "asset": "payload.bin",
+            "token_env": "DANSE_PUBLIC_TOKEN",
+        }
+        metadata = json.dumps(
+            {"assets": [{"name": "payload.bin", "url": "https://api.github.com/assets/1"}]}
+        ).encode()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = [metadata, b""]
+        response.__exit__.return_value = False
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DANSE_PUBLIC_TOKEN": "printable-token"},
+                clear=True,
+            ),
+            mock.patch.object(ASSETS, "_open_url", return_value=response) as open_url,
+        ):
+            url, headers = ASSETS._github_release_asset(source, 1.0)
+        self.assertEqual(url, "https://api.github.com/assets/1")
+        self.assertEqual(headers["Authorization"], "Bearer printable-token")
         open_url.assert_called_once()
 
     def test_header_construction_errors_are_redacted_asset_errors(self) -> None:
@@ -766,8 +893,12 @@ class AssetParityTest(unittest.TestCase):
             "https://example.com/private?signature=secret",
             "https://example.com/private#fragment",
             "https://example.com:444/private",
+            "https://-bad.example/private",
+            "https://example..com/private",
             "https://localhost/private",
+            "https://LOCALHOST/private",
             "https://127.0.0.1/private",
+            "https://999.999/private",
             "https://host.local/private",
             "https://[::1]/private",
         ):
