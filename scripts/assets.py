@@ -699,13 +699,16 @@ def _parent_descriptor_under(
                     ):
                         raise AssetError("asset ancestor changed during durable creation")
                 except (AssetError, OSError) as exc:
-                    os.close(child)
-                    if created:
-                        try:
-                            os.rmdir(part, dir_fd=current)
-                            os.fsync(current)
-                        except OSError:
-                            pass
+                    try:
+                        if created:
+                            _remove_created_directory_at(
+                                current,
+                                part,
+                                child,
+                                "asset ancestor",
+                            )
+                    finally:
+                        os.close(child)
                     if isinstance(exc, AssetError):
                         raise
                     raise AssetError("asset ancestor could not be durably synchronized") from exc
@@ -718,6 +721,34 @@ def _parent_descriptor_under(
     except OSError as exc:
         os.close(current)
         raise AssetError("asset target traverses a symlink or non-directory") from exc
+
+
+def _remove_created_directory_at(
+    parent: int,
+    name: str,
+    child: int,
+    label: str,
+) -> None:
+    guarded = os.fstat(child)
+    try:
+        linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        _fsync_asset_directory(parent, f"{label} cleanup parent")
+        return
+    except OSError as exc:
+        raise AssetError(f"{label} could not be authenticated before cleanup") from exc
+    if (
+        not stat.S_ISDIR(linked.st_mode)
+        or (guarded.st_dev, guarded.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        raise AssetError(f"{label} changed before cleanup; refusing destructive rollback")
+    try:
+        os.rmdir(name, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise AssetError(f"{label} could not be removed safely") from exc
+    _fsync_asset_directory(parent, f"{label} cleanup parent")
 
 
 def _temporary_file_at(parent: int, *, prefix: str = ".asset-") -> tuple[int, str]:
@@ -780,6 +811,25 @@ def _repository_head(root: Path, lock: Lock | None = None) -> str:
             check=False,
             env=environment,
         )
+        middle_identity = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        final_status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        final_index_flags = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-v", "-z"],
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
         final_identity = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
             capture_output=True,
@@ -792,7 +842,12 @@ def _repository_head(root: Path, lock: Lock | None = None) -> str:
     lines = identity.stdout.splitlines()
     if identity.returncode != 0 or len(lines) != 2 or not GIT_SHA.fullmatch(lines[1]):
         raise AssetError("asset root is not a readable Git checkout")
-    if final_identity.returncode != 0 or final_identity.stdout != identity.stdout:
+    if (
+        middle_identity.returncode != 0
+        or final_identity.returncode != 0
+        or middle_identity.stdout != identity.stdout
+        or final_identity.stdout != identity.stdout
+    ):
         raise AssetError("Git checkout identity changed during verification")
     try:
         top = Path(lines[0]).resolve(strict=True)
@@ -800,8 +855,15 @@ def _repository_head(root: Path, lock: Lock | None = None) -> str:
         raise AssetError("Git checkout root cannot be resolved") from exc
     if top != root:
         raise AssetError("asset root must be the exact Git checkout root")
-    if status.returncode != 0 or index_flags.returncode != 0:
+    if (
+        status.returncode != 0
+        or index_flags.returncode != 0
+        or final_status.returncode != 0
+        or final_index_flags.returncode != 0
+    ):
         raise AssetError("Git checkout state cannot be read")
+    if status.stdout != final_status.stdout or index_flags.stdout != final_index_flags.stdout:
+        raise AssetError("Git checkout state changed during verification")
     for record in index_flags.stdout.split(b"\0"):
         if not record:
             continue
@@ -1208,16 +1270,118 @@ def _fsync_asset_file(descriptor: int, label: str) -> None:
         raise AssetError(f"{label} could not be fully synchronized on Darwin") from exc
 
 
-def _remove_published_link(descriptor: int, name: str) -> None:
+def _inode_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return _stat_identity(value)
+
+
+def _inode_identity_at(
+    descriptor: int,
+    name: str,
+    label: str,
+) -> tuple[int, int, int, int, int, int]:
+    try:
+        value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        raise AssetError(f"{label} disappeared") from None
+    except OSError as exc:
+        raise AssetError(f"{label} could not be authenticated") from exc
+    if not stat.S_ISREG(value.st_mode):
+        raise AssetError(f"{label} is not a regular file")
+    return _inode_identity(value)
+
+
+def _guarded_identity_at(
+    descriptor: int,
+    name: str,
+    guard: int,
+    label: str,
+) -> tuple[int, int, int, int, int, int]:
+    guarded = os.fstat(guard)
+    try:
+        linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise AssetError(f"{label} changed while guarded") from exc
+    if (guarded.st_dev, guarded.st_ino) != (linked.st_dev, linked.st_ino):
+        raise AssetError(f"{label} changed while guarded")
+    return _stat_identity(linked)
+
+
+def _remove_published_link(
+    descriptor: int,
+    name: str,
+    proof: tuple[int, int, int, int, int, int] | None,
+    label: str,
+) -> bool:
+    if proof is None:
+        raise AssetError(f"{label} has no authenticated cleanup identity")
+    try:
+        current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        _fsync_asset_directory(descriptor, f"{label} cleanup parent")
+        return False
+    except OSError as exc:
+        raise AssetError(f"{label} could not be authenticated before cleanup") from exc
+    if _inode_identity(current) != proof:
+        raise AssetError(f"{label} changed before cleanup; refusing destructive rollback")
     try:
         os.unlink(name, dir_fd=descriptor)
     except FileNotFoundError:
-        return
+        _fsync_asset_directory(descriptor, f"{label} cleanup parent")
+        return False
+    except OSError as exc:
+        raise AssetError(f"{label} could not be removed safely") from exc
+    _fsync_asset_directory(descriptor, f"{label} cleanup parent")
+    return True
+
+
+def _durably_sync_verified_asset_at(
+    descriptor: int,
+    name: str,
+    asset: Asset,
+    label: str,
+) -> None:
+    # Order the published dentry first, then force the regular-file inode/data
+    # to stable media on Darwin, then persist the post-flush directory state.
+    _fsync_asset_directory(descriptor, f"{label} parent")
+    _fsync_verified_asset_at(descriptor, name, asset)
+    _fsync_asset_directory(descriptor, f"{label} parent")
+
+
+def _durably_sync_published_inode_at(
+    descriptor: int,
+    name: str,
+    proof: tuple[int, int, int, int, int, int],
+    label: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    _fsync_asset_directory(descriptor, f"{label} parent")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        os.fsync(descriptor)
-    except OSError:
-        # The caller still fails closed and therefore cannot publish a receipt.
-        pass
+        opened = os.open(name, flags, dir_fd=descriptor)
+    except OSError as exc:
+        raise AssetError(f"{label} could not be opened for durable synchronization") from exc
+    try:
+        before = os.fstat(opened)
+        if _inode_identity(before) != proof or not stat.S_ISREG(before.st_mode):
+            raise AssetError(f"{label} changed before durable synchronization")
+        with os.fdopen(opened, "rb", closefd=False) as handle:
+            size, digest = _sha256_stream(handle)
+        if size != expected_size or digest != expected_sha256:
+            raise AssetError(f"{label} content changed before durable synchronization")
+        _fsync_asset_file(opened, label)
+        after = os.fstat(opened)
+        linked = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if (
+            _stat_identity(after) != _stat_identity(before)
+            or _stat_identity(linked) != _stat_identity(after)
+            or _inode_identity(linked) != proof
+        ):
+            raise AssetError(f"{label} changed during durable synchronization")
+    finally:
+        os.close(opened)
+    _fsync_asset_directory(descriptor, f"{label} parent")
 
 
 def _fsync_verified_under(root: Path, relative: str, asset: Asset, label: str) -> None:
@@ -1231,8 +1395,7 @@ def _fsync_verified_under(root: Path, relative: str, asset: Asset, label: str) -
         raise AssetError(f"{label} disappeared before durable synchronization")
     descriptor, name = parent
     try:
-        _fsync_verified_asset_at(descriptor, name, asset)
-        _fsync_asset_directory(descriptor, f"{label} parent")
+        _durably_sync_verified_asset_at(descriptor, name, asset, label)
         if not _parent_descriptor_matches(root, relative, descriptor):
             raise AssetError(f"{label} parent changed during durable synchronization")
     finally:
@@ -1256,8 +1419,12 @@ def _cache_from_sources(
     try:
         state = _identity_at(cache_descriptor, cache_name, asset)
         if state == "verified":
-            _fsync_verified_asset_at(cache_descriptor, cache_name, asset)
-            _fsync_asset_directory(cache_descriptor, "content-addressed cache parent")
+            _durably_sync_verified_asset_at(
+                cache_descriptor,
+                cache_name,
+                asset,
+                "content-addressed cache",
+            )
             if not _parent_descriptor_matches(root, relative, cache_descriptor):
                 raise AssetError("content-addressed cache parent changed during hydration")
             return root / relative
@@ -1266,11 +1433,16 @@ def _cache_from_sources(
         errors: list[str] = []
         for index, source in enumerate(asset.sources, start=1):
             temporary_descriptor = -1
+            temporary_guard = -1
             temporary_name: str | None = None
+            temporary_proof: tuple[int, int, int, int, int, int] | None = None
             published = False
+            published_proof: tuple[int, int, int, int, int, int] | None = None
             try:
                 try:
                     temporary_descriptor, temporary_name = _temporary_file_at(cache_descriptor)
+                    temporary_guard = os.dup(temporary_descriptor)
+                    temporary_proof = _inode_identity(os.fstat(temporary_guard))
                     output = os.fdopen(temporary_descriptor, "wb")
                     temporary_descriptor = -1
                     with output, _source_stream(
@@ -1293,64 +1465,124 @@ def _cache_from_sources(
                             dst_dir_fd=cache_descriptor,
                             follow_symlinks=False,
                         )
+                        published_proof = _inode_identity_at(
+                            cache_descriptor,
+                            cache_name,
+                            "published cache object",
+                        )
                         published = True
                     except FileExistsError:
                         pass
-                    try:
-                        os.unlink(temporary_name, dir_fd=cache_descriptor)
-                    except OSError as exc:
-                        if published:
-                            _remove_published_link(cache_descriptor, cache_name)
-                        raise AssetError(
-                            "temporary cache object could not be removed before publication"
-                        ) from exc
+                    if temporary_proof is None:
+                        raise AssetError("temporary cache object proof is missing")
+                    temporary_proof = _inode_identity(os.fstat(temporary_guard))
+                    _remove_published_link(
+                        cache_descriptor,
+                        temporary_name,
+                        temporary_proof,
+                        "temporary cache object",
+                    )
                     temporary_name = None
+                    if published:
+                        published_proof = _guarded_identity_at(
+                            cache_descriptor,
+                            cache_name,
+                            temporary_guard,
+                            "published cache object",
+                        )
+                    os.close(temporary_guard)
+                    temporary_guard = -1
                 except (
                     AssetError,
                     OSError,
                     urllib.error.URLError,
                     http.client.HTTPException,
                 ) as exc:
+                    if published:
+                        if temporary_guard >= 0:
+                            published_proof = _guarded_identity_at(
+                                cache_descriptor,
+                                cache_name,
+                                temporary_guard,
+                                "published cache object",
+                            )
+                        _remove_published_link(
+                            cache_descriptor,
+                            cache_name,
+                            published_proof,
+                            "published cache object",
+                        )
+                        published = False
                     errors.append(f"source {index} ({source['kind']}): {exc}")
                     continue
                 if _identity_at(cache_descriptor, cache_name, asset) != "verified":
+                    if published:
+                        _remove_published_link(
+                            cache_descriptor,
+                            cache_name,
+                            published_proof,
+                            "published cache object",
+                        )
+                        published = False
                     errors.append(
                         f"source {index} ({source['kind']}): "
                         "cache publication did not preserve asset identity"
                     )
                     continue
-                _fsync_verified_asset_at(cache_descriptor, cache_name, asset)
+                if published and published_proof is None:
+                    raise AssetError("published cache object proof is missing")
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
-                        _remove_published_link(cache_descriptor, cache_name)
+                        _remove_published_link(
+                            cache_descriptor,
+                            cache_name,
+                            published_proof,
+                            "published cache object",
+                        )
                     raise AssetError("content-addressed cache parent changed during hydration")
                 try:
-                    _fsync_asset_directory(
+                    _durably_sync_verified_asset_at(
                         cache_descriptor,
-                        "content-addressed cache parent",
+                        cache_name,
+                        asset,
+                        "content-addressed cache",
                     )
                 except AssetError:
                     if published:
-                        _remove_published_link(cache_descriptor, cache_name)
+                        _remove_published_link(
+                            cache_descriptor,
+                            cache_name,
+                            published_proof,
+                            "published cache object",
+                        )
                     raise
                 if not _parent_descriptor_matches(root, relative, cache_descriptor):
                     if published:
-                        _remove_published_link(cache_descriptor, cache_name)
+                        _remove_published_link(
+                            cache_descriptor,
+                            cache_name,
+                            published_proof,
+                            "published cache object",
+                        )
                     raise AssetError("content-addressed cache parent changed during hydration")
                 return root / relative
             finally:
-                if temporary_descriptor >= 0:
-                    os.close(temporary_descriptor)
-                if temporary_name is not None:
-                    try:
-                        os.unlink(temporary_name, dir_fd=cache_descriptor)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        try:
-                            os.fsync(cache_descriptor)
-                        except OSError:
-                            pass
+                try:
+                    if temporary_descriptor >= 0:
+                        os.close(temporary_descriptor)
+                    if temporary_name is not None:
+                        if temporary_guard < 0:
+                            raise AssetError("temporary cache object proof is missing")
+                        temporary_proof = _inode_identity(os.fstat(temporary_guard))
+                        _remove_published_link(
+                            cache_descriptor,
+                            temporary_name,
+                            temporary_proof,
+                            "temporary cache object",
+                        )
+                finally:
+                    if temporary_guard >= 0:
+                        os.close(temporary_guard)
         detail = "; ".join(errors) if errors else "no sources declared"
         raise AssetError(f"no source satisfied asset {asset.asset_id}: {detail}")
     finally:
@@ -1382,8 +1614,12 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target parent changed before publication")
             target_state = _identity_at(target_descriptor, target_name, asset)
             if target_state == "verified":
-                _fsync_verified_asset_at(target_descriptor, target_name, asset)
-                _fsync_asset_directory(target_descriptor, "asset target parent")
+                _durably_sync_verified_asset_at(
+                    target_descriptor,
+                    target_name,
+                    asset,
+                    "asset target",
+                )
                 if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                     raise AssetError("asset target parent changed during verification")
                 return
@@ -1392,6 +1628,7 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                     "existing asset target disagrees with the lock; refusing to overwrite"
                 )
             published = False
+            published_proof: tuple[int, int, int, int, int, int] | None = None
             try:
                 os.link(
                     cache_name,
@@ -1400,6 +1637,11 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                     dst_dir_fd=target_descriptor,
                     follow_symlinks=False,
                 )
+                published_proof = _inode_identity_at(
+                    target_descriptor,
+                    target_name,
+                    "published asset target",
+                )
                 published = True
             except FileExistsError:
                 pass
@@ -1407,27 +1649,56 @@ def _publish_no_overwrite(root: Path, target_relative: str, asset: Asset) -> Non
                 raise AssetError("asset target could not be published atomically") from exc
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(target_descriptor, target_name)
+                    _remove_published_link(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
                 raise AssetError("asset target parent changed during publication")
             final_state = _identity_at(target_descriptor, target_name, asset)
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(target_descriptor, target_name)
+                    _remove_published_link(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
                 raise AssetError("asset target parent changed during final verification")
             if final_state != "verified":
                 if published:
-                    _remove_published_link(target_descriptor, target_name)
+                    _remove_published_link(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
                 raise AssetError("published asset target disagrees with the lock")
-            _fsync_verified_asset_at(target_descriptor, target_name, asset)
             try:
-                _fsync_asset_directory(target_descriptor, "asset target parent")
+                _durably_sync_verified_asset_at(
+                    target_descriptor,
+                    target_name,
+                    asset,
+                    "asset target",
+                )
             except AssetError:
                 if published:
-                    _remove_published_link(target_descriptor, target_name)
+                    _remove_published_link(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
                 raise
             if not _parent_descriptor_matches(root, target_relative, target_descriptor):
                 if published:
-                    _remove_published_link(target_descriptor, target_name)
+                    _remove_published_link(
+                        target_descriptor,
+                        target_name,
+                        published_proof,
+                        "published asset target",
+                    )
                 raise AssetError("asset target parent changed during durable publication")
         finally:
             os.close(target_descriptor)
@@ -1606,13 +1877,16 @@ def _open_durable_output_directory(path: Path) -> int:
                 ):
                     raise AssetError("output parent changed during durable creation")
             except (AssetError, OSError) as exc:
-                os.close(child)
-                if created:
-                    try:
-                        os.rmdir(part, dir_fd=current)
-                        os.fsync(current)
-                    except OSError:
-                        pass
+                try:
+                    if created:
+                        _remove_created_directory_at(
+                            current,
+                            part,
+                            child,
+                            "output ancestor",
+                        )
+                finally:
+                    os.close(child)
                 if isinstance(exc, AssetError):
                     raise
                 raise AssetError("output parent changed during durable creation") from exc
@@ -1643,10 +1917,13 @@ def _atomic_json(
         _receipt_outside_checkout(path, forbidden_root)
     parent_descriptor = _open_durable_output_directory(parent_path)
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
     temporary_descriptor = -1
+    temporary_guard = -1
     temporary_name: str | None = None
+    temporary_proof: tuple[int, int, int, int, int, int] | None = None
     published = False
-    directory_changed = False
+    published_proof: tuple[int, int, int, int, int, int] | None = None
 
     def parent_is_valid() -> bool:
         if not _directory_descriptor_matches(parent_path, parent_descriptor):
@@ -1665,12 +1942,16 @@ def _atomic_json(
             parent_descriptor,
             prefix=".receipt-",
         )
+        temporary_guard = os.dup(temporary_descriptor)
+        temporary_proof = _inode_identity(os.fstat(temporary_guard))
         if not parent_is_valid():
             raise AssetError("output parent changed before publication")
         with os.fdopen(temporary_descriptor, "wb") as handle:
             temporary_descriptor = -1
             handle.write(payload)
             handle.flush()
+            _fsync_asset_file(handle.fileno(), "receipt file")
+            os.fchmod(handle.fileno(), 0o444)
             _fsync_asset_file(handle.fileno(), "receipt file")
         if not parent_is_valid():
             raise AssetError("output parent changed before publication")
@@ -1683,8 +1964,12 @@ def _atomic_json(
                     dst_dir_fd=parent_descriptor,
                     follow_symlinks=False,
                 )
+                published_proof = _inode_identity_at(
+                    parent_descriptor,
+                    path.name,
+                    "published receipt",
+                )
                 published = True
-                directory_changed = True
             except FileExistsError as exc:
                 raise AssetError("output already exists; refusing to overwrite") from exc
             except OSError as exc:
@@ -1700,58 +1985,98 @@ def _atomic_json(
             except OSError as exc:
                 raise AssetError("output could not be published atomically") from exc
             temporary_name = None
+            published_proof = _inode_identity_at(
+                parent_descriptor,
+                path.name,
+                "published receipt",
+            )
             published = True
-            directory_changed = True
         if not parent_is_valid():
-            try:
-                os.unlink(path.name, dir_fd=parent_descriptor)
+            if published:
+                _remove_published_link(
+                    parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
                 published = False
-                directory_changed = True
-            except FileNotFoundError:
-                pass
             raise AssetError("output parent changed during publication")
-        if temporary_name is not None:
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
-            temporary_name = None
-            directory_changed = True
         try:
-            _fsync_output_parent(parent_descriptor)
+            if temporary_name is not None:
+                temporary_proof = _inode_identity(os.fstat(temporary_guard))
+                _remove_published_link(
+                    parent_descriptor,
+                    temporary_name,
+                    temporary_proof,
+                    "temporary receipt object",
+                )
+                temporary_name = None
+                if published:
+                    published_proof = _guarded_identity_at(
+                        parent_descriptor,
+                        path.name,
+                        temporary_guard,
+                        "published receipt",
+                    )
+                os.close(temporary_guard)
+                temporary_guard = -1
+            if published_proof is None:
+                raise AssetError("published receipt proof is missing")
+            _durably_sync_published_inode_at(
+                parent_descriptor,
+                path.name,
+                published_proof,
+                "published receipt",
+                expected_size=len(payload),
+                expected_sha256=payload_sha256,
+            )
         except AssetError:
-            if no_overwrite and published:
-                try:
-                    os.unlink(path.name, dir_fd=parent_descriptor)
-                    published = False
-                    directory_changed = True
-                except FileNotFoundError:
-                    pass
-            raise
-        directory_changed = False
-        if not parent_is_valid():
-            try:
-                os.unlink(path.name, dir_fd=parent_descriptor)
+            if published:
+                if temporary_guard >= 0:
+                    published_proof = _guarded_identity_at(
+                        parent_descriptor,
+                        path.name,
+                        temporary_guard,
+                        "published receipt",
+                    )
+                _remove_published_link(
+                    parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
                 published = False
-                directory_changed = True
-                _fsync_output_parent(parent_descriptor)
-                directory_changed = False
-            except FileNotFoundError:
-                pass
+            raise
+        if not parent_is_valid():
+            if published:
+                _remove_published_link(
+                    parent_descriptor,
+                    path.name,
+                    published_proof,
+                    "published receipt",
+                )
+                published = False
             raise AssetError("output parent changed during durable publication")
     finally:
-        if temporary_descriptor >= 0:
-            os.close(temporary_descriptor)
-        if temporary_name is not None:
+        try:
             try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
-                directory_changed = True
-            except FileNotFoundError:
-                pass
-        if directory_changed:
-            try:
-                _fsync_output_parent(parent_descriptor)
-            except AssetError:
-                if published:
-                    raise
-        os.close(parent_descriptor)
+                if temporary_descriptor >= 0:
+                    os.close(temporary_descriptor)
+                if temporary_name is not None:
+                    if temporary_guard < 0:
+                        raise AssetError("temporary receipt object proof is missing")
+                    temporary_proof = _inode_identity(os.fstat(temporary_guard))
+                    _remove_published_link(
+                        parent_descriptor,
+                        temporary_name,
+                        temporary_proof,
+                        "temporary receipt object",
+                    )
+            finally:
+                if temporary_guard >= 0:
+                    os.close(temporary_guard)
+        finally:
+            os.close(parent_descriptor)
 
 
 def _receipt_outside_checkout(path: Path, root: Path) -> Path:

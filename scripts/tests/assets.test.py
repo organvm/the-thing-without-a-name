@@ -277,6 +277,43 @@ class AssetParityTest(unittest.TestCase):
         finally:
             os.close(descriptor)
 
+    def test_darwin_published_inode_fullsync_follows_directory_barrier(self) -> None:
+        parent = self.fixture.base / "darwin-publication"
+        parent.mkdir()
+        path = parent / "receipt.json"
+        payload = b'{"ok":true}\n'
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        proof = ASSETS._inode_identity(path.stat())
+        events = []
+
+        def record_fsync(descriptor):
+            events.append("directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+
+        try:
+            with (
+                mock.patch.object(ASSETS.sys, "platform", "darwin"),
+                mock.patch.object(ASSETS.fcntl, "F_FULLFSYNC", 51, create=True),
+                mock.patch.object(ASSETS.os, "fsync", side_effect=record_fsync),
+                mock.patch.object(
+                    ASSETS.fcntl,
+                    "fcntl",
+                    side_effect=lambda _fd, _command: events.append("fullfsync"),
+                ),
+            ):
+                ASSETS._durably_sync_published_inode_at(
+                    parent_descriptor,
+                    path.name,
+                    proof,
+                    "test receipt",
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+        finally:
+            os.close(parent_descriptor)
+        self.assertEqual(events, ["directory", "file", "fullfsync", "directory"])
+
     def test_verified_fast_path_syncs_inode_and_directories_before_receipt(self) -> None:
         self.assertEqual(
             ASSETS.main(
@@ -742,6 +779,36 @@ class AssetParityTest(unittest.TestCase):
             ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
         self.assertFalse(target.exists())
 
+    def test_parent_swap_cleanup_never_deletes_concurrent_replacement(self) -> None:
+        asset = ASSETS.load_lock(self.fixture.lock).assets[0]
+        cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
+        cache.write_bytes(self.fixture.payload)
+        cache.chmod(0o444)
+        target = self.fixture.root / asset.target
+        target.parent.mkdir(parents=True)
+        real_matches = ASSETS._parent_descriptor_matches
+        checks = 0
+
+        def replace_after_publication(root, relative, descriptor):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                target.unlink()
+                target.write_bytes(b"concurrent replacement")
+                return False
+            return real_matches(root, relative, descriptor)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_parent_descriptor_matches",
+                side_effect=replace_after_publication,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "refusing destructive rollback"),
+        ):
+            ASSETS._publish_no_overwrite(self.fixture.root, asset.target, asset)
+        self.assertEqual(target.read_bytes(), b"concurrent replacement")
+
     def test_target_parent_swap_after_final_identity_removes_publication(self) -> None:
         asset = ASSETS.load_lock(self.fixture.lock).assets[0]
         cache = ASSETS._cache_path(self.fixture.root, asset, create=True)
@@ -859,6 +926,34 @@ class AssetParityTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(source_stream.call_count, 2)
         self.assertTrue(json.loads(self.fixture.receipt.read_text(encoding="utf-8"))["ok"])
+
+    def test_vanished_cache_temp_is_missing_tolerant(self) -> None:
+        real_unlink = os.unlink
+        vanished = False
+
+        def vanish_then_report_missing(name, *args, **kwargs):
+            nonlocal vanished
+            if not vanished and str(name).startswith(".asset-"):
+                vanished = True
+                real_unlink(name, *args, **kwargs)
+                raise FileNotFoundError(name)
+            return real_unlink(name, *args, **kwargs)
+
+        with mock.patch.object(ASSETS.os, "unlink", side_effect=vanish_then_report_missing):
+            code = ASSETS.main(
+                [
+                    "pull",
+                    "--lock",
+                    str(self.fixture.lock),
+                    "--root",
+                    str(self.fixture.root),
+                    "--allow-file",
+                    "--file-source-root",
+                    str(self.fixture.source),
+                ]
+            )
+        self.assertTrue(vanished)
+        self.assertEqual(code, 0)
 
     def test_repository_commit_is_exact(self) -> None:
         self.fixture.write_lock(repository_commit="a" * 40)
@@ -993,6 +1088,25 @@ class AssetParityTest(unittest.TestCase):
                 ["git", "-C", str(self.fixture.root), "checkout", "--quiet", second],
                 check=True,
             )
+
+    def test_repository_head_rejects_tracked_mutation_after_first_status(self) -> None:
+        real_run = subprocess.run
+        mutated = False
+
+        def mutate_after_first_status(command, *args, **kwargs):
+            nonlocal mutated
+            result = real_run(command, *args, **kwargs)
+            if not mutated and "status" in command:
+                (self.fixture.root / "README.md").write_text("changed mid-census\n", encoding="utf-8")
+                mutated = True
+            return result
+
+        with (
+            mock.patch.object(ASSETS.subprocess, "run", side_effect=mutate_after_first_status),
+            self.assertRaisesRegex(ASSETS.AssetError, "state changed|tracked or staged"),
+        ):
+            ASSETS._repository_head(self.fixture.root)
+        self.assertTrue(mutated)
 
     def test_complete_target_set_is_stable_before_report_construction(self) -> None:
         lock = ASSETS.load_lock(self.fixture.lock)
@@ -1149,7 +1263,10 @@ class AssetParityTest(unittest.TestCase):
 
         with mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync):
             ASSETS._atomic_json(output, {"durable": True}, no_overwrite=True)
-        self.assertEqual(synced_directories, ["file", "directory"])
+        self.assertEqual(
+            synced_directories,
+            ["file", "file", "directory", "directory", "file", "directory"],
+        )
         self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"durable": True})
 
         blocked = self.fixture.base / "unsynced-output.json"
@@ -1165,6 +1282,90 @@ class AssetParityTest(unittest.TestCase):
         ):
             ASSETS._atomic_json(blocked, {"durable": False}, no_overwrite=True)
         self.assertFalse(blocked.exists())
+
+    def test_exact_cleanup_surfaces_barrier_failure_and_preserves_replacement(self) -> None:
+        parent = self.fixture.base / "cleanup-parent"
+        parent.mkdir()
+        descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        original = parent / "object"
+        original.write_bytes(b"original")
+        proof = ASSETS._inode_identity(original.stat())
+        try:
+            with (
+                mock.patch.object(
+                    ASSETS,
+                    "_fsync_asset_directory",
+                    side_effect=ASSETS.AssetError("cleanup barrier failed"),
+                ),
+                self.assertRaisesRegex(ASSETS.AssetError, "cleanup barrier failed"),
+            ):
+                ASSETS._remove_published_link(descriptor, original.name, proof, "test object")
+            self.assertFalse(original.exists())
+
+            original.write_bytes(b"first")
+            stale_proof = ASSETS._inode_identity(original.stat())
+            original.unlink()
+            original.write_bytes(b"replacement")
+            with self.assertRaisesRegex(ASSETS.AssetError, "refusing destructive rollback"):
+                ASSETS._remove_published_link(
+                    descriptor,
+                    original.name,
+                    stale_proof,
+                    "test object",
+                )
+            self.assertEqual(original.read_bytes(), b"replacement")
+        finally:
+            os.close(descriptor)
+
+    def test_vanished_receipt_temp_is_missing_tolerant(self) -> None:
+        output = self.fixture.base / "vanished-temp-receipt.json"
+        real_unlink = os.unlink
+        vanished = False
+
+        def vanish_then_report_missing(name, *args, **kwargs):
+            nonlocal vanished
+            if not vanished and str(name).startswith(".receipt-"):
+                vanished = True
+                real_unlink(name, *args, **kwargs)
+                raise FileNotFoundError(name)
+            return real_unlink(name, *args, **kwargs)
+
+        with mock.patch.object(ASSETS.os, "unlink", side_effect=vanish_then_report_missing):
+            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
+        self.assertTrue(vanished)
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"ok": True})
+
+    def test_atomic_json_rejects_final_name_substitution_without_deleting_it(self) -> None:
+        output = self.fixture.base / "substituted-receipt.json"
+        attacker = b'{"attacker":true}\n'
+        real_sync = ASSETS._durably_sync_published_inode_at
+        substituted = False
+
+        def substitute(parent, name, proof, label, **kwargs):
+            nonlocal substituted
+            os.unlink(name, dir_fd=parent)
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444, dir_fd=parent)
+            try:
+                os.write(descriptor, attacker)
+            finally:
+                os.close(descriptor)
+            substituted = True
+            return real_sync(parent, name, proof, label, **kwargs)
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_durably_sync_published_inode_at",
+                side_effect=substitute,
+            ),
+            self.assertRaisesRegex(
+                ASSETS.AssetError,
+                "changed before durable synchronization|refusing destructive rollback",
+            ),
+        ):
+            ASSETS._atomic_json(output, {"ok": True}, no_overwrite=True)
+        self.assertTrue(substituted)
+        self.assertEqual(output.read_bytes(), attacker)
 
     def test_atomic_json_persists_every_new_output_ancestor(self) -> None:
         output = self.fixture.base / "external/a/b/proof.json"
@@ -1860,8 +2061,32 @@ class AssetParityTest(unittest.TestCase):
                 nfd_path["assets"][0]["sources"] = [
                     {"kind": "file", "path": "cafe\u0301/asset.bin"}
                 ]
-            with self.subTest(field=field), self.assertRaises(jsonschema.ValidationError):
-                jsonschema.Draft202012Validator(lock_schema).validate(nfd_path)
+            jsonschema.Draft202012Validator(lock_schema).validate(nfd_path)
+
+            overlay_path = copy.deepcopy(lock_value)
+            if field == "target":
+                overlay_path["assets"][0]["target"] = "a\u0338/asset.bin"
+            else:
+                overlay_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "a\u0338/asset.bin"}
+                ]
+            jsonschema.Draft202012Validator(lock_schema).validate(overlay_path)
+
+            hangul_nfd = copy.deepcopy(lock_value)
+            if field == "target":
+                hangul_nfd["assets"][0]["target"] = "\u1100\u1161/asset.bin"
+            else:
+                hangul_nfd["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "\u1100\u1161/asset.bin"}
+                ]
+            jsonschema.Draft202012Validator(lock_schema).validate(hangul_nfd)
+        self.assertEqual(ASSETS._safe_relative("a\u0338/asset.bin", "test path"), "a\u0338/asset.bin")
+        for non_nfc in ("cafe\u0301/asset.bin", "\u1100\u1161/asset.bin"):
+            with self.subTest(runtime_non_nfc=non_nfc), self.assertRaisesRegex(
+                ASSETS.AssetError,
+                "safe POSIX-relative",
+            ):
+                ASSETS._safe_relative(non_nfc, "test path")
         for field in ("target", "file source"):
             unsafe_path = copy.deepcopy(lock_value)
             if field == "target":

@@ -21,7 +21,8 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F])(?!.*[\\u0300-\\u036F\\u1AB0-\\u1AFF\\u1DC0-\\u1DFF\\u20D0-\\u20FF\\uFE20-\\uFE2F])(?!/)(?!\\.[Gg][Ii][Tt](?:/|$))(?!\\.[Aa][Ss][Ss][Ee][Tt]-[Cc][Aa][Cc][Hh][Ee](?:/|$))(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\).+$"
+      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F])(?!/)(?!\\.[Gg][Ii][Tt](?:/|$))(?!\\.[Aa][Ss][Ss][Ee][Tt]-[Cc][Aa][Cc][Hh][Ee](?:/|$))(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\).+$",
+      "$comment": "Unicode normalization is enforced as exact NFC by scripts/assets.py; JSON Schema patterns cannot express canonical normalization."
     },
     "httpsSource": {
       "type": "object",
