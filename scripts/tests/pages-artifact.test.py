@@ -2015,17 +2015,25 @@ class InterfaceContractTest(unittest.TestCase):
 
     def test_legacy_project_fragments_open_the_moved_live_section(self) -> None:
         redirect = (ROOT / "404.html").read_text(encoding="utf-8")
+        state = (ROOT / "interface/state.js").read_text(encoding="utf-8")
         self.assertIn(r"/^\/project(?:\/index\.html)?\/?$/", redirect)
         self.assertIn("${location.search}${location.hash}", redirect)
-        self.assertIn('evidence: "project-evidence"', self.script)
-        self.assertIn('"ballet-score": "project-film"', self.script)
+        self.assertIn('evidence: "project-evidence"', state)
+        self.assertIn('"ballet-score": "project-film"', state)
+        self.assertIn("projectSectionFor", self.script)
         helper = self.script.split(
-            "async function openProjectSection(section = projectSectionFor()) {", 1
+            "async function openProjectSection(section = projectSectionFor(location.hash)) {", 1
         )[1].split("\n}", 1)[0]
         self.assertIn("await openMap(", helper)
         self.assertIn('target?.scrollIntoView({ block: "start" })', helper)
         self.assertIn("target?.focus({ preventScroll: true })", helper)
         self.assertIn("void openProjectSection();", self.script)
+
+    def test_legacy_project_fragment_survives_the_river_url_updater(self) -> None:
+        updater = self.script.split("setInterval(() => {", 1)[1].split("}, 1000);", 1)[0]
+        guard = "if (shifted || projectSectionFor(location.hash)) return;"
+        self.assertIn(guard, updater)
+        self.assertLess(updater.index(guard), updater.index("history.replaceState"))
 
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]

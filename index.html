@@ -332,7 +332,7 @@ import { Renderer } from "./engine/renderer.js";
 import { InteractionRenderer } from "./interaction/adapter.js";
 import { InteractionController } from "./interaction/controller.js";
 import { ScoreAudio } from "./sound/browser-midi.js";
-import { ACTIONS, sharePresentationState, sharePresentationUrl, shortcutAction } from "./interface/state.js";
+import { ACTIONS, projectSectionFor, sharePresentationState, sharePresentationUrl, shortcutAction } from "./interface/state.js";
 import { createControlActions } from "./interface/actions.js";
 import { renderControlSurface } from "./interface/render.js";
 
@@ -543,7 +543,7 @@ requestAnimationFrame(frame);
 // lets the clock say where in it you are. While `shifted`, nothing is written at
 // all: a position reached for debugging must not overwrite the river you keep.
 setInterval(() => {
-  if (shifted) return;
+  if (shifted || projectSectionFor(location.hash)) return;
   history.replaceState(null, "", Arrival.href(river, { mode: program ? null : "free" }));
 }, 1000);
 
@@ -972,28 +972,7 @@ async function openMap(trigger) {
   el("map-close").focus();
 }
 
-const PROJECT_FRAGMENT_SECTIONS = Object.freeze({
-  artwork: "project-artwork",
-  film: "project-film",
-  "ballet-score": "project-film",
-  status: "project-status",
-  readings: "project-readings",
-  cubism: "project-readings",
-  glitch: "project-readings",
-  evidence: "project-evidence",
-});
-
-function projectSectionFor(fragment = location.hash) {
-  let key;
-  try {
-    key = decodeURIComponent(fragment.replace(/^#/, "")).toLowerCase();
-  } catch {
-    return null;
-  }
-  return PROJECT_FRAGMENT_SECTIONS[key] ?? null;
-}
-
-async function openProjectSection(section = projectSectionFor()) {
+async function openProjectSection(section = projectSectionFor(location.hash)) {
   if (!section || !controlBus) return false;
   await openMap(dock.querySelector('[data-category="map"]'));
   const target = el(section);

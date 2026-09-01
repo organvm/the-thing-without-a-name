@@ -7,6 +7,7 @@ import { ScoreAudio } from "../../sound/browser-midi.js";
 import {
   ACTIONS,
   initialControlState,
+  projectSectionFor,
   reduceControlState,
   sharePresentationState,
   sharePresentationUrl,
@@ -19,6 +20,24 @@ async function test(name, run) {
   passed += 1;
   process.stdout.write(`  ok ${passed} - ${name}\n`);
 }
+
+await test("legacy Project fragments resolve narrowly and fail closed", () => {
+  assert.equal(projectSectionFor("#evidence"), "project-evidence");
+  assert.equal(projectSectionFor("#%65VIDENCE"), "project-evidence");
+  assert.equal(projectSectionFor("#ballet-score"), "project-film");
+  assert.equal(projectSectionFor("#cubism"), "project-readings");
+  for (const fragment of [
+    "",
+    "#s=20170620&e=0",
+    "#evidence/extra",
+    "#evidence?admin=true",
+    "#%",
+    "#__proto__",
+    null,
+  ]) {
+    assert.equal(projectSectionFor(fragment), null, String(fragment));
+  }
+});
 
 await test("state contracts cover hold, program, cutout, music, surfaces, audition, and presence", () => {
   let state = initialControlState({ reducedMotion: true, scoreAvailable: false });
