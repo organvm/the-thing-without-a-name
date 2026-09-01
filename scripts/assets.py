@@ -21,7 +21,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -668,7 +667,7 @@ def _parent_descriptor_under(
         raise AssetError("asset target traverses a symlink or non-directory") from exc
 
 
-def _temporary_file_at(parent: int) -> tuple[int, str]:
+def _temporary_file_at(parent: int, *, prefix: str = ".asset-") -> tuple[int, str]:
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -677,14 +676,14 @@ def _temporary_file_at(parent: int) -> tuple[int, str]:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     for _ in range(128):
-        name = f".asset-{secrets.token_hex(16)}"
+        name = f"{prefix}{secrets.token_hex(16)}"
         try:
             return os.open(name, flags, 0o600, dir_fd=parent), name
         except FileExistsError:
             continue
         except OSError as exc:
-            raise AssetError("temporary cache object could not be created safely") from exc
-    raise AssetError("temporary cache object name space is exhausted")
+            raise AssetError("temporary output object could not be created safely") from exc
+    raise AssetError("temporary output object name space is exhausted")
 
 
 def _parent_descriptor_matches(root: Path, relative: str, expected: int) -> bool:
@@ -842,48 +841,74 @@ def _identity(path: Path, asset: Asset) -> str:
         os.close(descriptor)
 
 
-def _identity_at(parent: int, name: str, asset: Asset) -> str:
+def _identity_proof_at(
+    parent: int,
+    name: str,
+    asset: Asset,
+) -> tuple[str, tuple[int, int, int, int, int, int] | None]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=parent)
     except FileNotFoundError:
-        return "missing"
+        return "missing", None
     except OSError:
-        return "unsafe"
+        return "unsafe", None
     try:
         before = os.fstat(descriptor)
+        before_identity = _stat_identity(before)
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_size != asset.size
             or before.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
         ):
-            return "mismatch"
+            return "mismatch", before_identity
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             size, digest = _sha256_stream(handle)
         after = os.fstat(descriptor)
-        stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) == (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
+        after_identity = _stat_identity(after)
+        try:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError:
+            return "mismatch", None
+        current_identity = _stat_identity(current)
+        stable = before_identity == after_identity == current_identity
+        state = (
+            "verified"
+            if stable and size == asset.size and digest == asset.sha256
+            else "mismatch"
         )
-        return "verified" if stable and size == asset.size and digest == asset.sha256 else "mismatch"
+        return state, after_identity if stable else None
+    finally:
+        os.close(descriptor)
+
+
+def _identity_at(parent: int, name: str, asset: Asset) -> str:
+    return _identity_proof_at(parent, name, asset)[0]
+
+
+def _identity_proof_under(
+    root: Path,
+    relative: str,
+    asset: Asset,
+) -> tuple[str, tuple[int, int, int, int, int, int] | None]:
+    try:
+        parent = _parent_descriptor_under(root, relative, create_parents=False)
+    except AssetError:
+        return "unsafe", None
+    if parent is None:
+        return "missing", None
+    descriptor, name = parent
+    try:
+        proof = _identity_proof_at(descriptor, name, asset)
+        if not _parent_descriptor_matches(root, relative, descriptor):
+            return "unsafe", None
+        return proof
     finally:
         os.close(descriptor)
 
 
 def _identity_under(root: Path, relative: str, asset: Asset) -> str:
-    try:
-        parent = _parent_descriptor_under(root, relative, create_parents=False)
-    except AssetError:
-        return "unsafe"
-    if parent is None:
-        return "missing"
-    descriptor, name = parent
-    try:
-        return _identity_at(descriptor, name, asset)
-    finally:
-        os.close(descriptor)
+    return _identity_proof_under(root, relative, asset)[0]
 
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
@@ -1256,15 +1281,28 @@ def _report(command: str, lock: Lock, rows: list[tuple[Asset, str, str]]) -> dic
 def inspect(command: str, lock: Lock, root: Path) -> dict:
     _assert_repository_binding(root, lock)
     _assert_locked_tree(root, lock)
-    rows = []
-    for asset in lock.assets:
-        rows.append(
-            (
-                asset,
-                _identity_under(root, asset.target, asset),
-                _identity_under(root, _cache_relative(asset), asset),
-            )
+    first_targets = [
+        _identity_proof_under(root, asset.target, asset) for asset in lock.assets
+    ]
+    cache_states = [
+        _identity_under(root, _cache_relative(asset), asset) for asset in lock.assets
+    ]
+    _assert_repository_binding(root, lock)
+    _assert_locked_tree(root, lock)
+    final_targets = [
+        _identity_proof_under(root, asset.target, asset) for asset in lock.assets
+    ]
+    if final_targets != first_targets:
+        raise AssetError("asset target tree changed during completed verification")
+    rows = [
+        (asset, target[0], cache_state)
+        for asset, target, cache_state in zip(
+            lock.assets,
+            final_targets,
+            cache_states,
+            strict=True,
         )
+    ]
     return _report(command, lock, rows)
 
 
@@ -1305,28 +1343,161 @@ def pull(
     return report
 
 
-def _atomic_json(path: Path, value: dict, *, no_overwrite: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".receipt-", dir=path.parent)
-    temporary = Path(temporary_name)
+def _directory_descriptor_matches(path: Path, expected: int) -> bool:
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        current = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(expected)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(current.st_mode)
+        and stat.S_ISDIR(opened.st_mode)
+        and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+    )
+
+
+def _fsync_output_parent(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise AssetError("output parent could not be durably synchronized") from exc
+
+
+def _atomic_json(
+    path: Path,
+    value: dict,
+    *,
+    no_overwrite: bool,
+    forbidden_root: Path | None = None,
+) -> None:
+    try:
+        parent_path = path.parent.resolve(strict=False)
+        parent_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AssetError("output parent could not be prepared safely") from exc
+    path = parent_path / path.name
+    if forbidden_root is not None:
+        _receipt_outside_checkout(path, forbidden_root)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_descriptor = os.open(parent_path, directory_flags)
+    except OSError as exc:
+        raise AssetError("output parent could not be opened safely") from exc
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+    temporary_descriptor = -1
+    temporary_name: str | None = None
+    published = False
+    directory_changed = False
+
+    def parent_is_valid() -> bool:
+        if not _directory_descriptor_matches(parent_path, parent_descriptor):
+            return False
+        if forbidden_root is not None:
+            try:
+                _receipt_outside_checkout(path, forbidden_root)
+            except AssetError:
+                return False
+        return True
+
+    try:
+        if not parent_is_valid():
+            raise AssetError("output parent changed before publication")
+        temporary_descriptor, temporary_name = _temporary_file_at(
+            parent_descriptor,
+            prefix=".receipt-",
+        )
+        if not parent_is_valid():
+            raise AssetError("output parent changed before publication")
+        with os.fdopen(temporary_descriptor, "wb") as handle:
+            temporary_descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if not parent_is_valid():
+            raise AssetError("output parent changed before publication")
         if no_overwrite:
             try:
-                os.link(temporary, path)
+                os.link(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                published = True
+                directory_changed = True
             except FileExistsError as exc:
                 raise AssetError("output already exists; refusing to overwrite") from exc
+            except OSError as exc:
+                raise AssetError("output could not be published atomically") from exc
         else:
-            os.replace(temporary, path)
-    finally:
+            try:
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+            except OSError as exc:
+                raise AssetError("output could not be published atomically") from exc
+            temporary_name = None
+            published = True
+            directory_changed = True
+        if not parent_is_valid():
+            try:
+                os.unlink(path.name, dir_fd=parent_descriptor)
+                published = False
+                directory_changed = True
+            except FileNotFoundError:
+                pass
+            raise AssetError("output parent changed during publication")
+        if temporary_name is not None:
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary_name = None
+            directory_changed = True
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            _fsync_output_parent(parent_descriptor)
+        except AssetError:
+            if no_overwrite and published:
+                try:
+                    os.unlink(path.name, dir_fd=parent_descriptor)
+                    published = False
+                    directory_changed = True
+                except FileNotFoundError:
+                    pass
+            raise
+        directory_changed = False
+        if not parent_is_valid():
+            try:
+                os.unlink(path.name, dir_fd=parent_descriptor)
+                published = False
+                directory_changed = True
+                _fsync_output_parent(parent_descriptor)
+                directory_changed = False
+            except FileNotFoundError:
+                pass
+            raise AssetError("output parent changed during durable publication")
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                directory_changed = True
+            except FileNotFoundError:
+                pass
+        if directory_changed:
+            try:
+                _fsync_output_parent(parent_descriptor)
+            except AssetError:
+                if published:
+                    raise
+        os.close(parent_descriptor)
 
 
 def _receipt_outside_checkout(path: Path, root: Path) -> Path:
@@ -1504,6 +1675,7 @@ def main(argv: list[str] | None = None) -> int:
                 _receipt_outside_checkout(receipt, root),
                 report,
                 no_overwrite=True,
+                forbidden_root=root,
             )
         print(
             f"assets: {args.command} {'OK' if report['ok'] else 'BLOCKED'} "

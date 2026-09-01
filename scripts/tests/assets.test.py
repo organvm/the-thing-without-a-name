@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -503,6 +504,35 @@ class AssetParityTest(unittest.TestCase):
                         check=True,
                     )
 
+    def test_complete_target_set_is_stable_before_report_construction(self) -> None:
+        lock = ASSETS.load_lock(self.fixture.lock)
+        asset = lock.assets[0]
+        target = self.fixture.root / asset.target
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.payload)
+        target.chmod(0o444)
+        real_identity = ASSETS._identity_proof_under
+        mutated = False
+
+        def remove_earlier_target_while_cache_is_checked(root, relative, checked_asset):
+            nonlocal mutated
+            proof = real_identity(root, relative, checked_asset)
+            if relative == ASSETS._cache_relative(asset) and not mutated:
+                target.unlink()
+                mutated = True
+            return proof
+
+        with (
+            mock.patch.object(
+                ASSETS,
+                "_identity_proof_under",
+                side_effect=remove_earlier_target_while_cache_is_checked,
+            ),
+            self.assertRaisesRegex(ASSETS.AssetError, "target tree changed"),
+        ):
+            ASSETS.inspect("verify", lock, self.fixture.root)
+        self.assertTrue(mutated)
+
     def test_receipts_are_immutable(self) -> None:
         self.assertEqual(
             ASSETS.main(
@@ -556,6 +586,95 @@ class AssetParityTest(unittest.TestCase):
                     1,
                 )
                 self.assertFalse(receipt.exists())
+
+    def test_receipt_parent_swap_cannot_redirect_descriptor_publication(self) -> None:
+        receipt_parent = self.fixture.base / "external-receipts"
+        receipt_parent.mkdir()
+        receipt = receipt_parent / "proof.json"
+        held_parent = self.fixture.base / "external-receipts-held"
+        checkout_destination = self.fixture.root / ".asset-cache/redirected-receipts"
+        checkout_destination.mkdir(parents=True)
+        real_link = os.link
+
+        def publish_then_swap(source, destination, **kwargs):
+            result = real_link(source, destination, **kwargs)
+            receipt_parent.rename(held_parent)
+            receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+            return result
+
+        with (
+            mock.patch.object(ASSETS.os, "link", side_effect=publish_then_swap),
+            self.assertRaisesRegex(ASSETS.AssetError, "parent changed during publication"),
+        ):
+            ASSETS._atomic_json(
+                receipt,
+                {"ok": True},
+                no_overwrite=True,
+                forbidden_root=self.fixture.root,
+            )
+        self.assertFalse((checkout_destination / receipt.name).exists())
+        self.assertEqual(list(held_parent.iterdir()), [])
+
+    def test_atomic_json_fsyncs_parent_after_temporary_cleanup(self) -> None:
+        output = self.fixture.base / "durable-output.json"
+        real_fsync = os.fsync
+        synced_directories = []
+
+        def record_sync(descriptor):
+            synced_directories.append(stat_mode_descriptor(descriptor))
+            return real_fsync(descriptor)
+
+        with mock.patch.object(ASSETS.os, "fsync", side_effect=record_sync):
+            ASSETS._atomic_json(output, {"durable": True}, no_overwrite=True)
+        self.assertEqual(synced_directories, ["file", "directory"])
+        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"durable": True})
+
+        blocked = self.fixture.base / "unsynced-output.json"
+
+        def reject_directory_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("injected directory fsync failure")
+            return real_fsync(descriptor)
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=reject_directory_sync),
+            self.assertRaisesRegex(ASSETS.AssetError, "durably synchronized"),
+        ):
+            ASSETS._atomic_json(blocked, {"durable": False}, no_overwrite=True)
+        self.assertFalse(blocked.exists())
+
+    def test_receipt_parent_swap_during_directory_sync_removes_published_link(self) -> None:
+        receipt_parent = self.fixture.base / "late-swap-receipts"
+        receipt_parent.mkdir()
+        receipt = receipt_parent / "proof.json"
+        held_parent = self.fixture.base / "late-swap-receipts-held"
+        checkout_destination = self.fixture.root / ".asset-cache/late-redirect"
+        checkout_destination.mkdir(parents=True)
+        real_fsync = os.fsync
+        swapped = False
+
+        def sync_then_swap(descriptor):
+            nonlocal swapped
+            result = real_fsync(descriptor)
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not swapped:
+                receipt_parent.rename(held_parent)
+                receipt_parent.symlink_to(checkout_destination, target_is_directory=True)
+                swapped = True
+            return result
+
+        with (
+            mock.patch.object(ASSETS.os, "fsync", side_effect=sync_then_swap),
+            self.assertRaisesRegex(ASSETS.AssetError, "durable publication"),
+        ):
+            ASSETS._atomic_json(
+                receipt,
+                {"ok": True},
+                no_overwrite=True,
+                forbidden_root=self.fixture.root,
+            )
+        self.assertTrue(swapped)
+        self.assertFalse((checkout_destination / receipt.name).exists())
+        self.assertEqual(list(held_parent.iterdir()), [])
 
     def test_inventory_is_deterministic_closed_and_no_overwrite(self) -> None:
         duplicate = self.fixture.source / "other/duplicate.JPG"
@@ -995,6 +1114,11 @@ class AssetParityTest(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertEqual(workflow.count(f'      - "{path}"'), 2)
+        self.assertIn(
+            "python render/browser.py --check --verify --arrival --probe --interaction",
+            workflow,
+        )
+        self.assertNotIn("--controls", workflow)
 
     @unittest.skipIf(jsonschema is None, "jsonschema is not installed")
     def test_lock_and_redacted_receipt_match_tracked_schemas(self) -> None:
@@ -1030,6 +1154,18 @@ class AssetParityTest(unittest.TestCase):
                 jsonschema.ValidationError
             ):
                 jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
+        for field in ("target", "file source"):
+            unsafe_path = copy.deepcopy(lock_value)
+            if field == "target":
+                unsafe_path["assets"][0]["target"] = "foo\x00bar"
+            else:
+                unsafe_path["assets"][0]["sources"] = [
+                    {"kind": "file", "path": "foo\x00bar"}
+                ]
+            with self.subTest(schema_path_field=field), self.assertRaises(
+                jsonschema.ValidationError
+            ):
+                jsonschema.Draft202012Validator(lock_schema).validate(unsafe_path)
         self.assertEqual(
             ASSETS.main(
                 [
@@ -1059,6 +1195,10 @@ class AssetParityTest(unittest.TestCase):
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def stat_mode_descriptor(descriptor: int) -> str:
+    return "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
 
 
 if __name__ == "__main__":
