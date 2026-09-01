@@ -7425,6 +7425,14 @@ class DeliveryContractTest(unittest.TestCase):
                         self.assertNotEqual(rejected.returncode, 0)
                         self.assertIn("score/choreography differs", rejected.stderr)
 
+    def test_finisher_resolves_tree_from_captured_repository_head(self) -> None:
+        source = SCREENDANCE_FINISHER.read_text()
+        self.assertIn(
+            'rev-parse "${REPOSITORY_HEAD}^{tree}"',
+            source,
+        )
+        self.assertNotIn("rev-parse 'HEAD^{tree}'", source)
+
     def test_finisher_accepts_sha1_repository_tree_identity(self) -> None:
         repository_head = "4" * 40
         repository_tree = "5" * 40
@@ -7490,38 +7498,48 @@ class DeliveryContractTest(unittest.TestCase):
             segment_path.write_text(json.dumps(segment))
             segment_digest = hashlib.sha256(segment_path.read_bytes()).hexdigest()
             concat_path = root / "picture.mp4.receipt.json"
-            concat_path.write_text(
-                json.dumps(
-                    {
-                        "schema": "danse.render.concat.v1",
-                        "codec": "h264",
-                        "file_sha256": picture_digest,
-                        "file_bytes": 1,
-                        "decoded_video": decoded,
-                        "segments": [
-                            {"name": name, "receipt_sha256": segment_digest}
-                        ],
-                    }
+            concat = {
+                "schema": "danse.render.concat.v1",
+                "codec": "h264",
+                "file_sha256": picture_digest,
+                "file_bytes": 1,
+                "decoded_video": decoded,
+                "segments": [{"name": name, "receipt_sha256": segment_digest}],
+            }
+            concat_path.write_text(json.dumps(concat))
+
+            def validate(destination: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-",
+                        "copy",
+                        str(concat_path),
+                        picture_digest,
+                        "1",
+                        str(root / destination),
+                        repository_head,
+                        repository_tree,
+                        source_tree,
+                    ],
+                    input=finisher_python("picture_receipt_graph"),
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
-            )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-",
-                    "copy",
-                    str(concat_path),
-                    picture_digest,
-                    "1",
-                    str(root / "copied"),
-                    repository_head,
-                    source_tree,
-                ],
-                input=finisher_python("picture_receipt_graph"),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
+
+            accepted = validate("copied")
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            segment["inputs"]["repository_tree"] = "d" * 40
+            segment_path.write_text(json.dumps(segment))
+            concat["segments"][0]["receipt_sha256"] = hashlib.sha256(
+                segment_path.read_bytes()
+            ).hexdigest()
+            concat_path.write_text(json.dumps(concat))
+            rejected = validate("copied-forged")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("fixed emergency screener rail", rejected.stderr)
 
 
 if __name__ == "__main__":
