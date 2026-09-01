@@ -66,7 +66,7 @@ RELEASE_BUILD = RELEASE_SUPPORT.BUILD
 def add_release_validation_fixture(root: Path) -> None:
     """Add the complete release data contract without replacing the tiny corpus."""
     for relative in RELEASE_SUPPORT.FIXTURE_FILES:
-        if relative == "corpus/manifest.json":
+        if relative in {"corpus/manifest.json", PAGES.VENDOR_MANIFEST}:
             continue
         source = ROOT / relative
         target = root / relative
@@ -110,6 +110,47 @@ class Markup(HTMLParser):
 def write(path: Path, data: bytes = b"fixture\n") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+
+
+def commit_complete_pages_fixture(root: Path, message: str) -> str:
+    """Commit every synthetic Pages input, including ignored fixture media."""
+    if not (root / ".git").is_dir():
+        subprocess.run(
+            ["git", "-C", str(root), "init", "-q"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        ["git", "-C", str(root), "add", "-f", "-A"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return RELEASE_SUPPORT.commit_git_fixture(root, message)
+
+
+class SyntheticReleaseBuilderProxy:
+    """Isolate downstream Pages tests from deliberately absent authority.
+
+    This wrapper exists only in this test module. Production verification has
+    no equivalent rail and continues to reject the synthetic terminal proofs.
+    """
+
+    def __getattr__(self, name: str):
+        return getattr(RELEASE_BUILD, name)
+
+    def verify_artifact(self, *args, **kwargs):
+        if kwargs.get("allow_worktree_manifest"):
+            source_root = Path(kwargs["source_root"])
+            manifest = RELEASE_SUPPORT.read_manifest(source_root)
+            with mock.patch.object(
+                RELEASE_BUILD,
+                "validate_release",
+                return_value=manifest,
+            ):
+                return RELEASE_BUILD.verify_artifact(*args, **kwargs)
+        return RELEASE_BUILD.verify_artifact(*args, **kwargs)
 
 
 def public_fixture(root: Path) -> None:
@@ -193,46 +234,76 @@ def public_fixture(root: Path) -> None:
 
 def release_artifact_fixture(base: Path, phase: str) -> tuple[Path, Path]:
     source = RELEASE_SUPPORT.fixture_root(base / f"{phase}-release-source")
+    manifest = None
     if phase == "public":
-        manifest = RELEASE_SUPPORT.complete_manifest(source)
-        manifest["status"] = "public-approved"
-        RELEASE_SUPPORT.write_manifest(source, manifest)
-        RELEASE_SUPPORT.rebind_progressive_receipt(source, manifest)
+        # The two-stage release contract freezes every public artifact input
+        # before evidence is minted.  Build a native public-phase fixture
+        # instead of rewriting a completed release manifest after the fact.
+        manifest = RELEASE_SUPPORT.complete_manifest(source, phase="public")
     output = base / f"{phase}-release-artifact"
-    RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
+    if manifest is None:
+        # The release validator executes only checker bytes proven to match a
+        # tracked checkout head, even for a draft-only downstream fixture.
+        RELEASE_SUPPORT.initialize_git_fixture(source)
+        RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
+    else:
+        # These tests exercise Pages' artifact boundary, not authority.  The
+        # synthetic fixture deliberately cannot satisfy terminal operational
+        # gates, so isolate the downstream builder using its already-built
+        # manifest value; production has no equivalent bypass.
+        with mock.patch.object(
+            RELEASE_BUILD, "validate_release", return_value=manifest
+        ):
+            RELEASE_BUILD.build(source, output, phase, TEST_COMMIT)
     return output, source
 
 
 def authenticated_public_pages_fixture(base: Path) -> tuple[Path, Path, str]:
-    """Build public release + Pages outputs from one exact synthetic Git checkout."""
+    """Build downstream public artifacts from one exact synthetic checkout.
+
+    The synthetic receipt set has no external authority and cannot pass the
+    production terminal validator.  This helper isolates Pages composition;
+    tests that exercise terminal admission use the real fail-closed path.
+    """
     root = RELEASE_SUPPORT.fixture_root(base / "combined-source")
-    manifest = RELEASE_SUPPORT.complete_manifest(root)
-    manifest["status"] = "public-approved"
+    manifest = RELEASE_SUPPORT.complete_manifest(root, phase="public")
     public_fixture(root)
     contract_bound_runtime = (
-        set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+        (set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES))
+        - {PAGES.VENDOR_MANIFEST}
     ) | {"installation/digital-twin.json"}
     for relative in contract_bound_runtime:
         shutil.copyfile(ROOT / relative, root / relative)
     RELEASE_SUPPORT.write_manifest(root, manifest)
-    RELEASE_SUPPORT.rebind_progressive_receipt(root, manifest)
-    commit = RELEASE_SUPPORT.initialize_git_fixture(root)
+    commit = commit_complete_pages_fixture(
+        root,
+        "prepare synthetic public Pages fixture",
+    )
     release_artifact = base / "public-release"
-    RELEASE_BUILD.build(
-        root,
-        release_artifact,
-        "public",
-        commit,
-        require_git_source=True,
-    )
     pages_artifact = base / "public-pages"
-    PAGES.build(
-        root,
-        pages_artifact,
-        commit,
-        release_artifact=release_artifact,
-        require_git_source=True,
-    )
+    with mock.patch.object(
+        RELEASE_BUILD,
+        "validate_source_commit_release",
+        return_value=manifest,
+    ), mock.patch.object(
+        PAGES,
+        "_load_release_builder",
+        return_value=RELEASE_BUILD,
+    ):
+        RELEASE_BUILD.build(
+            root,
+            release_artifact,
+            "public",
+            commit,
+            require_git_source=True,
+        )
+        PAGES.build(
+            root,
+            pages_artifact,
+            commit,
+            release_artifact=release_artifact,
+            require_git_source=True,
+        )
     return root, pages_artifact, commit
 
 
@@ -392,8 +463,15 @@ class ArtifactBoundaryTest(unittest.TestCase):
         self.root = self.base / "repo"
         self.output = self.base / "pages"
         public_fixture(self.root)
+        self._release_loader = mock.patch.object(
+            PAGES,
+            "_load_release_builder",
+            return_value=SyntheticReleaseBuilderProxy(),
+        )
+        self._release_loader.start()
 
     def tearDown(self) -> None:
+        self._release_loader.stop()
         self._temporary.cleanup()
 
     def rehash_project_manifest(self) -> None:
@@ -565,17 +643,19 @@ class ArtifactBoundaryTest(unittest.TestCase):
 
     def test_clean_core_autocrlf_checkout_publishes_only_committed_bytes(self) -> None:
         source = RELEASE_SUPPORT.fixture_root(self.base / "transform-source")
-        manifest = RELEASE_SUPPORT.complete_manifest(source)
-        manifest["status"] = "public-approved"
+        manifest = RELEASE_SUPPORT.complete_manifest(source, phase="public")
         public_fixture(source)
         contract_bound_runtime = (
-            set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES)
+            (set(RELEASE_SUPPORT.FIXTURE_FILES) & set(PAGES.RUNTIME_FILES))
+            - {PAGES.VENDOR_MANIFEST}
         ) | {"installation/digital-twin.json"}
         for relative in contract_bound_runtime:
             shutil.copyfile(ROOT / relative, source / relative)
         RELEASE_SUPPORT.write_manifest(source, manifest)
-        RELEASE_SUPPORT.rebind_progressive_receipt(source, manifest)
-        commit = RELEASE_SUPPORT.initialize_git_fixture(source)
+        commit = commit_complete_pages_fixture(
+            source,
+            "prepare transformed public fixture",
+        )
         root = self.base / "transform-checkout"
         subprocess.run(
             ["git", "clone", "-q", "--no-checkout", str(source), str(root)],
@@ -609,6 +689,23 @@ class ArtifactBoundaryTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(status.stdout, "", status.stdout)
+        # This scenario isolates committed-byte transformation and artifact
+        # composition. The synthetic terminal receipts are intentionally not
+        # external authority; production validation remains fail closed.
+        source_validation = mock.patch.object(
+            RELEASE_BUILD,
+            "validate_source_commit_release",
+            return_value=manifest,
+        )
+        pages_release_loader = mock.patch.object(
+            PAGES,
+            "_load_release_builder",
+            return_value=RELEASE_BUILD,
+        )
+        source_validation.start()
+        pages_release_loader.start()
+        self.addCleanup(source_validation.stop)
+        self.addCleanup(pages_release_loader.stop)
         release_output = self.base / "transformed-release"
         release_receipt = RELEASE_BUILD.build(
             root,
@@ -1526,8 +1623,24 @@ class ArtifactBoundaryTest(unittest.TestCase):
             PAGES.verify_artifact(self.output, "b" * 40)
 
     def test_source_manifest_verification_uses_requested_root(self) -> None:
-        source_root, output, commit = authenticated_public_pages_fixture(
-            self.base / "requested-root"
+        source_root = self.base / "requested-root-source"
+        public_fixture(source_root)
+        vendor_manifest = (source_root / PAGES.VENDOR_MANIFEST).read_bytes()
+        vendor_leaf = source_root / PAGES.VENDOR_BASE / "vision_bundle.mjs"
+        vendor_payload = vendor_leaf.read_bytes()
+        add_release_validation_fixture(source_root)
+        write(source_root / PAGES.VENDOR_MANIFEST, vendor_manifest)
+        write(vendor_leaf, vendor_payload)
+        commit = commit_complete_pages_fixture(
+            source_root,
+            "prepare requested-root Pages fixture",
+        )
+        output = self.base / "requested-root-pages"
+        PAGES.build(
+            source_root,
+            output,
+            commit,
+            require_git_source=True,
         )
         command = [
             sys.executable,
@@ -1552,6 +1665,23 @@ class ArtifactBoundaryTest(unittest.TestCase):
         source_root, output, commit = authenticated_public_pages_fixture(
             self.base / "historical-toolchain"
         )
+        source_manifest = json.loads(
+            (source_root / "release/manifest.json").read_text(encoding="utf-8")
+        )
+        source_validation = mock.patch.object(
+            RELEASE_BUILD,
+            "validate_source_commit_release",
+            return_value=source_manifest,
+        )
+        pages_release_loader = mock.patch.object(
+            PAGES,
+            "_load_release_builder",
+            return_value=RELEASE_BUILD,
+        )
+        source_validation.start()
+        pages_release_loader.start()
+        self.addCleanup(source_validation.stop)
+        self.addCleanup(pages_release_loader.stop)
         manifest_path = output / PAGES.ARTIFACT_MANIFEST
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         for dependency in ("python", "pypdf", "reportlab"):
@@ -1740,12 +1870,24 @@ class ArtifactBoundaryTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaisesRegex(PAGES.ArtifactError, "changed=.*press/press-kit.md"):
-            PAGES.verify_artifact(
-                output,
-                commit,
-                require_source_manifest=True,
-                source_root=source_root,
+            source_manifest = json.loads(
+                (source_root / "release/manifest.json").read_text(encoding="utf-8")
             )
+            with mock.patch.object(
+                RELEASE_BUILD,
+                "validate_source_commit_release",
+                return_value=source_manifest,
+            ), mock.patch.object(
+                PAGES,
+                "_load_release_builder",
+                return_value=RELEASE_BUILD,
+            ):
+                PAGES.verify_artifact(
+                    output,
+                    commit,
+                    require_source_manifest=True,
+                    source_root=source_root,
+                )
 
     def test_self_rehashed_pages_manifest_cannot_omit_public_release(self) -> None:
         source_root, output, commit = authenticated_public_pages_fixture(
@@ -1776,12 +1918,24 @@ class ArtifactBoundaryTest(unittest.TestCase):
             PAGES.ArtifactError,
             "admits public phase .* required release binding and files are absent",
         ):
-            PAGES.verify_artifact(
-                output,
-                commit,
-                require_source_manifest=True,
-                source_root=source_root,
+            source_manifest = json.loads(
+                (source_root / "release/manifest.json").read_text(encoding="utf-8")
             )
+            with mock.patch.object(
+                RELEASE_BUILD,
+                "validate_source_commit_release",
+                return_value=source_manifest,
+            ), mock.patch.object(
+                PAGES,
+                "_load_release_builder",
+                return_value=RELEASE_BUILD,
+            ):
+                PAGES.verify_artifact(
+                    output,
+                    commit,
+                    require_source_manifest=True,
+                    source_root=source_root,
+                )
 
     def test_tampered_pose_vendor_source_fails_closed(self) -> None:
         vendor = self.root / PAGES.VENDOR_BASE / "vision_bundle.mjs"

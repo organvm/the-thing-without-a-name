@@ -37,9 +37,33 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import jsonschema
+
 APP = Path(__file__).resolve().parent.parent
+PROGRESSIVE_RECEIPT = APP / "release/evidence/progressive-controls-replay.json"
+PROGRESSIVE_SCHEMA = APP / "release/progressive-controls-replay.schema.json"
+PROGRESSIVE_CHECKS = (
+    "exact-head",
+    "desktop-layout",
+    "mobile-320-layout",
+    "mobile-390-layout",
+    "zoom-200-layout",
+    "touch-targets",
+    "keyboard-focus",
+    "reduced-motion",
+    "receipt-state",
+    "shipped-score-audio",
+    "map-gating",
+    "console-clean",
+    "http-clean",
+)
+APPLE_METAL_RENDERER = re.compile(
+    r"^ANGLE \(Apple, ANGLE Metal Renderer: Apple M([1-9][0-9]*)"
+    r"(?: (Pro|Max|Ultra))?, Unspecified Version\)$"
+)
 
 # The machine-bound receipt contract accepts only system Chrome's structured
 # ANGLE identity.  An Apple OpenGL label or non-Apple Metal renderer must never
@@ -50,6 +74,230 @@ APPLE_ANGLE_METAL_RENDERER = re.compile(
 )
 CANONICAL_RENDER_CONTEXT = "canonical"
 EMERGENCY_SOFTWARE_CAPTURE_CONTEXT = "emergency-software-capture"
+
+
+def canonical_json(value) -> bytes:
+    return (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git(*args: str, root: Path = APP, text: bool = True):
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=text,
+        check=False,
+        env=environment,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("cannot resolve the exact progressive-controls source")
+    return result.stdout.strip() if text else result.stdout
+
+
+def parse_apple_metal_renderer(value: str) -> dict[str, object]:
+    """Reduce the exact Chrome string to non-prose structured hardware identity."""
+
+    match = APPLE_METAL_RENDERER.fullmatch(value)
+    if match is None:
+        raise RuntimeError("progressive controls require canonical Apple Metal ANGLE")
+    generation, tier = match.groups()
+    return {
+        "vendor": "Apple",
+        "api": "Metal",
+        "generation": int(generation),
+        "tier": (tier or "base").lower(),
+        "raw_renderer_sha256": sha256_bytes(value.encode("utf-8")),
+    }
+
+
+def capture_controls_source(root: Path = APP) -> dict[str, object]:
+    """Freeze the clean pre-evidence source identity for one replay."""
+
+    if _git("for-each-ref", "--format=%(refname)", "refs/replace", root=root):
+        raise RuntimeError("progressive controls reject Git replacement refs")
+    if _git("status", "--porcelain=v1", "--untracked-files=all", root=root):
+        raise RuntimeError("progressive controls require a clean committed checkout")
+    head = _git("rev-parse", "HEAD", root=root)
+    tree = _git("rev-parse", "HEAD^{tree}", root=root)
+    manifest_path = root / "release/manifest.json"
+    for source_path in (
+        "release/manifest.json",
+        "release/progressive-controls-replay.schema.json",
+        "render/browser.py",
+    ):
+        _git("ls-files", "--error-unmatch", source_path, root=root)
+        committed = _git("show", f"{head}:{source_path}", root=root, text=False)
+        if (root / source_path).read_bytes() != committed:
+            raise RuntimeError(
+                "progressive controls require tracked source bytes from exact HEAD"
+            )
+    manifest = json.loads(
+        _git("show", f"{head}:release/manifest.json", root=root, text=False).decode(
+            "utf-8"
+        )
+    )
+    return {
+        "release_id": manifest["release_id"],
+        "release_version": manifest["version"],
+        "repository_head": head,
+        "repository_tree": tree,
+        "release_manifest_sha256": sha256_bytes(
+            _git(
+                "show",
+                f"{head}:release/manifest.json",
+                root=root,
+                text=False,
+            )
+        ),
+        "package_manifest_sha256": None,
+    }
+
+
+def build_controls_receipt(
+    *,
+    source: dict[str, object],
+    browser_version: str,
+    renderer: str,
+    screenshots: list[dict[str, object]],
+    observed_at: str | None = None,
+    root: Path = APP,
+) -> dict[str, object]:
+    """Build, but do not write, one passed machine replay receipt."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("progressive controls receipts require the authorized macOS host")
+    observed = observed_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    graphics = parse_apple_metal_renderer(renderer)
+    runtime = {
+        "platform": "darwin",
+        "browser": {"name": "Google Chrome", "version": browser_version},
+        "graphics": graphics,
+    }
+    raw_capture = {
+        "schema": "danse.progressive-controls-raw-capture.v1",
+        "observed_at": observed,
+        "subject": source,
+        "runtime": runtime,
+        "check_ids": list(PROGRESSIVE_CHECKS),
+        "screenshots": sorted(screenshots, key=lambda item: str(item["id"])),
+        "failure_count": 0,
+        "console_error_count": 0,
+        "http_error_count": 0,
+        "console_error_log_sha256": sha256_bytes(canonical_json([])),
+        "http_error_log_sha256": sha256_bytes(canonical_json([])),
+    }
+    raw_digest = sha256_bytes(canonical_json(raw_capture))
+    generator_bytes = _git(
+        "show",
+        f"{source['repository_head']}:render/browser.py",
+        root=root,
+        text=False,
+    )
+    generator_digest = sha256_bytes(generator_bytes)
+    return {
+        "schema": "danse.progressive-controls-replay.v2",
+        "proof_id": "progressive-controls-exact-head-replay",
+        "gate_id": "progressive-controls-replay",
+        "issue": 17,
+        "result": "passed",
+        "observed_at": observed,
+        "subject": source,
+        "generator": {
+            "path": "render/browser.py",
+            "sha256": generator_digest,
+            "version": "danse-browser-replay.v1",
+            "pull_request": 43,
+        },
+        "runtime": runtime,
+        "raw_capture": raw_capture,
+        "raw_capture_sha256": raw_digest,
+        "checks": [
+            {
+                "id": check_id,
+                "result": "passed",
+                "receipt_sha256": sha256_bytes(
+                    canonical_json(
+                        {"check_id": check_id, "raw_capture_sha256": raw_digest}
+                    )
+                ),
+            }
+            for check_id in PROGRESSIVE_CHECKS
+        ],
+        "claim_scope": "progressive-controls-verified-only",
+    }
+
+
+def write_controls_receipt(path: Path, receipt: dict[str, object]) -> None:
+    """Schema-check and atomically publish one successful replay receipt."""
+
+    schema = json.loads(PROGRESSIVE_SCHEMA.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.FormatChecker()
+    ).validate(receipt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise RuntimeError("progressive controls receipt already exists")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if temporary.exists():
+        raise RuntimeError("progressive controls receipt staging path already exists")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(canonical_json(receipt))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def publish_controls_receipt(
+    *,
+    result: int,
+    source: dict[str, object],
+    browser_version: str,
+    renderer: str,
+    screenshots: list[dict[str, object]],
+    root: Path = APP,
+    path: Path = PROGRESSIVE_RECEIPT,
+) -> bool:
+    """Publish only a successful, unchanged, exact-source machine replay."""
+
+    if result != 0:
+        return False
+    if path.resolve() != (root / PROGRESSIVE_RECEIPT.relative_to(APP)).resolve():
+        raise RuntimeError("progressive controls receipt must use its canonical path")
+    if capture_controls_source(root) != source:
+        raise RuntimeError("progressive controls source changed during replay")
+    receipt = build_controls_receipt(
+        source=source,
+        browser_version=browser_version,
+        renderer=renderer,
+        screenshots=screenshots,
+        root=root,
+    )
+    write_controls_receipt(path, receipt)
+    return True
 
 READ_RENDERER = """
 () => {
@@ -405,11 +653,17 @@ def run_interaction(page, base: str) -> int:
     return 1
 
 
-def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
+def run_controls(
+    page,
+    base: str,
+    screenshot_dir: Path | None = None,
+    audit: dict[str, object] | None = None,
+) -> int:
     """Exercise the progressive controls against the live engine adapter."""
     failures: list[str] = []
     console_errors: list[str] = []
     http_errors: list[str] = []
+    screenshot_receipts: list[dict[str, object]] = []
     page.on("console", lambda message: console_errors.append(f"{message.text} @ {message.location}") if message.type == "error" else None)
     page.on("response", lambda response: http_errors.append(f"{response.status} {response.url}") if response.status >= 400 else None)
 
@@ -427,7 +681,15 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
           const toast = document.getElementById('toast');
           if (toast) { toast.hidden = true; toast.textContent = ''; }
         }""")
-        page.screenshot(path=str(screenshot_dir / f"{name}.png"), full_page=False)
+        screenshot_path = screenshot_dir / f"{name}.png"
+        page.screenshot(path=str(screenshot_path), full_page=False)
+        screenshot_receipts.append(
+            {
+                "id": name,
+                "sha256": sha256_file(screenshot_path),
+                "bytes": screenshot_path.stat().st_size,
+            }
+        )
 
     def touch_targets(scope: str, label: str) -> None:
         targets = page.evaluate(
@@ -830,6 +1092,16 @@ def run_controls(page, base: str, screenshot_dir: Path | None = None) -> int:
             print(f"  BROKEN — {failure}")
         print("\nPROGRESSIVE CONTROLS BROKEN")
         return 1
+    if audit is not None:
+        audit.clear()
+        audit.update(
+            {
+                "screenshots": screenshot_receipts,
+                "failure_count": 0,
+                "console_error_count": 0,
+                "http_error_count": 0,
+            }
+        )
     print("\nPROGRESSIVE CONTROLS HOLD — shared actions, focus, status, and layouts passed")
     return 0
 
@@ -842,13 +1114,28 @@ def main() -> int:
     ap.add_argument("--probe", action="store_true", help="run probe.html's projection-continuity self-test")
     ap.add_argument("--interaction", action="store_true", help="run local pose/fallback/privacy verification")
     ap.add_argument("--controls", action="store_true", help="run progressive-control and responsive-layout verification")
+    ap.add_argument(
+        "--controls-receipt",
+        action="store_true",
+        help="atomically write the canonical receipt after an exact successful controls replay",
+    )
     ap.add_argument("--screenshots", type=Path, help="write control verification screenshots")
     ap.add_argument("--headed", action="store_true", help="show the window (debugging)")
     ap.add_argument("--base", help="use an already-running server instead of starting one")
     args = ap.parse_args()
 
+    if args.controls_receipt and not args.controls:
+        ap.error("--controls-receipt requires --controls")
+    if args.controls_receipt and any(
+        (args.check, args.verify, args.arrival, args.probe, args.interaction)
+    ):
+        ap.error("--controls-receipt may only accompany --controls")
+
     if not args.check and not args.verify and not args.arrival and not args.probe and not args.interaction and not args.controls:
         ap.error("nothing to do — pass --check, --verify, --arrival, --probe, --interaction or --controls")
+
+    receipt_source = capture_controls_source() if args.controls_receipt else None
+    controls_audit: dict[str, object] = {}
 
     with contextlib.ExitStack() as stack:
         if args.base:
@@ -872,7 +1159,25 @@ def main() -> int:
         if args.interaction:
             rc = run_interaction(page, base) or rc
         if args.controls:
-            rc = run_controls(page, base, args.screenshots) or rc
+            controls_rc = run_controls(
+                page,
+                base,
+                args.screenshots,
+                controls_audit if args.controls_receipt else None,
+            )
+            rc = controls_rc or rc
+            if args.controls_receipt and receipt_source is not None:
+                launched = page.context.browser
+                if launched is None:
+                    raise RuntimeError("cannot identify the exact Chrome runtime")
+                if publish_controls_receipt(
+                    result=controls_rc,
+                    source=receipt_source,
+                    browser_version=launched.version,
+                    renderer=page.gl_renderer,
+                    screenshots=list(controls_audit.get("screenshots", [])),
+                ):
+                    print(f"receipt     {PROGRESSIVE_RECEIPT.relative_to(APP)}")
         return rc
 
 

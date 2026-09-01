@@ -7044,6 +7044,100 @@ class DeliveryContractTest(unittest.TestCase):
             self.assertEqual(BROWSER.run_probe(page, "http://example.test"), 0)
         page.goto.assert_called_once_with("http://example.test/probe.html", wait_until="load")
 
+    def test_progressive_receipt_parser_accepts_only_canonical_apple_metal(self) -> None:
+        graphics = BROWSER.parse_apple_metal_renderer(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)"
+        )
+        self.assertEqual(
+            graphics,
+            {
+                "vendor": "Apple",
+                "api": "Metal",
+                "generation": 5,
+                "tier": "pro",
+                "raw_renderer_sha256": hashlib.sha256(
+                    b"ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)"
+                ).hexdigest(),
+            },
+        )
+        for renderer in (
+            "ANGLE (Apple, ANGLE Metal Renderer: Final Cut Approved Rights Cleared)",
+            "ANGLE (Apple, ANGLE Metal Renderer: not Apple and not Metal)",
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro)",
+            "ANGLE (Apple, Apple M5 Pro, Unspecified Version)",
+            "ANGLE (Unknown, ANGLE Metal Renderer: Metal, Unspecified Version)",
+        ):
+            with self.subTest(renderer=renderer), self.assertRaises(RuntimeError):
+                BROWSER.parse_apple_metal_renderer(renderer)
+
+    def test_progressive_receipt_builder_embeds_a_closed_raw_capture(self) -> None:
+        source = {
+            "release_id": "fixture-release",
+            "release_version": "1",
+            "repository_head": "a" * 40,
+            "repository_tree": "b" * 40,
+            "release_manifest_sha256": "c" * 64,
+            "package_manifest_sha256": None,
+        }
+        with (
+            mock.patch.object(BROWSER.sys, "platform", "darwin"),
+            mock.patch.object(BROWSER, "_git", return_value=b"exact generator bytes\n"),
+        ):
+            receipt = BROWSER.build_controls_receipt(
+                source=source,
+                browser_version="123.0.6312.87",
+                renderer=(
+                    "ANGLE (Apple, ANGLE Metal Renderer: "
+                    "Apple M5 Max, Unspecified Version)"
+                ),
+                screenshots=[],
+                observed_at="2026-08-30T12:00:00Z",
+            )
+        schema = json.loads(
+            (ROOT / "release/progressive-controls-replay.schema.json").read_text()
+        )
+        BROWSER.jsonschema.Draft202012Validator(schema).validate(receipt)
+        self.assertEqual(
+            receipt["raw_capture_sha256"],
+            hashlib.sha256(BROWSER.canonical_json(receipt["raw_capture"])).hexdigest(),
+        )
+        self.assertNotIn("renderer", receipt["runtime"]["graphics"])
+        self.assertNotIn("Final Cut", json.dumps(receipt))
+        for check in receipt["checks"]:
+            expected = hashlib.sha256(
+                BROWSER.canonical_json(
+                    {
+                        "check_id": check["id"],
+                        "raw_capture_sha256": receipt["raw_capture_sha256"],
+                    }
+                )
+            ).hexdigest()
+            self.assertEqual(check["receipt_sha256"], expected)
+
+    def test_failed_progressive_replay_never_creates_a_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "release/evidence/progressive-controls-replay.json"
+            published = BROWSER.publish_controls_receipt(
+                result=1,
+                source={},
+                browser_version="123.0.6312.87",
+                renderer="not used",
+                screenshots=[],
+                root=root,
+                path=path,
+            )
+            self.assertFalse(published)
+            self.assertFalse(path.exists())
+
+    def test_invalid_progressive_receipt_is_not_staged_or_published(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progressive-controls-replay.json"
+            with self.assertRaises(BROWSER.jsonschema.ValidationError):
+                BROWSER.write_controls_receipt(path, {"schema": "wrong"})
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.glob(".*.tmp")), [])
+
     def test_explicit_browser_base_never_falls_back_to_local_checkout(self) -> None:
         forbidden = mock.Mock(side_effect=AssertionError("local server fallback invoked"))
         with (

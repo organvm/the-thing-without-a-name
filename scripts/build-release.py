@@ -3,10 +3,108 @@
 
 from __future__ import annotations
 
+_bootstrap_sys = __import__("sys")
+_bootstrap_os = __import__("os")
+if getattr(getattr(_bootstrap_os, "__spec__", None), "origin", None) not in {
+    "built-in",
+    "frozen",
+}:
+    raise RuntimeError("release builder requires the frozen OS path bootstrap")
+_bootstrap_scripts = _bootstrap_os.path.realpath(
+    _bootstrap_os.path.dirname(__file__)
+)
+_bootstrap_root = _bootstrap_os.path.dirname(_bootstrap_scripts)
+_bootstrap_boundaries = [_bootstrap_root]
+_bootstrap_argv_index = 0
+_bootstrap_root_value = ""
+_bootstrap_root_present = False
+while _bootstrap_argv_index < len(_bootstrap_sys.argv):
+    _bootstrap_argument = _bootstrap_sys.argv[_bootstrap_argv_index]
+    if _bootstrap_argument in {"--r", "--ro", "--roo", "--root"}:
+        _bootstrap_root_present = True
+        if _bootstrap_argv_index + 1 < len(_bootstrap_sys.argv):
+            _bootstrap_argv_index += 1
+            _bootstrap_root_value = _bootstrap_sys.argv[_bootstrap_argv_index]
+    elif any(
+        _bootstrap_argument.startswith(prefix)
+        for prefix in ("--r=", "--ro=", "--roo=", "--root=")
+    ):
+        _bootstrap_root_present = True
+        _bootstrap_root_value = _bootstrap_argument.split("=", 1)[1]
+    if _bootstrap_root_present:
+        _bootstrap_boundaries.append(
+            _bootstrap_os.path.realpath(
+                _bootstrap_root_value or _bootstrap_os.getcwd()
+            )
+        )
+        _bootstrap_root_value = ""
+        _bootstrap_root_present = False
+    _bootstrap_argv_index += 1
+_bootstrap_prefix = _bootstrap_os.path.realpath(_bootstrap_sys.prefix)
+_bootstrap_active_venv = _bootstrap_sys.prefix != _bootstrap_sys.base_prefix
+_bootstrap_safe_path: list[str] = []
+_bootstrap_argument = ""
+_bootstrap_boundary = ""
+_bootstrap_entry = ""
+_bootstrap_candidate = ""
+_bootstrap_common = ""
+_bootstrap_inside_repository = False
+_bootstrap_prefix_common = ""
+for _bootstrap_entry in _bootstrap_sys.path:
+    _bootstrap_candidate = _bootstrap_os.path.realpath(
+        _bootstrap_entry or _bootstrap_os.getcwd()
+    )
+    _bootstrap_inside_repository = False
+    for _bootstrap_boundary in _bootstrap_boundaries:
+        try:
+            _bootstrap_common = _bootstrap_os.path.commonpath(
+                [_bootstrap_candidate, _bootstrap_boundary]
+            )
+        except ValueError:
+            _bootstrap_common = ""
+        if _bootstrap_common == _bootstrap_boundary:
+            _bootstrap_inside_repository = True
+            break
+    try:
+        _bootstrap_prefix_common = _bootstrap_os.path.commonpath(
+            [_bootstrap_candidate, _bootstrap_prefix]
+        )
+    except ValueError:
+        _bootstrap_prefix_common = ""
+    if (
+        _bootstrap_inside_repository
+        and not (
+            _bootstrap_active_venv
+            and _bootstrap_prefix_common == _bootstrap_prefix
+        )
+    ):
+        continue
+    _bootstrap_safe_path.append(_bootstrap_entry)
+_bootstrap_sys.path[:] = _bootstrap_safe_path
+del (
+    _bootstrap_active_venv,
+    _bootstrap_argument,
+    _bootstrap_argv_index,
+    _bootstrap_boundaries,
+    _bootstrap_boundary,
+    _bootstrap_candidate,
+    _bootstrap_common,
+    _bootstrap_entry,
+    _bootstrap_inside_repository,
+    _bootstrap_os,
+    _bootstrap_prefix,
+    _bootstrap_prefix_common,
+    _bootstrap_root,
+    _bootstrap_root_present,
+    _bootstrap_root_value,
+    _bootstrap_safe_path,
+    _bootstrap_scripts,
+    _bootstrap_sys,
+)
+
 import argparse
 import hashlib
 import html
-import importlib.util
 import io
 import os
 import platform
@@ -14,7 +112,9 @@ import posixpath
 import re
 import stat
 import subprocess
+import sys
 import tempfile
+import types
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
@@ -27,18 +127,20 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-
 def _load_release_contract():
-    """Load only the contract beside this exact builder checkout."""
+    """Load source bytes only from the contract beside this builder."""
     path = Path(__file__).resolve().with_name("release_contract.py")
     identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
     module_name = f"danse_release_contract_{identity}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load the sibling release contract")
-    module = importlib.util.module_from_spec(spec)
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = None
     try:
-        spec.loader.exec_module(module)
+        source = path.read_bytes()
+        code = compile(source, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
         required = (
             "EXPECTED_OPPORTUNITY_FROZEN_AT",
             "EXPECTED_OPPORTUNITY_RECEIPT_SHA256",
@@ -57,6 +159,7 @@ def _load_release_contract():
             "decode_json_object",
             "load_json",
             "phase_blockers",
+            "provenance_git_command",
             "provenance_git_env",
             "reject_git_rewrites",
             "require_commit_object",
@@ -93,6 +196,7 @@ canonical_json = _RELEASE_CONTRACT.canonical_json
 decode_json_object = _RELEASE_CONTRACT.decode_json_object
 load_json = _RELEASE_CONTRACT.load_json
 phase_blockers = _RELEASE_CONTRACT.phase_blockers
+provenance_git_command = _RELEASE_CONTRACT.provenance_git_command
 provenance_git_env = _RELEASE_CONTRACT.provenance_git_env
 reject_git_rewrites = _RELEASE_CONTRACT.reject_git_rewrites
 require_commit_object = _RELEASE_CONTRACT.require_commit_object
@@ -1330,7 +1434,7 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
     reject_git_rewrites(root)
     git_env = provenance_git_env()
     identity = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel", "HEAD"],
+        provenance_git_command(root, "rev-parse", "--show-toplevel", "HEAD"),
         capture_output=True,
         text=True,
         check=False,
@@ -1348,15 +1452,13 @@ def validate_git_source(root: Path, expected_commit: str) -> None:
             f"source commit {expected_commit} does not match checkout HEAD {actual_commit}"
         )
     status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
+        provenance_git_command(
+            root,
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-        ],
+        ),
         capture_output=True,
         text=True,
         check=False,
@@ -1657,16 +1759,25 @@ def source_release_manifest(
 ) -> tuple[dict, str]:
     """Read the release manifest from the declared commit, or an explicit fixture."""
     root = root.absolute().resolve()
+    if allow_worktree_fallback and not (root / ".git").exists():
+        path = source_file(root, MANIFEST.as_posix(), "release manifest")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseError(f"release manifest cannot be read: {exc}") from exc
+        manifest = decode_json_object(data, "source-commit release manifest")
+        return manifest, hashlib.sha256(data).hexdigest()
     if not allow_worktree_fallback:
         commit = require_commit_object(root, commit)
+    else:
+        reject_git_rewrites(root)
     committed = subprocess.run(
-        ["git", "-C", str(root), "show", f"{commit}:{MANIFEST.as_posix()}"],
+        provenance_git_command(root, "show", f"{commit}:{MANIFEST.as_posix()}"),
         capture_output=True,
         check=False,
         env=provenance_git_env(),
     )
     if committed.returncode == 0:
-        reject_git_rewrites(root)
         data = committed.stdout
     elif allow_worktree_fallback:
         path = source_file(root, MANIFEST.as_posix(), "release manifest")
@@ -1749,63 +1860,51 @@ def validate_source_commit_release(
     commit = require_commit_object(root, commit)
     with tempfile.TemporaryDirectory(prefix="danse-source-release-") as temporary:
         snapshot = Path(temporary)
-
-        def materialize(relative: str, label: str) -> bytes:
-            data, executable = source_commit_blob(root, commit, relative, label)
+        listing = subprocess.run(
+            provenance_git_command(
+                root,
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                commit,
+            ),
+            capture_output=True,
+            check=False,
+            env=provenance_git_env(),
+        )
+        if listing.returncode != 0:
+            raise ReleaseError("cannot enumerate the declared source commit")
+        for row in (item for item in listing.stdout.split(b"\0") if item):
+            if b"\t" not in row:
+                raise ReleaseError("declared source commit has an invalid tree record")
+            identity, encoded_path = row.split(b"\t", 1)
+            try:
+                mode, kind, object_id = identity.decode("ascii").split()
+                relative = encoded_path.decode("utf-8")
+            except (UnicodeError, ValueError) as exc:
+                raise ReleaseError(
+                    "declared source commit has an invalid tree identity"
+                ) from exc
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                continue
+            relative = safe_relative(relative, "declared source path")
+            blob = subprocess.run(
+                provenance_git_command(root, "cat-file", "blob", object_id),
+                capture_output=True,
+                check=False,
+                env=provenance_git_env(),
+            )
+            if blob.returncode != 0:
+                raise ReleaseError(
+                    f"cannot read declared source file {relative}"
+                )
             target = snapshot / PurePosixPath(relative)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            target.chmod(0o755 if executable else 0o644)
-            return data
+            target.write_bytes(blob.stdout)
+            target.chmod(0o755 if mode == "100755" else 0o644)
 
-        materialize(MANIFEST.as_posix(), "release manifest")
-        materialize(SCHEMA.as_posix(), "release schema")
         validate_schema(snapshot, manifest)
-
-        evidence_paths = _manifest_evidence_paths(manifest)
-        support_paths = {
-            "opportunities/opportunity.schema.json",
-            "submission/screendance-2027.yaml",
-        }
-        progressive_evidence = next(
-            (
-                gate.get("evidence")
-                for gate in manifest.get("gates", [])
-                if isinstance(gate, dict)
-                and gate.get("id") == "progressive-controls-replay"
-            ),
-            None,
-        )
-        if (
-            isinstance(progressive_evidence, dict)
-            and progressive_evidence.get("path")
-            == PROGRESSIVE_CONTROLS_EVIDENCE_PATH
-        ):
-            support_paths.add(PROGRESSIVE_CONTROLS_SCHEMA_PATH)
-        for relative in sorted(evidence_paths | support_paths):
-            if relative not in {MANIFEST.as_posix(), SCHEMA.as_posix()}:
-                materialize(relative, f"source validation file {relative}")
-
-        twin_relative = manifest["installation"]["reference_contract"]["digital_twin"][
-            "path"
-        ]
-        twin = decode_json_object(
-            (snapshot / PurePosixPath(twin_relative)).read_bytes(),
-            "source-commit installation digital twin",
-        )
-        contracts = twin.get("source_contracts")
-        if not isinstance(contracts, list):
-            raise ReleaseError("source-commit installation source contracts are invalid")
-        for index, contract in enumerate(contracts):
-            if not isinstance(contract, dict):
-                raise ReleaseError(
-                    f"source-commit installation source contract {index} is invalid"
-                )
-            relative = safe_relative(
-                contract.get("path"),
-                f"installation source contract {index} path",
-            )
-            materialize(relative, f"installation source contract {index}")
 
         # The declared commit supplies data only. Executable validators always
         # come from this verifier's trusted, versioned source tree.
@@ -2235,7 +2334,7 @@ def build(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--output", type=Path, help="build a new release artifact outside the repository")
     action.add_argument("--verify", type=Path, help="verify an existing release artifact")
