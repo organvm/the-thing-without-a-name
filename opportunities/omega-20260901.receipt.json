@@ -1,0 +1,21 @@
+{
+  "schema": "danse.opportunity-receipt.v1",
+  "issued_at": "2026-09-01T04:17:08Z",
+  "snapshot": {
+    "path": "opportunities/omega-20260901.json",
+    "sha256": "74cdb8da3b574f0e19655c00c44278a5318c514dc4dcacfbb0438ef08ee27777",
+    "bytes": 51151,
+    "snapshot_id": "omega-20260901",
+    "frozen_at": "2026-09-01T02:40:40Z"
+  },
+  "opportunity_count": 17,
+  "source_count": 24,
+  "ranked_action_count": 5,
+  "consumers": [
+    {
+      "issue": 22,
+      "binding": "https://github.com/organvm/the-thing-without-a-name/issues/22",
+      "status": "maintenance"
+    }
+  ]
+}
