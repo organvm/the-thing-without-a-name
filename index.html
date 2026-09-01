@@ -361,6 +361,7 @@ const musicalScore = scoreUrl
   : null;
 let navigationGeneration = 0;
 let programGeneration = 0;
+let previousRiverUrl = null;
 
 const canvas = document.getElementById("stage");
 const el = (id) => document.getElementById(id);
@@ -552,6 +553,17 @@ setInterval(() => {
 // shared river can fail while looking like it worked. `replaceState` above does
 // not fire this event, so the page cannot chase its own tail.
 addEventListener("hashchange", async () => {
+  const projectSection = projectSectionFor(location.hash);
+  if (projectSection) {
+    navigationGeneration += 1;
+    programGeneration += 1;
+    previousRiver = null;
+    previousRiverUrl = null;
+    previousRiverWasRemembered = false;
+    el("river-undo").disabled = true;
+    await openProjectSection(projectSection);
+    return;
+  }
   const generation = ++navigationGeneration;
   const programIntent = ++programGeneration;
   const nextRiver = Arrival.arrive(location.hash);
@@ -565,6 +577,7 @@ addEventListener("hashchange", async () => {
   if (generation !== navigationGeneration) return;
   river = nextRiver;
   previousRiver = null;
+  previousRiverUrl = null;
   previousRiverWasRemembered = false;
   el("river-undo").disabled = true;
   el("river-receipt").textContent = `River ${hex(river.seed)} arrived from this link. Undo is unavailable.`;
@@ -789,6 +802,7 @@ function toggleHold() {
 function newRiver() {
   navigationGeneration += 1;
   previousRiver = river;
+  previousRiverUrl = shifted ? location.href : null;
   const remembered = Arrival.recall();
   previousRiverWasRemembered = !river.shifted && Boolean(remembered)
     && remembered.seed === river.seed
@@ -812,6 +826,8 @@ function undoRiver() {
   if (previousRiverWasRemembered) Arrival.remember(river);
   previousRiverWasRemembered = false;
   shifted = Boolean(river.shifted);
+  if (shifted && previousRiverUrl) history.replaceState(null, "", previousRiverUrl);
+  previousRiverUrl = null;
   heldAt = reducedMotion.matches ? Arrival.now(river) : null;
   el("river-seed").textContent = `Current river: ${hex(river.seed)}`;
   el("river-undo").disabled = true;
@@ -956,6 +972,36 @@ async function openMap(trigger) {
   el("map-close").focus();
 }
 
+const PROJECT_FRAGMENT_SECTIONS = Object.freeze({
+  artwork: "project-artwork",
+  film: "project-film",
+  "ballet-score": "project-film",
+  status: "project-status",
+  readings: "project-readings",
+  cubism: "project-readings",
+  glitch: "project-readings",
+  evidence: "project-evidence",
+});
+
+function projectSectionFor(fragment = location.hash) {
+  let key;
+  try {
+    key = decodeURIComponent(fragment.replace(/^#/, "")).toLowerCase();
+  } catch {
+    return null;
+  }
+  return PROJECT_FRAGMENT_SECTIONS[key] ?? null;
+}
+
+async function openProjectSection(section = projectSectionFor()) {
+  if (!section || !controlBus) return false;
+  await openMap(dock.querySelector('[data-category="map"]'));
+  const target = el(section);
+  target?.scrollIntoView({ block: "start" });
+  target?.focus({ preventScroll: true });
+  return Boolean(target);
+}
+
 controlBus = createControlActions({
   hold: toggleHold,
   newRiver,
@@ -1033,6 +1079,7 @@ dock.hidden = false;
 dock.removeAttribute("aria-hidden");
 hudToggle.hidden = false;
 hudToggle.removeAttribute("aria-hidden");
+void openProjectSection();
 
 addEventListener("pagehide", () => interaction.stop(at()));
 

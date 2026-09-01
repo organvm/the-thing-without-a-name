@@ -15,8 +15,8 @@
   <p><a href="https://danse.pages.dev/">Enter Danse Macabre</a></p>
 </main>
 <script>
-if (/\/project\/(?:index\.html)?$/.test(location.pathname)) {
-  location.replace(`https://danse.pages.dev/${location.search}`);
+if (/^\/project(?:\/index\.html)?\/?$/.test(location.pathname)) {
+  location.replace(`https://danse.pages.dev/${location.search}${location.hash}`);
 }
 </script>
 </body>

@@ -1998,6 +1998,35 @@ class InterfaceContractTest(unittest.TestCase):
         self.assertIn("navigationGeneration += 1;", new_river)
         self.assertLess(undo_river.index("if (!previousRiver) return null;"), undo_river.index("navigationGeneration += 1;"))
 
+    def test_shifted_river_undo_restores_its_pre_mint_address(self) -> None:
+        new_river = self.script.split("function newRiver() {", 1)[1].split("\n}", 1)[0]
+        undo_river = self.script.split("function undoRiver() {", 1)[1].split("\n}", 1)[0]
+        hash_navigation = self.script.split(
+            'addEventListener("hashchange", async () => {', 1
+        )[1].split("/** Wind this river", 1)[0]
+        self.assertIn("let previousRiverUrl = null;", self.script)
+        self.assertIn("previousRiverUrl = shifted ? location.href : null;", new_river)
+        self.assertIn(
+            'if (shifted && previousRiverUrl) history.replaceState(null, "", previousRiverUrl);',
+            undo_river,
+        )
+        self.assertIn("previousRiverUrl = null;", undo_river)
+        self.assertIn("previousRiverUrl = null;", hash_navigation)
+
+    def test_legacy_project_fragments_open_the_moved_live_section(self) -> None:
+        redirect = (ROOT / "404.html").read_text(encoding="utf-8")
+        self.assertIn(r"/^\/project(?:\/index\.html)?\/?$/", redirect)
+        self.assertIn("${location.search}${location.hash}", redirect)
+        self.assertIn('evidence: "project-evidence"', self.script)
+        self.assertIn('"ballet-score": "project-film"', self.script)
+        helper = self.script.split(
+            "async function openProjectSection(section = projectSectionFor()) {", 1
+        )[1].split("\n}", 1)[0]
+        self.assertIn("await openMap(", helper)
+        self.assertIn('target?.scrollIntoView({ block: "start" })', helper)
+        self.assertIn("target?.focus({ preventScroll: true })", helper)
+        self.assertIn("void openProjectSection();", self.script)
+
     def test_reduced_motion_preserves_the_actual_manual_hold(self) -> None:
         handler = self.script.split("function reducedMotionChanged({ matches }) {", 1)[1].split("\n}", 1)[0]
         self.assertIn('playback === "running"', handler)
