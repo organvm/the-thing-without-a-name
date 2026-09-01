@@ -591,16 +591,56 @@ def _public_https_addresses(
     except OSError as exc:
         raise AssetError("HTTPS source host cannot be resolved") from exc
     addresses: list[HTTPSAddress] = []
-    for family, socket_type, protocol, _canonical_name, sockaddr in rows:
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 5:
+            raise AssetError("HTTPS source host returned an invalid address")
+        family, socket_type, protocol, _canonical_name, sockaddr = row
         if family not in {socket.AF_INET, socket.AF_INET6}:
             continue
-        if socket_type not in {0, socket.SOCK_STREAM}:
-            continue
+        if (
+            socket_type not in {0, socket.SOCK_STREAM}
+            or protocol not in {0, socket.IPPROTO_TCP}
+        ):
+            raise AssetError("HTTPS source host returned a non-TCP address")
+        if not isinstance(sockaddr, tuple):
+            raise AssetError("HTTPS source host returned an invalid address")
+        if family == socket.AF_INET:
+            if len(sockaddr) != 2:
+                raise AssetError("HTTPS source host returned an invalid IPv4 address")
+            raw_address, port = sockaddr
+        else:
+            if len(sockaddr) != 4:
+                raise AssetError("HTTPS source host returned an invalid IPv6 address")
+            raw_address, port, flow_info, scope_id = sockaddr
+            if (
+                not isinstance(flow_info, int)
+                or not isinstance(scope_id, int)
+                or scope_id != 0
+            ):
+                raise AssetError("HTTPS source host returned a scoped IPv6 address")
+        if port != 443:
+            raise AssetError("HTTPS source host returned an unexpected TLS port")
+        if not isinstance(raw_address, str):
+            raise AssetError("HTTPS source host returned an invalid address")
         try:
-            address = ipaddress.ip_address(sockaddr[0])
-        except (IndexError, TypeError, ValueError) as exc:
+            address = ipaddress.ip_address(raw_address)
+        except (TypeError, ValueError) as exc:
             raise AssetError("HTTPS source host returned an invalid address") from exc
-        if not address.is_global:
+        expected_version = 4 if family == socket.AF_INET else 6
+        if address.version != expected_version:
+            raise AssetError("HTTPS source host returned an invalid address family")
+        if isinstance(address, ipaddress.IPv6Address) and address.scope_id is not None:
+            raise AssetError("HTTPS source host returned a scoped IPv6 address")
+        # Python 3.11 can classify IPv4-mapped special-use space as global.
+        # Apply policy to the effective IPv4 endpoint while retaining the
+        # resolver's original IPv6 sockaddr for the pinned connection.
+        policy_address = (
+            address.ipv4_mapped
+            if isinstance(address, ipaddress.IPv6Address)
+            and address.ipv4_mapped is not None
+            else address
+        )
+        if not policy_address.is_global:
             raise AssetError("HTTPS source URL cannot target a non-public address")
         candidate = (
             family,

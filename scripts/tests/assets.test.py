@@ -3592,6 +3592,131 @@ class AssetParityTest(unittest.TestCase):
             ASSETS._open_url("https://example.com/private", {}, 1.0)
         pinned.assert_not_called()
 
+    def test_public_https_addresses_rejects_unsafe_resolver_rows(self) -> None:
+        unsafe_rows = {
+            "mapped CGNAT": [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("::ffff:100.64.0.1", 443, 0, 0),
+                )
+            ],
+            "mapped loopback": [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("::ffff:127.0.0.1", 443, 0, 0),
+                )
+            ],
+            "non-TLS port": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("93.184.216.34", 8443),
+                )
+            ],
+            "non-TCP protocol": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_UDP,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ],
+            "scoped IPv6": [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("2606:4700:4700::1111", 443, 0, 7),
+                )
+            ],
+            "malformed IPv4 sockaddr": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("93.184.216.34",),
+                )
+            ],
+            "non-text address": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    (b"93.184.216.34", 443),
+                )
+            ],
+            "malformed resolver row": [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                )
+            ],
+        }
+        for label, rows in unsafe_rows.items():
+            with (
+                self.subTest(label=label),
+                mock.patch.object(ASSETS.socket, "getaddrinfo", return_value=rows),
+                self.assertRaises(ASSETS.AssetError),
+            ):
+                ASSETS._public_https_addresses("https://example.com/object")
+
+    def test_public_https_addresses_rejects_mixed_public_private_answers(
+        self,
+    ) -> None:
+        rows = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", 443),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("10.0.0.1", 443),
+            ),
+        ]
+        with (
+            mock.patch.object(ASSETS.socket, "getaddrinfo", return_value=rows),
+            self.assertRaisesRegex(ASSETS.AssetError, "non-public address"),
+        ):
+            ASSETS._public_https_addresses("https://example.com/object")
+
+    def test_public_https_addresses_preserves_public_mapped_sockaddr(self) -> None:
+        row = (
+            socket.AF_INET6,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("::ffff:8.8.8.8", 443, 0, 0),
+        )
+        with mock.patch.object(
+            ASSETS.socket,
+            "getaddrinfo",
+            return_value=[row],
+        ):
+            addresses = ASSETS._public_https_addresses(
+                "https://example.com/object"
+            )
+        self.assertEqual(addresses, (row[:3] + (row[4],),))
+
     def test_header_construction_errors_are_redacted_asset_errors(self) -> None:
         leaked = "do-not-echo-this-header"
         with (
