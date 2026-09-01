@@ -68,8 +68,12 @@ can remember, repeat, and reveal.
 - A finite ScreenDance capture and public project package remain in draft.
 - The installation is a reference design and simulator. Its venue, hardware,
   calibration, recovery, and restore gates are blocked.
-- Performer credit, pictured-object review, music clearance, selected press
-  stills, and several publication approvals remain pending.
+- Madison Garber is credited as performer and primary choreographer; Anthony J.
+  Padavano is credited for concept, direction, additional choreography,
+  image-making, editing, sound, software, archive, and production. Performer
+  release, pictured-object review, music clearance, selected press stills, and
+  several publication approvals remain governed by the draft rights and release
+  records.
 
 These are not small-print caveats. They distinguish an implemented artwork from
 uses that require other people, a venue, a final cut, or explicit permission.
