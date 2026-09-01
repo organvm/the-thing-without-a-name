@@ -858,6 +858,8 @@ class AssetParityTest(unittest.TestCase):
         source.mkdir()
         (source / "Asset.bin").write_bytes(b"first")
         (source / "asset.bin").write_bytes(b"second")
+        if {entry.name for entry in source.iterdir()} != {"Asset.bin", "asset.bin"}:
+            self.skipTest("case-insensitive filesystem cannot hold case-colliding names")
         output = self.fixture.base / "case-colliding-lock.json"
         with self.assertRaisesRegex(ASSETS.AssetError, "case-colliding"):
             ASSETS.inventory(
